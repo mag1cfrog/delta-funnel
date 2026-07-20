@@ -466,6 +466,7 @@ mod tests {
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
             _reporter: Option<&ProgressReporter>,
+            _stage_context: crate::profiling::OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let mut rows = 0_u64;
             let mut batch_count = 0_u64;
@@ -524,6 +525,7 @@ mod tests {
             write_backend: MssqlWriteBackend,
             validation_options: ValidationOptions,
             reporter: Option<&ProgressReporter>,
+            stage_context: crate::profiling::OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = crate::plan_mssql_target_for_resolved_output(
                 output_schema.as_ref(),
@@ -539,6 +541,7 @@ mod tests {
                 write_backend,
                 validation_options,
                 reporter,
+                stage_context,
             )
             .await
         }

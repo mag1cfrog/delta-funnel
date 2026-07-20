@@ -5,8 +5,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryFuture, MssqlOutputWriteJob,
     MssqlWorkflowOutputWriter, MssqlWorkflowWriteReport, WriteAllCacheAliasReport,
-    profiling::OperationTraceContext, progress::ProgressReporter,
-    report::OperationTimelineRecorder, usize_to_u64_saturating, write_mssql_outputs_with_writer,
+    profiling::OperationTraceContext, progress::ProgressReporter, usize_to_u64_saturating,
+    write_mssql_outputs_with_writer,
 };
 
 use super::super::super::{
@@ -29,7 +29,8 @@ impl DeltaFunnelSession {
         output_schema: SchemaRef,
         create_query_execution: Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>,
         progress: Option<ProgressReporter>,
-        timeline: Option<OperationTimelineRecorder>,
+        trace_context: Option<OperationTraceContext>,
+        stage_owner_id: u64,
     ) -> MssqlOutputWriteJob {
         MssqlOutputWriteJob::new_with_query_execution_factory(
             output_schema,
@@ -41,7 +42,7 @@ impl DeltaFunnelSession {
         )
         .with_phase_timings(planned.phase_timings().to_vec())
         .with_progress_reporter(progress)
-        .with_operation_timeline(timeline)
+        .with_operation_trace_context(trace_context, stage_owner_id)
     }
 
     /// Builds deferred uncached jobs and binds each optional progress reporter
@@ -76,6 +77,7 @@ impl DeltaFunnelSession {
             .iter()
             .enumerate()
             .map(|(output_index, planned)| {
+                let stage_owner_id = usize_to_u64_saturating(output_index.saturating_add(1));
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
                 let progress = reporter.and_then(|reporter| {
                     reporter.for_output(
@@ -89,6 +91,7 @@ impl DeltaFunnelSession {
                     progress.clone(),
                     profile_mode,
                     trace_context.clone(),
+                    Some(stage_owner_id),
                 );
 
                 Ok(self.build_write_all_job(
@@ -96,10 +99,8 @@ impl DeltaFunnelSession {
                     output_schema,
                     create_query_execution,
                     progress,
-                    trace_context
-                        .as_ref()
-                        .and_then(OperationTraceContext::timeline)
-                        .cloned(),
+                    trace_context.clone(),
+                    stage_owner_id,
                 ))
             })
             .collect()
@@ -119,6 +120,7 @@ impl DeltaFunnelSession {
             .iter()
             .enumerate()
             .map(|(output_index, planned)| {
+                let stage_owner_id = usize_to_u64_saturating(output_index.saturating_add(1));
                 let output_schema = Arc::clone(self.schema_for_lazy_table(planned.table())?);
                 let progress = reporter.and_then(|reporter| {
                     reporter.for_output(
@@ -133,6 +135,7 @@ impl DeltaFunnelSession {
                     progress.clone(),
                     profile_mode,
                     trace_context.clone(),
+                    Some(stage_owner_id),
                 )?;
 
                 Ok(self.build_write_all_job(
@@ -140,10 +143,8 @@ impl DeltaFunnelSession {
                     output_schema,
                     create_query_execution,
                     progress,
-                    trace_context
-                        .as_ref()
-                        .and_then(OperationTraceContext::timeline)
-                        .cloned(),
+                    trace_context.clone(),
+                    stage_owner_id,
                 ))
             })
             .collect()

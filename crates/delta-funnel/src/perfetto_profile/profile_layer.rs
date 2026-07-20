@@ -14,8 +14,8 @@ use tracing::{
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 use super::{
-    SemanticTrack, diagnostics_track, operation_track, perfetto_te_ns, phase_track, query_track,
-    worker_track,
+    SemanticTrack, diagnostics_track, operation_track, owner_track, perfetto_te_ns, phase_track,
+    query_track, worker_track,
 };
 
 /// Exact tracing target consumed by the Perfetto profile layer.
@@ -104,6 +104,10 @@ struct ProfileFields {
     maximum_spans: Option<u64>,
     operator_name: Option<String>,
     phase: Option<String>,
+    operation_kind: Option<String>,
+    stage_name: Option<String>,
+    stage_category: Option<String>,
+    stage_owner_id: Option<u64>,
     result: Option<String>,
     time_semantics: Option<String>,
 }
@@ -119,6 +123,7 @@ impl Visit for ProfileFields {
             "operator_partition" => self.operator_partition = Some(value),
             "execution_stream_id" => self.execution_stream_id = Some(value),
             "maximum_spans" => self.maximum_spans = Some(value),
+            "stage_owner_id" => self.stage_owner_id = Some(value),
             _ => {}
         }
     }
@@ -131,6 +136,9 @@ impl Visit for ProfileFields {
             "activity" => self.activity = Some(value.to_owned()),
             "operator_name" => self.operator_name = Some(value.to_owned()),
             "phase" => self.phase = Some(value.to_owned()),
+            "operation_kind" => self.operation_kind = Some(value.to_owned()),
+            "stage_name" => self.stage_name = Some(value.to_owned()),
+            "stage_category" => self.stage_category = Some(value.to_owned()),
             "result" => self.result = Some(value.to_owned()),
             "time_semantics" => self.time_semantics = Some(value.to_owned()),
             _ => {}
@@ -178,6 +186,21 @@ impl ActiveProfileSpan {
                 kind: OperationPhaseKind::from_str(fields.phase.as_deref()?)?,
                 phases: phase_track(operation_id, operation.uuid),
             },
+            "Delta Funnel operation stage" => {
+                OperationKind::from_str(fields.operation_kind.as_deref()?)?;
+                let name = fields.stage_name.clone()?;
+                if fields.stage_category.as_deref()?.is_empty() {
+                    return None;
+                }
+                let track = fields
+                    .stage_owner_id
+                    .filter(|owner_id| *owner_id != 0)
+                    .map_or_else(
+                        || phase_track(operation_id, operation.uuid),
+                        |owner_id| owner_track(operation_id, owner_id, operation.uuid),
+                    );
+                ProfileEvent::Stage { name, track }
+            }
             "DataFusion operator poll" => {
                 let query_execution_id = fields.query_execution_id?;
                 let worker_lane_id = fields.worker_lane_id?;
@@ -284,6 +307,27 @@ impl ActiveProfileSpan {
                     }
                 ),
             },
+            ProfileEvent::Stage { name, track } => {
+                if let Ok(name) = CString::new(name.as_str()) {
+                    track_event!(
+                        "delta_funnel.profile",
+                        TrackEventType::SliceBegin(name.as_ptr()),
+                        |context: &mut EventContext| {
+                            track.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                } else {
+                    track_event_begin!(
+                        "delta_funnel.profile",
+                        "Delta Funnel operation stage",
+                        |context: &mut EventContext| {
+                            track.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                }
+            }
             ProfileEvent::Operator { name, worker } => {
                 if let Ok(name) = CString::new(name.as_str()) {
                     track_event!(
@@ -313,6 +357,7 @@ impl ActiveProfileSpan {
             ProfileEvent::Operation { operation, .. } => (operation, true),
             ProfileEvent::Planning { phases, .. } => (phases, false),
             ProfileEvent::Phase { phases, .. } => (phases, false),
+            ProfileEvent::Stage { track, .. } => (track, false),
             ProfileEvent::Operator { worker, .. } => (worker, false),
         };
         track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
@@ -372,6 +417,18 @@ impl ActiveProfileSpan {
         if let Some(activity) = &self.fields.activity {
             context.add_debug_arg("activity", TrackEventDebugArg::String(activity));
         }
+        if let Some(operation_kind) = &self.fields.operation_kind {
+            context.add_debug_arg("operation_kind", TrackEventDebugArg::String(operation_kind));
+        }
+        if let Some(stage_name) = &self.fields.stage_name {
+            context.add_debug_arg("stage_name", TrackEventDebugArg::String(stage_name));
+        }
+        if let Some(stage_category) = &self.fields.stage_category {
+            context.add_debug_arg("stage_category", TrackEventDebugArg::String(stage_category));
+        }
+        if let Some(stage_owner_id) = self.fields.stage_owner_id {
+            context.add_debug_arg("stage_owner_id", TrackEventDebugArg::Uint64(stage_owner_id));
+        }
         if let Some(time_semantics) = &self.fields.time_semantics {
             context.add_debug_arg("time_semantics", TrackEventDebugArg::String(time_semantics));
         }
@@ -395,6 +452,7 @@ impl ActiveProfileSpan {
             ProfileEvent::Operation { operation, .. } => operation,
             ProfileEvent::Planning { phases, .. } => phases,
             ProfileEvent::Phase { phases, .. } => phases,
+            ProfileEvent::Stage { track, .. } => track,
             ProfileEvent::Operator { worker, .. } => worker,
         }
     }
@@ -415,6 +473,10 @@ enum ProfileEvent {
         kind: OperationPhaseKind,
         phases: SemanticTrack,
     },
+    Stage {
+        name: String,
+        track: SemanticTrack,
+    },
     Operator {
         name: String,
         worker: SemanticTrack,
@@ -426,6 +488,17 @@ enum OperationKind {
     Preview,
     MssqlWrite,
     WriteAll,
+}
+
+impl OperationKind {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "preview" => Some(Self::Preview),
+            "mssql_write" => Some(Self::MssqlWrite),
+            "write_all" => Some(Self::WriteAll),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -579,6 +652,120 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn operation_stages_use_bounded_fields_and_deterministic_owner_tracks() {
+        let stage = |owner_id| ProfileFields {
+            operation_id: Some(7),
+            operation_kind: Some("write_all".to_owned()),
+            stage_name: Some("Execute output workflow".to_owned()),
+            stage_category: Some("delta_funnel.write_all.execution".to_owned()),
+            stage_owner_id: owner_id,
+            time_semantics: Some("wall_clock".to_owned()),
+            ..ProfileFields::default()
+        };
+        let operation_stage =
+            ActiveProfileSpan::from_fields("Delta Funnel operation stage", stage(None))
+                .expect("an operation stage should map");
+        let operation_phase = ActiveProfileSpan::from_fields(
+            "Delta Funnel operation phase",
+            ProfileFields {
+                operation_id: Some(7),
+                phase: Some("execution".to_owned()),
+                ..ProfileFields::default()
+            },
+        )
+        .expect("an operation phase should map");
+        let owner = ActiveProfileSpan::from_fields("Delta Funnel operation stage", stage(Some(4)))
+            .expect("an owner stage should map");
+        let duplicate =
+            ActiveProfileSpan::from_fields("Delta Funnel operation stage", stage(Some(4)))
+                .expect("the same owner should map");
+        let other_owner =
+            ActiveProfileSpan::from_fields("Delta Funnel operation stage", stage(Some(5)))
+                .expect("another owner should map");
+
+        assert_eq!(operation_stage.track(), operation_phase.track());
+        assert_eq!(owner.track(), duplicate.track());
+        assert_ne!(owner.track().uuid, other_owner.track().uuid);
+        assert!(
+            owner
+                .track()
+                .name
+                .contains("owner [o-00000000000000000004]")
+        );
+        assert_eq!(
+            owner.track().parent_uuid,
+            operation_phase.track().parent_uuid
+        );
+
+        assert!(
+            ActiveProfileSpan::from_fields(
+                "Delta Funnel operation stage",
+                ProfileFields {
+                    operation_id: Some(7),
+                    operation_kind: Some("unknown".to_owned()),
+                    stage_name: Some("Unknown".to_owned()),
+                    stage_category: Some("delta_funnel.test".to_owned()),
+                    ..ProfileFields::default()
+                },
+            )
+            .is_none()
+        );
+        assert!(
+            ActiveProfileSpan::from_fields(
+                "Delta Funnel operation stage",
+                ProfileFields {
+                    operation_id: Some(7),
+                    operation_kind: Some("preview".to_owned()),
+                    stage_name: Some("Missing category".to_owned()),
+                    stage_category: Some(String::new()),
+                    ..ProfileFields::default()
+                },
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn operation_stage_begin_fields_are_immutable_and_result_is_terminal() {
+        let mut active = ActiveProfileSpan::from_fields(
+            "Delta Funnel operation stage",
+            ProfileFields {
+                operation_id: Some(7),
+                operation_kind: Some("preview".to_owned()),
+                stage_name: Some("Physical planning".to_owned()),
+                stage_category: Some("delta_funnel.preview.phase".to_owned()),
+                stage_owner_id: Some(2),
+                time_semantics: Some("wall_clock".to_owned()),
+                ..ProfileFields::default()
+            },
+        )
+        .expect("the stage should map");
+
+        active.record(ProfileFields {
+            operation_id: Some(99),
+            operation_kind: Some("write_all".to_owned()),
+            stage_name: Some("Changed".to_owned()),
+            stage_category: Some("changed".to_owned()),
+            stage_owner_id: Some(99),
+            result: Some("ok".to_owned()),
+            ..ProfileFields::default()
+        });
+
+        assert_eq!(active.fields.operation_id, Some(7));
+        assert_eq!(active.fields.operation_kind.as_deref(), Some("preview"));
+        assert_eq!(
+            active.fields.stage_name.as_deref(),
+            Some("Physical planning")
+        );
+        assert_eq!(
+            active.fields.stage_category.as_deref(),
+            Some("delta_funnel.preview.phase")
+        );
+        assert_eq!(active.fields.stage_owner_id, Some(2));
+        assert_eq!(active.fields.result.as_deref(), Some("ok"));
     }
 
     #[derive(Clone)]

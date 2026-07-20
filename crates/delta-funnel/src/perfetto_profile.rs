@@ -113,6 +113,19 @@ pub(crate) fn phase_track(operation_id: u64, operation_uuid: u64) -> SemanticTra
     )
 }
 
+pub(crate) fn owner_track(operation_id: u64, owner_id: u64, operation_uuid: u64) -> SemanticTrack {
+    SemanticTrack::new(
+        format!(
+            "Operation [{}] / owner [{}]",
+            operation_token(operation_id),
+            owner_token(owner_id)
+        ),
+        owner_id,
+        operation_uuid,
+        30_u64.saturating_add(owner_id),
+    )
+}
+
 pub(crate) fn query_track(
     operation_id: u64,
     query_execution_id: u64,
@@ -160,6 +173,10 @@ pub(crate) fn query_token(id: u64) -> String {
 
 pub(crate) fn worker_token(id: u64) -> String {
     format!("w-{id:020}")
+}
+
+pub(crate) fn owner_token(id: u64) -> String {
+    format!("o-{id:020}")
 }
 
 /// Initializes the system Perfetto producer and registers the profile category

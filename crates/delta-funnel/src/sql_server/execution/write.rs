@@ -19,6 +19,7 @@ use futures_util::{
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     observability,
+    profiling::OperationStageContext,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     report::{
         OperationTimelineRecorder, OperationTimelineSpanRecorder,
@@ -596,29 +597,30 @@ where
     W: MssqlBulkLoadWriter,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>>,
 {
-    write_mssql_batches_with_writer_and_timeline(
+    write_mssql_batches_with_writer_and_stage_context(
         output_plan,
         batches,
         writer,
         _options,
         reporter,
-        None,
+        OperationStageContext::default(),
     )
     .await
 }
 
-pub(crate) async fn write_mssql_batches_with_writer_and_timeline<W, S>(
+pub(crate) async fn write_mssql_batches_with_writer_and_stage_context<W, S>(
     output_plan: &MssqlTargetOutputPlan,
     batches: S,
     mut writer: W,
     _options: MssqlWriteBackend,
     reporter: Option<&ProgressReporter>,
-    timeline: Option<&OperationTimelineRecorder>,
+    stage_context: OperationStageContext<'_>,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     W: MssqlBulkLoadWriter,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>>,
 {
+    let timeline = stage_context.timeline();
     let mut rows_written = 0_u64;
     let mut batches_written = 0_u64;
     let mut input_rows = 0_u64;
@@ -791,19 +793,19 @@ where
     }
 
     let finalize_started_at = Instant::now();
-    let finalize_span = timeline.map(|timeline| {
-        timeline.start_span(
-            "Finalize SQL Server writer",
-            "delta_funnel.write.sql_server",
-            "Finalize writer",
-        )
-    });
+    let finalize_span = stage_context.start(
+        "Finalize SQL Server writer",
+        "delta_funnel.write.sql_server",
+        "Finalize writer",
+    );
     let finish_result = MssqlBulkLoadWriter::finish(writer).await;
     let finalize_elapsed = finalize_started_at.elapsed();
     if finish_result.is_ok() {
-        complete_batch_span(finalize_span);
-    } else {
-        fail_batch_span(finalize_span);
+        if let Some(span) = finalize_span {
+            span.completed();
+        }
+    } else if let Some(span) = finalize_span {
+        span.failed();
     }
     finish_result.map_err(|source| {
         let elapsed_ms = elapsed_ms_since(started_at);
@@ -1907,13 +1909,13 @@ mod tests {
         let batches = stream::iter(vec![Ok(first), Ok(second)]);
         let timeline = OperationTimelineRecorder::start();
 
-        write_mssql_batches_with_writer_and_timeline(
+        write_mssql_batches_with_writer_and_stage_context(
             &output_plan,
             batches,
             writer,
             default_mssql_write_backend(),
             None,
-            Some(&timeline),
+            OperationStageContext::from_timeline(Some(&timeline)),
         )
         .await?;
 

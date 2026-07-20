@@ -1394,6 +1394,7 @@ mod tests {
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
             _reporter: Option<&crate::progress::ProgressReporter>,
+            _stage_context: crate::profiling::OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, crate::DeltaFunnelError> {
             self.outcomes.pop_front().ok_or_else(|| {
                 crate::DeltaFunnelError::MssqlWorkflowPlanning {

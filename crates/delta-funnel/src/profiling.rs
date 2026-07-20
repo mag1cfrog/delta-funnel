@@ -4,19 +4,35 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Duration;
 
-use crate::report::OperationTimelineRecorder;
+use serde_json::Value;
+
+use crate::{
+    TimelineSpanStatus,
+    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
+};
 
 pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperationTraceKind {
     Preview,
     MssqlWrite,
     WriteAll,
+}
+
+impl OperationTraceKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::MssqlWrite => "mssql_write",
+            Self::WriteAll => "write_all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +56,7 @@ impl OperationTracePhase {
 #[derive(Debug, Clone)]
 pub(crate) struct OperationTraceContext {
     operation_id: u64,
+    kind: OperationTraceKind,
     next_query_execution_id: Arc<AtomicU64>,
     timeline: Option<OperationTimelineRecorder>,
     process_trace: Option<Arc<ProcessOperationTrace>>,
@@ -65,6 +82,7 @@ impl OperationTraceContext {
         let operation_id = allocate_id(&NEXT_OPERATION_ID)?;
         Some(Self {
             operation_id,
+            kind,
             next_query_execution_id: Arc::new(AtomicU64::new(1)),
             timeline,
             process_trace: process_spans_enabled
@@ -121,10 +139,7 @@ impl OperationTraceContext {
         }
     }
 
-    fn start_process_phase(
-        &self,
-        phase: OperationTracePhase,
-    ) -> Option<ProcessOperationPhaseTrace> {
+    fn start_process_phase(&self, phase: OperationTracePhase) -> Option<ProcessSpanTrace> {
         let root = self.process_root_span()?;
         let span = tracing::trace_span!(
             target: PROFILE_TARGET,
@@ -135,8 +150,35 @@ impl OperationTraceContext {
             result = tracing::field::Empty,
             time_semantics = "wall_clock",
         );
-        Some(ProcessOperationPhaseTrace {
+        Some(ProcessSpanTrace {
             span,
+            _parent: root.clone(),
+            result_recorded: false,
+        })
+    }
+
+    fn start_process_stage(
+        &self,
+        name: &'static str,
+        category: &'static str,
+        owner_id: Option<u64>,
+    ) -> Option<ProcessSpanTrace> {
+        let root = self.process_root_span()?;
+        let span = tracing::trace_span!(
+            target: PROFILE_TARGET,
+            parent: root,
+            "Delta Funnel operation stage",
+            operation_id = self.operation_id,
+            operation_kind = self.kind.as_str(),
+            stage_name = name,
+            stage_category = category,
+            stage_owner_id = owner_id,
+            result = tracing::field::Empty,
+            time_semantics = "wall_clock",
+        );
+        Some(ProcessSpanTrace {
+            span,
+            _parent: root.clone(),
             result_recorded: false,
         })
     }
@@ -153,7 +195,7 @@ impl OperationTraceContext {
 #[derive(Debug, Default)]
 pub(crate) struct ProcessOperationPhaseTracker {
     // Drop the active child before releasing the operation root.
-    active: Option<ProcessOperationPhaseTrace>,
+    active: Option<ProcessSpanTrace>,
     context: Option<OperationTraceContext>,
 }
 
@@ -193,23 +235,171 @@ impl ProcessOperationPhaseTracker {
 }
 
 #[derive(Debug)]
-struct ProcessOperationPhaseTrace {
+struct ProcessSpanTrace {
     span: tracing::Span,
+    // Keep the parent open until this child closes.
+    _parent: tracing::Span,
     result_recorded: bool,
 }
 
-impl ProcessOperationPhaseTrace {
+impl ProcessSpanTrace {
     pub(crate) fn finish(mut self, result: &'static str) {
         self.span.record("result", result);
         self.result_recorded = true;
     }
 }
 
-impl Drop for ProcessOperationPhaseTrace {
+impl Drop for ProcessSpanTrace {
     fn drop(&mut self) {
         if !self.result_recorded {
             self.span.record("result", "cancelled");
         }
+    }
+}
+
+/// Read-only destinations and identity shared by one operation's bounded stages.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OperationStageContext<'a> {
+    operation: Option<&'a OperationTraceContext>,
+    timeline: Option<&'a OperationTimelineRecorder>,
+    owner_id: Option<u64>,
+}
+
+impl<'a> OperationStageContext<'a> {
+    pub(crate) const fn new(
+        operation: Option<&'a OperationTraceContext>,
+        owner_id: Option<u64>,
+    ) -> Self {
+        let timeline = match operation {
+            Some(operation) => operation.timeline(),
+            None => None,
+        };
+        Self {
+            operation,
+            timeline,
+            owner_id,
+        }
+    }
+
+    pub(crate) const fn from_timeline(timeline: Option<&'a OperationTimelineRecorder>) -> Self {
+        Self {
+            operation: None,
+            timeline,
+            owner_id: None,
+        }
+    }
+
+    pub(crate) const fn timeline(self) -> Option<&'a OperationTimelineRecorder> {
+        self.timeline
+    }
+
+    pub(crate) fn start(
+        self,
+        name: &'static str,
+        category: &'static str,
+        track_name: impl Into<String>,
+    ) -> Option<OperationStageTrace> {
+        OperationStageTrace::start_with_timeline_name(
+            self.operation,
+            self.timeline,
+            name,
+            name,
+            category,
+            track_name,
+            self.owner_id,
+        )
+    }
+
+    pub(crate) fn start_with_timeline_name(
+        self,
+        name: &'static str,
+        timeline_name: impl Into<String>,
+        category: &'static str,
+        track_name: impl Into<String>,
+    ) -> Option<OperationStageTrace> {
+        OperationStageTrace::start_with_timeline_name(
+            self.operation,
+            self.timeline,
+            name,
+            timeline_name,
+            category,
+            track_name,
+            self.owner_id,
+        )
+    }
+}
+
+/// One bounded wall-clock stage shared by the stable timeline and process trace.
+#[derive(Debug)]
+pub(crate) struct OperationStageTrace {
+    timeline_span: Option<OperationTimelineSpanRecorder>,
+    process_span: Option<ProcessSpanTrace>,
+}
+
+impl OperationStageTrace {
+    pub(crate) fn start(
+        context: Option<&OperationTraceContext>,
+        timeline: Option<&OperationTimelineRecorder>,
+        name: &'static str,
+        category: &'static str,
+        track_name: impl Into<String>,
+        owner_id: Option<u64>,
+    ) -> Option<Self> {
+        Self::start_with_timeline_name(
+            context, timeline, name, name, category, track_name, owner_id,
+        )
+    }
+
+    fn start_with_timeline_name(
+        context: Option<&OperationTraceContext>,
+        timeline: Option<&OperationTimelineRecorder>,
+        name: &'static str,
+        timeline_name: impl Into<String>,
+        category: &'static str,
+        track_name: impl Into<String>,
+        owner_id: Option<u64>,
+    ) -> Option<Self> {
+        debug_assert!(owner_id.is_none_or(|owner_id| owner_id != 0));
+        let timeline_span =
+            timeline.map(|timeline| timeline.start_span(timeline_name, category, track_name));
+        let process_span = context.and_then(|context| {
+            context.start_process_stage(name, category, owner_id.filter(|owner_id| *owner_id != 0))
+        });
+        (timeline_span.is_some() || process_span.is_some()).then_some(Self {
+            timeline_span,
+            process_span,
+        })
+    }
+
+    pub(crate) fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
+        self.timeline_span = self
+            .timeline_span
+            .map(|span| span.with_attribute(name, value));
+        self
+    }
+
+    pub(crate) fn completed(self) {
+        let _ = self.finish_with_duration(TimelineSpanStatus::Completed);
+    }
+
+    pub(crate) fn failed(self) {
+        let _ = self.finish_with_duration(TimelineSpanStatus::Failed);
+    }
+
+    pub(crate) fn finish_with_duration(mut self, status: TimelineSpanStatus) -> Duration {
+        let duration = self
+            .timeline_span
+            .take()
+            .map(|span| span.finish_with_duration(status))
+            .unwrap_or_default();
+        if let Some(span) = self.process_span.take() {
+            span.finish(match status {
+                TimelineSpanStatus::Completed => "ok",
+                TimelineSpanStatus::Failed => "error",
+                TimelineSpanStatus::Cancelled => "cancelled",
+            });
+        }
+        duration
     }
 }
 
@@ -513,5 +703,152 @@ mod tests {
         assert_eq!(phase.fields["time_semantics"], "wall_clock");
         assert_eq!(phase.enter_count, 0);
         assert_eq!(phase.exit_count, 0);
+    }
+
+    #[test]
+    fn operation_stage_routes_all_activation_modes_and_terminal_results() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        assert!(
+            OperationStageTrace::start(
+                None,
+                None,
+                "Disabled stage",
+                "delta_funnel.test",
+                "Disabled track",
+                None,
+            )
+            .is_none()
+        );
+
+        let timeline_only = OperationTimelineRecorder::start();
+        let semantic = OperationTraceContext::start_for_modes(
+            OperationTraceKind::Preview,
+            Some(timeline_only.clone()),
+            false,
+        )
+        .expect("the timeline should create a context");
+        OperationStageTrace::start(
+            Some(&semantic),
+            semantic.timeline(),
+            "Timeline stage",
+            "delta_funnel.test.timeline",
+            "Timeline track",
+            None,
+        )
+        .expect("the timeline stage should start")
+        .with_attribute("phase_name", Value::String("timeline_stage".to_owned()))
+        .finish_with_duration(TimelineSpanStatus::Completed);
+        let timeline_only = timeline_only.finish("timeline only", TimelineSpanStatus::Completed);
+        assert_eq!(timeline_only.spans().len(), 1);
+        assert_eq!(timeline_only.spans()[0].name(), "Timeline stage");
+        assert_eq!(
+            timeline_only.spans()[0].attributes()["phase_name"],
+            "timeline_stage"
+        );
+
+        let process =
+            OperationTraceContext::start_for_modes(OperationTraceKind::MssqlWrite, None, true)
+                .expect("process tracing should create a context");
+        let process_root_id = process
+            .process_root_span()
+            .and_then(tracing::Span::id)
+            .expect("the process root should be enabled")
+            .into_u64();
+        let process_stage = OperationStageTrace::start(
+            Some(&process),
+            None,
+            "Process stage",
+            "delta_funnel.test.process",
+            "Unused timeline track",
+            Some(7),
+        )
+        .expect("the process stage should start");
+        drop(process);
+        assert!(
+            !capture
+                .captured()
+                .spans()
+                .into_iter()
+                .find(|span| span.id == process_root_id)
+                .expect("the process root should be captured")
+                .closed
+        );
+        process_stage.finish_with_duration(TimelineSpanStatus::Completed);
+
+        let combined_timeline = OperationTimelineRecorder::start();
+        let combined = OperationTraceContext::start_for_modes(
+            OperationTraceKind::WriteAll,
+            Some(combined_timeline.clone()),
+            true,
+        )
+        .expect("combined tracing should create a context");
+        OperationStageTrace::start(
+            Some(&combined),
+            combined.timeline(),
+            "Combined stage",
+            "delta_funnel.test.combined",
+            "Combined track",
+            None,
+        )
+        .expect("the combined stage should start")
+        .finish_with_duration(TimelineSpanStatus::Failed);
+        let combined_timeline = combined_timeline.finish("combined", TimelineSpanStatus::Failed);
+        assert_eq!(
+            combined_timeline.spans()[0].status(),
+            TimelineSpanStatus::Failed
+        );
+        drop(combined);
+
+        let cancelled_timeline = OperationTimelineRecorder::start();
+        let cancelled = OperationTraceContext::start_for_modes(
+            OperationTraceKind::Preview,
+            Some(cancelled_timeline.clone()),
+            true,
+        )
+        .expect("combined tracing should create a context");
+        let cancelled_stage = OperationStageTrace::start(
+            Some(&cancelled),
+            cancelled.timeline(),
+            "Cancelled stage",
+            "delta_funnel.test.cancelled",
+            "Cancelled track",
+            None,
+        )
+        .expect("the cancelled stage should start");
+        drop(cancelled);
+        drop(cancelled_stage);
+        let cancelled_timeline =
+            cancelled_timeline.finish("cancelled", TimelineSpanStatus::Cancelled);
+        assert_eq!(
+            cancelled_timeline.spans()[0].status(),
+            TimelineSpanStatus::Cancelled
+        );
+
+        let stages = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].parent_id, Some(process_root_id));
+        assert_eq!(stages[0].fields["operation_kind"], "mssql_write");
+        assert_eq!(stages[0].fields["stage_name"], "Process stage");
+        assert_eq!(
+            stages[0].fields["stage_category"],
+            "delta_funnel.test.process"
+        );
+        assert_eq!(stages[0].fields["stage_owner_id"], "7");
+        assert_eq!(stages[0].fields["result"], "ok");
+        assert_eq!(stages[1].fields["result"], "error");
+        assert_eq!(stages[2].fields["result"], "cancelled");
+        assert!(stages.iter().all(|stage| {
+            stage.target == PROFILE_TARGET
+                && stage.level == tracing::Level::TRACE
+                && stage.fields["time_semantics"] == "wall_clock"
+                && stage.enter_count == 0
+                && stage.exit_count == 0
+                && stage.closed
+        }));
     }
 }

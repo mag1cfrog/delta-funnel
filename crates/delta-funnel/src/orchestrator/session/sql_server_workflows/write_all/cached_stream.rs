@@ -6,8 +6,10 @@ use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionContext};
 use crate::MssqlOutputBatchStreamFactory;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryError, MssqlOutputQueryExecution,
-    MssqlOutputQueryFuture, MssqlWritePhase, profiling::OperationTraceContext,
-    progress::ProgressReporter, report::PhaseTimer,
+    MssqlOutputQueryFuture, MssqlWritePhase,
+    profiling::{OperationStageContext, OperationTraceContext},
+    progress::ProgressReporter,
+    report::PhaseTimer,
 };
 
 use super::super::super::{
@@ -50,21 +52,18 @@ async fn create_cached_output_query_execution_from_retained_sql(
     reporter: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
     trace_context: Option<OperationTraceContext>,
+    stage_owner_id: Option<u64>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
-    let timeline = trace_context
-        .as_ref()
-        .and_then(OperationTraceContext::timeline);
+    let stage_context = OperationStageContext::new(trace_context.as_ref(), stage_owner_id);
     let output_name = planned.resolved_target().output_name();
     let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
-    let dataframe_span = timeline.as_ref().map(|timeline| {
-        timeline
-            .start_span(
-                "Build query DataFrame",
-                "delta_funnel.write.query",
-                "Query DataFrame planning",
-            )
-            .with_attribute("output_name", output_name.to_owned().into())
-    });
+    let dataframe_span = stage_context
+        .start(
+            "Build query DataFrame",
+            "delta_funnel.write.query",
+            "Query DataFrame planning",
+        )
+        .map(|span| span.with_attribute("output_name", output_name.to_owned().into()));
     let dataframe = match context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
         .await
@@ -115,6 +114,7 @@ async fn create_cached_output_query_execution_from_retained_sql(
         reporter,
         profile_mode,
         trace_context.as_ref(),
+        stage_owner_id,
         None,
     )
     .await
@@ -189,9 +189,14 @@ impl DeltaFunnelSession {
             reporter,
             profile_mode,
             None,
+            None,
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cached output setup carries route, reporting, and profiling state"
+    )]
     pub(super) fn cached_output_query_factory_with_trace_context(
         &self,
         planned: &PlannedMssqlOutput,
@@ -200,6 +205,7 @@ impl DeltaFunnelSession {
         reporter: Option<ProgressReporter>,
         profile_mode: ExecutionProfileMode,
         trace_context: Option<OperationTraceContext>,
+        stage_owner_id: Option<u64>,
     ) -> Result<Box<dyn FnOnce() -> MssqlOutputQueryFuture + Send>, DeltaFunnelError> {
         let request = planned.request();
         if !self.output_requires_cache_replan(request, active_aliases)? {
@@ -209,6 +215,7 @@ impl DeltaFunnelSession {
                 reporter,
                 profile_mode,
                 trace_context,
+                stage_owner_id,
             ));
         }
 
@@ -238,6 +245,7 @@ impl DeltaFunnelSession {
                     reporter,
                     profile_mode,
                     trace_context,
+                    stage_owner_id,
                 )
                 .await
             })

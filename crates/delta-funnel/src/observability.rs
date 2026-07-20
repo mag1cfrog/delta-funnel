@@ -655,7 +655,10 @@ pub(crate) mod test_capture {
     use std::{
         collections::BTreeMap,
         fmt,
-        sync::{Arc, Mutex, MutexGuard, Once},
+        sync::{
+            Arc, Mutex, MutexGuard, Once,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use tracing::{
@@ -755,12 +758,14 @@ pub(crate) mod test_capture {
         pub(crate) enter_count: u64,
         pub(crate) exit_count: u64,
         pub(crate) closed: bool,
+        pub(crate) close_sequence: Option<u64>,
     }
 
     #[derive(Clone, Default)]
     pub(crate) struct CapturedEvents {
         events: Arc<Mutex<Vec<CapturedEvent>>>,
         spans: Arc<Mutex<Vec<CapturedSpan>>>,
+        next_close_sequence: Arc<AtomicU64>,
     }
 
     impl CapturedEvents {
@@ -834,6 +839,7 @@ pub(crate) mod test_capture {
                 enter_count: 0,
                 exit_count: 0,
                 closed: false,
+                close_sequence: None,
             };
 
             if let Ok(mut spans) = self.events.spans.lock() {
@@ -864,7 +870,14 @@ pub(crate) mod test_capture {
         }
 
         fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
-            self.events.update_span(&id, |span| span.closed = true);
+            let close_sequence = self
+                .events
+                .next_close_sequence
+                .fetch_add(1, Ordering::Relaxed);
+            self.events.update_span(&id, |span| {
+                span.closed = true;
+                span.close_sequence = Some(close_sequence);
+            });
         }
 
         fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {

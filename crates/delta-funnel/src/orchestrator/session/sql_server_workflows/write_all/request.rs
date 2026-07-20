@@ -5,13 +5,12 @@ use crate::{
     MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode,
     observability,
     profiling::{
-        OperationTraceContext, OperationTraceKind, OperationTracePhase,
-        ProcessOperationPhaseTracker,
+        OperationStageContext, OperationStageTrace, OperationTraceContext, OperationTraceKind,
+        OperationTracePhase, ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     report::{
-        OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer, TimelineSpanStatus,
-        sql_server::WriteAllReport,
+        OperationTimelineRecorder, PhaseTimer, TimelineSpanStatus, sql_server::WriteAllReport,
     },
     support::sanitize_text_for_display,
     usize_to_u64_saturating,
@@ -43,7 +42,7 @@ impl DeltaFunnelSession {
         &self,
         requests: &[OutputWritePlan],
         reporter: Option<&ProgressReporter>,
-        timeline: Option<&OperationTimelineRecorder>,
+        trace_context: Option<&OperationTraceContext>,
     ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(requests.len());
 
@@ -60,7 +59,10 @@ impl DeltaFunnelSession {
                         Some(request.target().output_name()),
                     ));
                 }
-                self.plan_mssql_output_with_timeline(request, timeline)
+                self.plan_mssql_output_with_stage_context(
+                    request,
+                    OperationStageContext::new(trace_context, Some(output_index)),
+                )
             })
             .collect()
     }
@@ -104,6 +106,7 @@ impl DeltaFunnelSession {
         let timeline = trace_context
             .as_ref()
             .and_then(OperationTraceContext::timeline);
+        let stage_context = OperationStageContext::new(trace_context.as_ref(), None);
         let mut process_phases = ProcessOperationPhaseTracker::start(
             trace_context.as_ref(),
             OperationTracePhase::Planning,
@@ -116,22 +119,22 @@ impl DeltaFunnelSession {
         let result = async {
             // Resolve every output before cache planning or execution starts.
             let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-            let planning_span = start_write_all_phase_span(
-                timeline,
+            let planning_span = stage_context.start(
                 "Plan outputs",
                 "delta_funnel.write_all.planning",
+                "Write-all phases",
             );
-            let planned_outputs = match self.plan_write_outputs(requests, active_reporter, timeline)
-            {
-                Ok(outputs) => {
-                    complete_write_all_span(planning_span);
-                    outputs
-                }
-                Err(error) => {
-                    fail_write_all_span(planning_span);
-                    return Err(error);
-                }
-            };
+            let planned_outputs =
+                match self.plan_write_outputs(requests, active_reporter, trace_context.as_ref()) {
+                    Ok(outputs) => {
+                        complete_write_all_span(planning_span);
+                        outputs
+                    }
+                    Err(error) => {
+                        fail_write_all_span(planning_span);
+                        return Err(error);
+                    }
+                };
             let mut phase_timings = vec![planning_timer.completed()];
 
             // Cache planning selects the execution route. Disabled mode records
@@ -139,10 +142,10 @@ impl DeltaFunnelSession {
             let automatic_cache_plan = match options.cache_mode() {
                 WriteAllCacheMode::Auto => {
                     let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
-                    let cache_span = start_write_all_phase_span(
-                        timeline,
+                    let cache_span = stage_context.start(
                         "Plan caches",
                         "delta_funnel.write_all.planning",
+                        "Write-all phases",
                     );
                     let cache_plan = self.plan_mssql_output_cache(requests);
                     complete_write_all_span(cache_span);
@@ -163,10 +166,10 @@ impl DeltaFunnelSession {
             process_phases.transition(OperationTracePhase::Execution);
             let shared_provider_stats = shared_provider_stats_snapshots();
             let workflow_timer = PhaseTimer::start(WORKFLOW_EXECUTION_PHASE);
-            let workflow_span = start_write_all_phase_span(
-                timeline,
+            let workflow_span = stage_context.start(
                 "Execute output workflow",
                 "delta_funnel.write_all.execution",
+                "Write-all phases",
             );
             let workflow_result = match automatic_cache_plan.as_ref() {
                 Some(cache_plan) => match cache_plan.decision() {
@@ -240,10 +243,10 @@ impl DeltaFunnelSession {
                 ));
             }
             let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-            let source_span = start_write_all_phase_span(
-                timeline,
+            let source_span = stage_context.start(
                 "Report sources",
                 "delta_funnel.write_all.reporting",
+                "Write-all phases",
             );
             let sources = match self.source_reports_for_planned_outputs_with_provider_stats(
                 &planned_outputs,
@@ -443,21 +446,13 @@ fn ensure_write_all_execute_run_mode(run_mode: RunMode) -> Result<(), DeltaFunne
     }
 }
 
-fn start_write_all_phase_span(
-    timeline: Option<&OperationTimelineRecorder>,
-    name: &str,
-    category: &str,
-) -> Option<OperationTimelineSpanRecorder> {
-    timeline.map(|timeline| timeline.start_span(name, category, "Write-all phases"))
-}
-
-fn complete_write_all_span(span: Option<OperationTimelineSpanRecorder>) {
+fn complete_write_all_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.completed();
     }
 }
 
-fn fail_write_all_span(span: Option<OperationTimelineSpanRecorder>) {
+fn fail_write_all_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.failed();
     }
@@ -535,6 +530,7 @@ mod tests {
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
         observability::test_capture::{CapturedEvent, TracingCapture},
         plan_mssql_target_for_resolved_output,
+        profiling::OperationStageContext,
         progress::{
             ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
         },
@@ -625,6 +621,7 @@ mod tests {
             _write_backend: MssqlWriteBackend,
             _validation_options: crate::ValidationOptions,
             reporter: Option<&ProgressReporter>,
+            _stage_context: OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = plan_mssql_target_for_resolved_output(
                 output_schema.as_ref(),
@@ -822,6 +819,35 @@ mod tests {
                 .map(|span| (span.fields["phase"].clone(), span.fields["result"].clone()))
                 .collect(),
         )
+    }
+
+    fn process_write_all_stages(capture: &TracingCapture) -> Vec<(String, Option<String>, String)> {
+        let spans = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.target == crate::profiling::PROFILE_TARGET)
+            .collect::<Vec<_>>();
+        let root_id = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel SQL Server write_all")
+            .expect("expected SQL Server write_all process root")
+            .id;
+        spans
+            .into_iter()
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .map(|stage| {
+                assert_eq!(stage.parent_id, Some(root_id));
+                assert_eq!(stage.fields["operation_kind"], "write_all");
+                assert_eq!(stage.fields["time_semantics"], "wall_clock");
+                assert!(stage.closed);
+                (
+                    stage.fields["stage_name"].clone(),
+                    stage.fields.get("stage_owner_id").cloned(),
+                    stage.fields["result"].clone(),
+                )
+            })
+            .collect()
     }
 
     const fn detailed_uncached_write_all_options() -> WriteAllOptions {
@@ -1091,6 +1117,37 @@ mod tests {
                     ],
                 )
             );
+            let stages = process_write_all_stages(&capture);
+            assert_eq!(
+                stages
+                    .iter()
+                    .filter(|(_, owner, _)| owner.is_none())
+                    .map(|(name, _, result)| (name.as_str(), result.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("Plan outputs", "ok"),
+                    ("Execute output workflow", "ok"),
+                    ("Report sources", "ok"),
+                ]
+            );
+            assert!(stages.iter().all(|(name, _, _)| name != "Plan caches"));
+            for owner_id in ["1", "2"] {
+                assert_eq!(
+                    stages
+                        .iter()
+                        .filter(|(_, owner, _)| owner.as_deref() == Some(owner_id))
+                        .map(|(name, _, result)| (name.as_str(), result.as_str()))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("Plan output schema", "ok"),
+                        ("Plan SQL Server target", "ok"),
+                        ("Write output", "ok"),
+                        ("Build query DataFrame", "ok"),
+                        ("Build physical plan", "ok"),
+                        ("Set up query stream", "ok"),
+                    ]
+                );
+            }
 
             let events = events.lock().map_err(|_| "progress event lock poisoned")?;
             assert_eq!(events.len(), 9);
@@ -1259,6 +1316,7 @@ mod tests {
                 LoadMode::AppendExisting,
             )?;
             let (reporter, events) = recording_progress();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
             let report = session
                 .write_all_with_progress_and_writer(
                     &[output, skipped],
@@ -1269,6 +1327,14 @@ mod tests {
                 .await?;
             assert_eq!(report.failed_count(), 1);
             assert_eq!(report.skipped_count(), 1);
+            let stages = process_write_all_stages(&capture);
+            assert!(stages.iter().all(|(name, _, _)| name != "Plan caches"));
+            assert!(stages.iter().any(|(name, owner, result)| {
+                name == "Write output" && owner.as_deref() == Some("1") && result == "error"
+            }));
+            assert!(!stages.iter().any(|(name, owner, _)| {
+                name == "Write output" && owner.as_deref() == Some("2")
+            }));
             {
                 let events = events.lock().map_err(|_| "progress event lock poisoned")?;
                 assert_eq!(
@@ -1287,6 +1353,7 @@ mod tests {
                 assert_eq!(attempted_outputs[0].output_index, Some(1));
                 assert_eq!(attempted_outputs[0].output_count, Some(2));
             }
+            drop(capture);
 
             let mut session = DeltaFunnelSession::new(SessionOptions::new())?;
             let missing_connection = session.table_from_sql("select 1 as id").await?;
@@ -2198,6 +2265,7 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let report = session.write_all_with_writer(&[west, east], writer).await?;
             let calls = calls
@@ -2211,6 +2279,13 @@ mod tests {
             assert_eq!(calls[1].rows, 1);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);
             assert!(report.all_succeeded());
+            assert!(
+                process_write_all_stages(&capture)
+                    .iter()
+                    .any(|(name, owner, result)| name == "Plan caches"
+                        && owner.is_none()
+                        && result == "ok")
+            );
             assert!(matches!(
                 report.cache(),
                 WriteAllCacheReport::NoCache {
@@ -2253,7 +2328,7 @@ mod tests {
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
             let (reporter, _events) = recording_progress();
-            let capture = TracingCapture::start();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let report = session
                 .write_all_with_progress_and_writer(
@@ -2318,6 +2393,21 @@ mod tests {
             assert_eq!(aliases[0].execution_profile(), None);
             assert!(report.to_json_value()["cache"]["aliases"][0]["execution_profile"].is_null());
             assert!(execution_profile_events(&capture).is_empty());
+            assert_eq!(report.operation_timeline(), None);
+            let stages = process_write_all_stages(&capture);
+            for expected_name in [
+                "Resolve cache DataFrame",
+                "Build cache physical plan",
+                "Set up cache streams",
+                "Execute and collect cache",
+                "Build cache MemTable",
+                "Install cache alias",
+                "Restore cache alias",
+            ] {
+                assert!(stages.iter().any(|(name, owner, result)| {
+                    name == expected_name && owner.is_none() && result == "ok"
+                }));
+            }
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -2825,7 +2915,7 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
-            let capture = TracingCapture::start();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let error = session
                 .write_all_with_options_and_writer(
@@ -2888,6 +2978,23 @@ mod tests {
             assert_eq!(alias.execution_profile(), None);
             assert!(execution_profile_events(&capture).is_empty());
             assert!(alias.to_json_value()["execution_profile"].is_null());
+            let stages = process_write_all_stages(&capture);
+            assert!(stages.iter().any(|(name, owner, result)| {
+                name == "Resolve cache DataFrame" && owner.is_none() && result == "ok"
+            }));
+            assert!(stages.iter().any(|(name, owner, result)| {
+                name == "Build cache physical plan" && owner.is_none() && result == "error"
+            }));
+            assert!(stages.iter().all(|(name, _, _)| {
+                !matches!(
+                    name.as_str(),
+                    "Set up cache streams"
+                        | "Execute and collect cache"
+                        | "Build cache MemTable"
+                        | "Install cache alias"
+                        | "Restore cache alias"
+                )
+            }));
             assert!(matches!(
                 *source,
                 DeltaFunnelError::MssqlWorkflowPlanning { message }
