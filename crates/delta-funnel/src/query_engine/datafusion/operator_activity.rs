@@ -848,7 +848,11 @@ mod tests {
 
     use datafusion::{
         arrow::datatypes::Schema,
-        physical_plan::{collect, stream::RecordBatchReceiverStreamBuilder},
+        common::DataFusionError,
+        physical_plan::{
+            collect,
+            stream::{RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter},
+        },
         prelude::SessionContext,
     };
     use futures_util::StreamExt;
@@ -898,6 +902,49 @@ mod tests {
             Ok(())
         });
         builder.build()
+    }
+
+    fn delayed_error_record_batch_stream(
+        delay: Duration,
+        message: &'static str,
+    ) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+        let output = builder.tx();
+        builder.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = output
+                .send(Err(DataFusionError::Execution(message.to_owned())))
+                .await;
+            Ok(())
+        });
+        builder.build()
+    }
+
+    fn pending_record_batch_stream() -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures_util::stream::pending::<DataFusionResult<RecordBatch>>(),
+        ))
+    }
+
+    fn profiled_delta_scan_stream(
+        activity: OperatorActivityRecorder,
+        inner: SendableRecordBatchStream,
+    ) -> Pin<Box<ProfiledRecordBatchStream>> {
+        Box::pin(ProfiledRecordBatchStream {
+            schema: inner.schema(),
+            inner,
+            operator_name: "DeltaScanPlanningExec".to_owned(),
+            node_id: 4,
+            parent_node_id: Some(3),
+            partition: 2,
+            stream_id: 7,
+            activity,
+            records_delta_scan_output_wait: true,
+            pending_delta_scan_output_wait: None,
+        })
     }
 
     fn collect_profiled_operators<'a>(
@@ -1477,20 +1524,8 @@ mod tests {
             100,
         ));
         let operation_id = activity.context.operation_id();
-        let inner = delayed_record_batch_stream(DELAY);
-        let schema = inner.schema();
-        let mut stream = Box::pin(ProfiledRecordBatchStream {
-            schema,
-            inner,
-            operator_name: "DeltaScanPlanningExec".to_owned(),
-            node_id: 4,
-            parent_node_id: Some(3),
-            partition: 2,
-            stream_id: 7,
-            activity: activity.clone(),
-            records_delta_scan_output_wait: true,
-            pending_delta_scan_output_wait: None,
-        });
+        let mut stream =
+            profiled_delta_scan_stream(activity.clone(), delayed_record_batch_stream(DELAY));
 
         let started_at = Instant::now();
         let batch = stream.next().await.ok_or("expected delayed batch")??;
@@ -1563,6 +1598,110 @@ mod tests {
         );
         assert_eq!(process_wait.fields["result"], "ok");
         assert_eq!(process_wait.fields["time_semantics"], "wall_clock");
+        assert_eq!(process_wait.enter_count, 0);
+        assert_eq!(process_wait.exit_count, 0);
+        assert!(process_wait.closed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_scan_output_wait_reports_error_without_error_details()
+    -> Result<(), Box<dyn Error>> {
+        const SENSITIVE_ERROR: &str = "secret object path";
+
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let mut stream = profiled_delta_scan_stream(
+            activity.clone(),
+            delayed_error_record_batch_stream(Duration::from_millis(10), SENSITIVE_ERROR),
+        );
+
+        let error = stream
+            .next()
+            .await
+            .ok_or("expected delayed error")?
+            .expect_err("the delayed item should fail");
+        assert!(error.to_string().contains(SENSITIVE_ERROR));
+        drop(stream);
+        activity.context.record_process_result("error");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Failed);
+        let wait = timeline
+            .spans()
+            .iter()
+            .find(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .ok_or("expected failed output wait")?;
+        assert_eq!(wait.status(), TimelineSpanStatus::Failed);
+        assert_eq!(wait.attributes()["result"], "error");
+        assert!(
+            wait.attributes()
+                .values()
+                .all(|value| !value.to_string().contains(SENSITIVE_ERROR))
+        );
+
+        let process_wait = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "DataFusion execution activity")
+            .ok_or("expected failed process wait")?;
+        assert_eq!(process_wait.fields["result"], "error");
+        assert!(
+            process_wait
+                .fields
+                .values()
+                .all(|value| !value.contains(SENSITIVE_ERROR))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_pending_delta_scan_output_receiver_cancels_both_outputs()
+    -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let mut stream =
+            profiled_delta_scan_stream(activity.clone(), pending_record_batch_stream());
+        let waker = futures_util::task::noop_waker_ref();
+        let mut poll_context = Context::from_waker(waker);
+
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut poll_context),
+            Poll::Pending
+        ));
+        drop(stream);
+        activity.context.record_process_result("cancelled");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Cancelled);
+        let wait = timeline
+            .spans()
+            .iter()
+            .find(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .ok_or("expected cancelled output wait")?;
+        assert_eq!(wait.status(), TimelineSpanStatus::Cancelled);
+        assert_eq!(wait.attributes()["result"], "cancelled");
+
+        let process_wait = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "DataFusion execution activity")
+            .ok_or("expected cancelled process wait")?;
+        assert_eq!(process_wait.fields["result"], "cancelled");
         assert_eq!(process_wait.enter_count, 0);
         assert_eq!(process_wait.exit_count, 0);
         assert!(process_wait.closed);
