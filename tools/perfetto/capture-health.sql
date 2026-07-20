@@ -6,6 +6,7 @@ semantic_slices AS (
     extract_arg(s.arg_set_id, 'debug.operation_id') AS operation_id,
     extract_arg(s.arg_set_id, 'debug.query_execution_id') AS query_execution_id,
     extract_arg(s.arg_set_id, 'debug.query_scope') AS query_scope,
+    extract_arg(s.arg_set_id, 'debug.query_owner') AS query_owner,
     extract_arg(s.arg_set_id, 'debug.worker_lane_id') AS worker_lane_id,
     extract_arg(s.arg_set_id, 'debug.worker_kind') AS worker_kind,
     extract_arg(s.arg_set_id, 'debug.node_id') AS node_id,
@@ -107,6 +108,30 @@ crossing_counts AS (
       AS crossing_planning_activity_slice_count
   FROM crossing_semantic_slice_ids
 ),
+invalid_planning_activity_hierarchy AS (
+  SELECT child.id
+  FROM classified_slices AS child
+  LEFT JOIN classified_slices AS parent ON parent.id = child.parent_id
+  WHERE child.semantic_kind = 'planning_activity'
+    AND (
+      parent.id IS NULL
+      OR parent.semantic_kind IS NULL
+      OR parent.semantic_kind NOT IN ('query_planning', 'planning_activity')
+      OR parent.track_id IS NOT child.track_id
+      OR parent.operation_id IS NOT child.operation_id
+      OR parent.query_execution_id IS NOT child.query_execution_id
+      OR parent.query_scope IS NOT child.query_scope
+      OR parent.query_owner IS NOT child.query_owner
+      OR (
+        child.dur >= 0
+        AND parent.dur >= 0
+        AND (
+          child.ts < parent.ts
+          OR child.ts + child.dur > parent.ts + parent.dur
+        )
+      )
+    )
+),
 profile_counts AS (
   SELECT
     coalesce(sum(semantic_kind = 'operation'), 0) AS operation_root_count,
@@ -188,6 +213,7 @@ health_values AS (
       AND missing_canonical_field_count = 0
       AND crossing_worker_slice_count = 0
       AND crossing_planning_activity_slice_count = 0
+      AND (SELECT count(*) FROM invalid_planning_activity_hierarchy) = 0
       AND semantic_buffer_loss_count = 0
       AS semantic_complete,
     tracing_disabled_count > 0 AS finalization_observed,
@@ -200,6 +226,8 @@ health_values AS (
     missing_canonical_field_count,
     crossing_worker_slice_count,
     crossing_planning_activity_slice_count,
+    (SELECT count(*) FROM invalid_planning_activity_hierarchy)
+      AS invalid_planning_activity_hierarchy_count,
     perf_sample_count,
     perf_sample_without_callsite_count,
     perf_samples_skipped,
@@ -229,6 +257,7 @@ SELECT
   missing_canonical_field_count,
   crossing_worker_slice_count,
   crossing_planning_activity_slice_count,
+  invalid_planning_activity_hierarchy_count,
   perf_sample_count,
   perf_sample_without_callsite_count,
   perf_samples_skipped,
