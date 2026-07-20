@@ -79,10 +79,18 @@ venv_python="$work_dir/venv/bin/python"
 native_module=$("$venv_python" - <<'PY'
 import os
 import subprocess
+from importlib.metadata import version
 from importlib.resources import files
 
 import deltafunnel
 import deltafunnel.deltafunnel as native
+
+distribution_version = version("deltafunnel")
+if deltafunnel.__version__ != distribution_version:
+    raise SystemExit(
+        "installed distribution and native module versions do not match: "
+        f"{distribution_version} != {deltafunnel.__version__}"
+    )
 
 assets = files("deltafunnel").joinpath("perfetto")
 required = [

@@ -14,6 +14,9 @@ const PERFETTO_ASSETS: [&str; 5] = [
 ];
 
 fn main() -> io::Result<()> {
+    let python_version = env!("CARGO_PKG_VERSION").replace("-dev.", ".dev");
+    println!("cargo:rustc-env=DELTAFUNNEL_PY_VERSION={python_version}");
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_dir = manifest_dir.join("../../tools/perfetto");
     let out_dir =

@@ -32,6 +32,6 @@ fn deltafunnel(module: &Bound<'_, PyModule>) -> PyResult<()> {
     output::add_output(module)?;
     session::add_session(module)?;
     table::add_table(module)?;
-    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add("__version__", env!("DELTAFUNNEL_PY_VERSION"))?;
     Ok(())
 }
