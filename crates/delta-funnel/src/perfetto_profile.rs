@@ -180,6 +180,25 @@ pub(crate) fn worker_track(
     )
 }
 
+pub(crate) fn delta_scan_output_track(
+    operation_id: u64,
+    query_execution_id: u64,
+    execution_stream_id: u64,
+    query_uuid: u64,
+) -> SemanticTrack {
+    SemanticTrack::new(
+        format!(
+            "Operation [{}] / query [{}] / Delta scan output [{}]",
+            operation_token(operation_id),
+            query_token(query_execution_id),
+            stream_token(execution_stream_id)
+        ),
+        execution_stream_id,
+        query_uuid,
+        execution_stream_id,
+    )
+}
+
 pub(crate) fn operation_token(id: u64) -> String {
     format!("op-{id:020}")
 }
@@ -190,6 +209,10 @@ pub(crate) fn query_token(id: u64) -> String {
 
 pub(crate) fn worker_token(id: u64) -> String {
     format!("w-{id:020}")
+}
+
+pub(crate) fn stream_token(id: u64) -> String {
+    format!("s-{id:020}")
 }
 
 pub(crate) fn owner_token(id: u64) -> String {
