@@ -60,7 +60,7 @@ impl DeltaFunnelSession {
                         Some(request.target().output_name()),
                     ));
                 }
-                self.plan_mssql_output_with_timeline(request, timeline)
+                self.plan_mssql_output_with_timeline(request, timeline, None, None)
             })
             .collect()
     }

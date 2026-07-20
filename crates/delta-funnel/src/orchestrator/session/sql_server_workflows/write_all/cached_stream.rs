@@ -116,6 +116,7 @@ async fn create_cached_output_query_execution_from_retained_sql(
         profile_mode,
         trace_context.as_ref(),
         None,
+        None,
     )
     .await
 }

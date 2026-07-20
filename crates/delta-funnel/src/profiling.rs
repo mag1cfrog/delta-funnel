@@ -292,6 +292,14 @@ impl OperationStageTrace {
         self
     }
 
+    pub(crate) fn completed(self) {
+        let _ = self.finish_with_duration(TimelineSpanStatus::Completed);
+    }
+
+    pub(crate) fn failed(self) {
+        let _ = self.finish_with_duration(TimelineSpanStatus::Failed);
+    }
+
     pub(crate) fn finish_with_duration(mut self, status: TimelineSpanStatus) -> Duration {
         let duration = self
             .timeline_span

@@ -10,12 +10,12 @@ use crate::{
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
     TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     profiling::{
-        OperationTraceContext, OperationTraceKind, OperationTracePhase,
+        OperationStageTrace, OperationTraceContext, OperationTraceKind, OperationTracePhase,
         ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{QueryTraceIdentity, with_query_planning_activity},
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder, PhaseTimer},
+    report::{OperationTimelineRecorder, PhaseTimer},
     sql_server::write_planned_output_batches_to_mssql_for_workflow,
 };
 
@@ -34,6 +34,7 @@ pub(in crate::orchestrator::session) const OUTPUT_SCHEMA_PLANNING_PHASE: &str =
     "output_schema_planning";
 pub(in crate::orchestrator::session) const SQL_TARGET_PLANNING_PHASE: &str = "sql_target_planning";
 const VALIDATION_PHASE: &str = "validation";
+const SINGLE_OUTPUT_STAGE_OWNER_ID: u64 = 1;
 pub(super) const QUERY_DATAFRAME_PLANNING_PHASE: &str = "query_dataframe_planning";
 pub(super) const QUERY_PHYSICAL_PLANNING_PHASE: &str = "query_physical_planning";
 pub(super) const QUERY_STREAM_SETUP_PHASE: &str = "query_stream_setup";
@@ -63,22 +64,26 @@ impl DeltaFunnelSession {
         &self,
         request: &OutputWritePlan,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
-        self.plan_mssql_output_with_timeline(request, None)
+        self.plan_mssql_output_with_timeline(request, None, None, None)
     }
 
     pub(super) fn plan_mssql_output_with_timeline(
         &self,
         request: &OutputWritePlan,
         timeline: Option<&OperationTimelineRecorder>,
+        trace_context: Option<&OperationTraceContext>,
+        stage_owner_id: Option<u64>,
     ) -> Result<PlannedMssqlOutput, DeltaFunnelError> {
         let mut phase_timings = self.phase_timings_for_lazy_table(request.table())?;
 
         let schema_timer = PhaseTimer::start(OUTPUT_SCHEMA_PLANNING_PHASE);
         let schema_span = start_write_span(
+            trace_context,
             timeline,
             "Plan output schema",
             "delta_funnel.write.planning",
             "Output schema planning",
+            stage_owner_id,
         )
         .map(|span| {
             span.with_attribute(
@@ -101,10 +106,12 @@ impl DeltaFunnelSession {
 
         let target_timer = PhaseTimer::start(SQL_TARGET_PLANNING_PHASE);
         let target_span = start_write_span(
+            trace_context,
             timeline,
             "Plan SQL Server target",
             "delta_funnel.write.planning",
             "SQL Server target planning",
+            stage_owner_id,
         )
         .map(|span| {
             span.with_attribute(
@@ -374,6 +381,7 @@ impl DeltaFunnelSession {
                     profile_mode,
                     trace_context.as_ref(),
                     None,
+                    None,
                 )
                 .await
             })
@@ -409,7 +417,12 @@ impl DeltaFunnelSession {
                     output_name,
                 ));
             }
-            let planned = self.plan_mssql_output_with_timeline(request, timeline)?;
+            let planned = self.plan_mssql_output_with_timeline(
+                request,
+                timeline,
+                trace_context.as_ref(),
+                Some(SINGLE_OUTPUT_STAGE_OWNER_ID),
+            )?;
             if let Some(reporter) = reporter {
                 reporter.emit(&ProgressEvent::phase_changed(
                     ProgressPhase::SettingUpStream,
@@ -430,6 +443,7 @@ impl DeltaFunnelSession {
                 reporter.cloned(),
                 profile_mode,
                 trace_context.as_ref(),
+                Some(SINGLE_OUTPUT_STAGE_OWNER_ID),
                 Some(&mut process_phases),
             )
             .await
@@ -499,6 +513,7 @@ pub(super) async fn create_mssql_output_query_execution_with_trace_context(
     progress: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
     trace_context: Option<&OperationTraceContext>,
+    stage_owner_id: Option<u64>,
     process_phases: Option<&mut ProcessOperationPhaseTracker>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let timeline = trace_context.and_then(OperationTraceContext::timeline);
@@ -506,10 +521,12 @@ pub(super) async fn create_mssql_output_query_execution_with_trace_context(
 
     let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
     let dataframe_span = start_write_span(
+        trace_context,
         timeline,
         "Build query DataFrame",
         "delta_funnel.write.query",
         "Query DataFrame planning",
+        stage_owner_id,
     )
     .map(|span| {
         span.with_attribute(
@@ -551,6 +568,7 @@ pub(super) async fn create_mssql_output_query_execution_with_trace_context(
         progress,
         profile_mode,
         trace_context,
+        stage_owner_id,
         process_phases,
     )
     .await
@@ -569,6 +587,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
     progress: Option<ProgressReporter>,
     profile_mode: ExecutionProfileMode,
     trace_context: Option<&OperationTraceContext>,
+    stage_owner_id: Option<u64>,
     process_phases: Option<&mut ProcessOperationPhaseTracker>,
 ) -> Result<MssqlOutputQueryExecution, MssqlOutputQueryError> {
     let timeline = trace_context.and_then(OperationTraceContext::timeline);
@@ -581,10 +600,12 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
     });
     let physical_plan_timer = PhaseTimer::start(QUERY_PHYSICAL_PLANNING_PHASE);
     let physical_plan_span = start_write_span(
+        trace_context,
         timeline,
         "Build physical plan",
         "delta_funnel.write.query",
         "Query physical planning",
+        stage_owner_id,
     )
     .map(|span| {
         span.with_attribute(
@@ -621,10 +642,12 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
 
     let stream_setup_timer = PhaseTimer::start(QUERY_STREAM_SETUP_PHASE);
     let stream_setup_span = start_write_span(
+        trace_context,
         timeline,
         "Set up query stream",
         "delta_funnel.write.query",
         "Query stream setup",
+        stage_owner_id,
     )
     .map(|span| {
         span.with_attribute(
@@ -864,21 +887,30 @@ fn with_mssql_write_operation_timeline(
 }
 
 fn start_write_span(
+    trace_context: Option<&OperationTraceContext>,
     timeline: Option<&OperationTimelineRecorder>,
-    name: &str,
-    category: &str,
+    name: &'static str,
+    category: &'static str,
     track_name: &str,
-) -> Option<OperationTimelineSpanRecorder> {
-    timeline.map(|timeline| timeline.start_span(name, category, track_name))
+    stage_owner_id: Option<u64>,
+) -> Option<OperationStageTrace> {
+    OperationStageTrace::start(
+        trace_context,
+        timeline,
+        name,
+        category,
+        track_name,
+        stage_owner_id,
+    )
 }
 
-fn complete_write_span(span: Option<OperationTimelineSpanRecorder>) {
+fn complete_write_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.completed();
     }
 }
 
-fn fail_write_span(span: Option<OperationTimelineSpanRecorder>) {
+fn fail_write_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.failed();
     }
@@ -1053,8 +1085,8 @@ mod tests {
     use super::{
         OUTPUT_SCHEMA_PLANNING_PHASE, OrchestratorMssqlOutputWriter,
         QUERY_DATAFRAME_PLANNING_PHASE, QUERY_PHASE_NAMES, QUERY_PHYSICAL_PLANNING_PHASE,
-        QUERY_STREAM_SETUP_PHASE, SQL_TARGET_PLANNING_PHASE, VALIDATION_PHASE,
-        mssql_query_phase_error, prepend_mssql_write_phase_timings,
+        QUERY_STREAM_SETUP_PHASE, SINGLE_OUTPUT_STAGE_OWNER_ID, SQL_TARGET_PLANNING_PHASE,
+        VALIDATION_PHASE, mssql_query_phase_error, prepend_mssql_write_phase_timings,
     };
 
     type RecordedProgress = (
@@ -1672,6 +1704,7 @@ mod tests {
             LoadMode::AppendExisting,
         )?;
         let (reporter, events) = recording_reporter();
+        let capture = TracingCapture::start_with_profile_spans_enabled();
 
         let error = session
             .write_to_mssql_with_reporter(&request, reporter)
@@ -1698,6 +1731,25 @@ mod tests {
                 (ProgressEventKind::Failed, None, None),
             ]
         );
+        let spans = capture.captured().spans();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel SQL Server write")
+            .ok_or("expected failed SQL Server write root")?;
+        assert_eq!(root.fields["result"], "error");
+        let stages = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].fields["stage_name"], "Plan output schema");
+        assert_eq!(stages[0].fields["result"], "ok");
+        assert_eq!(stages[1].fields["stage_name"], "Plan SQL Server target");
+        assert_eq!(stages[1].fields["result"], "error");
+        assert!(stages.iter().all(|stage| {
+            stage.parent_id == Some(root.id)
+                && stage.fields["stage_owner_id"] == SINGLE_OUTPUT_STAGE_OWNER_ID.to_string()
+        }));
         Ok(())
     }
 
@@ -1785,6 +1837,32 @@ mod tests {
             phase.parent_id == Some(root.id)
                 && phase.fields["operation_id"] == root.fields["operation_id"]
                 && phase.closed
+        }));
+        let stages = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages
+                .iter()
+                .map(|span| span.fields["stage_name"].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Plan output schema",
+                "Plan SQL Server target",
+                "Build query DataFrame",
+                "Build physical plan",
+                "Set up query stream",
+            ]
+        );
+        assert!(stages.iter().all(|stage| {
+            stage.parent_id == Some(root.id)
+                && stage.fields["operation_id"] == root.fields["operation_id"]
+                && stage.fields["operation_kind"] == "mssql_write"
+                && stage.fields["stage_owner_id"] == SINGLE_OUTPUT_STAGE_OWNER_ID.to_string()
+                && stage.fields["result"] == "ok"
+                && stage.fields["time_semantics"] == "wall_clock"
+                && stage.closed
         }));
         assert_eq!(
             report
