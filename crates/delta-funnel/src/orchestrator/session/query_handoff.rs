@@ -28,7 +28,7 @@ use crate::{
     ReportReasonCode, TimelineSpanStatus,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     profiling::{
-        OperationTraceContext, OperationTraceKind, OperationTracePhase,
+        OperationStageTrace, OperationTraceContext, OperationTraceKind, OperationTracePhase,
         ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
@@ -43,7 +43,7 @@ use crate::{
         profiled_datafusion_query_output_stream_with_effective_root,
         snapshot_delta_provider_read_stats, with_query_planning_activity,
     },
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
+    report::OperationTimelineRecorder,
     usize_to_u64_saturating,
 };
 
@@ -609,11 +609,12 @@ struct PreviewTimingTracker {
     phase_timings: Vec<PhaseTimingReport>,
     timeline: OperationTimelineRecorder,
     process_phases: ProcessOperationPhaseTracker,
+    trace_context: Option<OperationTraceContext>,
 }
 
 struct PreviewPhaseTimer {
     phase_name: &'static str,
-    timeline_span: OperationTimelineSpanRecorder,
+    stage: Option<OperationStageTrace>,
 }
 
 impl PreviewTimingTracker {
@@ -622,21 +623,28 @@ impl PreviewTimingTracker {
             phase_timings: Vec::with_capacity(PREVIEW_PHASE_NAMES.len()),
             timeline: OperationTimelineRecorder::start(),
             process_phases: ProcessOperationPhaseTracker::default(),
+            trace_context: None,
         }
     }
 
     fn start_phase(&self, phase_name: &'static str) -> PreviewPhaseTimer {
         let display_name = preview_phase_display_name(phase_name);
-        PreviewPhaseTimer {
-            phase_name,
-            timeline_span: self
-                .timeline
-                .start_span(display_name, "delta_funnel.preview.phase", display_name)
-                .with_attribute(
-                    "phase_name",
-                    serde_json::Value::String(phase_name.to_owned()),
-                ),
-        }
+        let stage = OperationStageTrace::start(
+            self.trace_context.as_ref(),
+            Some(&self.timeline),
+            display_name,
+            "delta_funnel.preview.phase",
+            display_name,
+            None,
+        )
+        .map(|stage| {
+            stage.with_attribute(
+                "phase_name",
+                serde_json::Value::String(phase_name.to_owned()),
+            )
+        });
+        debug_assert!(stage.is_some());
+        PreviewPhaseTimer { phase_name, stage }
     }
 
     fn record_completed(&mut self, timer: PreviewPhaseTimer) {
@@ -649,7 +657,10 @@ impl PreviewTimingTracker {
         timer: PreviewPhaseTimer,
         status: TimelineSpanStatus,
     ) -> PhaseTimingReport {
-        let duration = timer.timeline_span.finish_with_duration(status);
+        let duration = timer
+            .stage
+            .map(|stage| stage.finish_with_duration(status))
+            .unwrap_or_default();
         match status {
             TimelineSpanStatus::Completed => {
                 PhaseTimingReport::completed(timer.phase_name, duration)
@@ -858,6 +869,7 @@ impl DeltaFunnelSession {
             (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
                 .then(|| timings.timeline.clone()),
         );
+        timings.trace_context = trace_context.clone();
         timings.process_phases = ProcessOperationPhaseTracker::start(
             trace_context.as_ref(),
             OperationTracePhase::Planning,
@@ -2482,6 +2494,36 @@ mod tests {
                 && phase.exit_count == 0
                 && phase.closed
         }));
+        let stages = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages
+                .iter()
+                .map(|span| span.fields["stage_name"].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "DataFrame planning",
+                "Physical planning",
+                "Stream setup",
+                "Execute and collect",
+                "Format text",
+                "Format HTML",
+            ]
+        );
+        assert!(stages.iter().all(|stage| {
+            stage.parent_id == Some(root.id)
+                && stage.fields["operation_id"] == root.fields["operation_id"]
+                && stage.fields["operation_kind"] == "preview"
+                && stage.fields["stage_category"] == "delta_funnel.preview.phase"
+                && !stage.fields.contains_key("stage_owner_id")
+                && stage.fields["result"] == "ok"
+                && stage.fields["time_semantics"] == "wall_clock"
+                && stage.enter_count == 0
+                && stage.exit_count == 0
+                && stage.closed
+        }));
         let planning = spans
             .iter()
             .find(|span| span.name == "DataFusion query planning")
@@ -2505,6 +2547,7 @@ mod tests {
     async fn preview_unknown_table_returns_dataframe_failure_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
 
         let result = session
             .preview_table_with_options(
@@ -2530,6 +2573,20 @@ mod tests {
         assert_eq!(context_json.as_object().map(serde_json::Map::len), Some(4));
         assert_eq!(context_json["operation_timeline"]["status"], "failed");
         assert!(context_json.get("source").is_none());
+        let spans = capture.captured().spans();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel preview")
+            .ok_or("expected failed preview root")?;
+        assert_eq!(root.fields["result"], "error");
+        let stages = spans
+            .iter()
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].parent_id, Some(root.id));
+        assert_eq!(stages[0].fields["stage_name"], "DataFrame planning");
+        assert_eq!(stages[0].fields["result"], "error");
         Ok(())
     }
 
