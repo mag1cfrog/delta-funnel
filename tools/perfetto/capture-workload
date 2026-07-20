@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: capture-workload [--mode short|streaming|deep-system] --output TRACE -- COMMAND [ARG...]
+
+Record one diagnostics-enabled Python workload and check the saved trace.
+The default mode is short.
+EOF
+}
+
+mode=short
+capture_path=
+while (( $# > 0 )); do
+  case $1 in
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --mode)
+      if (( $# < 2 )); then
+        usage >&2
+        exit 64
+      fi
+      mode=${2:-}
+      shift 2
+      ;;
+    --output)
+      if (( $# < 2 )); then
+        usage >&2
+        exit 64
+      fi
+      capture_path=${2:-}
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      printf 'capture-workload: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [[ -z $capture_path || $# == 0 ]]; then
+  usage >&2
+  exit 64
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+case $mode in
+  short)
+    capture_config=$script_dir/delta-funnel-standard.pbtx
+    configured_file_cap_bytes=
+    ;;
+  streaming)
+    capture_config=$script_dir/delta-funnel-standard-streaming.pbtx
+    configured_file_cap_bytes=536870912
+    ;;
+  deep-system)
+    capture_config=$script_dir/delta-funnel-deep-system.pbtx
+    configured_file_cap_bytes=
+    ;;
+  *)
+    printf 'capture-workload: unsupported mode: %s\n' "$mode" >&2
+    exit 64
+    ;;
+esac
+
+if [[ ! -r $capture_config || ! -x $script_dir/capture-health ]]; then
+  printf 'capture-workload: packaged Perfetto assets are incomplete\n' >&2
+  exit 69
+fi
+
+tracebox=${TRACEBOX:-tracebox}
+trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
+perf=${PERF:-perf}
+for executable in "$tracebox" "$trace_processor" "$perf" timeout od; do
+  if ! command -v "$executable" >/dev/null 2>&1; then
+    printf 'capture-workload: required command is unavailable: %s\n' \
+      "$executable" >&2
+    exit 127
+  fi
+done
+
+if [[ $(uname -s) != Linux ]]; then
+  printf 'capture-workload: Perfetto diagnostics require Linux\n' >&2
+  exit 69
+fi
+if [[ $mode == deep-system ]]; then
+  test -r /sys/kernel/tracing/events/sched/sched_switch/id &&
+    test -w /sys/kernel/tracing/tracing_on || {
+      printf 'capture-workload: deep-system mode requires tracefs access\n' >&2
+      exit 77
+    }
+fi
+
+capture_dir=$(dirname -- "$capture_path")
+mkdir -p -- "$capture_dir"
+if [[ ! -w $capture_dir ]]; then
+  printf 'capture-workload: output directory is not writable: %s\n' \
+    "$capture_dir" >&2
+  exit 73
+fi
+if [[ -e $capture_path ]]; then
+  printf 'capture-workload: output already exists: %s\n' "$capture_path" >&2
+  exit 73
+fi
+
+target=$1
+if [[ $target != */* ]]; then
+  target=$(command -v "$target") || {
+    printf 'capture-workload: command is unavailable: %s\n' "$1" >&2
+    exit 127
+  }
+fi
+if [[ ! -x $target ]]; then
+  printf 'capture-workload: command is not executable: %s\n' "$target" >&2
+  exit 126
+fi
+shift
+
+target_dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd -P)
+target_name=$(basename -- "$target")
+launcher=$target_dir/delta-funnel-perfetto-preview
+if [[ -e $launcher || -L $launcher ]]; then
+  if [[ ! -x $launcher ]] || [[ ! $launcher -ef $target ]]; then
+    printf 'capture-workload: incompatible diagnostics launcher: %s\n' \
+      "$launcher" >&2
+    exit 73
+  fi
+else
+  ln -s -- "$target_name" "$launcher"
+fi
+runtime_dir=$(mktemp -d "$capture_dir/.delta-funnel-perfetto.XXXXXX")
+ready_fifo=$runtime_dir/tracebox-ready
+trace_pid=
+
+stop_tracebox() {
+  if [[ -z $trace_pid ]]; then
+    return
+  fi
+  kill -TERM "$trace_pid" 2>/dev/null || true
+  if wait "$trace_pid"; then
+    tracebox_status=0
+  else
+    tracebox_status=$?
+  fi
+  trace_pid=
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  stop_tracebox
+  rm -rf -- "$runtime_dir"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+"$tracebox" --system-sockets --query >/dev/null || {
+  printf 'capture-workload: Perfetto system service is unavailable\n' >&2
+  exit 69
+}
+"$perf" stat --all-cpus --event cpu-clock -- sleep 0.1 >/dev/null 2>&1 || {
+  printf 'capture-workload: Linux performance events are unavailable\n' >&2
+  exit 77
+}
+
+mkfifo "$ready_fifo"
+"$tracebox" --txt --system-sockets --no-clobber \
+  --notify-fd 3 \
+  --config "$capture_config" \
+  --out "$capture_path" \
+  3>"$ready_fifo" &
+trace_pid=$!
+
+if readiness_raw=$(timeout 15 od -An -tu1 -N1 "$ready_fifo"); then
+  readiness=$(tr -d '[:space:]' <<<"$readiness_raw")
+else
+  readiness=
+fi
+rm -f -- "$ready_fifo"
+if [[ $readiness != 0 ]]; then
+  stop_tracebox
+  printf 'capture-workload: tracebox readiness failed: status=%s\n' \
+    "${tracebox_status:-125}" >&2
+  exit 69
+fi
+
+if "$launcher" "$@"; then
+  workload_status=0
+else
+  workload_status=$?
+fi
+stop_tracebox
+
+health_args=("$capture_path")
+if [[ -n $configured_file_cap_bytes ]]; then
+  health_args+=("$configured_file_cap_bytes")
+fi
+if health_output=$(TRACE_PROCESSOR_SHELL=$trace_processor \
+  "$script_dir/capture-health" "${health_args[@]}"); then
+  printf '%s\n' "$health_output"
+  health_row=$(sed -n '$p' <<<"$health_output")
+  capture_complete=${health_row%%,*}
+  if [[ $capture_complete == 1 ]]; then
+    health_status=0
+  else
+    health_status=65
+  fi
+else
+  health_status=$?
+fi
+
+printf 'workload_status=%s tracebox_status=%s health_status=%s trace=%s\n' \
+  "$workload_status" "${tracebox_status:-125}" "$health_status" "$capture_path"
+if (( workload_status == 0 && (tracebox_status != 0 || health_status != 0) )); then
+  printf '%s\n' \
+    'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2
+fi
+exit "$workload_status"
