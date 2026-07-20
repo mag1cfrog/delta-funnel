@@ -14,8 +14,8 @@ use tracing::{
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 use super::{
-    SemanticTrack, diagnostics_track, operation_track, owner_track, perfetto_te_ns, phase_track,
-    planning_track, query_track, worker_track,
+    SemanticTrack, delta_scan_output_track, diagnostics_track, operation_track, owner_track,
+    perfetto_te_ns, phase_track, planning_track, query_track, worker_track,
 };
 
 /// Exact tracing target consumed by the Perfetto profile layer.
@@ -102,6 +102,7 @@ struct ProfileFields {
     execution_stream_id: Option<u64>,
     activity: Option<String>,
     planning_activity_name: Option<String>,
+    execution_activity_name: Option<String>,
     maximum_spans: Option<u64>,
     operator_name: Option<String>,
     phase: Option<String>,
@@ -136,6 +137,7 @@ impl Visit for ProfileFields {
             "worker_kind" => self.worker_kind = Some(value.to_owned()),
             "activity" => self.activity = Some(value.to_owned()),
             "planning_activity_name" => self.planning_activity_name = Some(value.to_owned()),
+            "execution_activity_name" => self.execution_activity_name = Some(value.to_owned()),
             "operator_name" => self.operator_name = Some(value.to_owned()),
             "phase" => self.phase = Some(value.to_owned()),
             "operation_kind" => self.operation_kind = Some(value.to_owned()),
@@ -195,6 +197,24 @@ impl ActiveProfileSpan {
                 ProfileEvent::PlanningActivity {
                     name,
                     planning: planning_track(operation_id, query_execution_id, phases.uuid),
+                }
+            }
+            "DataFusion execution activity" => {
+                let query_execution_id = fields.query_execution_id?;
+                let execution_stream_id = fields.execution_stream_id?;
+                let name = fields.execution_activity_name.clone()?;
+                if fields.activity.as_deref()?.is_empty() {
+                    return None;
+                }
+                let query = query_track(operation_id, query_execution_id, operation.uuid);
+                ProfileEvent::ExecutionActivity {
+                    name,
+                    output: delta_scan_output_track(
+                        operation_id,
+                        query_execution_id,
+                        execution_stream_id,
+                        query.uuid,
+                    ),
                 }
             }
             "Delta Funnel operation phase" => ProfileEvent::Phase {
@@ -319,6 +339,27 @@ impl ActiveProfileSpan {
                     );
                 }
             }
+            ProfileEvent::ExecutionActivity { name, output } => {
+                if let Ok(name) = CString::new(name.as_str()) {
+                    track_event!(
+                        "delta_funnel.profile",
+                        TrackEventType::SliceBegin(name.as_ptr()),
+                        |context: &mut EventContext| {
+                            output.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                } else {
+                    track_event_begin!(
+                        "delta_funnel.profile",
+                        "DataFusion execution activity",
+                        |context: &mut EventContext| {
+                            output.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                }
+            }
             ProfileEvent::Phase { kind, phases } => match kind {
                 OperationPhaseKind::Planning => track_event_begin!(
                     "delta_funnel.profile",
@@ -395,6 +436,7 @@ impl ActiveProfileSpan {
             ProfileEvent::Operation { operation, .. } => (operation, true),
             ProfileEvent::Planning { planning, .. }
             | ProfileEvent::PlanningActivity { planning, .. } => (planning, false),
+            ProfileEvent::ExecutionActivity { output, .. } => (output, false),
             ProfileEvent::Phase { phases, .. } => (phases, false),
             ProfileEvent::Stage { track, .. } => (track, false),
             ProfileEvent::Operator { worker, .. } => (worker, false),
@@ -459,6 +501,9 @@ impl ActiveProfileSpan {
         if let Some(name) = &self.fields.planning_activity_name {
             context.add_debug_arg("planning_activity_name", TrackEventDebugArg::String(name));
         }
+        if let Some(name) = &self.fields.execution_activity_name {
+            context.add_debug_arg("execution_activity_name", TrackEventDebugArg::String(name));
+        }
         if let Some(operation_kind) = &self.fields.operation_kind {
             context.add_debug_arg("operation_kind", TrackEventDebugArg::String(operation_kind));
         }
@@ -494,6 +539,7 @@ impl ActiveProfileSpan {
             ProfileEvent::Operation { operation, .. } => operation,
             ProfileEvent::Planning { planning, .. }
             | ProfileEvent::PlanningActivity { planning, .. } => planning,
+            ProfileEvent::ExecutionActivity { output, .. } => output,
             ProfileEvent::Phase { phases, .. } => phases,
             ProfileEvent::Stage { track, .. } => track,
             ProfileEvent::Operator { worker, .. } => worker,
@@ -515,6 +561,10 @@ enum ProfileEvent {
     PlanningActivity {
         name: String,
         planning: SemanticTrack,
+    },
+    ExecutionActivity {
+        name: String,
+        output: SemanticTrack,
     },
     Phase {
         kind: OperationPhaseKind,
@@ -960,6 +1010,127 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn execution_activities_use_query_specific_output_tracks() {
+        let execution_fields = |query_execution_id, execution_stream_id| ProfileFields {
+            operation_id: Some(7),
+            query_execution_id: Some(query_execution_id),
+            query_scope: Some("preview".to_owned()),
+            execution_stream_id: Some(execution_stream_id),
+            operator_partition: Some(2),
+            execution_activity_name: Some("Await Delta scan output".to_owned()),
+            activity: Some("await_output".to_owned()),
+            time_semantics: Some("wall_clock".to_owned()),
+            ..ProfileFields::default()
+        };
+        let activity =
+            ActiveProfileSpan::from_fields("DataFusion execution activity", execution_fields(3, 1))
+                .expect("the execution activity should map");
+        let duplicate =
+            ActiveProfileSpan::from_fields("DataFusion execution activity", execution_fields(3, 1))
+                .expect("the same execution activity should map");
+        let other_stream = ActiveProfileSpan::from_fields(
+            "DataFusion execution activity",
+            execution_fields(3, 10),
+        )
+        .expect("another output stream should map");
+        let other_query =
+            ActiveProfileSpan::from_fields("DataFusion execution activity", execution_fields(4, 1))
+                .expect("another query should map");
+
+        assert_eq!(activity.track(), duplicate.track());
+        assert_ne!(activity.track().uuid, other_stream.track().uuid);
+        assert_ne!(activity.track().uuid, other_query.track().uuid);
+        let query = query_track(7, 3, operation_track(7, diagnostics_track(0).uuid).uuid);
+        let same_id_worker = worker_track(7, 3, 10, query.uuid, 10);
+        assert!(same_id_worker.sibling_order_rank < other_stream.track().sibling_order_rank);
+        assert_eq!(activity.track().parent_uuid, query.uuid);
+        assert!(
+            activity
+                .track()
+                .name
+                .contains("Delta scan output [s-00000000000000000001]")
+        );
+        assert!(
+            !other_stream
+                .track()
+                .name
+                .contains("Delta scan output [s-00000000000000000001]")
+        );
+        assert_eq!(
+            activity.fields.execution_activity_name.as_deref(),
+            Some("Await Delta scan output")
+        );
+        assert_eq!(activity.fields.activity.as_deref(), Some("await_output"));
+        assert_eq!(activity.fields.execution_stream_id, Some(1));
+        assert_eq!(activity.fields.operator_partition, Some(2));
+        assert_eq!(
+            activity.fields.time_semantics.as_deref(),
+            Some("wall_clock")
+        );
+    }
+
+    #[test]
+    fn execution_activity_requires_bounded_identity_and_only_updates_terminal_fields() {
+        let complete = || ProfileFields {
+            operation_id: Some(7),
+            query_execution_id: Some(3),
+            execution_stream_id: Some(1),
+            execution_activity_name: Some("Await Delta scan output".to_owned()),
+            activity: Some("await_output".to_owned()),
+            time_semantics: Some("wall_clock".to_owned()),
+            ..ProfileFields::default()
+        };
+        for incomplete in [
+            ProfileFields {
+                query_execution_id: None,
+                ..complete()
+            },
+            ProfileFields {
+                execution_stream_id: None,
+                ..complete()
+            },
+            ProfileFields {
+                execution_activity_name: None,
+                ..complete()
+            },
+            ProfileFields {
+                activity: Some(String::new()),
+                ..complete()
+            },
+        ] {
+            assert!(
+                ActiveProfileSpan::from_fields("DataFusion execution activity", incomplete)
+                    .is_none()
+            );
+        }
+
+        let mut active =
+            ActiveProfileSpan::from_fields("DataFusion execution activity", complete())
+                .expect("the complete execution activity should map");
+        active.record(ProfileFields {
+            operation_id: Some(99),
+            query_execution_id: Some(99),
+            execution_stream_id: Some(99),
+            execution_activity_name: Some("Changed".to_owned()),
+            activity: Some("changed".to_owned()),
+            time_semantics: Some("active".to_owned()),
+            result: Some("ok".to_owned()),
+            ..ProfileFields::default()
+        });
+
+        assert_eq!(active.fields.operation_id, Some(7));
+        assert_eq!(active.fields.query_execution_id, Some(3));
+        assert_eq!(active.fields.execution_stream_id, Some(1));
+        assert_eq!(
+            active.fields.execution_activity_name.as_deref(),
+            Some("Await Delta scan output")
+        );
+        assert_eq!(active.fields.activity.as_deref(), Some("await_output"));
+        assert_eq!(active.fields.time_semantics.as_deref(), Some("wall_clock"));
+        assert_eq!(active.fields.result.as_deref(), Some("ok"));
     }
 
     #[derive(Clone)]

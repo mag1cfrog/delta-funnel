@@ -23,13 +23,18 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::{
-    QueryExecutionScope, profiling::OperationTraceContext, report::OperationTimelineSpanRecorder,
+    QueryExecutionScope,
+    profiling::{OperationStageTrace, OperationTraceContext},
+    report::OperationTimelineSpanRecorder,
     usize_to_u64_saturating,
 };
 
-use super::QueryTraceIdentity;
+use super::{QueryTraceIdentity, execution::DeltaScanPlanningExec};
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
+const DELTA_SCAN_OUTPUT_WAIT_CATEGORY: &str = "datafusion.execution.activity";
+const DELTA_SCAN_OUTPUT_WAIT_NAME: &str = "Await Delta scan output";
+const DELTA_SCAN_OUTPUT_WAIT_ACTIVITY: &str = "await_output";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityWorkerKind {
@@ -268,6 +273,69 @@ impl OperatorActivityRecorder {
         })
     }
 
+    fn start_delta_scan_output_wait(
+        &self,
+        node_id: u64,
+        partition: usize,
+        stream_id: u64,
+    ) -> Option<ExecutionActivitySpanRecorder> {
+        if self.context.timeline().is_none() && !self.context.process_spans_enabled() {
+            return None;
+        }
+        if let Err(limit) = self.context.reserve_operator_activity() {
+            if limit.should_report {
+                self.report_truncation(limit.maximum_spans);
+            }
+            return None;
+        }
+
+        let track_name = format!(
+            "DataFusion query [{}] / Delta scan output [{}]",
+            self.query_execution_id, stream_id
+        );
+        let timeline_span = self.context.timeline().map(|timeline| {
+            self.with_query_identity(timeline.start_span(
+                DELTA_SCAN_OUTPUT_WAIT_NAME,
+                DELTA_SCAN_OUTPUT_WAIT_CATEGORY,
+                track_name,
+            ))
+            .with_attribute(
+                "activity",
+                Value::String(DELTA_SCAN_OUTPUT_WAIT_ACTIVITY.to_owned()),
+            )
+            .with_attribute("node_id", Value::from(node_id))
+            .with_attribute(
+                "operator_partition",
+                Value::from(usize_to_u64_saturating(partition)),
+            )
+            .with_attribute("execution_stream_id", Value::from(stream_id))
+        });
+        let process_span = self.context.process_root_span().map(|parent| {
+            let span = tracing::trace_span!(
+                target: crate::profiling::PROFILE_TARGET,
+                parent: parent,
+                "DataFusion execution activity",
+                operation_id = self.context.operation_id(),
+                query_execution_id = self.query_execution_id,
+                query_scope = self.query_scope.as_str(),
+                query_owner = tracing::field::Empty,
+                execution_activity_name = DELTA_SCAN_OUTPUT_WAIT_NAME,
+                node_id,
+                operator_partition = usize_to_u64_saturating(partition),
+                execution_stream_id = stream_id,
+                activity = DELTA_SCAN_OUTPUT_WAIT_ACTIVITY,
+                result = tracing::field::Empty,
+                time_semantics = "wall_clock",
+            );
+            if let Some(query_owner) = &self.query_owner {
+                span.record("query_owner", query_owner.as_ref());
+            }
+            (span, parent.clone())
+        });
+        let stage = OperationStageTrace::from_parts(timeline_span, process_span)?;
+        Some(ExecutionActivitySpanRecorder { stage: Some(stage) })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the process span records the canonical operator activity identity"
@@ -466,6 +534,32 @@ struct OperatorActivitySpanRecorder {
     active: ActiveOperatorActivitySpan,
 }
 
+struct ExecutionActivitySpanRecorder {
+    stage: Option<OperationStageTrace>,
+}
+
+impl ExecutionActivitySpanRecorder {
+    fn finish(mut self, result: &'static str, failed: bool) {
+        let Some(stage) = self.stage.take() else {
+            return;
+        };
+        let stage = stage.with_attribute("result", Value::String(result.to_owned()));
+        if failed {
+            stage.failed();
+        } else {
+            stage.completed();
+        }
+    }
+}
+
+impl Drop for ExecutionActivitySpanRecorder {
+    fn drop(&mut self) {
+        if let Some(stage) = self.stage.take() {
+            drop(stage.with_attribute("result", Value::String("cancelled".to_owned())));
+        }
+    }
+}
+
 impl OperatorActivitySpanRecorder {
     fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
         match &self.process_span {
@@ -552,11 +646,15 @@ fn instrument_query_execution_node(
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
     let inner = plan.with_new_children(children)?;
+    // Instrument only the provider-owned output boundary. Name matching could
+    // accidentally include an unrelated third-party plan with the same label.
+    let records_delta_scan_output_wait = inner.as_any().is::<DeltaScanPlanningExec>();
     let plan: Arc<dyn ExecutionPlan> = Arc::new(ProfiledOperatorExec {
         inner,
         node_id,
         parent_node_id,
         activity: activity.clone(),
+        records_delta_scan_output_wait,
     });
     instrumented.insert(identity, Arc::clone(&plan));
     Ok(plan)
@@ -578,6 +676,7 @@ struct ProfiledOperatorExec {
     node_id: u64,
     parent_node_id: Option<u64>,
     activity: OperatorActivityRecorder,
+    records_delta_scan_output_wait: bool,
 }
 
 impl DisplayAs for ProfiledOperatorExec {
@@ -617,6 +716,7 @@ impl ExecutionPlan for ProfiledOperatorExec {
             node_id: self.node_id,
             parent_node_id: self.parent_node_id,
             activity: self.activity.clone(),
+            records_delta_scan_output_wait: self.records_delta_scan_output_wait,
         }))
     }
 
@@ -651,6 +751,8 @@ impl ExecutionPlan for ProfiledOperatorExec {
                 partition,
                 stream_id,
                 activity: self.activity.clone(),
+                records_delta_scan_output_wait: self.records_delta_scan_output_wait,
+                pending_delta_scan_output_wait: None,
             }) as SendableRecordBatchStream
         })
     }
@@ -669,6 +771,8 @@ struct ProfiledRecordBatchStream {
     partition: usize,
     stream_id: u64,
     activity: OperatorActivityRecorder,
+    records_delta_scan_output_wait: bool,
+    pending_delta_scan_output_wait: Option<ExecutionActivitySpanRecorder>,
 }
 
 impl Stream for ProfiledRecordBatchStream {
@@ -696,6 +800,33 @@ impl Stream for ProfiledRecordBatchStream {
             };
             span.finish(result, failed);
         }
+        if self.records_delta_scan_output_wait {
+            // One wait spans Pending through the first later Ready. A spurious
+            // wake that polls Pending again keeps the same interval open.
+            match &poll {
+                Poll::Pending if self.pending_delta_scan_output_wait.is_none() => {
+                    self.pending_delta_scan_output_wait = self
+                        .activity
+                        .start_delta_scan_output_wait(self.node_id, self.partition, self.stream_id);
+                }
+                Poll::Pending => {}
+                Poll::Ready(Some(Ok(_))) => {
+                    if let Some(span) = self.pending_delta_scan_output_wait.take() {
+                        span.finish("ok", false);
+                    }
+                }
+                Poll::Ready(Some(Err(_))) => {
+                    if let Some(span) = self.pending_delta_scan_output_wait.take() {
+                        span.finish("error", true);
+                    }
+                }
+                Poll::Ready(None) => {
+                    if let Some(span) = self.pending_delta_scan_output_wait.take() {
+                        span.finish("ok", false);
+                    }
+                }
+            }
+        }
         poll
     }
 }
@@ -712,15 +843,28 @@ mod tests {
         collections::BTreeSet,
         error::Error,
         sync::{Arc, mpsc},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use datafusion::{
+        arrow::datatypes::Schema,
+        common::DataFusionError,
+        physical_plan::{
+            collect,
+            stream::{RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter},
+        },
+        prelude::SessionContext,
+    };
+    use futures_util::StreamExt;
 
     use crate::{
         QueryExecutionOutcome, QueryExecutionScope, TimelineSpanStatus, TimelineSpanTimeSemantics,
-        observability::test_capture::TracingCapture, profiling::OperationTraceContext,
-        query_engine::datafusion::execution_profile::collect_query_execution_profile,
+        observability::test_capture::TracingCapture,
+        profiling::OperationTraceContext,
+        query_engine::datafusion::{
+            execution_profile::collect_query_execution_profile,
+            test_support::register_fixture_source,
+        },
         report::OperationTimelineRecorder,
     };
 
@@ -746,6 +890,94 @@ mod tests {
         .expect("profiling should create a context");
         QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
             .expect("query trace identity should be available")
+    }
+
+    fn delayed_record_batch_stream(delay: Duration) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), 1);
+        let output = builder.tx();
+        builder.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = output.send(Ok(RecordBatch::new_empty(schema))).await;
+            Ok(())
+        });
+        builder.build()
+    }
+
+    fn delayed_error_record_batch_stream(
+        delay: Duration,
+        message: &'static str,
+    ) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+        let output = builder.tx();
+        builder.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = output
+                .send(Err(DataFusionError::Execution(message.to_owned())))
+                .await;
+            Ok(())
+        });
+        builder.build()
+    }
+
+    fn pending_record_batch_stream() -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures_util::stream::pending::<DataFusionResult<RecordBatch>>(),
+        ))
+    }
+
+    fn delayed_closed_record_batch_stream(delay: Duration) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+        let output = builder.tx();
+        builder.spawn(async move {
+            tokio::time::sleep(delay).await;
+            drop(output);
+            Ok(())
+        });
+        builder.build()
+    }
+
+    fn profiled_delta_scan_stream(
+        activity: OperatorActivityRecorder,
+        inner: SendableRecordBatchStream,
+    ) -> Pin<Box<ProfiledRecordBatchStream>> {
+        profiled_delta_scan_stream_on(activity, 2, 7, inner)
+    }
+
+    fn profiled_delta_scan_stream_on(
+        activity: OperatorActivityRecorder,
+        partition: usize,
+        stream_id: u64,
+        inner: SendableRecordBatchStream,
+    ) -> Pin<Box<ProfiledRecordBatchStream>> {
+        Box::pin(ProfiledRecordBatchStream {
+            schema: inner.schema(),
+            inner,
+            operator_name: "DeltaScanPlanningExec".to_owned(),
+            node_id: 4,
+            parent_node_id: Some(3),
+            partition,
+            stream_id,
+            activity,
+            records_delta_scan_output_wait: true,
+            pending_delta_scan_output_wait: None,
+        })
+    }
+
+    fn collect_profiled_operators<'a>(
+        plan: &'a dyn ExecutionPlan,
+        operators: &mut Vec<&'a ProfiledOperatorExec>,
+    ) {
+        if let Some(operator) = plan.as_any().downcast_ref::<ProfiledOperatorExec>() {
+            operators.push(operator);
+        }
+        for child in plan.children() {
+            collect_profiled_operators(child.as_ref(), operators);
+        }
     }
 
     #[test]
@@ -1269,6 +1501,441 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_delta_scan_plan_marks_its_output_stream_for_wait_tracing()
+    -> Result<(), Box<dyn Error>> {
+        let context = SessionContext::new();
+        let _table =
+            register_fixture_source(&context, "orders", "delta-scan-output-wait-instrumentation")?;
+        let dataframe = context.sql("select id from orders").await?;
+        let plan = dataframe.create_physical_plan().await?;
+        let timeline = OperationTimelineRecorder::start();
+        let plan = instrument_query_execution_plan(plan, test_trace_identity(timeline))?;
+        let mut operators = Vec::new();
+        collect_profiled_operators(plan.as_ref(), &mut operators);
+
+        let marked = operators
+            .iter()
+            .filter(|operator| operator.records_delta_scan_output_wait)
+            .collect::<Vec<_>>();
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].inner.as_any().is::<DeltaScanPlanningExec>());
+        assert!(operators.iter().all(|operator| {
+            operator.records_delta_scan_output_wait
+                == operator.inner.as_any().is::<DeltaScanPlanningExec>()
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_scan_output_wait_records_three_second_pending_gap_in_both_outputs()
+    -> Result<(), Box<dyn Error>> {
+        const DELAY: Duration = Duration::from_secs(3);
+        const MINIMUM_DELAY_MICROS: u64 = 2_800_000;
+        const MAXIMUM_DELAY_MICROS: u64 = 5_000_000;
+
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let operation_id = activity.context.operation_id();
+        let mut stream =
+            profiled_delta_scan_stream(activity.clone(), delayed_record_batch_stream(DELAY));
+
+        let started_at = Instant::now();
+        let batch = stream.next().await.ok_or("expected delayed batch")??;
+        assert_eq!(batch.num_rows(), 0);
+        assert!(started_at.elapsed() >= DELAY);
+        drop(stream);
+        activity.context.record_process_result("ok");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let waits = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .collect::<Vec<_>>();
+        assert_eq!(waits.len(), 1);
+        let wait = waits[0];
+        assert_eq!(wait.name(), DELTA_SCAN_OUTPUT_WAIT_NAME);
+        assert_eq!(
+            wait.track_name(),
+            "DataFusion query [1] / Delta scan output [7]"
+        );
+        assert_eq!(wait.parent_id(), None);
+        assert_eq!(wait.status(), TimelineSpanStatus::Completed);
+        assert_eq!(wait.time_semantics(), TimelineSpanTimeSemantics::WallClock);
+        assert!(
+            (MINIMUM_DELAY_MICROS..=MAXIMUM_DELAY_MICROS).contains(&wait.duration_micros()),
+            "three-second wait recorded {} microseconds",
+            wait.duration_micros()
+        );
+        assert_eq!(wait.attributes()["query_execution_id"], 1);
+        assert_eq!(wait.attributes()["query_scope"], "preview");
+        assert_eq!(wait.attributes()["node_id"], 4);
+        assert_eq!(wait.attributes()["operator_partition"], 2);
+        assert_eq!(wait.attributes()["execution_stream_id"], 7);
+        assert_eq!(
+            wait.attributes()["activity"],
+            DELTA_SCAN_OUTPUT_WAIT_ACTIVITY
+        );
+        assert_eq!(wait.attributes()["result"], "ok");
+
+        let spans = capture.captured().spans();
+        let root = spans
+            .iter()
+            .find(|span| span.name == "Delta Funnel preview")
+            .expect("operation root span should be captured");
+        let process_waits = spans
+            .iter()
+            .filter(|span| span.name == "DataFusion execution activity")
+            .collect::<Vec<_>>();
+        assert_eq!(process_waits.len(), 1);
+        let process_wait = process_waits[0];
+        assert_eq!(process_wait.parent_id, Some(root.id));
+        assert_eq!(
+            process_wait.fields["operation_id"],
+            operation_id.to_string()
+        );
+        assert_eq!(process_wait.fields["query_execution_id"], "1");
+        assert_eq!(process_wait.fields["query_scope"], "preview");
+        assert_eq!(
+            process_wait.fields["execution_activity_name"],
+            DELTA_SCAN_OUTPUT_WAIT_NAME
+        );
+        assert_eq!(process_wait.fields["node_id"], "4");
+        assert_eq!(process_wait.fields["operator_partition"], "2");
+        assert_eq!(process_wait.fields["execution_stream_id"], "7");
+        assert_eq!(
+            process_wait.fields["activity"],
+            DELTA_SCAN_OUTPUT_WAIT_ACTIVITY
+        );
+        assert_eq!(process_wait.fields["result"], "ok");
+        assert_eq!(process_wait.fields["time_semantics"], "wall_clock");
+        assert_eq!(process_wait.enter_count, 0);
+        assert_eq!(process_wait.exit_count, 0);
+        assert!(process_wait.closed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_scan_output_wait_reports_error_without_error_details()
+    -> Result<(), Box<dyn Error>> {
+        const SENSITIVE_ERROR: &str = "secret object path";
+
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let mut stream = profiled_delta_scan_stream(
+            activity.clone(),
+            delayed_error_record_batch_stream(Duration::from_millis(10), SENSITIVE_ERROR),
+        );
+
+        let error = stream
+            .next()
+            .await
+            .ok_or("expected delayed error")?
+            .expect_err("the delayed item should fail");
+        assert!(error.to_string().contains(SENSITIVE_ERROR));
+        drop(stream);
+        activity.context.record_process_result("error");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Failed);
+        let wait = timeline
+            .spans()
+            .iter()
+            .find(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .ok_or("expected failed output wait")?;
+        assert_eq!(wait.status(), TimelineSpanStatus::Failed);
+        assert_eq!(wait.attributes()["result"], "error");
+        assert!(
+            wait.attributes()
+                .values()
+                .all(|value| !value.to_string().contains(SENSITIVE_ERROR))
+        );
+
+        let process_wait = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "DataFusion execution activity")
+            .ok_or("expected failed process wait")?;
+        assert_eq!(process_wait.fields["result"], "error");
+        assert!(
+            process_wait
+                .fields
+                .values()
+                .all(|value| !value.contains(SENSITIVE_ERROR))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_delta_scan_output_producer_finishes_pending_wait_as_eof()
+    -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let mut stream = profiled_delta_scan_stream(
+            activity.clone(),
+            delayed_closed_record_batch_stream(Duration::from_millis(10)),
+        );
+
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        activity.context.record_process_result("ok");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let wait = timeline
+            .spans()
+            .iter()
+            .find(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .ok_or("expected completed output wait")?;
+        assert_eq!(wait.status(), TimelineSpanStatus::Completed);
+        assert_eq!(wait.attributes()["result"], "ok");
+
+        let process_wait = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "DataFusion execution activity")
+            .ok_or("expected completed process wait")?;
+        assert_eq!(process_wait.fields["result"], "ok");
+        assert_eq!(process_wait.enter_count, 0);
+        assert_eq!(process_wait.exit_count, 0);
+        assert!(process_wait.closed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_pending_delta_scan_output_stream_cancels_both_outputs() -> Result<(), Box<dyn Error>>
+    {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let mut stream =
+            profiled_delta_scan_stream(activity.clone(), pending_record_batch_stream());
+        let waker = futures_util::task::noop_waker_ref();
+        let mut poll_context = Context::from_waker(waker);
+
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut poll_context),
+            Poll::Pending
+        ));
+        drop(stream);
+        activity.context.record_process_result("cancelled");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Cancelled);
+        let wait = timeline
+            .spans()
+            .iter()
+            .find(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .ok_or("expected cancelled output wait")?;
+        assert_eq!(wait.status(), TimelineSpanStatus::Cancelled);
+        assert_eq!(wait.attributes()["result"], "cancelled");
+
+        let process_wait = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "DataFusion execution activity")
+            .ok_or("expected cancelled process wait")?;
+        assert_eq!(process_wait.fields["result"], "cancelled");
+        assert_eq!(process_wait.enter_count, 0);
+        assert_eq!(process_wait.exit_count, 0);
+        assert!(process_wait.closed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_operations_keep_delta_scan_output_waits_isolated()
+    -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let first_timeline = OperationTimelineRecorder::start();
+        let second_timeline = OperationTimelineRecorder::start();
+        let first_activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(first_timeline.clone()),
+            true,
+            100,
+        ));
+        let second_activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(second_timeline.clone()),
+            true,
+            100,
+        ));
+        let operation_ids = [
+            first_activity.context.operation_id(),
+            second_activity.context.operation_id(),
+        ];
+        let mut first_stream = profiled_delta_scan_stream_on(
+            first_activity.clone(),
+            0,
+            1,
+            delayed_record_batch_stream(Duration::from_millis(20)),
+        );
+        let mut second_stream = profiled_delta_scan_stream_on(
+            second_activity.clone(),
+            0,
+            1,
+            delayed_record_batch_stream(Duration::from_millis(20)),
+        );
+
+        let (first, second) = tokio::join!(first_stream.next(), second_stream.next());
+        first.ok_or("expected first operation batch")??;
+        second.ok_or("expected second operation batch")??;
+        drop(first_stream);
+        drop(second_stream);
+        first_activity.context.record_process_result("ok");
+        second_activity.context.record_process_result("ok");
+        drop(first_activity);
+        drop(second_activity);
+
+        for timeline in [first_timeline, second_timeline] {
+            let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+            let waits = timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+                .collect::<Vec<_>>();
+            assert_eq!(waits.len(), 1);
+            assert_eq!(waits[0].attributes()["query_execution_id"], 1);
+            assert_eq!(waits[0].attributes()["execution_stream_id"], 1);
+        }
+
+        let process_wait_operation_ids = capture
+            .captured()
+            .spans()
+            .iter()
+            .filter(|span| span.name == "DataFusion execution activity")
+            .map(|span| span.fields["operation_id"].parse::<u64>())
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        assert_eq!(
+            process_wait_operation_ids,
+            operation_ids.into_iter().collect()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_delta_scan_partitions_keep_overlapping_waits_on_separate_tracks()
+    -> Result<(), Box<dyn Error>> {
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity(timeline.clone()));
+        let mut first = profiled_delta_scan_stream_on(
+            activity.clone(),
+            0,
+            11,
+            delayed_record_batch_stream(Duration::from_millis(50)),
+        );
+        let mut second = profiled_delta_scan_stream_on(
+            activity,
+            1,
+            12,
+            delayed_record_batch_stream(Duration::from_millis(50)),
+        );
+
+        let (first_batch, second_batch) = tokio::join!(first.next(), second.next());
+        first_batch.ok_or("expected first partition batch")??;
+        second_batch.ok_or("expected second partition batch")??;
+        drop(first);
+        drop(second);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let waits = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .collect::<Vec<_>>();
+        assert_eq!(waits.len(), 2);
+        assert_ne!(waits[0].track_name(), waits[1].track_name());
+        assert_eq!(
+            waits
+                .iter()
+                .map(|span| span.attributes()["operator_partition"].as_u64())
+                .collect::<BTreeSet<_>>(),
+            [Some(0), Some(1)].into_iter().collect()
+        );
+        let latest_start = waits
+            .iter()
+            .map(|span| span.start_offset_micros())
+            .max()
+            .ok_or("expected latest wait start")?;
+        let earliest_end = waits
+            .iter()
+            .map(|span| {
+                span.start_offset_micros()
+                    .saturating_add(span.duration_micros())
+            })
+            .min()
+            .ok_or("expected earliest wait end")?;
+        assert!(latest_start < earliest_end);
+
+        Ok(())
+    }
+
+    #[test]
+    fn delta_scan_output_waits_share_one_operation_activity_budget_and_marker() {
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            false,
+            1,
+        ));
+
+        activity
+            .start_delta_scan_output_wait(4, 0, 1)
+            .expect("first output wait should fit")
+            .finish("ok", false);
+        assert!(
+            activity
+                .start_span("FilterExec", 0, None, 0, 2, "poll_next")
+                .is_none()
+        );
+        assert!(activity.start_delta_scan_output_wait(4, 1, 3).is_none());
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+                .count(),
+            1
+        );
+        let markers = timeline
+            .spans()
+            .iter()
+            .filter(|span| span.name() == "Operator activity trace truncated")
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].attributes()["maximum_spans"], 1);
     }
 
     #[tokio::test]
