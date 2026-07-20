@@ -113,6 +113,23 @@ pub(crate) fn phase_track(operation_id: u64, operation_uuid: u64) -> SemanticTra
     )
 }
 
+pub(crate) fn planning_track(
+    operation_id: u64,
+    query_execution_id: u64,
+    phases_uuid: u64,
+) -> SemanticTrack {
+    SemanticTrack::new(
+        format!(
+            "Operation [{}] / query [{}] / planning",
+            operation_token(operation_id),
+            query_token(query_execution_id)
+        ),
+        query_execution_id,
+        phases_uuid,
+        20_u64.saturating_add(query_execution_id),
+    )
+}
+
 pub(crate) fn owner_track(operation_id: u64, owner_id: u64, operation_uuid: u64) -> SemanticTrack {
     SemanticTrack::new(
         format!(

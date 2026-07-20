@@ -200,15 +200,12 @@ impl PlanningActivityContext {
                 operation_id = self.identity.operation_id(),
                 query_execution_id = self.identity.query_execution_id(),
                 query_scope = self.identity.query_scope().as_str(),
-                query_owner = tracing::field::Empty,
+                query_owner = self.identity.query_owner(),
                 planning_activity_name = name,
                 activity,
                 result = tracing::field::Empty,
                 time_semantics = "wall_clock",
             );
-            if let Some(owner) = self.identity.query_owner() {
-                span.record("query_owner", owner);
-            }
             (span, parent)
         });
         let active_span = ActivePlanningSpan {
