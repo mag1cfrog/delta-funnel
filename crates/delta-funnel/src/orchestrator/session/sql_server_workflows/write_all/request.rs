@@ -2329,7 +2329,7 @@ mod tests {
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
             let (reporter, _events) = recording_progress();
-            let capture = TracingCapture::start();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let report = session
                 .write_all_with_progress_and_writer(
@@ -2394,6 +2394,21 @@ mod tests {
             assert_eq!(aliases[0].execution_profile(), None);
             assert!(report.to_json_value()["cache"]["aliases"][0]["execution_profile"].is_null());
             assert!(execution_profile_events(&capture).is_empty());
+            assert_eq!(report.operation_timeline(), None);
+            let stages = process_write_all_stages(&capture);
+            for expected_name in [
+                "Resolve cache DataFrame",
+                "Build cache physical plan",
+                "Set up cache streams",
+                "Execute and collect cache",
+                "Build cache MemTable",
+                "Install cache alias",
+                "Restore cache alias",
+            ] {
+                assert!(stages.iter().any(|(name, owner, result)| {
+                    name == expected_name && owner.is_none() && result == "ok"
+                }));
+            }
 
             let restored_big_factory = session.lazy_table_batch_stream_factory(big, None, None);
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
@@ -2901,7 +2916,7 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
-            let capture = TracingCapture::start();
+            let capture = TracingCapture::start_with_profile_spans_enabled();
 
             let error = session
                 .write_all_with_options_and_writer(
@@ -2964,6 +2979,23 @@ mod tests {
             assert_eq!(alias.execution_profile(), None);
             assert!(execution_profile_events(&capture).is_empty());
             assert!(alias.to_json_value()["execution_profile"].is_null());
+            let stages = process_write_all_stages(&capture);
+            assert!(stages.iter().any(|(name, owner, result)| {
+                name == "Resolve cache DataFrame" && owner.is_none() && result == "ok"
+            }));
+            assert!(stages.iter().any(|(name, owner, result)| {
+                name == "Build cache physical plan" && owner.is_none() && result == "error"
+            }));
+            assert!(stages.iter().all(|(name, _, _)| {
+                !matches!(
+                    name.as_str(),
+                    "Set up cache streams"
+                        | "Execute and collect cache"
+                        | "Build cache MemTable"
+                        | "Install cache alias"
+                        | "Restore cache alias"
+                )
+            }));
             assert!(matches!(
                 *source,
                 DeltaFunnelError::MssqlWorkflowPlanning { message }
