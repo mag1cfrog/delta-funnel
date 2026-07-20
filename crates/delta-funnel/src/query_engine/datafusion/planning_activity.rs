@@ -267,12 +267,26 @@ impl Drop for PlanningActivitySpanRecorder {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::{
         QueryExecutionScope, TimelineSpanStatus, observability::test_capture::TracingCapture,
         profiling::OperationTraceContext, report::OperationTimelineRecorder,
     };
 
     use super::*;
+
+    fn without_timing(mut value: Value) -> Value {
+        value["total_duration_micros"] = Value::from(0);
+        for span in value["spans"]
+            .as_array_mut()
+            .expect("timeline spans should be an array")
+        {
+            span["start_offset_micros"] = Value::from(0);
+            span["duration_micros"] = Value::from(0);
+        }
+        value
+    }
 
     #[tokio::test]
     async fn nested_planning_failures_keep_parentage_and_status() {
@@ -368,17 +382,20 @@ mod tests {
         let timeline_context =
             OperationTraceContext::start_for_test(Some(timeline_only.clone()), false)
                 .expect("the timeline should create a context");
-        let timeline_identity =
-            QueryTraceIdentity::new(timeline_context, QueryExecutionScope::Preview, None)
-                .expect("timeline identity should be available");
+        let timeline_identity = QueryTraceIdentity::new(
+            timeline_context,
+            QueryExecutionScope::MssqlOutput,
+            Some("orders"),
+        )
+        .expect("timeline identity should be available");
         with_query_planning_activity(timeline_identity, async {
-            profile_query_planning_sync_result("timeline", "timeline", || Ok::<_, &str>(()))
+            profile_query_planning_sync_result("shared", "shared", || Ok::<_, &str>(()))
         })
         .await
         .expect("timeline activity should succeed");
-        let timeline = timeline_only.finish("timeline", TimelineSpanStatus::Completed);
+        let timeline = timeline_only.finish("stable", TimelineSpanStatus::Completed);
         assert_eq!(timeline.spans().len(), 1);
-        assert_eq!(timeline.spans()[0].name(), "timeline");
+        assert_eq!(timeline.spans()[0].name(), "shared");
 
         let process_context = OperationTraceContext::start_for_test(None, true)
             .expect("process diagnostics should create a context");
@@ -404,15 +421,19 @@ mod tests {
         )
         .expect("combined identity should be available");
         with_query_planning_activity(combined_identity, async {
-            profile_query_planning_sync_result("combined", "combined", || Ok::<_, &str>(()))
+            profile_query_planning_sync_result("shared", "shared", || Ok::<_, &str>(()))
         })
         .await
         .expect("combined activity should succeed");
         combined_context.record_process_result("ok");
         drop(combined_context);
-        let combined = combined_timeline.finish("combined", TimelineSpanStatus::Completed);
+        let combined = combined_timeline.finish("stable", TimelineSpanStatus::Completed);
         assert_eq!(combined.spans().len(), 1);
-        assert_eq!(combined.spans()[0].name(), "combined");
+        assert_eq!(combined.spans()[0].name(), "shared");
+        assert_eq!(
+            without_timing(timeline.to_json_value()),
+            without_timing(combined.to_json_value())
+        );
 
         let process_activities = capture
             .captured()
@@ -430,7 +451,7 @@ mod tests {
         assert!(
             process_activities
                 .iter()
-                .any(|span| span.fields["planning_activity_name"] == "combined"
+                .any(|span| span.fields["planning_activity_name"] == "shared"
                     && span.fields["query_owner"] == "orders")
         );
         assert!(
@@ -475,6 +496,172 @@ mod tests {
             .expect("the process activity should be captured");
         assert_eq!(process.fields["result"], "cancelled");
         assert!(process.closed);
+    }
+
+    #[tokio::test]
+    async fn successful_nesting_and_siblings_do_not_cross() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let recorder = OperationTimelineRecorder::start();
+        let context = OperationTraceContext::start_for_test(Some(recorder.clone()), true)
+            .expect("both diagnostics should create a context");
+        let identity = QueryTraceIdentity::new(
+            context.clone(),
+            QueryExecutionScope::MssqlOutput,
+            Some("orders"),
+        )
+        .expect("query trace identity should be available");
+
+        with_query_planning_activity(identity, async {
+            profile_query_planning_sync_result("parent", "parent", || {
+                profile_query_planning_sync_result("child", "child", || Ok::<_, &str>(()))
+            })?;
+            profile_query_planning_sync_result("sibling", "sibling", || Ok::<_, &str>(()))
+        })
+        .await
+        .expect("planning activities should succeed");
+        context.record_process_result("ok");
+        drop(context);
+
+        let timeline = recorder.finish("nested", TimelineSpanStatus::Completed);
+        let parent = timeline
+            .spans()
+            .iter()
+            .find(|span| span.name() == "parent")
+            .expect("the parent should be recorded");
+        let child = timeline
+            .spans()
+            .iter()
+            .find(|span| span.name() == "child")
+            .expect("the child should be recorded");
+        let sibling = timeline
+            .spans()
+            .iter()
+            .find(|span| span.name() == "sibling")
+            .expect("the sibling should be recorded");
+        assert_eq!(child.parent_id(), Some(parent.id()));
+        assert_eq!(sibling.parent_id(), None);
+        assert!(parent.start_offset_micros() <= child.start_offset_micros());
+        assert!(
+            child
+                .start_offset_micros()
+                .saturating_add(child.duration_micros())
+                <= parent
+                    .start_offset_micros()
+                    .saturating_add(parent.duration_micros())
+        );
+        assert!(
+            parent
+                .start_offset_micros()
+                .saturating_add(parent.duration_micros())
+                <= sibling.start_offset_micros()
+        );
+
+        let spans = capture.captured().spans();
+        let query_planning = spans
+            .iter()
+            .find(|span| span.name == "DataFusion query planning")
+            .expect("query planning should be captured");
+        let activities = spans
+            .iter()
+            .filter(|span| span.name == "DataFusion planning activity")
+            .collect::<Vec<_>>();
+        let process_parent = activities
+            .iter()
+            .find(|span| span.fields["activity"] == "parent")
+            .expect("the process parent should be captured");
+        let process_child = activities
+            .iter()
+            .find(|span| span.fields["activity"] == "child")
+            .expect("the process child should be captured");
+        let process_sibling = activities
+            .iter()
+            .find(|span| span.fields["activity"] == "sibling")
+            .expect("the process sibling should be captured");
+        assert_eq!(process_parent.parent_id, Some(query_planning.id));
+        assert_eq!(process_child.parent_id, Some(process_parent.id));
+        assert_eq!(process_sibling.parent_id, Some(query_planning.id));
+        let expected_fields = BTreeSet::from([
+            "activity",
+            "operation_id",
+            "planning_activity_name",
+            "query_execution_id",
+            "query_owner",
+            "query_scope",
+            "result",
+            "time_semantics",
+        ]);
+        assert!(activities.iter().all(|span| {
+            span.fields
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+                == expected_fields
+                && span.fields["result"] == "ok"
+        }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_operations_keep_task_local_planning_parents() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let first = OperationTraceContext::start_for_test(None, true)
+            .expect("the first process context should start");
+        let second = OperationTraceContext::start_for_test(None, true)
+            .expect("the second process context should start");
+        let first_operation_id = first.operation_id();
+        let second_operation_id = second.operation_id();
+        let first_identity = QueryTraceIdentity::new(
+            first.clone(),
+            QueryExecutionScope::MssqlOutput,
+            Some("first"),
+        )
+        .expect("the first query identity should start");
+        let second_identity = QueryTraceIdentity::new(
+            second.clone(),
+            QueryExecutionScope::MssqlOutput,
+            Some("second"),
+        )
+        .expect("the second query identity should start");
+
+        let first_planning = with_query_planning_activity(first_identity, async {
+            tokio::task::yield_now().await;
+            profile_query_planning_sync_result("first", "first", || Ok::<_, &str>(()))
+        });
+        let second_planning = with_query_planning_activity(second_identity, async {
+            tokio::task::yield_now().await;
+            profile_query_planning_sync_result("second", "second", || Ok::<_, &str>(()))
+        });
+        let (first_result, second_result) = tokio::join!(first_planning, second_planning);
+        assert_eq!(first_result, Ok(()));
+        assert_eq!(second_result, Ok(()));
+        first.record_process_result("ok");
+        second.record_process_result("ok");
+        drop(first);
+        drop(second);
+
+        let spans = capture.captured().spans();
+        let activities = spans
+            .iter()
+            .filter(|span| span.name == "DataFusion planning activity")
+            .collect::<Vec<_>>();
+        assert_eq!(activities.len(), 2);
+        for (activity, operation_id, owner) in [
+            ("first", first_operation_id, "first"),
+            ("second", second_operation_id, "second"),
+        ] {
+            let child = activities
+                .iter()
+                .find(|span| span.fields["activity"] == activity)
+                .expect("the planning activity should be captured");
+            let parent = spans
+                .iter()
+                .find(|span| Some(span.id) == child.parent_id)
+                .expect("the query planning parent should be captured");
+            assert_eq!(parent.name, "DataFusion query planning");
+            assert_eq!(child.fields["operation_id"], operation_id.to_string());
+            assert_eq!(parent.fields["operation_id"], child.fields["operation_id"]);
+            assert_eq!(child.fields["query_execution_id"], "1");
+            assert_eq!(child.fields["query_owner"], owner);
+        }
     }
 
     #[tokio::test]
