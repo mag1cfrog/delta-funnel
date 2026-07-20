@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: %s WHEEL\n' "$0"
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  usage
+  exit 0
+fi
+if (( $# != 1 )); then
+  usage >&2
+  exit 64
+fi
+
+wheel=$1
+python=${PYTHON:-python3}
+max_wheel_bytes=100000000
+
+if [[ ! -f $wheel || ! -r $wheel ]]; then
+  printf 'check-diagnostics-wheel: wheel is not readable: %s\n' "$wheel" >&2
+  exit 66
+fi
+for command in "$python" nm readelf; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    printf 'check-diagnostics-wheel: required command is unavailable: %s\n' \
+      "$command" >&2
+    exit 127
+  fi
+done
+
+wheel_bytes=$(stat --format='%s' -- "$wheel")
+if (( wheel_bytes >= max_wheel_bytes )); then
+  printf 'check-diagnostics-wheel: wheel is %s bytes; limit is less than %s\n' \
+    "$wheel_bytes" "$max_wheel_bytes" >&2
+  exit 65
+fi
+
+work_dir=$(mktemp -d)
+trap 'rm -rf -- "$work_dir"' EXIT
+
+"$python" - "$wheel" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+wheel_path = Path(sys.argv[1])
+if (
+    "-cp310-abi3-" not in wheel_path.name
+    or not wheel_path.name.endswith("_x86_64.whl")
+):
+    raise SystemExit("diagnostics wheel must target CPython abi3 on Linux x86_64")
+required = {
+    "deltafunnel/perfetto/capture-health",
+    "deltafunnel/perfetto/capture-health.sql",
+    "deltafunnel/perfetto/delta-funnel-deep-system.pbtx",
+    "deltafunnel/perfetto/delta-funnel-standard-streaming.pbtx",
+    "deltafunnel/perfetto/delta-funnel-standard.pbtx",
+}
+
+with zipfile.ZipFile(wheel_path) as wheel:
+    names = set(wheel.namelist())
+    missing = sorted(required - names)
+    if missing:
+        raise SystemExit("missing diagnostics assets: " + ", ".join(missing))
+
+    health = wheel.getinfo("deltafunnel/perfetto/capture-health")
+    mode = health.external_attr >> 16
+    if mode & 0o111 == 0:
+        raise SystemExit("capture-health is not executable in the wheel")
+PY
+
+"$python" -m venv "$work_dir/venv"
+venv_python="$work_dir/venv/bin/python"
+"$venv_python" -m pip install --disable-pip-version-check --no-cache-dir \
+  --no-deps "$wheel" >/dev/null
+
+native_module=$("$venv_python" - <<'PY'
+import os
+import subprocess
+from importlib.resources import files
+
+import deltafunnel
+import deltafunnel.deltafunnel as native
+
+assets = files("deltafunnel").joinpath("perfetto")
+required = [
+    "capture-health",
+    "capture-health.sql",
+    "delta-funnel-deep-system.pbtx",
+    "delta-funnel-standard-streaming.pbtx",
+    "delta-funnel-standard.pbtx",
+]
+for name in required:
+    if not assets.joinpath(name).is_file():
+        raise SystemExit(f"installed diagnostics asset is missing: {name}")
+
+health = assets.joinpath("capture-health")
+if not os.access(health, os.X_OK):
+    raise SystemExit("installed capture-health is not executable")
+subprocess.run([health, "--help"], check=True, stdout=subprocess.DEVNULL)
+
+try:
+    activated = deltafunnel.init_perfetto_diagnostics(wait_timeout_seconds=0.01)
+except deltafunnel.DeltaFunnelError as error:
+    if error.kind not in {"capture_timeout", "capture_unavailable"}:
+        raise
+else:
+    if not activated:
+        raise SystemExit("Perfetto diagnostics did not activate")
+
+print(native.__file__)
+PY
+)
+
+readelf -SW "$native_module" >"$work_dir/sections"
+if grep -Fq '.debug_' "$work_dir/sections"; then
+  printf 'check-diagnostics-wheel: native extension contains DWARF debug sections\n' >&2
+  exit 65
+fi
+
+nm -C "$native_module" >"$work_dir/symbols"
+for symbol in PerfettoProducerSystemInit delta_funnel::perfetto_profile; do
+  if ! grep -Fq "$symbol" "$work_dir/symbols"; then
+    printf 'check-diagnostics-wheel: required symbol is missing: %s\n' \
+      "$symbol" >&2
+    exit 65
+  fi
+done
+
+printf 'diagnostics wheel check passed: %s bytes\n' "$wheel_bytes"

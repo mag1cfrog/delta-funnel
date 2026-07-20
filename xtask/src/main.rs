@@ -631,6 +631,14 @@ if len(metadata_files) != 1:
     raise SystemExit("expected exactly one METADATA file")
 if not native_modules:
     raise SystemExit("missing native extension module")
+diagnostic_assets = sorted(
+    name for name in names if name.startswith("deltafunnel/perfetto/")
+)
+if diagnostic_assets:
+    raise SystemExit(
+        "default wheel unexpectedly contains diagnostics assets: "
+        + ", ".join(diagnostic_assets)
+    )
 
 with zipfile.ZipFile(wheel_path) as wheel:
     metadata = email.parser.Parser().parsestr(wheel.read(metadata_files[0]).decode())

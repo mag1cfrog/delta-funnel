@@ -19,7 +19,7 @@ cd delta-funnel
 Install `maturin` if it is not already available:
 
 ```bash
-python -m pip install "maturin>=1.11,<2"
+python -m pip install "maturin>=1.13,<2"
 ```
 
 ## Check the Rust workspace
