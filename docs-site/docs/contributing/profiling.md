@@ -2,10 +2,11 @@
 
 Use this guide to choose between exact semantic timelines and sampled native
 call stacks when diagnosing Python-driven Delta Funnel workloads on Linux.
-Stable semantic JSON works with normal Python builds. The Samply and Perfetto
-workflows are intended for experienced developers working from a source
-checkout. Published Python wheels do not include the optional Perfetto
-producer.
+Stable semantic JSON works with normal Python builds. Samply is intended for
+experienced developers working from a source checkout. Perfetto diagnostics
+can use either the Linux x86_64 diagnostics wheel published from `main` to
+TestPyPI or a local source build. Stable PyPI wheels do not include the optional
+Perfetto producer.
 
 ## Choose the diagnostic mode
 
@@ -13,6 +14,7 @@ producer.
 | --- | --- |
 | Inspect exact operation, phase, query, worker, and operator timing | Stable semantic JSON export |
 | Find native Rust CPU hotspots and source lines with the smallest capture | Samply |
+| Correlate a real Python workload without building from source | TestPyPI Perfetto diagnostics wheel |
 | Correlate a brief workload with sampled native Rust stacks | Standard short Perfetto |
 | Correlate a workload expected to run for up to ten minutes | Standard streaming Perfetto |
 | Add scheduler and wakeup context to a short standard capture | Deep-system Perfetto |
@@ -204,22 +206,26 @@ decision evidence and
 [#527](https://github.com/mag1cfrog/delta-funnel/issues/527) for the bounded
 streaming design and validation contract.
 
-Run this workflow from the repository root. Install these tools and make them
-available on `PATH`:
+Run the commands in this workflow from Bash. Store captures under a private
+working directory such as the ignored `target` directory in a source checkout.
+Install these host tools and make them available on `PATH`:
 
-- `maturin`
 - Perfetto `tracebox`
 - Perfetto `trace_processor_shell`
 - Linux `perf`
 - GNU `timeout`
+
+Install `perf` with the Linux distribution's package manager. Install matching
+`tracebox` and `trace_processor_shell` binaries from the same Perfetto release.
+The diagnostics wheel contains the Delta Funnel producer, capture configs, and
+health query, but it does not bundle either Perfetto executable or `perf`.
 
 The workflow is verified with matching Perfetto v57.2 tools. Record the version
 output when sharing a health summary:
 
 ```sh
 test "$(uname -s)" = Linux
-command -v maturin tracebox trace_processor_shell perf timeout
-maturin --version
+command -v tracebox trace_processor_shell perf timeout
 tracebox --version
 trace_processor_shell --version
 tracebox --help | grep -F -- '--system-sockets'
@@ -230,7 +236,7 @@ perf stat --all-cpus --event cpu-clock -- sleep 0.1 >/dev/null
 ```
 
 The `perf stat` command exercises the same per-CPU software clock used by the
-checked-in Perfetto configs. It is the authoritative permission preflight;
+provided Perfetto configs. It is the authoritative permission preflight;
 `tracebox --notify-fd` can report ready even when the kernel later rejects
 `perf_event_open`. The final `tracebox` readiness check below independently
 verifies the producer and configured data sources. Either check must fail
@@ -256,29 +262,97 @@ These commands show every privileged action. Do not lower the setting on a
 shared or production host without approval. Use the least permissive host
 policy that passes the real readiness check.
 
-## Build a diagnostics-enabled Python extension
+## Install or build a diagnostics-enabled Python extension
 
-From the repository root, create and activate a dedicated virtual environment:
+Create and activate a dedicated virtual environment. The executable alias is
+required because the provided configs select the diagnostics process by this
+exact command-line token:
 
 ```sh
-python -m venv target/python-perfetto-venv
+python3 -m venv target/python-perfetto-venv
 source target/python-perfetto-venv/bin/activate
+diagnostics_python="$VIRTUAL_ENV/bin/delta-funnel-perfetto-preview"
+ln -sf python "$diagnostics_python"
+```
+
+### Install the latest TestPyPI diagnostics wheel
+
+Use this route to profile a real workload without a source build:
+
+```sh
+test "$(uname -m)" = x86_64
+python -m pip install --upgrade --pre --only-binary=:all: \
+  --index-url https://test.pypi.org/simple/ \
+  deltafunnel
+
+diagnostics_version="$(python -c \
+  'from importlib.metadata import version; print(version("deltafunnel"))')"
+perfetto_assets="$(python -c \
+  'from importlib.resources import files; print(files("deltafunnel") / "perfetto")')"
+capture_health="$perfetto_assets/capture-health"
+
+python - <<'PY'
+from importlib.metadata import version
+import deltafunnel
+
+installed_version = version("deltafunnel")
+assert ".dev" in installed_version
+assert deltafunnel.__version__ == installed_version
+assert hasattr(deltafunnel, "init_perfetto_diagnostics")
+print(deltafunnel.__version__)
+PY
+```
+
+The automated `main` workflow publishes one CPython 3.10+ ABI3 Linux x86_64
+wheel for glibc 2.28 or newer, with a version such as
+`0.3.4.dev202607200036290042`. Record the exact version with the capture.
+Reinstall that same build later with:
+
+```sh
+python -m pip install --pre --only-binary=:all: \
+  --index-url https://test.pypi.org/simple/ \
+  "deltafunnel==$diagnostics_version"
+```
+
+These builds are for occasional diagnostics and dogfooding. They are not a
+stable release channel. The release build retains native function names for
+the Perfetto flame graph but omits the much larger DWARF line tables.
+
+### Build from source for line-level symbols
+
+Use this route from the repository root when native source-line resolution is
+required. Install `maturin>=1.13,<2`, then run:
+
+```sh
 maturin develop --locked --profile profiling \
   --features perfetto-profile \
   --manifest-path crates/delta-funnel-python/Cargo.toml
-ln -sf python \
-  target/python-perfetto-venv/bin/delta-funnel-perfetto-preview
+
+perfetto_assets="$PWD/tools/perfetto"
+capture_health="$perfetto_assets/capture-health"
 ```
 
 The `profiling` profile preserves information needed to symbolize native call
-stacks. The `perfetto-profile` feature is opt-in so normal builds and published
-wheels do not link the Perfetto SDK. The virtual-environment symlink gives the
-example a unique process command line without breaking Python's environment
-discovery. Keep this exact unstripped diagnostic extension available while
-inspecting the trace. Optimized and inlined Rust code can still collapse or
-move frames even when symbols are present. A restrictive `kernel.kptr_restrict`
-setting can leave kernel frames as raw addresses, but it does not prevent local
-user-space Rust symbolization or make the capture unhealthy.
+stacks. The `perfetto-profile` feature is opt-in so normal source builds and
+stable PyPI wheels do not link the Perfetto SDK.
+
+Both installation routes must finish with readable capture configs and an
+executable health command:
+
+```sh
+test -r "$perfetto_assets/delta-funnel-standard.pbtx"
+test -r "$perfetto_assets/delta-funnel-standard-streaming.pbtx"
+test -r "$perfetto_assets/delta-funnel-deep-system.pbtx"
+test -x "$capture_health"
+```
+
+The virtual-environment symlink gives the workload a unique process command
+line without breaking Python's environment discovery. Keep the same diagnostic
+extension installed while inspecting the trace. Optimized and inlined Rust
+code can still collapse or move frames even when symbols are present. A
+restrictive `kernel.kptr_restrict` setting can leave kernel frames as raw
+addresses, but it does not prevent local user-space Rust symbolization or make
+the capture unhealthy.
 
 ## Start the external capture
 
@@ -288,14 +362,14 @@ file and is intended for a workload expected to run for more than two minutes:
 
 ```bash
 # Short standard capture:
-capture_config=tools/perfetto/delta-funnel-standard.pbtx
+capture_config="$perfetto_assets/delta-funnel-standard.pbtx"
 capture_path=target/perfetto-captures/python-preview.pftrace
 configured_file_cap_bytes=
 ```
 
 ```bash
 # Bounded streaming standard capture:
-capture_config=tools/perfetto/delta-funnel-standard-streaming.pbtx
+capture_config="$perfetto_assets/delta-funnel-standard-streaming.pbtx"
 capture_path=target/perfetto-captures/python-preview-streaming.pftrace
 configured_file_cap_bytes=536870912
 ```
@@ -370,15 +444,32 @@ directly. Compression preserves every captured packet and reduces disk usage at
 the cost of additional tracing-service CPU. The short configurations remain
 uncompressed so their startup and finalization behavior does not change.
 
-## Activate diagnostics and run a preview
+## Activate diagnostics and run the workload
 
 Call `init_perfetto_diagnostics()` once, before `init_logging()` and before any
-preview or write operation:
+preview or write operation. Put this at the start of the real workload:
+
+```python
+import deltafunnel
+
+if not deltafunnel.init_perfetto_diagnostics():
+    raise RuntimeError("another tracing subscriber is already installed")
+```
+
+Set the workload path. A source checkout can use the repository example as a
+plumbing check; otherwise point it at the real script:
+
+```bash
+workload=path/to/workload.py
+# Source-checkout plumbing check:
+# workload=examples/perfetto_preview.py
+```
+
+Run it through the executable alias only after tracebox reports ready:
 
 ```bash
 if test -n "${trace_pid:-}" && kill -0 "$trace_pid" 2>/dev/null; then
-  if target/python-perfetto-venv/bin/delta-funnel-perfetto-preview \
-    examples/perfetto_preview.py; then
+  if "$diagnostics_python" "$workload"; then
     workload_status=0
   else
     workload_status=$?
@@ -392,7 +483,7 @@ fi
 The repository-owned example generates data in memory, exercises planning and
 parallel preview execution, and prints only a completion message. It exits
 nonzero if diagnostics are unavailable or not ready, and it never starts or
-stops `tracebox` itself.
+stops `tracebox` itself. A real workload must follow the same activation order.
 
 `DELTAFUNNEL_LOG` and the function's `filter` and `logger` arguments configure
 the Python logging side of the combined subscriber. They do not disable the
@@ -444,10 +535,9 @@ and the factual saved size:
 
 ```bash
 if test -n "$configured_file_cap_bytes"; then
-  tools/perfetto/capture-health \
-    "$capture_path" "$configured_file_cap_bytes"
+  "$capture_health" "$capture_path" "$configured_file_cap_bytes"
 else
-  tools/perfetto/capture-health "$capture_path"
+  "$capture_health" "$capture_path"
 fi
 ```
 
@@ -526,7 +616,7 @@ the current user tracefs access. Do not run tracebox or the Python workload with
 assignments in the start step:
 
 ```bash
-capture_config=tools/perfetto/delta-funnel-deep-system.pbtx
+capture_config="$perfetto_assets/delta-funnel-deep-system.pbtx"
 capture_path=target/perfetto-captures/python-preview-deep-system.pftrace
 configured_file_cap_bytes=
 ```
@@ -572,6 +662,16 @@ capture_unavailable
 
 An invalid logging filter remains a configuration error with kind
 `invalid_logging_filter`.
+
+If pip reports that no matching distribution exists, confirm that the active
+interpreter is CPython 3.10 or newer on Linux x86_64 with glibc 2.28 or newer.
+If the resource checks fail or activation reports `not_available`, inspect the
+installed package with `python -m pip show deltafunnel`. Also print
+`sys.executable` from Python to confirm that the workload uses the diagnostics
+virtual environment rather than a stable wheel from another environment. A
+`capture_timeout` or `capture_unavailable` error means the diagnostics build is
+present but the external capture did not become ready; repeat the `perf`,
+system-socket, and FIFO readiness checks before running the workload again.
 
 Python activates the producer and subscriber, but it does not start, stop, or
 finalize `tracebox`. Once activation succeeds, later capture-service problems
