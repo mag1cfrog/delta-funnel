@@ -321,19 +321,30 @@ Operation
       Operator and lower-level activity
 ```
 
-[![Perfetto semantic hierarchy filtered to one logical worker](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
+If the trace contains many workers, click the funnel-shaped track filter and
+paste an exact worker token such as `w-00000000000000000001]`. The closing
+bracket prevents worker 1 from also matching worker 10 or worker 14. Expand the
+remaining parent tracks to keep the operation, query, and worker ancestry in
+view.
 
-Use a worker token such as `w-00000000000000000001]` in the track filter to
-isolate one logical worker. The closing bracket prevents worker 1 from also
-matching worker 10 or worker 14.
+[![Full Perfetto timeline filtered to one logical worker](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
 
-Select an operation or worker time range, then open `Perf sample flamegraph`
-and choose `Top Down`. The semantic tracks show exact wall-clock intervals;
-the flame graph shows statistical on-CPU native samples for the selected time.
+The full viewport above keeps the 6.33-second wall-clock ruler and complete
+semantic ancestry visible while showing only worker 1.
+
+Drag across the worker track to select the time range you want to investigate.
+Temporarily clear the name filter, check `Process callstacks cpu-clock`, and
+then reapply the worker filter. The toolbar should now say `2 tracks`. Open
+`Current Selection`, choose `Perf sample flamegraph`, and keep `Top Down`
+selected. The semantic tracks show exact wall-clock intervals; the flame graph
+shows statistical on-CPU native samples from the same selected interval.
 
 [![Perfetto Top Down native flame graph](../assets/perfetto-native-flamegraph.png)](../assets/perfetto-native-flamegraph.png)
 
-Click either screenshot to open it at full size.
+The blue markers and shaded region above delimit the selected 3.26-second
+interval. The lower panel follows the native stack from the runtime into Delta
+Funnel and DataFusion. Click either screenshot to open the complete UI at full
+size.
 
 The repository example takes about 6 seconds and produced about 12 MB during
 validation. Hardware, workload, and symbols change both values.
