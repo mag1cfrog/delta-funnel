@@ -26,7 +26,7 @@ use super::{
     LoadMode, MssqlBatchShapingReport, MssqlConnectionSource, MssqlConnectionSummary,
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
-    drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_for_workflow,
+    drain_mssql_batches_for_stream_benchmark,
     write_output_batches_to_mssql_for_workflow_with_stage_context,
 };
 
@@ -731,7 +731,7 @@ pub(crate) struct MssqlStreamBenchmarkOutputWriter;
 pub(crate) trait MssqlWorkflowOutputWriter: Send {
     #[allow(
         clippy::too_many_arguments,
-        reason = "the workflow writer receives one planned write plus its progress reporter"
+        reason = "the workflow writer receives one planned write plus profiling state"
     )]
     async fn write_output(
         &mut self,
@@ -742,34 +742,8 @@ pub(crate) trait MssqlWorkflowOutputWriter: Send {
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
+        stage_context: OperationStageContext<'_>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the workflow writer receives one planned write plus profiling state"
-    )]
-    async fn write_output_with_stage_context(
-        &mut self,
-        output_schema: SchemaRef,
-        resolved_target: ResolvedMssqlTarget,
-        schema_options: MssqlSchemaPlanOptions,
-        batches: MssqlOutputBatchStream,
-        write_backend: MssqlWriteBackend,
-        validation_options: ValidationOptions,
-        reporter: Option<&ProgressReporter>,
-        _stage_context: OperationStageContext<'_>,
-    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        self.write_output(
-            output_schema,
-            resolved_target,
-            schema_options,
-            batches,
-            write_backend,
-            validation_options,
-            reporter,
-        )
-        .await
-    }
 }
 
 pub(crate) struct MssqlWorkflowSinkWriter;
@@ -777,28 +751,6 @@ pub(crate) struct MssqlWorkflowSinkWriter;
 #[async_trait]
 impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
     async fn write_output(
-        &mut self,
-        output_schema: SchemaRef,
-        resolved_target: ResolvedMssqlTarget,
-        schema_options: MssqlSchemaPlanOptions,
-        batches: MssqlOutputBatchStream,
-        write_backend: MssqlWriteBackend,
-        validation_options: ValidationOptions,
-        reporter: Option<&ProgressReporter>,
-    ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_for_workflow(
-            output_schema.as_ref(),
-            resolved_target,
-            schema_options,
-            batches,
-            write_backend,
-            validation_options,
-            reporter,
-        )
-        .await
-    }
-
-    async fn write_output_with_stage_context(
         &mut self,
         output_schema: SchemaRef,
         resolved_target: ResolvedMssqlTarget,
@@ -834,6 +786,7 @@ impl MssqlWorkflowOutputWriter for MssqlStreamBenchmarkOutputWriter {
         _write_backend: MssqlWriteBackend,
         _validation_options: ValidationOptions,
         _reporter: Option<&ProgressReporter>,
+        _stage_context: OperationStageContext<'_>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         let output_plan = plan_mssql_target_for_resolved_output(
             output_schema.as_ref(),
@@ -1020,7 +973,7 @@ where
 
     let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
     let write_result = writer
-        .write_output_with_stage_context(
+        .write_output(
             output_schema,
             resolved_target,
             schema_options,
@@ -1231,6 +1184,7 @@ mod tests {
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
             _reporter: Option<&ProgressReporter>,
+            _stage_context: OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()
@@ -1254,6 +1208,7 @@ mod tests {
             _write_backend: MssqlWriteBackend,
             _validation_options: ValidationOptions,
             _reporter: Option<&ProgressReporter>,
+            _stage_context: OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             self.attempted_outputs
                 .lock()

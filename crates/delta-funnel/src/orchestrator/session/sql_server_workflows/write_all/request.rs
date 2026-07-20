@@ -45,7 +45,6 @@ impl DeltaFunnelSession {
         trace_context: Option<&OperationTraceContext>,
     ) -> Result<Vec<PlannedMssqlOutput>, DeltaFunnelError> {
         let output_count = usize_to_u64_saturating(requests.len());
-        let timeline = trace_context.and_then(OperationTraceContext::timeline);
 
         requests
             .iter()
@@ -60,11 +59,9 @@ impl DeltaFunnelSession {
                         Some(request.target().output_name()),
                     ));
                 }
-                self.plan_mssql_output_with_timeline(
+                self.plan_mssql_output_with_stage_context(
                     request,
-                    timeline,
-                    trace_context,
-                    Some(output_index),
+                    OperationStageContext::new(trace_context, Some(output_index)),
                 )
             })
             .collect()
@@ -533,6 +530,7 @@ mod tests {
         WriteAllCacheAliasStatus, WriteAllCacheReport, WriteAllNoCacheReason,
         observability::test_capture::{CapturedEvent, TracingCapture},
         plan_mssql_target_for_resolved_output,
+        profiling::OperationStageContext,
         progress::{
             ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
         },
@@ -623,6 +621,7 @@ mod tests {
             _write_backend: MssqlWriteBackend,
             _validation_options: crate::ValidationOptions,
             reporter: Option<&ProgressReporter>,
+            _stage_context: OperationStageContext<'_>,
         ) -> Result<MssqlWriteReport, DeltaFunnelError> {
             let output_plan = plan_mssql_target_for_resolved_output(
                 output_schema.as_ref(),
