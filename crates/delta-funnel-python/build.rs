@@ -5,9 +5,10 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-const PERFETTO_ASSETS: [&str; 5] = [
+const PERFETTO_ASSETS: [&str; 6] = [
     "capture-health",
     "capture-health.sql",
+    "capture-workload",
     "delta-funnel-deep-system.pbtx",
     "delta-funnel-standard-streaming.pbtx",
     "delta-funnel-standard.pbtx",
