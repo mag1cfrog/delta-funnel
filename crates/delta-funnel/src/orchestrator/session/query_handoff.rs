@@ -695,8 +695,8 @@ impl PreviewTimingTracker {
         execution_profile: Option<QueryExecutionProfile>,
         source: DeltaFunnelError,
     ) -> DeltaFunnelError {
-        self.process_phases.finish("error");
         let failed_timing = self.record_timing(timer, TimelineSpanStatus::Failed);
+        self.process_phases.finish("error");
         let failed_phase = failed_timing.phase_name().to_owned();
         self.phase_timings.push(failed_timing);
         let next_phase_index = self.phase_timings.len();
@@ -2587,6 +2587,19 @@ mod tests {
         assert_eq!(stages[0].parent_id, Some(root.id));
         assert_eq!(stages[0].fields["stage_name"], "DataFrame planning");
         assert_eq!(stages[0].fields["result"], "error");
+        let planning_phase = spans
+            .iter()
+            .find(|span| {
+                span.name == "Delta Funnel operation phase" && span.fields["phase"] == "planning"
+            })
+            .ok_or("expected failed preview planning phase")?;
+        let stage_close = stages[0]
+            .close_sequence
+            .ok_or("expected failed preview stage to close")?;
+        let phase_close = planning_phase
+            .close_sequence
+            .ok_or("expected failed preview planning phase to close")?;
+        assert!(stage_close < phase_close);
         Ok(())
     }
 
