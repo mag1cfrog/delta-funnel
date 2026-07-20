@@ -26,7 +26,7 @@ use super::{
     MssqlSchemaPlanOptions, MssqlTargetSummary, MssqlTargetTable, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWriteReport, ResolvedMssqlTarget, default_mssql_write_backend,
     drain_mssql_batches_for_stream_benchmark, write_output_batches_to_mssql_for_workflow,
-    write_output_batches_to_mssql_for_workflow_with_timeline,
+    write_output_batches_to_mssql_for_workflow_with_stage_context,
 };
 
 const OUTPUT_STREAM_SETUP_PHASE: &str = "output_stream_setup";
@@ -804,7 +804,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
         reporter: Option<&ProgressReporter>,
         timeline: Option<&OperationTimelineRecorder>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        write_output_batches_to_mssql_for_workflow_with_timeline(
+        write_output_batches_to_mssql_for_workflow_with_stage_context(
             output_schema.as_ref(),
             resolved_target,
             schema_options,
@@ -812,7 +812,7 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
             write_backend,
             validation_options,
             reporter,
-            timeline,
+            crate::profiling::OperationStageContext::from_timeline(timeline),
         )
         .await
     }

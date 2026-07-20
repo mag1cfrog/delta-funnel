@@ -10,8 +10,8 @@ use crate::{
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
     TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     profiling::{
-        OperationStageTrace, OperationTraceContext, OperationTraceKind, OperationTracePhase,
-        ProcessOperationPhaseTracker,
+        OperationStageContext, OperationStageTrace, OperationTraceContext, OperationTraceKind,
+        OperationTracePhase, ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{QueryTraceIdentity, with_query_planning_activity},
@@ -458,14 +458,17 @@ impl DeltaFunnelSession {
             let mut phase_timings = planned.phase_timings().to_vec();
             phase_timings.extend(query_phase_timings);
             let result = writer
-                .write_output_with_timeline(
+                .write_output_with_stage_context(
                     planned.output_plan().clone(),
                     planned.resolved_target().clone(),
                     batches,
                     self.options.mssql_write_backend(),
                     self.options.validation_options(),
                     reporter,
-                    timeline,
+                    OperationStageContext::new(
+                        trace_context.as_ref(),
+                        Some(SINGLE_OUTPUT_STAGE_OWNER_ID),
+                    ),
                 )
                 .await;
             process_phases.transition_with_result(
@@ -969,8 +972,11 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
         reporter: Option<&ProgressReporter>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError>;
 
-    #[allow(clippy::too_many_arguments)]
-    async fn write_output_with_timeline(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the writer boundary receives one planned output plus optional profiling state"
+    )]
+    async fn write_output_with_stage_context(
         &mut self,
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
@@ -978,7 +984,7 @@ pub(crate) trait OrchestratorMssqlOutputWriter: Send {
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
-        _timeline: Option<&OperationTimelineRecorder>,
+        _stage_context: OperationStageContext<'_>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
         self.write_output(
             output_plan,
@@ -1016,7 +1022,7 @@ impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
         .await
     }
 
-    async fn write_output_with_timeline(
+    async fn write_output_with_stage_context(
         &mut self,
         output_plan: MssqlTargetOutputPlan,
         resolved_target: ResolvedMssqlTarget,
@@ -1024,16 +1030,16 @@ impl OrchestratorMssqlOutputWriter for MssqlOneOutputSinkWriter {
         write_backend: MssqlWriteBackend,
         validation_options: ValidationOptions,
         reporter: Option<&ProgressReporter>,
-        timeline: Option<&OperationTimelineRecorder>,
+        stage_context: OperationStageContext<'_>,
     ) -> Result<MssqlWriteReport, DeltaFunnelError> {
-        crate::sql_server::write_planned_output_batches_to_mssql_for_workflow_with_timeline(
+        crate::sql_server::write_planned_output_batches_to_mssql_for_workflow_with_stage_context(
             output_plan,
             resolved_target,
             batches,
             write_backend,
             validation_options,
             reporter,
-            timeline,
+            stage_context,
         )
         .await
     }

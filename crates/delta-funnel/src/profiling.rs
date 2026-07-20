@@ -257,6 +257,59 @@ impl Drop for ProcessSpanTrace {
     }
 }
 
+/// Read-only destinations and identity shared by one operation's bounded stages.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OperationStageContext<'a> {
+    operation: Option<&'a OperationTraceContext>,
+    timeline: Option<&'a OperationTimelineRecorder>,
+    owner_id: Option<u64>,
+}
+
+impl<'a> OperationStageContext<'a> {
+    pub(crate) const fn new(
+        operation: Option<&'a OperationTraceContext>,
+        owner_id: Option<u64>,
+    ) -> Self {
+        let timeline = match operation {
+            Some(operation) => operation.timeline(),
+            None => None,
+        };
+        Self {
+            operation,
+            timeline,
+            owner_id,
+        }
+    }
+
+    pub(crate) const fn from_timeline(timeline: Option<&'a OperationTimelineRecorder>) -> Self {
+        Self {
+            operation: None,
+            timeline,
+            owner_id: None,
+        }
+    }
+
+    pub(crate) const fn timeline(self) -> Option<&'a OperationTimelineRecorder> {
+        self.timeline
+    }
+
+    pub(crate) fn start(
+        self,
+        name: &'static str,
+        category: &'static str,
+        track_name: impl Into<String>,
+    ) -> Option<OperationStageTrace> {
+        OperationStageTrace::start(
+            self.operation,
+            self.timeline,
+            name,
+            category,
+            track_name,
+            self.owner_id,
+        )
+    }
+}
+
 /// One bounded wall-clock stage shared by the stable timeline and process trace.
 #[derive(Debug)]
 pub(crate) struct OperationStageTrace {
