@@ -929,6 +929,18 @@ mod tests {
         ))
     }
 
+    fn delayed_closed_record_batch_stream(delay: Duration) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::empty());
+        let mut builder = RecordBatchReceiverStreamBuilder::new(schema, 1);
+        let output = builder.tx();
+        builder.spawn(async move {
+            tokio::time::sleep(delay).await;
+            drop(output);
+            Ok(())
+        });
+        builder.build()
+    }
+
     fn profiled_delta_scan_stream(
         activity: OperatorActivityRecorder,
         inner: SendableRecordBatchStream,
@@ -1672,9 +1684,52 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dropping_pending_delta_scan_output_receiver_cancels_both_outputs()
+    #[tokio::test]
+    async fn closed_delta_scan_output_producer_finishes_pending_wait_as_eof()
     -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let timeline = OperationTimelineRecorder::start();
+        let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
+            Some(timeline.clone()),
+            true,
+            100,
+        ));
+        let mut stream = profiled_delta_scan_stream(
+            activity.clone(),
+            delayed_closed_record_batch_stream(Duration::from_millis(10)),
+        );
+
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        activity.context.record_process_result("ok");
+        drop(activity);
+
+        let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
+        let wait = timeline
+            .spans()
+            .iter()
+            .find(|span| span.category() == DELTA_SCAN_OUTPUT_WAIT_CATEGORY)
+            .ok_or("expected completed output wait")?;
+        assert_eq!(wait.status(), TimelineSpanStatus::Completed);
+        assert_eq!(wait.attributes()["result"], "ok");
+
+        let process_wait = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "DataFusion execution activity")
+            .ok_or("expected completed process wait")?;
+        assert_eq!(process_wait.fields["result"], "ok");
+        assert_eq!(process_wait.enter_count, 0);
+        assert_eq!(process_wait.exit_count, 0);
+        assert!(process_wait.closed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_pending_delta_scan_output_stream_cancels_both_outputs() -> Result<(), Box<dyn Error>>
+    {
         let capture = TracingCapture::start_with_profile_spans_enabled();
         let timeline = OperationTimelineRecorder::start();
         let activity = OperatorActivityRecorder::new(test_trace_identity_with_limit(
