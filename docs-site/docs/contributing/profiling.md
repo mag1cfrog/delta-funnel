@@ -21,11 +21,12 @@ Perfetto producer.
 
 Use the short standard mode for a brief workload and the streaming standard
 mode when the expected duration exceeds two minutes. Both modes record exact
-begin and end timestamps as semantic Track Events. Their 100 Hz native call
-stacks are statistical samples, so nearby runs can have different sample
-counts. On Linux, native sampling is on-CPU only. Time blocked on I/O, locks,
-or sleep is absent from the sampled stacks; use the deep-system mode only when
-scheduler context is needed.
+begin and end timestamps as semantic Track Events. Short mode samples native
+call stacks at 1000 Hz by default; streaming and deep-system modes default to
+100 Hz. These are statistical samples, so nearby runs can have different
+sample counts. On Linux, native sampling is on-CPU only. Time blocked on I/O,
+locks, or sleep is absent from the sampled stacks; use the deep-system mode
+only when scheduler context is needed.
 
 See the [profiling validation report](profiling-validation-report.md) for the
 canonical 13.4M-row performance comparison, 10-minute streaming result, and
@@ -299,13 +300,19 @@ workload, stops Perfetto, and checks the saved trace. A successful run ends
 with output like:
 
 ```text
-workload_status=0 tracebox_status=0 health_status=0 trace=target/perfetto-captures/query.pftrace
+workload_status=0 tracebox_status=0 health_status=0 sample_hz=1000 trace=target/perfetto-captures/query.pftrace
 ```
 
 `health_status=0` means the printed health row reported
 `capture_complete=1`. The command always exits with the workload's own status.
 A later capture or health failure cannot turn a successful database write into
 a failed workload. Never retry a write only because diagnostics failed.
+
+Short mode defaults to 1000 Hz. Pass `--sample-hz 100` when lower capture
+volume matters more than resolving short native work. The explicit override
+accepts only `100` or `1000` and works with every mode. At 1000 Hz the capture
+tool also drains the kernel sampling buffers more often to avoid losing short
+bursts.
 
 ### 5. Inspect the result
 
@@ -373,12 +380,13 @@ minutes and up to ten minutes:
 Streaming periodically drains its buffers, has a 12-minute safety timeout, and
 caps the saved file at 512 MiB. High event volume can reach the cap sooner.
 Missing tail time in an incomplete trace is unknown activity, not zero
-activity.
+activity. Streaming defaults to 100 Hz; explicitly selecting 1000 Hz can reach
+the file cap much sooner.
 
 ### Add scheduler context
 
 Use deep-system mode only when the question requires scheduler and wakeup
-evidence. It requires tracefs access:
+evidence. It defaults to 100 Hz and requires tracefs access:
 
 ```sh
 test -r /sys/kernel/tracing/events/sched/sched_switch/id

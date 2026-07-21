@@ -3,14 +3,16 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: capture-workload [--mode short|streaming|deep-system] --output TRACE -- COMMAND [ARG...]
+Usage: capture-workload [--mode short|streaming|deep-system] [--sample-hz 100|1000] --output TRACE -- COMMAND [ARG...]
 
 Record one diagnostics-enabled Python workload and check the saved trace.
-The default mode is short.
+The default mode is short. Short mode defaults to 1000 Hz; other modes default
+to 100 Hz.
 EOF
 }
 
 mode=short
+sample_hz=
 capture_path=
 while (( $# > 0 )); do
   case $1 in
@@ -24,6 +26,23 @@ while (( $# > 0 )); do
         exit 64
       fi
       mode=${2:-}
+      shift 2
+      ;;
+    --sample-hz)
+      if (( $# < 2 )); then
+        usage >&2
+        exit 64
+      fi
+      case ${2:-} in
+        100|1000)
+          sample_hz=$2
+          ;;
+        *)
+          printf 'capture-workload: unsupported sample frequency: %s\n' \
+            "${2:-}" >&2
+          exit 64
+          ;;
+      esac
       shift 2
       ;;
     --output)
@@ -54,15 +73,18 @@ fi
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 case $mode in
   short)
-    capture_config=$script_dir/delta-funnel-standard.pbtx
+    packaged_capture_config=$script_dir/delta-funnel-standard.pbtx
+    default_sample_hz=1000
     configured_file_cap_bytes=
     ;;
   streaming)
-    capture_config=$script_dir/delta-funnel-standard-streaming.pbtx
+    packaged_capture_config=$script_dir/delta-funnel-standard-streaming.pbtx
+    default_sample_hz=100
     configured_file_cap_bytes=536870912
     ;;
   deep-system)
-    capture_config=$script_dir/delta-funnel-deep-system.pbtx
+    packaged_capture_config=$script_dir/delta-funnel-deep-system.pbtx
+    default_sample_hz=100
     configured_file_cap_bytes=
     ;;
   *)
@@ -70,8 +92,11 @@ case $mode in
     exit 64
     ;;
 esac
+if [[ -z $sample_hz ]]; then
+  sample_hz=$default_sample_hz
+fi
 
-if [[ ! -r $capture_config || ! -x $script_dir/capture-health ]]; then
+if [[ ! -r $packaged_capture_config || ! -x $script_dir/capture-health ]]; then
   printf 'capture-workload: packaged Perfetto assets are incomplete\n' >&2
   exit 69
 fi
@@ -79,7 +104,7 @@ fi
 tracebox=${TRACEBOX:-tracebox}
 trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
 perf=${PERF:-perf}
-for executable in "$tracebox" "$trace_processor" "$perf" timeout od; do
+for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od; do
   if ! command -v "$executable" >/dev/null 2>&1; then
     printf 'capture-workload: required command is unavailable: %s\n' \
       "$executable" >&2
@@ -165,6 +190,29 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
+capture_config=$runtime_dir/capture.pbtx
+if ! awk -v sample_hz="$sample_hz" '
+  BEGIN { read_period_ms = sample_hz == 1000 ? 10 : 100 }
+  /^[[:space:]]*frequency:[[:space:]]*[0-9]+[[:space:]]*$/ {
+    frequency_count++
+    if (frequency_count == 1) {
+      sub(/[0-9]+/, sample_hz)
+    }
+  }
+  /^[[:space:]]*ring_buffer_read_period_ms:[[:space:]]*[0-9]+[[:space:]]*$/ {
+    read_period_count++
+    if (read_period_count == 1) {
+      sub(/[0-9]+/, read_period_ms)
+    }
+  }
+  { print }
+  END { if (frequency_count != 1 || read_period_count != 1) exit 1 }
+' "$packaged_capture_config" >"$capture_config"; then
+  printf 'capture-workload: failed to prepare Perfetto sampling config: %s\n' \
+    "$packaged_capture_config" >&2
+  exit 69
+fi
+
 "$tracebox" --system-sockets --query >/dev/null || {
   printf 'capture-workload: Perfetto system service is unavailable\n' >&2
   exit 69
@@ -220,8 +268,9 @@ else
   health_status=$?
 fi
 
-printf 'workload_status=%s tracebox_status=%s health_status=%s trace=%s\n' \
-  "$workload_status" "${tracebox_status:-125}" "$health_status" "$capture_path"
+printf 'workload_status=%s tracebox_status=%s health_status=%s sample_hz=%s trace=%s\n' \
+  "$workload_status" "${tracebox_status:-125}" "$health_status" "$sample_hz" \
+  "$capture_path"
 if (( workload_status == 0 && (tracebox_status != 0 || health_status != 0) )); then
   printf '%s\n' \
     'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2

@@ -54,6 +54,7 @@ data_sources {
         }
         kernel_frames: true
       }
+      ring_buffer_read_period_ms: 100
     }
   }
 }
