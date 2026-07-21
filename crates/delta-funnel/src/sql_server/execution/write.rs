@@ -798,7 +798,11 @@ where
         "delta_funnel.write.sql_server",
         "Finalize writer",
     );
-    let finish_result = MssqlBulkLoadWriter::finish(writer).await;
+    let finish = MssqlBulkLoadWriter::finish(writer);
+    let finish_result = match &finalize_span {
+        Some(span) => span.instrument_future(finish).await,
+        None => finish.await,
+    };
     let finalize_elapsed = finalize_started_at.elapsed();
     if finish_result.is_ok() {
         if let Some(span) = finalize_span {

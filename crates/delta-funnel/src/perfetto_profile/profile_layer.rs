@@ -20,8 +20,20 @@ use super::{
 
 /// Exact tracing target consumed by the Perfetto profile layer.
 pub const PROFILE_TARGET: &str = "delta_funnel::profile";
+const TIBERIUS_PROFILE_TARGET: &str = "tiberius_raw_bulk::protocol";
 
-/// Converts canonical Delta Funnel profiling spans into Perfetto Track Events.
+const BULK_FINALIZE_PREPARE: &str = "protocol.bulk_load.finalize.prepare";
+const BULK_FINALIZE_WRITE: &str = "protocol.bulk_load.finalize.write";
+const BULK_FINALIZE_FLUSH: &str = "protocol.bulk_load.finalize.flush";
+const BULK_FINALIZE_RESULT: &str = "protocol.bulk_load.finalize.result";
+
+/// Returns whether a tracing target contributes exact spans to a Perfetto profile.
+pub fn is_profile_target(target: &str) -> bool {
+    matches!(target, PROFILE_TARGET | TIBERIUS_PROFILE_TARGET)
+}
+
+/// Converts canonical Delta Funnel spans and their instrumented dependency spans
+/// into Perfetto Track Events.
 ///
 /// The host owns subscriber composition and installation.
 #[derive(Debug, Default)]
@@ -32,13 +44,36 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
-        let mut fields = ProfileFields::default();
-        attributes.record(&mut fields);
-        let Some(active) = ActiveProfileSpan::from_fields(attributes.metadata().name(), fields)
-        else {
+        let Some(span) = context.span(id) else {
             return;
         };
-        let Some(span) = context.span(id) else {
+        let metadata = attributes.metadata();
+        let active = if metadata.target() == PROFILE_TARGET {
+            let mut fields = ProfileFields::default();
+            attributes.record(&mut fields);
+            ActiveProfileSpan::from_fields(metadata.name(), fields)
+        } else if metadata.target() == TIBERIUS_PROFILE_TARGET {
+            let Some(name) = dependency_span_label(metadata.name()) else {
+                return;
+            };
+            let mut ancestor = span.parent();
+            loop {
+                let Some(parent) = ancestor else {
+                    break None;
+                };
+                let inherited = parent
+                    .extensions()
+                    .get::<ActiveProfileSpan>()
+                    .map(|active| active.inherit(name));
+                if inherited.is_some() {
+                    break inherited;
+                }
+                ancestor = parent.parent();
+            }
+        } else {
+            None
+        };
+        let Some(active) = active else {
             return;
         };
         active.emit_begin();
@@ -88,7 +123,17 @@ where
     }
 }
 
-#[derive(Debug, Default)]
+fn dependency_span_label(name: &str) -> Option<&'static str> {
+    match name {
+        BULK_FINALIZE_PREPARE => Some("Prepare final bulk packet"),
+        BULK_FINALIZE_WRITE => Some("Write final bulk packet"),
+        BULK_FINALIZE_FLUSH => Some("Flush SQL Server connection"),
+        BULK_FINALIZE_RESULT => Some("Await SQL Server result"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct ProfileFields {
     operation_id: Option<u64>,
     query_execution_id: Option<u64>,
@@ -256,6 +301,16 @@ impl ActiveProfileSpan {
         Some(Self { event, fields })
     }
 
+    fn inherit(&self, name: &str) -> Self {
+        Self {
+            event: ProfileEvent::Detail {
+                name: name.to_owned(),
+                track: self.track().clone(),
+            },
+            fields: self.fields.clone(),
+        }
+    }
+
     fn record(&mut self, fields: ProfileFields) {
         if !matches!(&self.event, ProfileEvent::PlanningActivity { .. })
             && fields.query_owner.is_some()
@@ -407,6 +462,27 @@ impl ActiveProfileSpan {
                     );
                 }
             }
+            ProfileEvent::Detail { name, track } => {
+                if let Ok(name) = CString::new(name.as_str()) {
+                    track_event!(
+                        "delta_funnel.profile",
+                        TrackEventType::SliceBegin(name.as_ptr()),
+                        |context: &mut EventContext| {
+                            track.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                } else {
+                    track_event_begin!(
+                        "delta_funnel.profile",
+                        "Instrumented detail",
+                        |context: &mut EventContext| {
+                            track.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                }
+            }
             ProfileEvent::Operator { name, worker } => {
                 if let Ok(name) = CString::new(name.as_str()) {
                     track_event!(
@@ -438,7 +514,9 @@ impl ActiveProfileSpan {
             | ProfileEvent::PlanningActivity { planning, .. } => (planning, false),
             ProfileEvent::ExecutionActivity { output, .. } => (output, false),
             ProfileEvent::Phase { phases, .. } => (phases, false),
-            ProfileEvent::Stage { track, .. } => (track, false),
+            ProfileEvent::Stage { track, .. } | ProfileEvent::Detail { track, .. } => {
+                (track, false)
+            }
             ProfileEvent::Operator { worker, .. } => (worker, false),
         };
         track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
@@ -533,7 +611,6 @@ impl ActiveProfileSpan {
         }
     }
 
-    #[cfg(test)]
     fn track(&self) -> &SemanticTrack {
         match &self.event {
             ProfileEvent::Operation { operation, .. } => operation,
@@ -541,7 +618,7 @@ impl ActiveProfileSpan {
             | ProfileEvent::PlanningActivity { planning, .. } => planning,
             ProfileEvent::ExecutionActivity { output, .. } => output,
             ProfileEvent::Phase { phases, .. } => phases,
-            ProfileEvent::Stage { track, .. } => track,
+            ProfileEvent::Stage { track, .. } | ProfileEvent::Detail { track, .. } => track,
             ProfileEvent::Operator { worker, .. } => worker,
         }
     }
@@ -571,6 +648,10 @@ enum ProfileEvent {
         phases: SemanticTrack,
     },
     Stage {
+        name: String,
+        track: SemanticTrack,
+    },
+    Detail {
         name: String,
         track: SemanticTrack,
     },
@@ -714,6 +795,48 @@ mod tests {
                 .is_none()
         );
         assert!(ActiveProfileSpan::from_fields("application span", fields(1, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn bulk_finalize_dependency_spans_use_friendly_labels_on_the_parent_track() {
+        let parent = ActiveProfileSpan::from_fields(
+            "Delta Funnel operation stage",
+            ProfileFields {
+                operation_id: Some(7),
+                operation_kind: Some("mssql_write".to_owned()),
+                stage_name: Some("Finalize SQL Server writer".to_owned()),
+                stage_category: Some("delta_funnel.write.sql_server".to_owned()),
+                stage_owner_id: Some(3),
+                ..ProfileFields::default()
+            },
+        )
+        .expect("the semantic parent should map");
+
+        let child = parent.inherit(
+            dependency_span_label(BULK_FINALIZE_RESULT)
+                .expect("the stable dependency span should map"),
+        );
+
+        assert_eq!(child.track(), parent.track());
+        assert_eq!(child.fields.operation_id, Some(7));
+        assert_eq!(child.fields.stage_owner_id, Some(3));
+        assert!(matches!(
+            child.event,
+            ProfileEvent::Detail { ref name, .. } if name == "Await SQL Server result"
+        ));
+        assert!(is_profile_target(PROFILE_TARGET));
+        assert!(is_profile_target(TIBERIUS_PROFILE_TARGET));
+        assert!(!is_profile_target("application"));
+
+        for (name, label) in [
+            (BULK_FINALIZE_PREPARE, "Prepare final bulk packet"),
+            (BULK_FINALIZE_WRITE, "Write final bulk packet"),
+            (BULK_FINALIZE_FLUSH, "Flush SQL Server connection"),
+            (BULK_FINALIZE_RESULT, "Await SQL Server result"),
+        ] {
+            assert_eq!(dependency_span_label(name), Some(label));
+        }
+        assert_eq!(dependency_span_label("protocol.bulk_load.request"), None);
     }
 
     #[test]
@@ -1149,7 +1272,7 @@ mod tests {
             .with(EventCounter(Arc::clone(&count)))
             .with(
                 PerfettoProfileLayer
-                    .with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET)),
+                    .with_filter(filter_fn(|metadata| is_profile_target(metadata.target()))),
             );
 
         tracing::subscriber::with_default(subscriber, || {

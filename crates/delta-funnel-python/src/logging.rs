@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
-    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+    PerfettoProfileLayer, initialize_perfetto, is_profile_target, wait_for_capture,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModuleMethods};
@@ -134,8 +134,8 @@ fn perfetto_diagnostics_subscriber(
     logger: String,
 ) -> impl Subscriber + Send + Sync + 'static {
     let logging_layer = python_logging_layer(logger).with_filter(filter);
-    let perfetto_layer =
-        PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET));
+    let perfetto_layer = PerfettoProfileLayer
+        .with_filter(filter_fn(|metadata| is_profile_target(metadata.target())));
     Registry::default().with(logging_layer).with(perfetto_layer)
 }
 
@@ -616,9 +616,17 @@ mod tests {
                     target: "delta_funnel::profile",
                     Level::TRACE
                 ));
+                assert!(tracing::enabled!(
+                    target: "tiberius_raw_bulk::protocol",
+                    Level::INFO
+                ));
                 assert!(tracing::enabled!(target: "delta_funnel", Level::INFO));
                 assert!(!tracing::enabled!(target: "unrelated", Level::TRACE));
                 tracing::trace!(target: "delta_funnel::profile", "profile.trace");
+                tracing::info!(
+                    target: "tiberius_raw_bulk::protocol",
+                    "protocol.bulk_load.finalize.result"
+                );
                 tracing::info!(target: "delta_funnel", "application.info");
                 tracing::trace!(target: "unrelated", "unrelated.trace");
             });
