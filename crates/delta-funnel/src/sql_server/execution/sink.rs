@@ -2097,6 +2097,13 @@ mod tests {
                 "Prepare target lifecycle",
                 "Initialize bulk writer",
                 "Stream and write batches",
+                "Poll query batch",
+                "Validate batch schema",
+                "Write batch to SQL Server",
+                "Poll query batch",
+                "Validate batch schema",
+                "Write batch to SQL Server",
+                "Poll query batch",
                 "Finalize SQL Server writer",
                 "Validate written target",
                 "Swap replace target",
@@ -3579,6 +3586,9 @@ mod tests {
                 ("Prepare target lifecycle", "ok"),
                 ("Initialize bulk writer", "ok"),
                 ("Stream and write batches", "error"),
+                ("Poll query batch", "ok"),
+                ("Validate batch schema", "ok"),
+                ("Write batch to SQL Server", "error"),
                 ("Clean up prepared target", "ok"),
             ]
         );

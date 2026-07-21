@@ -293,10 +293,6 @@ impl<'a> OperationStageContext<'a> {
         }
     }
 
-    pub(crate) const fn timeline(self) -> Option<&'a OperationTimelineRecorder> {
-        self.timeline
-    }
-
     pub(crate) fn start(
         self,
         name: &'static str,
