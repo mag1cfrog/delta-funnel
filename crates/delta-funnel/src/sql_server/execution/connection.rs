@@ -316,7 +316,7 @@ mod tests {
         assert!(dependencies.contains(&"arrow-tiberius"));
         assert_eq!(
             direct_manifest_dependency_version(manifest, "arrow-tiberius"),
-            Some("0.2.0")
+            Some("0.2.1")
         );
         assert!(!dependencies.contains(&"tiberius"));
         assert!(!dependencies.contains(&"tiberius-raw-bulk"));
