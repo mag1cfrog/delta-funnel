@@ -319,25 +319,32 @@ Operation
   Query
     Worker
       Operator and lower-level activity
+  Output owner
+    Output execution stages
 ```
 
-If the trace contains many workers, click the funnel-shaped track filter and
-paste an exact worker token such as `w-00000000000000000001]`. The closing
-bracket prevents worker 1 from also matching worker 10 or worker 14. Expand the
-remaining parent tracks to keep the operation, query, and worker ancestry in
-view.
+To isolate one operation, click the funnel-shaped track filter and paste its
+exact token, including the closing bracket, such as
+`op-00000000000000000003]`. The closing bracket prevents a shorter numeric ID
+from matching a longer one. Use the same technique with a worker token such as
+`w-00000000000000000001]` when a query contains many parallel workers. Expand
+the remaining parent tracks to keep the relevant ancestry in view.
 
-[![Full Perfetto timeline filtered to one logical worker](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
+[![Full Perfetto timeline filtered to one SQL Server write_all operation](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
 
-The full viewport above keeps the 6.33-second wall-clock ruler and complete
-semantic ancestry visible while showing only worker 1.
+The full viewport above shows a real SQL Server `write_all` operation. Each
+output owner contains an end-to-end `Execute output` parent. Its children show
+query setup and the actual SQL Server lifecycle, including connection, target
+preparation, streaming writes, writer finalization, and validation, on the
+same wall-clock ruler.
 
-Drag across the worker track to select the time range you want to investigate.
-Temporarily clear the name filter, check `Process callstacks cpu-clock`, and
-then reapply the worker filter. The toolbar should now say `2 tracks`. Open
-`Current Selection`, choose `Perf sample flamegraph`, and keep `Top Down`
-selected. The semantic tracks show exact wall-clock intervals; the flame graph
-shows statistical on-CPU native samples from the same selected interval.
+Drag across an output owner or worker track to select the time range you want
+to investigate. Temporarily clear the name filter, check
+`Process callstacks cpu-clock`, and then reapply the exact operation or worker
+filter. Open `Current Selection`, choose `Perf sample flamegraph`, and keep
+`Top Down` selected. The semantic tracks show exact wall-clock intervals; the
+flame graph shows statistical on-CPU native samples from the same selected
+interval.
 
 [![Perfetto Top Down native flame graph](../assets/perfetto-native-flamegraph.png)](../assets/perfetto-native-flamegraph.png)
 
