@@ -318,7 +318,7 @@ impl OperatorActivityRecorder {
                 operation_id = self.context.operation_id(),
                 query_execution_id = self.query_execution_id,
                 query_scope = self.query_scope.as_str(),
-                query_owner = tracing::field::Empty,
+                query_owner = self.query_owner.as_deref(),
                 execution_activity_name = DELTA_SCAN_OUTPUT_WAIT_NAME,
                 node_id,
                 operator_partition = usize_to_u64_saturating(partition),
@@ -327,9 +327,6 @@ impl OperatorActivityRecorder {
                 result = tracing::field::Empty,
                 time_semantics = "wall_clock",
             );
-            if let Some(query_owner) = &self.query_owner {
-                span.record("query_owner", query_owner.as_ref());
-            }
             (span, parent.clone())
         });
         let stage = OperationStageTrace::from_parts(timeline_span, process_span)?;
@@ -364,7 +361,7 @@ impl OperatorActivityRecorder {
             operation_id = self.context.operation_id(),
             query_execution_id = self.query_execution_id,
             query_scope = self.query_scope.as_str(),
-            query_owner = tracing::field::Empty,
+            query_owner = self.query_owner.as_deref(),
             operator_name,
             worker_lane_id = context.worker_lane.id,
             worker_kind = context.worker_lane.kind.as_str(),
@@ -376,9 +373,6 @@ impl OperatorActivityRecorder {
             result = tracing::field::Empty,
             time_semantics = "active",
         );
-        if let Some(query_owner) = &self.query_owner {
-            span.record("query_owner", query_owner.as_ref());
-        }
         if let Some(parent_node_id) = parent_node_id {
             span.record("parent_node_id", parent_node_id);
         }

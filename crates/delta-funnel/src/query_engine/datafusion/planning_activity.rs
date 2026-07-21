@@ -83,13 +83,10 @@ fn process_query_planning_span(identity: &QueryTraceIdentity) -> Option<ProcessP
         operation_id = identity.operation_id(),
         query_execution_id = identity.query_execution_id(),
         query_scope = identity.query_scope().as_str(),
-        query_owner = tracing::field::Empty,
+        query_owner = identity.query_owner(),
         result = tracing::field::Empty,
         time_semantics = "wall_clock",
     );
-    if let Some(owner) = identity.query_owner() {
-        span.record("query_owner", owner);
-    }
     Some(ProcessPlanningSpan {
         span,
         result_recorded: false,
@@ -732,6 +729,7 @@ mod tests {
         assert_eq!(planning.fields["query_execution_id"], "1");
         assert_eq!(planning.fields["query_scope"], "mssql_output");
         assert_eq!(planning.fields["query_owner"], "orders");
+        assert_eq!(planning.initial_fields["query_owner"], "orders");
         assert_eq!(planning.fields["result"], "error");
         assert_eq!(planning.fields["time_semantics"], "wall_clock");
         assert_eq!(planning.enter_count, 0);
