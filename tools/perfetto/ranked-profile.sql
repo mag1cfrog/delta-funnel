@@ -760,27 +760,29 @@ WHERE self.function_id = -1;
 
 CREATE PERFETTO TABLE delta_funnel_ranked_function_cycles AS
 WITH RECURSIVE ancestry(
-  semantic_id,
   start_function_id,
   function_id
 ) AS (
-  SELECT semantic_id, function_id, parent_function_id
-  FROM delta_funnel_ranked_function_aggregates
-  WHERE parent_function_id IS NOT NULL
+  SELECT id, parent_id
+  FROM (
+    SELECT DISTINCT id, parent_id
+    FROM delta_funnel_ranked_official_function_frames
+  )
+  WHERE parent_id IS NOT NULL
 
   UNION
 
   SELECT
-    ancestry.semantic_id,
     ancestry.start_function_id,
     parent.parent_function_id
   FROM ancestry
-  JOIN delta_funnel_ranked_function_aggregates AS parent
-    ON parent.semantic_id = ancestry.semantic_id
-    AND parent.function_id = ancestry.function_id
+  JOIN (
+    SELECT DISTINCT id, parent_id AS parent_function_id
+    FROM delta_funnel_ranked_official_function_frames
+  ) AS parent ON parent.id = ancestry.function_id
   WHERE parent.parent_function_id IS NOT NULL
 )
-SELECT DISTINCT semantic_id, start_function_id AS function_id
+SELECT DISTINCT start_function_id AS function_id
 FROM ancestry
 WHERE start_function_id = function_id;
 

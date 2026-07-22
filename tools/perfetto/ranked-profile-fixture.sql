@@ -149,7 +149,27 @@ SELECT column1 AS id, column2 AS parent_id
 FROM (VALUES
   (0, NULL),
   (1, 0),
-  (2, 0));
+  (2, 0),
+  (3, 4),
+  (4, 3));
+
+CREATE PERFETTO TABLE fixture_function_cycles AS
+WITH RECURSIVE ancestry(start_function_id, function_id) AS (
+  SELECT id, parent_id
+  FROM fixture_function_frames
+  WHERE parent_id IS NOT NULL
+
+  UNION
+
+  SELECT ancestry.start_function_id, parent.parent_id
+  FROM ancestry
+  JOIN fixture_function_frames AS parent
+    ON parent.id = ancestry.function_id
+  WHERE parent.parent_id IS NOT NULL
+)
+SELECT DISTINCT start_function_id AS function_id
+FROM ancestry
+WHERE start_function_id = function_id;
 
 CREATE PERFETTO TABLE fixture_function_self_counts(
   semantic_id LONG,
@@ -297,6 +317,8 @@ WITH checks AS (
         USING (semantic_id, function_id, inclusive_sample_count)
       WHERE expected.function_id IS NULL
     ) AS function_rollup_error,
+    (SELECT count(*) FROM fixture_function_cycles) != 2
+      AS function_cycle_error,
     (
       SELECT sum(self_sample_count) FROM fixture_function_self_counts
     ) != 7 AS function_self_conservation_error,
@@ -323,6 +345,7 @@ SELECT
     + attribution_conservation_error
     + operation_resolution_error
     + function_rollup_error
+    + function_cycle_error
     + function_self_conservation_error
     + unresolved_bucket_error
     + empty_profile_audit_error AS fixture_error_count
