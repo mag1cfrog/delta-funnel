@@ -31,7 +31,10 @@ SELECT
   extract_arg(slice.arg_set_id, 'debug.time_semantics') AS time_semantics,
   extract_arg(slice.arg_set_id, 'debug.result') AS result,
   extract_arg(slice.arg_set_id, 'debug.query_execution_id') AS query_execution_id,
+  extract_arg(slice.arg_set_id, 'debug.query_scope') AS query_scope,
+  extract_arg(slice.arg_set_id, 'debug.query_owner') AS query_owner,
   extract_arg(slice.arg_set_id, 'debug.worker_lane_id') AS worker_lane_id,
+  extract_arg(slice.arg_set_id, 'debug.worker_kind') AS worker_kind,
   extract_arg(slice.arg_set_id, 'debug.node_id') AS node_id,
   extract_arg(slice.arg_set_id, 'debug.parent_node_id') AS parent_node_id,
   extract_arg(slice.arg_set_id, 'debug.operator_partition') AS operator_partition,
@@ -352,6 +355,9 @@ SELECT
     + cross_operation_parent_count
     + invalid_parent_interval_count AS audit_error_count
 FROM metrics;
+
+-- Browser-facing exact semantic records. Internal track IDs, raw argument
+-- sets, and analysis-only completion bounds intentionally stay outside it.
 
 CREATE PERFETTO TABLE delta_funnel_ranked_sample_semantic_candidates AS
 SELECT
@@ -888,3 +894,148 @@ SELECT
     + function_sample_conservation_error_count
     + function_self_conservation_error_count AS audit_error_count
 FROM metrics;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_semantic_aggregates AS
+SELECT
+  semantic.semantic_id,
+  parent.parent_semantic_id,
+  semantic.operation_id,
+  semantic.name,
+  CASE
+    WHEN semantic.is_operation_root THEN 'operation'
+    WHEN semantic.stage_category IS NOT NULL THEN 'stage'
+    WHEN semantic.activity IS NOT NULL THEN 'activity'
+    WHEN semantic.name IN ('Planning', 'Execution', 'Finalization') THEN 'phase'
+    WHEN semantic.name = 'DataFusion query' THEN 'query'
+    WHEN semantic.name = 'DataFusion query planning' THEN 'query_planning'
+    ELSE 'semantic'
+  END AS semantic_kind,
+  semantic.operation_kind,
+  semantic.stage_category,
+  semantic.stage_name,
+  semantic.activity,
+  semantic.ts AS start_ns,
+  semantic.end_ts AS end_ns,
+  semantic.duration_ns,
+  semantic.time_semantics,
+  semantic.result,
+  semantic.is_complete,
+  semantic.query_execution_id,
+  semantic.query_scope,
+  semantic.query_owner,
+  semantic.worker_lane_id,
+  semantic.worker_kind,
+  semantic.node_id,
+  semantic.parent_node_id,
+  semantic.operator_partition,
+  semantic.execution_stream_id,
+  semantic.stage_owner_id,
+  sample_count.direct_sample_count,
+  sample_count.inclusive_sample_count
+FROM delta_funnel_ranked_semantics AS semantic
+JOIN delta_funnel_ranked_semantic_parents AS parent USING (semantic_id)
+JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count USING (semantic_id);
+
+-- Ambiguous and unattributed samples have no unique semantic owner, so their
+-- conservation totals remain profile-scoped rather than attached arbitrarily.
+CREATE PERFETTO TABLE delta_funnel_ranked_coverage_aggregate AS
+SELECT
+  'profile' AS scope,
+  count(*) AS eligible_sample_count,
+  coalesce(sum(attribution = 'direct'), 0) AS direct_sample_count,
+  coalesce(sum(attribution = 'ambiguous'), 0) AS ambiguous_sample_count,
+  coalesce(sum(attribution = 'unattributed'), 0) AS unattributed_sample_count
+FROM delta_funnel_ranked_sample_ownership;
+
+-- Measure the exact UTF-8 JSON Lines representation without emitting it or
+-- copying raw samples into the aggregate contract.
+CREATE PERFETTO TABLE delta_funnel_ranked_aggregate_size AS
+SELECT
+  (
+    SELECT coalesce(sum(length(CAST(json_object(
+      'kind', 'semantic',
+      'semantic_id', semantic_id,
+      'parent_semantic_id', parent_semantic_id,
+      'operation_id', operation_id,
+      'name', name,
+      'semantic_kind', semantic_kind,
+      'operation_kind', operation_kind,
+      'stage_category', stage_category,
+      'stage_name', stage_name,
+      'activity', activity,
+      'start_ns', start_ns,
+      'end_ns', end_ns,
+      'duration_ns', duration_ns,
+      'time_semantics', time_semantics,
+      'result', result,
+      'is_complete', is_complete,
+      'query_execution_id', query_execution_id,
+      'query_scope', query_scope,
+      'query_owner', query_owner,
+      'worker_lane_id', worker_lane_id,
+      'worker_kind', worker_kind,
+      'node_id', node_id,
+      'parent_node_id', parent_node_id,
+      'operator_partition', operator_partition,
+      'execution_stream_id', execution_stream_id,
+      'stage_owner_id', stage_owner_id,
+      'direct_sample_count', direct_sample_count,
+      'inclusive_sample_count', inclusive_sample_count
+    ) AS BLOB))) + count(*), 0)
+    FROM delta_funnel_ranked_semantic_aggregates
+  ) AS semantic_aggregate_json_bytes,
+  (
+    SELECT coalesce(sum(length(CAST(json_object(
+      'kind', 'function',
+      'semantic_id', semantic_id,
+      'function_id', function_id,
+      'parent_function_id', parent_function_id,
+      'name', name,
+      'module_name', module_name,
+      'source_file', source_file,
+      'line_number', line_number,
+      'self_sample_count', self_sample_count,
+      'inclusive_sample_count', inclusive_sample_count
+    ) AS BLOB))) + count(*), 0)
+    FROM delta_funnel_ranked_function_aggregates
+  ) AS function_aggregate_json_bytes,
+  (
+    SELECT coalesce(sum(length(CAST(json_object(
+      'kind', 'coverage',
+      'scope', scope,
+      'eligible_sample_count', eligible_sample_count,
+      'direct_sample_count', direct_sample_count,
+      'ambiguous_sample_count', ambiguous_sample_count,
+      'unattributed_sample_count', unattributed_sample_count
+    ) AS BLOB))) + count(*), 0)
+    FROM delta_funnel_ranked_coverage_aggregate
+  ) AS coverage_aggregate_json_bytes;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_aggregate_audit AS
+SELECT
+  semantic.semantic_count,
+  function.aggregate_function_node_count,
+  function.unresolved_function_node_count,
+  attribution.eligible_sample_count,
+  attribution.direct_sample_count,
+  attribution.ambiguous_sample_count,
+  attribution.unattributed_sample_count,
+  size.semantic_aggregate_json_bytes,
+  size.function_aggregate_json_bytes,
+  size.coverage_aggregate_json_bytes,
+  size.semantic_aggregate_json_bytes
+    + size.function_aggregate_json_bytes
+    + size.coverage_aggregate_json_bytes AS aggregate_json_bytes,
+  function.audit_error_count
+    + (
+      SELECT count(*) != semantic.semantic_count
+      FROM delta_funnel_ranked_semantic_aggregates
+    )
+    + (
+      SELECT count(*) != 1
+      FROM delta_funnel_ranked_coverage_aggregate
+    ) AS audit_error_count
+FROM delta_funnel_ranked_semantic_audit AS semantic
+CROSS JOIN delta_funnel_ranked_attribution_audit AS attribution
+CROSS JOIN delta_funnel_ranked_function_audit AS function
+CROSS JOIN delta_funnel_ranked_aggregate_size AS size;
