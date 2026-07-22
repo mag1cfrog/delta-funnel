@@ -203,6 +203,7 @@ LEFT JOIN delta_funnel_sample_context_leaves AS leaf
 CREATE PERFETTO TABLE delta_funnel_sample_correlation_audit AS
 WITH audit AS (
 SELECT
+  (SELECT count(*) FROM delta_funnel_profile_operations) AS operation_count,
   (SELECT count(*) FROM delta_funnel_profile_process_samples)
     AS profile_process_sample_count,
   count(*) AS eligible_sample_count,
@@ -230,12 +231,17 @@ SELECT
     FROM delta_funnel_profile_contexts
     WHERE profile_context_id IS NOT NULL
       AND operation_id IS NULL
-  ) AS unresolved_context_identity_count
+  ) AS unresolved_context_identity_count,
+  (
+    SELECT count(*) = 0
+    FROM delta_funnel_profile_operations
+  ) AS missing_operation_error_count
 FROM delta_funnel_sample_correlation
 )
 SELECT
   *,
   attribution_conservation_error_count
     + duplicate_context_identity_count
+    + missing_operation_error_count
     + unresolved_context_identity_count AS audit_error_count
 FROM audit;
