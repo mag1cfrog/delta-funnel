@@ -1042,10 +1042,21 @@ SELECT
   semantic.semantic_count,
   function.aggregate_function_node_count,
   function.unresolved_function_node_count,
+  (
+    SELECT profile_process_sample_count
+    FROM delta_funnel_sample_correlation_audit
+  ) AS profile_process_sample_count,
   attribution.eligible_sample_count,
   attribution.direct_sample_count,
+  (
+    SELECT coalesce(sum(inclusive_sample_count), 0)
+    FROM delta_funnel_ranked_semantic_sample_counts
+  ) AS inclusive_semantic_sample_count,
   attribution.ambiguous_sample_count,
   attribution.unattributed_sample_count,
+  function.resolved_function_sample_count,
+  function.unresolved_function_sample_count,
+  function.official_summary_mismatch_count,
   size.semantic_aggregate_json_bytes,
   size.function_aggregate_json_bytes,
   size.coverage_aggregate_json_bytes,
