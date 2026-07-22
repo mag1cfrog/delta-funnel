@@ -29,7 +29,10 @@ pub use ranked_report::{
     RankedSemantic,
 };
 #[doc(hidden)]
-pub use report_cli::{RankedReportArgumentError, RankedReportCliAction, parse_ranked_report_args};
+pub use report_cli::{
+    RankedReportArgumentError, RankedReportCliAction, RankedReportPathError, RankedReportPaths,
+    parse_ranked_report_args, preflight_ranked_report_paths,
+};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);

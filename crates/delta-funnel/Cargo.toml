@@ -15,7 +15,12 @@ categories = ["database"]
 workspace = true
 
 [features]
-perfetto-profile = ["dep:hyper-util", "dep:perfetto-sdk"]
+perfetto-profile = [
+    "dep:hyper-util",
+    "dep:perfetto-sdk",
+    "dep:same-file",
+    "dep:tempfile",
+]
 
 [dependencies]
 async-trait = "0.1"
@@ -36,8 +41,10 @@ libc = "0.2"
 object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
 perfetto-sdk = { version = "1.0.3", optional = true }
+same-file = { version = "1", optional = true }
 snafu = "0.9"
 serde_json = "1"
+tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
