@@ -34,6 +34,7 @@ data_sources {
     target_buffer: 0
     track_event_config {
       enabled_categories: "delta_funnel.profile"
+      enabled_categories: "delta_funnel.profile.context"
     }
   }
 }
@@ -54,6 +55,8 @@ data_sources {
         }
         kernel_frames: true
       }
+      # capture-workload doubles this per-CPU kernel buffer at 1000 Hz.
+      ring_buffer_pages: 256
       ring_buffer_read_period_ms: 100
     }
   }

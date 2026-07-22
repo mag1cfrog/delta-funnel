@@ -192,7 +192,10 @@ trap 'exit 129' HUP
 
 capture_config=$runtime_dir/capture.pbtx
 if ! awk -v sample_hz="$sample_hz" '
-  BEGIN { read_period_ms = sample_hz == 1000 ? 10 : 100 }
+  BEGIN {
+    read_period_ms = sample_hz == 1000 ? 10 : 100
+    ring_buffer_pages = sample_hz == 1000 ? 512 : 256
+  }
   /^[[:space:]]*frequency:[[:space:]]*[0-9]+[[:space:]]*$/ {
     frequency_count++
     if (frequency_count == 1) {
@@ -205,8 +208,16 @@ if ! awk -v sample_hz="$sample_hz" '
       sub(/[0-9]+/, read_period_ms)
     }
   }
+  /^[[:space:]]*ring_buffer_pages:[[:space:]]*[0-9]+[[:space:]]*$/ {
+    ring_buffer_pages_count++
+    if (ring_buffer_pages_count == 1) {
+      sub(/[0-9]+/, ring_buffer_pages)
+    }
+  }
   { print }
-  END { if (frequency_count != 1 || read_period_count != 1) exit 1 }
+  END {
+    if (frequency_count != 1 || read_period_count != 1 || ring_buffer_pages_count != 1) exit 1
+  }
 ' "$packaged_capture_config" >"$capture_config"; then
   printf 'capture-workload: failed to prepare Perfetto sampling config: %s\n' \
     "$packaged_capture_config" >&2

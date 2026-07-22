@@ -324,9 +324,12 @@ one level below the lifecycle: it measures `execute` and `poll_next`, but does
 not invent positions for aggregate custom timers or collect function-level CPU
 stacks inside those calls. An `execute` or `poll_next` error has failed status
 and `result="error"`. Successful stream creation uses `result="stream"`; poll
-events use `pending`, `batch`, or `eof`. Execution activity recording has a cap
-of 100,000 spans. If execution exceeds that bound, the trace contains one
-`Operator activity trace truncated` marker and continues the query normally.
+events use `pending`, `batch`, or `eof`. Detailed execution activity recording
+has a cap of 100,000 spans. If execution exceeds that bound, the trace contains
+one `Operator activity trace truncated` marker and continues the query
+normally. During a Perfetto capture, the outermost poll on each executor task
+continues to carry query and worker identity so later native samples remain
+attributed without restoring every high-cardinality child span.
 
 Omitting `profile`, or passing `None` or `False`, still returns all phase
 timings but leaves `execution_profile` as `None`. `Table.show()` always uses

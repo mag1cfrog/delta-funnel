@@ -16,6 +16,8 @@ use perfetto_sdk::track_event::{
 };
 use perfetto_sdk::{track_event_categories, track_event_category_enabled};
 
+use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
+
 mod profile_layer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
@@ -34,6 +36,11 @@ track_event_categories! {
         (
             "delta_funnel.profile",
             "Delta Funnel semantic profiling",
+            []
+        ),
+        (
+            "delta_funnel.profile.context",
+            "Delta Funnel semantic execution context",
             []
         ),
     }
@@ -228,7 +235,8 @@ pub(crate) fn owner_token(id: u64) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error when the process-wide category cannot be registered.
+/// Returns an error when the process-wide category or DataFusion task tracer
+/// cannot be registered.
 pub fn initialize_perfetto() -> io::Result<()> {
     match PERFETTO_INITIALIZATION.get_or_init(|| {
         let producer_args = ProducerInitArgsBuilder::new()
@@ -237,7 +245,9 @@ pub fn initialize_perfetto() -> io::Result<()> {
         Producer::init(producer_args.build());
         TrackEvent::init();
         perfetto_te_ns::register()
-            .map_err(|error| format!("failed to register Perfetto category: {error}"))
+            .map_err(|error| format!("failed to register Perfetto category: {error}"))?;
+        initialize_datafusion_task_tracing()
+            .map_err(|error| format!("failed to register DataFusion task tracer: {error}"))
     }) {
         Ok(()) => Ok(()),
         Err(message) => Err(io::Error::other(message.clone())),

@@ -18,6 +18,13 @@ use crate::{
 };
 
 pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
+#[cfg(feature = "perfetto-profile")]
+pub(crate) const OBJECT_STORE_TRANSPORT_ACTIVITY: &str = "object_store_transport";
+#[cfg(feature = "perfetto-profile")]
+pub(crate) const OBJECT_STORE_TRANSPORT_CONTEXT_NAME: &str =
+    "DataFusion object store transport context";
+#[cfg(feature = "perfetto-profile")]
+pub(crate) const OBJECT_STORE_TRANSPORT_DISPLAY_NAME: &str = "Object store transport";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -403,6 +410,13 @@ impl OperationStageTrace {
         }
     }
 
+    pub(crate) fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        match &self.process_span {
+            Some(process_span) => process_span.span.in_scope(operation),
+            None => operation(),
+        }
+    }
+
     pub(crate) fn completed(self) {
         let _ = self.finish_with_duration(TimelineSpanStatus::Completed);
     }
@@ -522,7 +536,7 @@ impl Drop for ProcessOperationTrace {
     }
 }
 
-fn allocate_id(counter: &AtomicU64) -> Option<u64> {
+pub(crate) fn allocate_id(counter: &AtomicU64) -> Option<u64> {
     loop {
         let current = counter.load(Ordering::Relaxed);
         if current == 0 {
