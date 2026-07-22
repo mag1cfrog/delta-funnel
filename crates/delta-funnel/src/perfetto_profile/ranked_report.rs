@@ -72,6 +72,21 @@ pub struct RankedProfileDocument {
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RankedProfileValidationError {
+    UnsupportedSchemaVersion {
+        schema_version: u32,
+    },
+    InvalidSampleFrequency,
+    InvalidUnit {
+        field: &'static str,
+        expected: &'static str,
+    },
+    InvalidSemanticTimeSemantics {
+        semantic_id: i64,
+    },
+    InvalidSemanticInterval {
+        semantic_id: i64,
+        reason: &'static str,
+    },
     MissingSemanticNodes,
     DuplicateSemanticId {
         semantic_id: i64,
@@ -155,6 +170,32 @@ pub enum RankedProfileValidationError {
 impl fmt::Display for RankedProfileValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedSchemaVersion { schema_version } => {
+                write!(
+                    formatter,
+                    "profile schema version {schema_version} is unsupported"
+                )
+            }
+            Self::InvalidSampleFrequency => {
+                write!(
+                    formatter,
+                    "profile sample frequency must be greater than zero"
+                )
+            }
+            Self::InvalidUnit { field, expected } => {
+                write!(formatter, "profile {field} must be {expected}")
+            }
+            Self::InvalidSemanticTimeSemantics { semantic_id } => write!(
+                formatter,
+                "semantic ID {semantic_id} has invalid time semantics"
+            ),
+            Self::InvalidSemanticInterval {
+                semantic_id,
+                reason,
+            } => write!(
+                formatter,
+                "semantic ID {semantic_id} has an invalid interval: {reason}"
+            ),
             Self::MissingSemanticNodes => write!(formatter, "profile has no semantic nodes"),
             Self::DuplicateSemanticId { semantic_id } => {
                 write!(formatter, "semantic ID {semantic_id} is duplicated")
@@ -286,8 +327,65 @@ impl std::error::Error for RankedProfileValidationError {}
 
 impl RankedProfileDocument {
     pub fn validate(&self) -> Result<(), RankedProfileValidationError> {
+        self.validate_metadata_and_intervals()?;
         self.validate_structure()?;
         self.validate_sample_counts()
+    }
+
+    fn validate_metadata_and_intervals(&self) -> Result<(), RankedProfileValidationError> {
+        if self.metadata.schema_version != 1 {
+            return Err(RankedProfileValidationError::UnsupportedSchemaVersion {
+                schema_version: self.metadata.schema_version,
+            });
+        }
+        if self.metadata.sample_frequency_hz == 0 {
+            return Err(RankedProfileValidationError::InvalidSampleFrequency);
+        }
+        for (field, actual, expected) in [
+            (
+                "exact_time_unit",
+                self.metadata.exact_time_unit.as_str(),
+                "nanoseconds",
+            ),
+            ("sample_unit", self.metadata.sample_unit.as_str(), "samples"),
+        ] {
+            if actual != expected {
+                return Err(RankedProfileValidationError::InvalidUnit { field, expected });
+            }
+        }
+
+        for semantic in &self.semantics {
+            if !matches!(semantic.time_semantics.as_str(), "wall_clock" | "lifecycle") {
+                return Err(RankedProfileValidationError::InvalidSemanticTimeSemantics {
+                    semantic_id: semantic.semantic_id,
+                });
+            }
+            match (semantic.is_complete, semantic.end_ns, semantic.duration_ns) {
+                (false, None, None) => {}
+                (false, _, _) => {
+                    return Err(RankedProfileValidationError::InvalidSemanticInterval {
+                        semantic_id: semantic.semantic_id,
+                        reason: "incomplete interval has an end or duration",
+                    });
+                }
+                (true, Some(end_ns), Some(duration_ns)) => {
+                    let actual_duration = end_ns.checked_sub(semantic.start_ns);
+                    if duration_ns < 0 || actual_duration != Some(duration_ns) {
+                        return Err(RankedProfileValidationError::InvalidSemanticInterval {
+                            semantic_id: semantic.semantic_id,
+                            reason: "complete interval has inconsistent bounds",
+                        });
+                    }
+                }
+                (true, _, _) => {
+                    return Err(RankedProfileValidationError::InvalidSemanticInterval {
+                        semantic_id: semantic.semantic_id,
+                        reason: "complete interval is missing an end or duration",
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_structure(&self) -> Result<(), RankedProfileValidationError> {
@@ -945,6 +1043,67 @@ mod tests {
         assert!(matches!(
             invalid.validate(),
             Err(RankedProfileValidationError::SampleCountOverflow { scope: "coverage" })
+        ));
+    }
+
+    #[test]
+    fn validates_metadata_units_and_semantic_intervals() {
+        let mut invalid = document();
+        invalid.metadata.schema_version = 2;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::UnsupportedSchemaVersion { schema_version: 2 })
+        ));
+
+        let mut invalid = document();
+        invalid.metadata.sample_frequency_hz = 0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSampleFrequency)
+        ));
+
+        let mut invalid = document();
+        invalid.metadata.exact_time_unit = "milliseconds".to_owned();
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidUnit {
+                field: "exact_time_unit",
+                expected: "nanoseconds"
+            })
+        ));
+
+        let mut invalid = document();
+        invalid.semantics[0].time_semantics = "active".to_owned();
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSemanticTimeSemantics { semantic_id: 1 })
+        ));
+
+        let mut valid = document();
+        valid.semantics[0].is_complete = false;
+        valid.semantics[0].end_ns = None;
+        valid.semantics[0].duration_ns = None;
+        assert_eq!(valid.validate(), Ok(()));
+
+        let mut invalid = valid;
+        invalid.semantics[0].end_ns = Some(1);
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
+        ));
+
+        let mut invalid = document();
+        invalid.semantics[0].duration_ns = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
+        ));
+
+        let mut invalid = document();
+        invalid.semantics[0].duration_ns = Some(2);
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
         ));
     }
 }
