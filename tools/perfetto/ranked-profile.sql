@@ -226,6 +226,12 @@ WITH RECURSIVE lineage(descendant_semantic_id, ancestor_semantic_id) AS (
 )
 SELECT * FROM lineage;
 
+CREATE PERFETTO INDEX delta_funnel_ranked_lineage_lookup
+ON delta_funnel_ranked_semantic_lineage(
+  descendant_semantic_id,
+  ancestor_semantic_id
+);
+
 CREATE PERFETTO TABLE delta_funnel_ranked_semantic_depths AS
 SELECT
   descendant_semantic_id AS semantic_id,
@@ -400,6 +406,9 @@ JOIN delta_funnel_ranked_semantics AS semantic
 JOIN delta_funnel_ranked_semantic_depths AS depth USING (semantic_id)
 WHERE sample.attribution != 'ambiguous';
 
+CREATE PERFETTO INDEX delta_funnel_ranked_candidate_lookup
+ON delta_funnel_ranked_sample_semantic_candidates(sample_id, semantic_id);
+
 CREATE PERFETTO TABLE delta_funnel_ranked_sample_candidate_rankings AS
 SELECT
   *,
@@ -408,6 +417,9 @@ SELECT
     ORDER BY semantic_depth DESC, semantic_id
   ) AS candidate_rank
 FROM delta_funnel_ranked_sample_semantic_candidates;
+
+CREATE PERFETTO INDEX delta_funnel_ranked_candidate_rank_lookup
+ON delta_funnel_ranked_sample_candidate_rankings(sample_id, candidate_rank);
 
 -- The deepest candidate is unique only when every other compatible candidate
 -- is one of its real ancestors. Parallel branches remain ambiguous.
@@ -612,6 +624,9 @@ SELECT semantic_id, function_id, count(*) AS self_sample_count
 FROM delta_funnel_ranked_function_sample_ownership
 GROUP BY semantic_id, function_id;
 
+CREATE PERFETTO INDEX delta_funnel_ranked_function_self_lookup
+ON delta_funnel_ranked_function_self_counts(semantic_id, function_id);
+
 CREATE PERFETTO TABLE delta_funnel_ranked_function_roots AS
 SELECT
   semantic_id,
@@ -671,6 +686,9 @@ SELECT semantic_id, function_id, self_sample_count
 FROM delta_funnel_ranked_function_self_counts
 WHERE function_id = -1;
 
+CREATE PERFETTO INDEX delta_funnel_ranked_function_inclusive_lookup
+ON delta_funnel_ranked_function_inclusive_counts(semantic_id, function_id);
+
 -- Aggregate metadata never contains unrestricted source or module paths.
 CREATE PERFETTO TABLE delta_funnel_ranked_function_metadata AS
 WITH RECURSIVE
@@ -727,6 +745,9 @@ FROM delta_funnel_ranked_official_function_frames AS frame
 LEFT JOIN modules AS module ON module.function_id = frame.id
 LEFT JOIN sources AS source ON source.function_id = frame.id;
 
+CREATE PERFETTO INDEX delta_funnel_ranked_function_metadata_lookup
+ON delta_funnel_ranked_function_metadata(function_id);
+
 CREATE PERFETTO TABLE delta_funnel_ranked_function_aggregates AS
 SELECT
   inclusive.semantic_id,
@@ -757,6 +778,9 @@ SELECT
   self.self_sample_count AS inclusive_sample_count
 FROM delta_funnel_ranked_function_self_counts AS self
 WHERE self.function_id = -1;
+
+CREATE PERFETTO INDEX delta_funnel_ranked_function_aggregate_identity
+ON delta_funnel_ranked_function_aggregates(semantic_id, function_id);
 
 CREATE PERFETTO TABLE delta_funnel_ranked_function_cycles AS
 WITH RECURSIVE ancestry(

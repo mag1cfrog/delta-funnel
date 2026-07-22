@@ -116,6 +116,9 @@ JOIN delta_funnel_profile_operations AS operation
   AND sample.ts >= operation.ts
   AND sample.ts < operation.end_ts;
 
+CREATE PERFETTO INDEX delta_funnel_operation_sample_lookup
+ON delta_funnel_operation_samples(sample_id, operation_id);
+
 CREATE PERFETTO TABLE delta_funnel_sample_context_matches AS
 SELECT
   sample.sample_id,
@@ -126,6 +129,9 @@ JOIN delta_funnel_profile_contexts AS context
   AND context.utid = sample.utid
   AND sample.ts >= context.ts
   AND sample.ts < context.end_ts;
+
+CREATE PERFETTO INDEX delta_funnel_sample_context_match_lookup
+ON delta_funnel_sample_context_matches(sample_id, depth);
 
 -- Perfetto depth includes any intervening thread slices. Selecting the
 -- greatest active depth is safer than requiring profile contexts to be direct
@@ -138,6 +144,9 @@ WHERE candidate.depth = (
   FROM delta_funnel_sample_context_matches AS active
   WHERE active.sample_id = candidate.sample_id
 );
+
+CREATE PERFETTO INDEX delta_funnel_sample_context_leaf_lookup
+ON delta_funnel_sample_context_leaves(sample_id, operation_id);
 
 CREATE PERFETTO FUNCTION delta_funnel_sample_attribution(
   operation_count LONG,
