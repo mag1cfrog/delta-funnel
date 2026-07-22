@@ -536,7 +536,7 @@ impl Drop for ProcessOperationTrace {
     }
 }
 
-fn allocate_id(counter: &AtomicU64) -> Option<u64> {
+pub(crate) fn allocate_id(counter: &AtomicU64) -> Option<u64> {
     loop {
         let current = counter.load(Ordering::Relaxed);
         if current == 0 {

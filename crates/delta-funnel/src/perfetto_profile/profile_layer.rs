@@ -1,6 +1,7 @@
 //! Direct adapter from Delta Funnel profiling spans to Perfetto Track Events.
 
 use std::ffi::CString;
+use std::sync::atomic::AtomicU64;
 
 use perfetto_sdk::track_event::{
     EventContext, TrackEventDebugArg, TrackEventTrack, TrackEventType,
@@ -17,7 +18,9 @@ use super::{
     SemanticTrack, delta_scan_output_track, diagnostics_track, operation_track, owner_track,
     perfetto_te_ns, phase_track, planning_track, query_track, worker_track,
 };
-use crate::profiling::{OBJECT_STORE_TRANSPORT_CONTEXT_NAME, OBJECT_STORE_TRANSPORT_DISPLAY_NAME};
+use crate::profiling::{
+    OBJECT_STORE_TRANSPORT_CONTEXT_NAME, OBJECT_STORE_TRANSPORT_DISPLAY_NAME, allocate_id,
+};
 
 /// Exact tracing target consumed by the Perfetto profile layer.
 pub const PROFILE_TARGET: &str = "delta_funnel::profile";
@@ -27,6 +30,7 @@ const BULK_FINALIZE_PREPARE: &str = "protocol.bulk_load.finalize.prepare";
 const BULK_FINALIZE_WRITE: &str = "protocol.bulk_load.finalize.write";
 const BULK_FINALIZE_FLUSH: &str = "protocol.bulk_load.finalize.flush";
 const BULK_FINALIZE_RESULT: &str = "protocol.bulk_load.finalize.result";
+static NEXT_PROFILE_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Returns whether a tracing target contributes exact spans to a Perfetto profile.
 pub fn is_profile_target(target: &str) -> bool {
@@ -96,7 +100,7 @@ where
         let Some(span) = context.span(id) else {
             return;
         };
-        if let Some(active) = span.extensions().get::<ActiveProfileSpan>() {
+        if let Some(active) = span.extensions_mut().get_mut::<ActiveProfileSpan>() {
             active.emit_context_enter();
         }
     }
@@ -105,7 +109,11 @@ where
         let Some(span) = context.span(id) else {
             return;
         };
-        if span.extensions().get::<ActiveProfileSpan>().is_some() {
+        if span
+            .extensions()
+            .get::<ActiveProfileSpan>()
+            .is_some_and(ActiveProfileSpan::context_event_enabled)
+        {
             track_event_end!("delta_funnel.profile.context");
         }
     }
@@ -220,6 +228,8 @@ impl Visit for ProfileFields {
 struct ActiveProfileSpan {
     event: ProfileEvent,
     fields: ProfileFields,
+    profile_context_id: Option<u64>,
+    profile_context_identity_dirty: bool,
 }
 
 impl ActiveProfileSpan {
@@ -327,7 +337,13 @@ impl ActiveProfileSpan {
             }
             _ => return None,
         };
-        Some(Self { event, fields })
+        let profile_context_identity_dirty = matches!(event, ProfileEvent::TaskContext { .. });
+        Some(Self {
+            event,
+            fields,
+            profile_context_id: None,
+            profile_context_identity_dirty,
+        })
     }
 
     fn inherit(&self, name: &str) -> Option<Self> {
@@ -341,10 +357,14 @@ impl ActiveProfileSpan {
                 track,
             },
             fields: self.fields.clone(),
+            profile_context_id: None,
+            profile_context_identity_dirty: false,
         })
     }
 
     fn record(&mut self, fields: ProfileFields) {
+        let previous_worker_lane_id = self.fields.worker_lane_id;
+        let previous_parent_node_id = self.fields.parent_node_id;
         if matches!(&self.event, ProfileEvent::TaskContext { .. }) {
             if fields.worker_lane_id.is_some() {
                 self.fields.worker_lane_id = fields.worker_lane_id;
@@ -363,6 +383,12 @@ impl ActiveProfileSpan {
         }
         if fields.result.is_some() {
             self.fields.result = fields.result;
+        }
+        if matches!(&self.event, ProfileEvent::TaskContext { .. })
+            && (self.fields.worker_lane_id != previous_worker_lane_id
+                || self.fields.parent_node_id != previous_parent_node_id)
+        {
+            self.profile_context_identity_dirty = true;
         }
     }
 
@@ -564,7 +590,41 @@ impl ActiveProfileSpan {
         });
     }
 
-    fn emit_context_enter(&self) {
+    fn emit_context_enter(&mut self) {
+        if matches!(&self.event, ProfileEvent::TaskContext { .. }) {
+            let identity_changed = self.refresh_profile_context_identity();
+            if let Some(profile_context_id) = self.profile_context_id {
+                if identity_changed {
+                    track_event_begin!(
+                        "delta_funnel.profile.context",
+                        "Delta Funnel execution context",
+                        |context: &mut EventContext| {
+                            context.add_debug_arg(
+                                "profile_context_id",
+                                TrackEventDebugArg::Uint64(profile_context_id),
+                            );
+                            context.add_debug_arg(
+                                "context_name",
+                                TrackEventDebugArg::String(self.event.name()),
+                            );
+                            self.add_profile_args(context);
+                        }
+                    );
+                } else {
+                    track_event_begin!(
+                        "delta_funnel.profile.context",
+                        "Delta Funnel execution context",
+                        |context: &mut EventContext| {
+                            context.add_debug_arg(
+                                "profile_context_id",
+                                TrackEventDebugArg::Uint64(profile_context_id),
+                            );
+                        }
+                    );
+                }
+            }
+            return;
+        }
         if let Ok(name) = CString::new(self.event.name()) {
             track_event!(
                 "delta_funnel.profile.context",
@@ -578,6 +638,20 @@ impl ActiveProfileSpan {
                 |context: &mut EventContext| self.add_profile_args(context)
             );
         }
+    }
+
+    fn refresh_profile_context_identity(&mut self) -> bool {
+        if !self.profile_context_identity_dirty {
+            return false;
+        }
+        self.profile_context_id = allocate_id(&NEXT_PROFILE_CONTEXT_ID);
+        self.profile_context_identity_dirty = false;
+        true
+    }
+
+    fn context_event_enabled(&self) -> bool {
+        !matches!(&self.event, ProfileEvent::TaskContext { .. })
+            || self.profile_context_id.is_some()
     }
 
     fn task_track(&self) -> Option<SemanticTrack> {
@@ -884,17 +958,37 @@ mod tests {
             worker_kind: Some("runtime".to_owned()),
             ..ProfileFields::default()
         });
+        assert!(active.refresh_profile_context_identity());
+        let worker_4_context_id = active
+            .profile_context_id
+            .expect("the first complete task identity should allocate an id");
+
+        active.record(ProfileFields {
+            worker_lane_id: Some(4),
+            worker_kind: Some("runtime".to_owned()),
+            ..ProfileFields::default()
+        });
+        assert!(!active.refresh_profile_context_identity());
+        assert_eq!(active.profile_context_id, Some(worker_4_context_id));
+
+        active.record(ProfileFields {
+            worker_lane_id: Some(5),
+            worker_kind: Some("runtime".to_owned()),
+            ..ProfileFields::default()
+        });
+        assert!(active.refresh_profile_context_identity());
+        assert_ne!(active.profile_context_id, Some(worker_4_context_id));
         let detail = active
             .inherit("DataFusion dependency")
             .expect("an entered task context should propagate its worker assignment");
 
-        assert_eq!(active.fields.worker_lane_id, Some(4));
+        assert_eq!(active.fields.worker_lane_id, Some(5));
         assert_eq!(active.fields.worker_kind.as_deref(), Some("runtime"));
         assert!(
             detail
                 .track()
                 .name
-                .contains("worker [w-00000000000000000004]")
+                .contains("worker [w-00000000000000000005]")
         );
     }
 
