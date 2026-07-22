@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{
     QueryExecutionScope,
@@ -57,17 +58,19 @@ where
         query_planning_track_name(identity.query_scope(), identity.query_owner()).into();
     let process_span = process_query_planning_span(&identity);
     let process_parent = process_span.as_ref().map(|span| span.span.clone());
-    let result = PLANNING_ACTIVITY
-        .scope(
-            PlanningActivityContext {
-                identity,
-                track_name,
-                process_parent,
-                active_spans: Arc::new(Mutex::new(Vec::new())),
-            },
-            future,
-        )
-        .await;
+    let planning = PLANNING_ACTIVITY.scope(
+        PlanningActivityContext {
+            identity,
+            track_name,
+            process_parent,
+            active_spans: Arc::new(Mutex::new(Vec::new())),
+        },
+        future,
+    );
+    let result = match &process_span {
+        Some(span) => planning.instrument(span.span.clone()).await,
+        None => planning.await,
+    };
     if let Some(span) = process_span {
         span.finish(if result.is_ok() { "ok" } else { "error" });
     }
@@ -134,7 +137,10 @@ pub(crate) fn profile_query_planning_sync_result<T, E>(
     let span = context
         .as_ref()
         .and_then(|context| context.start_span(name, activity));
-    let result = operation();
+    let result = match &span {
+        Some(span) => span.in_process_scope(operation),
+        None => operation(),
+    };
     if let Some(span) = span {
         if result.is_err() {
             span.with_attribute("result", Value::String("error".to_owned()))
@@ -230,6 +236,13 @@ struct PlanningActivitySpanRecorder {
 }
 
 impl PlanningActivitySpanRecorder {
+    fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        match &self.stage {
+            Some(stage) => stage.in_process_scope(operation),
+            None => operation(),
+        }
+    }
+
     fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
         if let Some(span) = self.stage.take() {
             self.stage = Some(span.with_attribute(name, value));
@@ -372,8 +385,8 @@ mod tests {
             assert_eq!(span.fields["query_owner"], "orders");
             assert_eq!(span.fields["result"], "error");
             assert_eq!(span.fields["time_semantics"], "wall_clock");
-            assert_eq!(span.enter_count, 0);
-            assert_eq!(span.exit_count, 0);
+            assert_eq!(span.enter_count, 1);
+            assert_eq!(span.exit_count, 1);
             assert!(span.closed);
         }
     }
@@ -691,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_planning_span_uses_lifetime_without_crossing_an_await() {
+    async fn process_planning_span_enters_once_per_poll_without_crossing_an_await() {
         let capture = TracingCapture::start_with_profile_spans_enabled();
         let context =
             OperationTraceContext::start(crate::profiling::OperationTraceKind::Preview, None)
@@ -732,8 +745,8 @@ mod tests {
         assert_eq!(planning.initial_fields["query_owner"], "orders");
         assert_eq!(planning.fields["result"], "error");
         assert_eq!(planning.fields["time_semantics"], "wall_clock");
-        assert_eq!(planning.enter_count, 0);
-        assert_eq!(planning.exit_count, 0);
+        assert!(planning.enter_count > 0);
+        assert_eq!(planning.exit_count, planning.enter_count);
         assert!(planning.closed);
     }
 
@@ -763,6 +776,8 @@ mod tests {
             .find(|span| span.name == "DataFusion query planning")
             .expect("planning span should be captured");
         assert_eq!(planning.fields["result"], "cancelled");
+        assert!(planning.enter_count > 0);
+        assert_eq!(planning.exit_count, planning.enter_count);
         assert!(planning.closed);
     }
 }

@@ -36,6 +36,11 @@ track_event_categories! {
             "Delta Funnel semantic profiling",
             []
         ),
+        (
+            "delta_funnel.profile.context",
+            "Delta Funnel semantic execution context",
+            []
+        ),
     }
 }
 

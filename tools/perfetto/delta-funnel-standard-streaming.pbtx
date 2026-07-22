@@ -33,6 +33,7 @@ data_sources {
     target_buffer: 0
     track_event_config {
       enabled_categories: "delta_funnel.profile"
+      enabled_categories: "delta_funnel.profile.context"
     }
   }
 }

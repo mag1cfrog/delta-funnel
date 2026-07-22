@@ -403,6 +403,13 @@ impl OperationStageTrace {
         }
     }
 
+    pub(crate) fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        match &self.process_span {
+            Some(process_span) => process_span.span.in_scope(operation),
+            None => operation(),
+        }
+    }
+
     pub(crate) fn completed(self) {
         let _ = self.finish_with_duration(TimelineSpanStatus::Completed);
     }

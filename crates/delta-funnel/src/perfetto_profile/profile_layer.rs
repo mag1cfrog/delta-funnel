@@ -91,6 +91,24 @@ where
         }
     }
 
+    fn on_enter(&self, id: &Id, context: Context<'_, S>) {
+        let Some(span) = context.span(id) else {
+            return;
+        };
+        if let Some(active) = span.extensions().get::<ActiveProfileSpan>() {
+            active.emit_context_enter();
+        }
+    }
+
+    fn on_exit(&self, id: &Id, context: Context<'_, S>) {
+        let Some(span) = context.span(id) else {
+            return;
+        };
+        if span.extensions().get::<ActiveProfileSpan>().is_some() {
+            track_event_end!("delta_funnel.profile.context");
+        }
+    }
+
     fn on_close(&self, id: Id, context: Context<'_, S>) {
         let Some(span) = context.span(&id) else {
             return;
@@ -528,6 +546,22 @@ impl ActiveProfileSpan {
         });
     }
 
+    fn emit_context_enter(&self) {
+        if let Ok(name) = CString::new(self.event.name()) {
+            track_event!(
+                "delta_funnel.profile.context",
+                TrackEventType::SliceBegin(name.as_ptr()),
+                |context: &mut EventContext| self.add_profile_args(context)
+            );
+        } else {
+            track_event_begin!(
+                "delta_funnel.profile.context",
+                "Delta Funnel execution context",
+                |context: &mut EventContext| self.add_profile_args(context)
+            );
+        }
+    }
+
     fn set_operation_on(&self, context: &mut EventContext, operation: &SemanticTrack) {
         operation.set_on(context);
         self.add_profile_args(context);
@@ -661,6 +695,21 @@ enum ProfileEvent {
     },
 }
 
+impl ProfileEvent {
+    fn name(&self) -> &str {
+        match self {
+            Self::Operation { kind, .. } => kind.name(),
+            Self::Planning { .. } => "DataFusion query planning",
+            Self::PlanningActivity { name, .. }
+            | Self::ExecutionActivity { name, .. }
+            | Self::Stage { name, .. }
+            | Self::Detail { name, .. }
+            | Self::Operator { name, .. } => name,
+            Self::Phase { kind, .. } => kind.name(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum OperationKind {
     Preview,
@@ -669,6 +718,14 @@ enum OperationKind {
 }
 
 impl OperationKind {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Preview => "Delta Funnel preview",
+            Self::MssqlWrite => "Delta Funnel SQL Server write",
+            Self::WriteAll => "Delta Funnel SQL Server write_all",
+        }
+    }
+
     fn from_str(value: &str) -> Option<Self> {
         match value {
             "preview" => Some(Self::Preview),
@@ -687,6 +744,14 @@ enum OperationPhaseKind {
 }
 
 impl OperationPhaseKind {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Planning => "Planning",
+            Self::Execution => "Execution",
+            Self::Finalization => "Finalization",
+        }
+    }
+
     fn from_str(value: &str) -> Option<Self> {
         match value {
             "planning" => Some(Self::Planning),

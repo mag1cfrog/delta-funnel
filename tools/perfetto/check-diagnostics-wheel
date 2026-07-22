@@ -119,6 +119,14 @@ for name in config_names:
         raise SystemExit(
             f"installed diagnostics config has an invalid read period: {name}"
         )
+    for category in [
+        'enabled_categories: "delta_funnel.profile"',
+        'enabled_categories: "delta_funnel.profile.context"',
+    ]:
+        if fields.count(category) != 1:
+            raise SystemExit(
+                f"installed diagnostics config is missing {category}: {name}"
+            )
 
 health = assets.joinpath("capture-health")
 if not os.access(health, os.X_OK):
