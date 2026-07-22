@@ -19,8 +19,14 @@ use perfetto_sdk::{track_event_categories, track_event_category_enabled};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
+mod ranked_report;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
+#[doc(hidden)]
+pub use ranked_report::{
+    RankedFunction, RankedProfileDocument, RankedProfileMetadata, RankedProfileValidationError,
+    RankedSemantic,
+};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
