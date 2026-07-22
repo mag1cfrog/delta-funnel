@@ -89,6 +89,11 @@ pub enum RankedProfileValidationError {
         char_count: usize,
         limit: usize,
     },
+    UnsafeFunctionMetadata {
+        semantic_id: i64,
+        function_id: i64,
+        field: &'static str,
+    },
     UnsupportedSchemaVersion {
         schema_version: u32,
     },
@@ -204,6 +209,14 @@ impl fmt::Display for RankedProfileValidationError {
             } => write!(
                 formatter,
                 "{record_kind} ID {record_id} {field} has {char_count} characters, exceeding the {limit} character limit"
+            ),
+            Self::UnsafeFunctionMetadata {
+                semantic_id,
+                function_id,
+                field,
+            } => write!(
+                formatter,
+                "function ID {function_id} under semantic ID {semantic_id} has unsafe {field}"
             ),
             Self::UnsupportedSchemaVersion { schema_version } => {
                 write!(
@@ -361,6 +374,19 @@ impl fmt::Display for RankedProfileValidationError {
 impl std::error::Error for RankedProfileValidationError {}
 
 impl RankedProfileDocument {
+    pub fn normalize_source_metadata(&mut self) {
+        for function in &mut self.functions {
+            function.module_name = function
+                .module_name
+                .as_deref()
+                .and_then(normalize_module_name);
+            function.source_file = function
+                .source_file
+                .as_deref()
+                .and_then(normalize_source_file);
+        }
+    }
+
     pub fn validate(&self) -> Result<(), RankedProfileValidationError> {
         self.validate_bounds()?;
         self.validate_metadata_and_intervals()?;
@@ -399,6 +425,32 @@ impl RankedProfileDocument {
             ] {
                 if let Some(value) = value {
                     require_display_string("function", function.function_id, field, value)?;
+                }
+            }
+            for (field, value, normalized) in [
+                (
+                    "module_name",
+                    function.module_name.as_deref(),
+                    function
+                        .module_name
+                        .as_deref()
+                        .and_then(normalize_module_name),
+                ),
+                (
+                    "source_file",
+                    function.source_file.as_deref(),
+                    function
+                        .source_file
+                        .as_deref()
+                        .and_then(normalize_source_file),
+                ),
+            ] {
+                if value.is_some() && normalized.as_deref() != value {
+                    return Err(RankedProfileValidationError::UnsafeFunctionMetadata {
+                        semantic_id: function.semantic_id,
+                        function_id: function.function_id,
+                        field,
+                    });
                 }
             }
         }
@@ -767,6 +819,74 @@ impl RankedProfileDocument {
         }
         Ok(())
     }
+}
+
+fn normalize_module_name(value: &str) -> Option<String> {
+    safe_basename(value).map(str::to_owned)
+}
+
+fn normalize_source_file(value: &str) -> Option<String> {
+    let segments = value
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>();
+    let basename = segments
+        .last()
+        .copied()
+        .filter(|segment| is_safe_path_segment(segment))?;
+    if segments.contains(&"..") {
+        return Some(basename.to_owned());
+    }
+
+    const SOURCE_ROOTS: [&str; 6] = ["benches", "crates", "examples", "src", "tests", "xtask"];
+    let start = if is_absolute_path(value) {
+        segments
+            .iter()
+            .rposition(|segment| SOURCE_ROOTS.contains(segment))
+    } else if segments
+        .first()
+        .is_some_and(|segment| SOURCE_ROOTS.contains(segment))
+    {
+        Some(0)
+    } else {
+        segments.iter().rposition(|segment| *segment == "src")
+    };
+    let Some(start) = start else {
+        return Some(basename.to_owned());
+    };
+    let safe_segments = &segments[start..];
+    if safe_segments
+        .iter()
+        .any(|segment| !is_safe_path_segment(segment))
+    {
+        return Some(basename.to_owned());
+    }
+    Some(safe_segments.join("/"))
+}
+
+fn safe_basename(value: &str) -> Option<&str> {
+    value
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty() && *segment != ".")
+        .filter(|segment| is_safe_path_segment(segment))
+}
+
+fn is_safe_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !matches!(segment, "." | ".." | "~")
+        && !segment.starts_with('~')
+        && !(segment.len() >= 2
+            && segment.as_bytes()[0].is_ascii_alphabetic()
+            && segment.as_bytes()[1] == b':')
+}
+
+fn is_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with(['/', '\\'])
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 fn require_collection_bound(
@@ -1240,5 +1360,67 @@ mod tests {
         let mut valid = document();
         valid.functions[0].name = "\u{754c}".repeat(MAX_DISPLAY_STRING_CHARS);
         assert_eq!(valid.validate(), Ok(()));
+    }
+
+    #[test]
+    fn normalizes_posix_windows_unc_relative_and_missing_source_metadata() {
+        for (input, expected) in [
+            ("/usr/lib/libdelta.so", Some("libdelta.so")),
+            (r"C:\build\delta.dll", Some("delta.dll")),
+            (r"\\server\share\delta.dll", Some("delta.dll")),
+            ("delta-funnel", Some("delta-funnel")),
+            ("C:relative.dll", None),
+            ("~user", None),
+            ("", None),
+        ] {
+            assert_eq!(normalize_module_name(input).as_deref(), expected);
+        }
+        for (input, expected) in [
+            (
+                "/home/user/repo/crates/delta-funnel/src/query.rs",
+                Some("src/query.rs"),
+            ),
+            (
+                r"C:\work\repo\crates\delta-funnel\src\query.rs",
+                Some("src/query.rs"),
+            ),
+            (r"\\server\share\repo\src\query.rs", Some("src/query.rs")),
+            (
+                "crates/delta-funnel/src/query.rs",
+                Some("crates/delta-funnel/src/query.rs"),
+            ),
+            ("private/build/query.rs", Some("query.rs")),
+            ("../private/query.rs", Some("query.rs")),
+            ("C:relative.rs", None),
+            ("", None),
+        ] {
+            assert_eq!(normalize_source_file(input).as_deref(), expected);
+        }
+
+        let mut document = document();
+        document.functions[0].module_name = Some("/usr/lib/libdelta.so".to_owned());
+        document.functions[0].source_file =
+            Some(r"C:\work\repo\crates\delta-funnel\src\query.rs".to_owned());
+        assert!(matches!(
+            document.validate(),
+            Err(RankedProfileValidationError::UnsafeFunctionMetadata {
+                semantic_id: 1,
+                function_id: 90,
+                field: "module_name"
+            })
+        ));
+
+        document.normalize_source_metadata();
+        assert_eq!(
+            document.functions[0].module_name.as_deref(),
+            Some("libdelta.so")
+        );
+        assert_eq!(
+            document.functions[0].source_file.as_deref(),
+            Some("src/query.rs")
+        );
+        assert_eq!(document.functions[1].module_name, None);
+        assert_eq!(document.functions[1].source_file, None);
+        assert_eq!(document.validate(), Ok(()));
     }
 }
