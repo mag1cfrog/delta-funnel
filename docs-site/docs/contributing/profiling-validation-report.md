@@ -164,6 +164,73 @@ overwrote unread data, and no sequence packet loss, writer packet loss,
 data-source loss, or flush failure was reported. The saved file used 9.3
 percent of its configured 512 MiB cap.
 
+## Ranked aggregate feasibility
+
+Issue #546 analyzed unmodified raw captures with repository-owned PerfettoSQL.
+The 2026-07-22 matrix covered a deterministic preview, the 13,394,789-row Delta
+fixture through a real local MinIO S3 API at both supported sample rates, two
+overlapping previews, and the longer canonical delayed-HTTP storage model. The
+MinIO query forced a scan with aggregate reads from two data columns. The
+delayed-HTTP rows are retained as sustained-load evidence and are not described
+as MinIO or an external S3 service.
+
+| Capture | Sample rate | Process samples | Eligible samples | Semantic nodes | Function nodes | Direct | Inclusive semantic | Ambiguous | Unattributed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Deterministic preview | 1000 Hz | 85 | 10 | 22 | 7 | 10 | 39 | 0 | 0 |
+| MinIO 13.4M rows | 100 Hz | 2,021 | 1,977 | 1,927 | 44,093 | 1,977 | 6,437 | 0 | 0 |
+| MinIO 13.4M rows | 1000 Hz | 19,565 | 19,161 | 1,918 | 246,095 | 19,161 | 62,969 | 0 | 0 |
+| Two concurrent previews | 100 Hz | 25,777 | 25,774 | 24 | 17,724 | 25,746 | 77,238 | 28 | 0 |
+| Delayed HTTP 13.4M rows | 100 Hz | 12,349 | 10,203 | 2,414 | 39,481 | 10,203 | 31,504 | 0 | 0 |
+| Delayed HTTP 13.4M rows | 1000 Hz | 121,029 | 99,302 | 2,409 | 171,564 | 99,302 | 306,529 | 0 | 0 |
+
+Process samples include samples outside operation roots. Eligible samples are
+inside at least one operation root. The direct, ambiguous, and unattributed
+columns conserve eligible samples exactly. Inclusive semantic counts
+intentionally repeat direct samples through true ancestors and therefore do
+not participate in that equation.
+
+| Capture | Unresolved samples | Unresolved nodes | Official mismatches | Aggregate estimate | TP query | Command wall | Peak TP RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Deterministic preview | 10 | 7 | 0 | 15.3 KiB | 0.008 s | 0.05 s | 31.9 MiB |
+| MinIO 13.4M rows, 100 Hz | 547 | 81 | 0 | 17.8 MiB | 2.122 s | 2.31 s | 75.6 MiB |
+| MinIO 13.4M rows, 1000 Hz | 8,535 | 660 | 0 | 95.3 MiB | 15.506 s | 15.82 s | 171.3 MiB |
+| Two concurrent previews | 56 | 393 | 0 | 5.5 MiB | 5.917 s | 6.20 s | 190.8 MiB |
+| Delayed HTTP 13.4M rows, 100 Hz | 47 | 16 | 0 | 13.6 MiB | 19.594 s | 22.11 s | 308.8 MiB |
+| Delayed HTTP 13.4M rows, 1000 Hz | 459 | 185 | 0 | 56.5 MiB | 50.672 s | 53.91 s | 576.0 MiB |
+
+The aggregate estimate is the exact byte count of the proposed UTF-8 JSON
+Lines records without writing a report artifact. Peak RSS and command wall are
+GNU `time` measurements for Trace Processor. TP query is Trace Processor's own
+reported SQL execution duration. Every row had zero hierarchy, attribution,
+sample-conservation, unsafe-path, cycle, and official CPU-summary audit errors.
+
+The 1000 Hz MinIO capture recorded 4,746 load-shed samples and nine additional
+skipped samples while its semantic capture remained complete. The aggregate
+audit covers the 19,565 recorded process samples and does not claim that the
+missing statistical samples were recovered. The 100 Hz MinIO capture had no
+sample or buffer loss and is the representative correctness row.
+
+The concurrent capture contained two overlapping operation roots. Stable
+context identity assigned 12,930 samples directly to the first operation and
+12,816 directly to the second. The remaining 28 samples had no active context
+while both roots overlapped, so they remained explicitly ambiguous instead of
+receiving an arbitrary owner.
+
+The first production-scale query exposed a function-cycle audit that repeated
+the same native graph per semantic owner and did not finish within six minutes.
+Checking the immutable Perfetto callsite graph once reduced the 1000 Hz query
+to 80.7 s. Focused Perfetto indexes then reduced it to the final 53.9 s row;
+the retained indexes took about 12 ms to build. The remaining dominant SQL
+cost is the per-semantic native inclusive rollup. The following report slice
+can consume compact function self counts and callsite edges and perform one
+linear tree fold in Rust without loading raw samples or changing this aggregate
+contract.
+
+All required invariants passed, so the existing collector supplies sufficient
+raw identity and boundary data. No additional collector or instrumentation
+change is required. Generated traces, query output, symbol data, and local
+MinIO credentials remain under ignored `target/` paths.
+
 ## Buffer and lifecycle comparison
 
 The table below describes the current checked-in Perfetto configs. The #522
