@@ -20,6 +20,7 @@ use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
 mod ranked_report;
+mod report_aggregate;
 mod report_cli;
 mod report_health;
 mod report_trace_processor;
@@ -30,6 +31,8 @@ pub use ranked_report::{
     RankedFunction, RankedProfileDocument, RankedProfileMetadata, RankedProfileValidationError,
     RankedSemantic,
 };
+#[doc(hidden)]
+pub use report_aggregate::load_ranked_profile;
 #[doc(hidden)]
 pub use report_cli::{
     RankedReportArgumentError, RankedReportCliAction, RankedReportFailure,

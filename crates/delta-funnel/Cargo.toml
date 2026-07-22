@@ -20,6 +20,7 @@ perfetto-profile = [
     "dep:hyper-util",
     "dep:perfetto-sdk",
     "dep:same-file",
+    "dep:serde",
     "dep:tempfile",
 ]
 
@@ -44,6 +45,7 @@ object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
 perfetto-sdk = { version = "1.0.3", optional = true }
 same-file = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 snafu = "0.9"
 serde_json = "1"
 tempfile = { version = "3", optional = true }

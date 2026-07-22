@@ -2,13 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 
+use serde::Deserialize;
+
 // ponytail: This covers the 246,095-node production fixture while bounding
 // report memory. Raise it only with production and browser evidence.
-const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
+pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RankedProfileMetadata {
     pub schema_version: u32,
     pub sample_frequency_hz: u32,
@@ -21,7 +24,8 @@ pub struct RankedProfileMetadata {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RankedSemantic {
     pub semantic_id: i64,
     pub parent_semantic_id: Option<i64>,
@@ -939,7 +943,7 @@ fn require_nonnegative(
     Ok(())
 }
 
-fn fold_inclusive_counts<Id>(
+pub(super) fn fold_inclusive_counts<Id>(
     parents: &HashMap<Id, Option<Id>>,
     self_counts: &HashMap<Id, i64>,
 ) -> Option<HashMap<Id, i64>>

@@ -21,6 +21,7 @@ WITH
       0,
       hex(json_object(
         'record_kind', 'metadata',
+        'record', json_object(
         'schema_version', 1,
         'sample_frequency_hz', sample_config.sample_frequency_hz,
         'exact_time_unit', 'nanoseconds',
@@ -30,7 +31,7 @@ WITH
         'ambiguous_sample_count', coverage.ambiguous_sample_count,
         'unattributed_sample_count', coverage.unattributed_sample_count,
         'audit_error_count', audit.audit_error_count
-      ))
+      )))
     FROM sample_config
     CROSS JOIN (
       SELECT
@@ -51,6 +52,7 @@ WITH
       semantic.semantic_id,
       hex(json_object(
         'record_kind', 'semantic',
+        'record', json_object(
         'semantic_id', semantic.semantic_id,
         'parent_semantic_id', parent.parent_semantic_id,
         'operation_id', semantic.operation_id,
@@ -73,7 +75,10 @@ WITH
         'duration_ns', semantic.duration_ns,
         'time_semantics', semantic.time_semantics,
         'result', semantic.result,
-        'is_complete', semantic.is_complete,
+        'is_complete', json(CASE
+          WHEN semantic.is_complete THEN 'true'
+          ELSE 'false'
+        END),
         'query_execution_id', semantic.query_execution_id,
         'query_scope', semantic.query_scope,
         'query_owner', semantic.query_owner,
@@ -84,8 +89,9 @@ WITH
         'operator_partition', semantic.operator_partition,
         'execution_stream_id', semantic.execution_stream_id,
         'stage_owner_id', semantic.stage_owner_id,
-        'direct_sample_count', sample_count.direct_sample_count
-      ))
+        'direct_sample_count', sample_count.direct_sample_count,
+        'inclusive_sample_count', 0
+      )))
     FROM delta_funnel_ranked_semantics AS semantic
     JOIN delta_funnel_ranked_semantic_parents AS parent USING (semantic_id)
     JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count USING (semantic_id)
@@ -98,6 +104,7 @@ WITH
       0,
       hex(json_object(
         'record_kind', 'frame',
+        'record', json_object(
         'function_id', metadata.function_id,
         'parent_function_id', metadata.parent_function_id,
         'name', metadata.name,
@@ -106,7 +113,7 @@ WITH
         'line_number', metadata.line_number,
         'official_self_sample_count', frame.self_count,
         'official_inclusive_sample_count', summary.cumulative_count
-      ))
+      )))
     FROM delta_funnel_ranked_function_metadata AS metadata
     JOIN delta_funnel_ranked_official_function_frames AS frame
       ON frame.id = metadata.function_id
@@ -121,10 +128,11 @@ WITH
       self.function_id,
       hex(json_object(
         'record_kind', 'function_self',
+        'record', json_object(
         'semantic_id', self.semantic_id,
         'function_id', self.function_id,
         'self_sample_count', self.self_sample_count
-      ))
+      )))
     FROM delta_funnel_ranked_function_self_counts AS self
   )
 SELECT record_hex
