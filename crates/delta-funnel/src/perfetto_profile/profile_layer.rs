@@ -17,6 +17,7 @@ use super::{
     SemanticTrack, delta_scan_output_track, diagnostics_track, operation_track, owner_track,
     perfetto_te_ns, phase_track, planning_track, query_track, worker_track,
 };
+use crate::profiling::{OBJECT_STORE_TRANSPORT_CONTEXT_NAME, OBJECT_STORE_TRANSPORT_DISPLAY_NAME};
 
 /// Exact tracing target consumed by the Perfetto profile layer.
 pub const PROFILE_TARGET: &str = "delta_funnel::profile";
@@ -317,6 +318,13 @@ impl ActiveProfileSpan {
             "DataFusion task context" => ProfileEvent::TaskContext {
                 name: fields.operator_name.clone()?,
             },
+            name if name == OBJECT_STORE_TRANSPORT_CONTEXT_NAME => {
+                fields.query_execution_id?;
+                fields.execution_stream_id?;
+                ProfileEvent::TaskContext {
+                    name: OBJECT_STORE_TRANSPORT_DISPLAY_NAME.to_owned(),
+                }
+            }
             _ => return None,
         };
         Some(Self { event, fields })
@@ -887,6 +895,30 @@ mod tests {
                 .track()
                 .name
                 .contains("worker [w-00000000000000000004]")
+        );
+    }
+
+    #[test]
+    fn object_store_transport_context_uses_stream_identity_without_a_worker() {
+        let mut transport = fields(1, 2, 3);
+        transport.worker_lane_id = None;
+        transport.worker_kind = None;
+        let active = ActiveProfileSpan::from_fields(OBJECT_STORE_TRANSPORT_CONTEXT_NAME, transport)
+            .expect("complete transport identity should map");
+
+        assert!(matches!(
+            active.event,
+            ProfileEvent::TaskContext { ref name } if name == OBJECT_STORE_TRANSPORT_DISPLAY_NAME
+        ));
+        assert_eq!(active.fields.query_execution_id, Some(2));
+        assert_eq!(active.fields.execution_stream_id, Some(11));
+        assert_eq!(active.fields.worker_lane_id, None);
+
+        let mut incomplete = fields(1, 2, 3);
+        incomplete.execution_stream_id = None;
+        assert!(
+            ActiveProfileSpan::from_fields(OBJECT_STORE_TRANSPORT_CONTEXT_NAME, incomplete)
+                .is_none()
         );
     }
 

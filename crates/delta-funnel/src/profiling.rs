@@ -18,6 +18,13 @@ use crate::{
 };
 
 pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
+#[cfg(feature = "perfetto-profile")]
+pub(crate) const OBJECT_STORE_TRANSPORT_ACTIVITY: &str = "object_store_transport";
+#[cfg(feature = "perfetto-profile")]
+pub(crate) const OBJECT_STORE_TRANSPORT_CONTEXT_NAME: &str =
+    "DataFusion object store transport context";
+#[cfg(feature = "perfetto-profile")]
+pub(crate) const OBJECT_STORE_TRANSPORT_DISPLAY_NAME: &str = "Object store transport";
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);

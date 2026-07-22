@@ -26,6 +26,9 @@ use futures_util::Stream;
 use futures_util::{FutureExt, future::BoxFuture, future::poll_fn};
 use serde_json::Value;
 
+#[cfg(feature = "perfetto-profile")]
+use crate::profiling::{OBJECT_STORE_TRANSPORT_ACTIVITY, OBJECT_STORE_TRANSPORT_CONTEXT_NAME};
+
 use crate::{
     QueryExecutionScope,
     profiling::{OperationStageTrace, OperationTraceContext},
@@ -713,6 +716,18 @@ impl DataFusionTaskTraceContext {
         drop(guard);
         result
     }
+
+    fn object_store_transport_span(&self) -> tracing::Span {
+        tracing::trace_span!(
+            target: crate::profiling::PROFILE_TARGET,
+            parent: None,
+            OBJECT_STORE_TRANSPORT_CONTEXT_NAME,
+            operation_id = self.activity.context.operation_id(),
+            query_execution_id = self.activity.query_execution_id,
+            execution_stream_id = self.stream_id,
+            activity = OBJECT_STORE_TRANSPORT_ACTIVITY,
+        )
+    }
 }
 
 #[cfg(feature = "perfetto-profile")]
@@ -752,6 +767,11 @@ fn current_datafusion_task_trace_context() -> Option<DataFusionTaskTraceContext>
         })
         .ok()
         .flatten()
+}
+
+#[cfg(feature = "perfetto-profile")]
+pub(crate) fn current_datafusion_object_store_transport_span() -> Option<tracing::Span> {
+    current_datafusion_task_trace_context().map(|context| context.object_store_transport_span())
 }
 
 #[cfg(feature = "perfetto-profile")]

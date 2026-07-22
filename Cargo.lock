@@ -1269,6 +1269,7 @@ dependencies = [
  "datafusion",
  "delta_kernel",
  "futures-util",
+ "hyper-util",
  "libc",
  "object_store",
  "parquet",

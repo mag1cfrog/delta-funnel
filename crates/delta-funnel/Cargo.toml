@@ -15,7 +15,7 @@ categories = ["database"]
 workspace = true
 
 [features]
-perfetto-profile = ["dep:perfetto-sdk"]
+perfetto-profile = ["dep:hyper-util", "dep:perfetto-sdk"]
 
 [dependencies]
 async-trait = "0.1"
@@ -31,6 +31,7 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
     "internal-api",
 ] }
 futures-util = "0.3"
+hyper-util = { version = "0.1.20", default-features = false, features = ["tracing"], optional = true }
 libc = "0.2"
 object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
