@@ -39,6 +39,10 @@ if ! command -v "$trace_processor" >/dev/null 2>&1; then
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+health_sql=$script_dir/capture-health.sql
+if [[ ! -f $health_sql ]]; then
+  health_sql=$script_dir/../../crates/delta-funnel/src/perfetto_profile/sql/capture_health.sql
+fi
 saved_file_bytes=$(stat --format='%s' -- "$trace_path")
 
 {
@@ -46,5 +50,5 @@ saved_file_bytes=$(stat --format='%s' -- "$trace_path")
     "CREATE PERFETTO TABLE delta_funnel_capture_health_input AS" \
     "SELECT $configured_file_cap_bytes AS configured_file_cap_bytes," \
     "       $saved_file_bytes AS saved_file_bytes;"
-  sed -n '1,$p' "$script_dir/capture-health.sql"
+  sed -n '1,$p' "$health_sql"
 } | "$trace_processor" query --query-file - "$trace_path"
