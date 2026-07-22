@@ -349,3 +349,182 @@ SELECT
     + cross_operation_parent_count
     + invalid_parent_interval_count AS audit_error_count
 FROM metrics;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_sample_semantic_candidates AS
+SELECT
+  sample.sample_id,
+  semantic.semantic_id,
+  depth.semantic_depth
+FROM delta_funnel_sample_correlation AS sample
+JOIN delta_funnel_ranked_semantics AS semantic
+  ON semantic.operation_id = sample.operation_id
+  AND sample.ts >= semantic.ts
+  AND sample.ts < semantic.analysis_end_ts
+  AND (
+    semantic.query_execution_id IS NULL
+    OR semantic.query_execution_id = sample.query_execution_id
+  )
+  AND (
+    semantic.worker_lane_id IS NULL
+    OR semantic.worker_lane_id = sample.worker_lane_id
+  )
+  AND (
+    semantic.node_id IS NULL
+    OR semantic.node_id = sample.node_id
+  )
+  AND (
+    semantic.parent_node_id IS NULL
+    OR semantic.parent_node_id = sample.parent_node_id
+  )
+  AND (
+    semantic.operator_partition IS NULL
+    OR semantic.operator_partition = sample.operator_partition
+  )
+  AND (
+    semantic.execution_stream_id IS NULL
+    OR semantic.execution_stream_id = sample.execution_stream_id
+  )
+  AND (
+    semantic.stage_owner_id IS NULL
+    OR semantic.stage_owner_id = sample.stage_owner_id
+  )
+JOIN delta_funnel_ranked_semantic_depths AS depth USING (semantic_id)
+WHERE sample.attribution != 'ambiguous';
+
+CREATE PERFETTO TABLE delta_funnel_ranked_sample_candidate_rankings AS
+SELECT
+  *,
+  row_number() OVER (
+    PARTITION BY sample_id
+    ORDER BY semantic_depth DESC, semantic_id
+  ) AS candidate_rank
+FROM delta_funnel_ranked_sample_semantic_candidates;
+
+-- The deepest candidate is unique only when every other compatible candidate
+-- is one of its real ancestors. Parallel branches remain ambiguous.
+CREATE PERFETTO TABLE delta_funnel_ranked_sample_candidate_conflicts AS
+SELECT candidate.sample_id, count(*) AS conflict_count
+FROM delta_funnel_ranked_sample_semantic_candidates AS candidate
+JOIN delta_funnel_ranked_sample_candidate_rankings AS selected
+  ON selected.sample_id = candidate.sample_id
+  AND selected.candidate_rank = 1
+LEFT JOIN delta_funnel_ranked_semantic_lineage AS lineage
+  ON lineage.descendant_semantic_id = selected.semantic_id
+  AND lineage.ancestor_semantic_id = candidate.semantic_id
+WHERE lineage.ancestor_semantic_id IS NULL
+GROUP BY candidate.sample_id;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_sample_ownership AS
+WITH best AS (
+  SELECT
+    selected.sample_id,
+    selected.semantic_id,
+    coalesce(conflict.conflict_count, 0) AS conflict_count
+  FROM delta_funnel_ranked_sample_candidate_rankings AS selected
+  LEFT JOIN delta_funnel_ranked_sample_candidate_conflicts AS conflict
+    USING (sample_id)
+  WHERE selected.candidate_rank = 1
+)
+SELECT
+  sample.sample_id,
+  sample.ts,
+  sample.utid,
+  sample.callsite_id,
+  sample.unwind_error,
+  CASE
+    WHEN sample.attribution = 'ambiguous' THEN 'ambiguous'
+    WHEN best.conflict_count = 0
+      AND best.semantic_id IS NOT NULL THEN 'direct'
+    WHEN best.conflict_count > 0 THEN 'ambiguous'
+    ELSE 'unattributed'
+  END AS attribution,
+  sample.operation_id,
+  CASE WHEN best.conflict_count = 0 THEN best.semantic_id END AS semantic_id,
+  coalesce(best.conflict_count, 0) AS conflicting_candidate_count
+FROM delta_funnel_sample_correlation AS sample
+LEFT JOIN best USING (sample_id);
+
+CREATE PERFETTO TABLE delta_funnel_ranked_semantic_sample_counts AS
+WITH
+  direct AS (
+    SELECT semantic_id, count(*) AS direct_sample_count
+    FROM delta_funnel_ranked_sample_ownership
+    WHERE attribution = 'direct'
+    GROUP BY semantic_id
+  ),
+  inclusive AS (
+    SELECT
+      lineage.ancestor_semantic_id AS semantic_id,
+      sum(direct.direct_sample_count) AS inclusive_sample_count
+    FROM delta_funnel_ranked_semantic_lineage AS lineage
+    JOIN direct ON direct.semantic_id = lineage.descendant_semantic_id
+    GROUP BY lineage.ancestor_semantic_id
+  )
+SELECT
+  semantic.semantic_id,
+  coalesce(direct.direct_sample_count, 0) AS direct_sample_count,
+  coalesce(inclusive.inclusive_sample_count, 0) AS inclusive_sample_count
+FROM delta_funnel_ranked_semantics AS semantic
+LEFT JOIN direct USING (semantic_id)
+LEFT JOIN inclusive USING (semantic_id);
+
+CREATE PERFETTO TABLE delta_funnel_ranked_attribution_audit AS
+WITH metrics AS (
+SELECT
+  (SELECT audit_error_count FROM delta_funnel_sample_correlation_audit)
+    AS correlation_audit_error_count,
+  (SELECT audit_error_count FROM delta_funnel_ranked_semantic_audit)
+    AS semantic_audit_error_count,
+  count(*) AS eligible_sample_count,
+  coalesce(sum(attribution = 'direct'), 0) AS direct_sample_count,
+  coalesce(sum(attribution = 'ambiguous'), 0) AS ambiguous_sample_count,
+  coalesce(sum(attribution = 'unattributed'), 0) AS unattributed_sample_count,
+  count(*) - count(DISTINCT sample_id) AS duplicate_sample_ownership_count,
+  coalesce(sum(
+    attribution = 'direct' AND semantic_id IS NULL
+  ), 0) AS missing_direct_owner_count,
+  coalesce(sum(
+    attribution != 'direct' AND semantic_id IS NOT NULL
+  ), 0) AS invalid_non_direct_owner_count,
+  count(*) - coalesce(sum(
+    attribution IN ('direct', 'ambiguous', 'unattributed')
+  ), 0) AS attribution_conservation_error_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_semantics AS root
+    JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count
+      USING (semantic_id)
+    LEFT JOIN (
+      SELECT operation_id, count(*) AS direct_sample_count
+      FROM delta_funnel_ranked_sample_ownership
+      WHERE attribution = 'direct'
+      GROUP BY operation_id
+    ) AS operation_direct USING (operation_id)
+    WHERE root.is_operation_root
+      AND sample_count.inclusive_sample_count
+        != coalesce(operation_direct.direct_sample_count, 0)
+  ) AS inclusive_conservation_error_count,
+  (
+    SELECT abs(
+      coalesce(sum(direct_sample_count), 0)
+      - (
+        SELECT count(*)
+        FROM delta_funnel_ranked_sample_ownership
+        WHERE attribution = 'direct'
+      )
+    )
+    FROM delta_funnel_ranked_semantic_sample_counts
+  ) AS direct_count_reconciliation_error_count
+FROM delta_funnel_ranked_sample_ownership
+)
+SELECT
+  *,
+  correlation_audit_error_count
+    + semantic_audit_error_count
+    + duplicate_sample_ownership_count
+    + missing_direct_owner_count
+    + invalid_non_direct_owner_count
+    + attribution_conservation_error_count
+    + inclusive_conservation_error_count
+    + direct_count_reconciliation_error_count AS audit_error_count
+FROM metrics;
