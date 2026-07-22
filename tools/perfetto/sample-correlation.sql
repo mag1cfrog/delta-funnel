@@ -139,6 +139,17 @@ WHERE candidate.depth = (
   WHERE active.sample_id = candidate.sample_id
 );
 
+CREATE PERFETTO FUNCTION delta_funnel_sample_attribution(
+  operation_count LONG,
+  context_leaf_count LONG
+)
+RETURNS STRING AS
+SELECT CASE
+  WHEN $operation_count = 1 AND $context_leaf_count = 1 THEN 'direct'
+  WHEN $operation_count = 1 AND $context_leaf_count = 0 THEN 'unattributed'
+  ELSE 'ambiguous'
+END;
+
 CREATE PERFETTO TABLE delta_funnel_sample_resolution AS
 WITH counts AS (
   SELECT
@@ -156,13 +167,10 @@ SELECT
   min(sample.utid) AS utid,
   min(sample.callsite_id) AS callsite_id,
   min(sample.unwind_error) AS unwind_error,
-  CASE
-    WHEN counts.operation_count = 1
-      AND counts.context_leaf_count = 1 THEN 'direct'
-    WHEN counts.operation_count = 1
-      AND counts.context_leaf_count = 0 THEN 'unattributed'
-    ELSE 'ambiguous'
-  END AS attribution,
+  delta_funnel_sample_attribution(
+    counts.operation_count,
+    counts.context_leaf_count
+  ) AS attribution,
   CASE
     WHEN counts.operation_count = 1
       AND counts.context_leaf_count = 1 THEN min(leaf.operation_id)

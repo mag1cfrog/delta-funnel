@@ -2,12 +2,25 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s TRACE_PATH\n' "$0"
+  printf 'Usage: %s [--ranked-audit] TRACE_PATH\n' "$0"
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
   usage
   exit 0
+fi
+ranked_audit=false
+if [[ ${1:-} == --ranked-audit ]]; then
+  ranked_audit=true
+  shift
+fi
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  usage
+  exit 0
+fi
+if [[ ${1:-} == -* ]]; then
+  usage >&2
+  exit 64
 fi
 if (( $# != 1 )); then
   usage >&2
@@ -36,7 +49,12 @@ fi
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 output=$({
   sed -n '1,$p' "$script_dir/sample-correlation.sql"
-  printf '%s\n' 'SELECT * FROM delta_funnel_sample_correlation_audit;'
+  if $ranked_audit; then
+    sed -n '1,$p' "$script_dir/ranked-profile.sql"
+    printf '%s\n' 'SELECT * FROM delta_funnel_ranked_aggregate_audit;'
+  else
+    printf '%s\n' 'SELECT * FROM delta_funnel_sample_correlation_audit;'
+  fi
 } | "$trace_processor" query --query-file - "$trace_path")
 printf '%s\n' "$output"
 
@@ -46,7 +64,7 @@ if [[ ! $audit_error_count =~ ^[0-9]+$ ]]; then
   exit 65
 fi
 if (( audit_error_count != 0 )); then
-  printf 'sample-correlation: found %s correlation audit errors\n' \
+  printf 'sample-correlation: found %s profile audit errors\n' \
     "$audit_error_count" >&2
   exit 65
 fi

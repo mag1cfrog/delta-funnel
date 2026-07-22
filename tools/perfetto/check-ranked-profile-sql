@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
+if ! command -v "$trace_processor" >/dev/null 2>&1; then
+  printf 'check-ranked-profile-sql: required command is unavailable: %s\n' \
+    "$trace_processor" >&2
+  exit 127
+fi
+
+output=$({
+  sed -n '1,$p' "$script_dir/sample-correlation.sql"
+  sed -n '1,$p' "$script_dir/ranked-profile.sql"
+  sed -n '1,$p' "$script_dir/ranked-profile-fixture.sql"
+} | "$trace_processor" query --query-file - /dev/null)
+printf '%s\n' "$output"
+
+fixture_error_count=${output##*,}
+if [[ ! $fixture_error_count =~ ^[0-9]+$ ]]; then
+  printf 'check-ranked-profile-sql: unexpected fixture result\n' >&2
+  exit 65
+fi
+if (( fixture_error_count != 0 )); then
+  printf 'check-ranked-profile-sql: %s fixture checks failed\n' \
+    "$fixture_error_count" >&2
+  exit 65
+fi
