@@ -2,6 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 
+// ponytail: This covers the 246,095-node production fixture while bounding
+// report memory. Raise it only with production and browser evidence.
+const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
+const MAX_DISPLAY_STRING_CHARS: usize = 512;
+
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankedProfileMetadata {
@@ -72,6 +77,18 @@ pub struct RankedProfileDocument {
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RankedProfileValidationError {
+    TooManyRecords {
+        record_kind: &'static str,
+        count: usize,
+        limit: usize,
+    },
+    DisplayStringTooLong {
+        record_kind: &'static str,
+        record_id: i64,
+        field: &'static str,
+        char_count: usize,
+        limit: usize,
+    },
     UnsupportedSchemaVersion {
         schema_version: u32,
     },
@@ -170,6 +187,24 @@ pub enum RankedProfileValidationError {
 impl fmt::Display for RankedProfileValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TooManyRecords {
+                record_kind,
+                count,
+                limit,
+            } => write!(
+                formatter,
+                "profile has {count} {record_kind} records, exceeding the {limit} record limit"
+            ),
+            Self::DisplayStringTooLong {
+                record_kind,
+                record_id,
+                field,
+                char_count,
+                limit,
+            } => write!(
+                formatter,
+                "{record_kind} ID {record_id} {field} has {char_count} characters, exceeding the {limit} character limit"
+            ),
             Self::UnsupportedSchemaVersion { schema_version } => {
                 write!(
                     formatter,
@@ -327,9 +362,47 @@ impl std::error::Error for RankedProfileValidationError {}
 
 impl RankedProfileDocument {
     pub fn validate(&self) -> Result<(), RankedProfileValidationError> {
+        self.validate_bounds()?;
         self.validate_metadata_and_intervals()?;
         self.validate_structure()?;
         self.validate_sample_counts()
+    }
+
+    fn validate_bounds(&self) -> Result<(), RankedProfileValidationError> {
+        require_collection_bound("semantic", self.semantics.len())?;
+        require_collection_bound("function", self.functions.len())?;
+
+        for semantic in &self.semantics {
+            for (field, value) in [
+                ("name", Some(semantic.name.as_str())),
+                ("semantic_kind", Some(semantic.semantic_kind.as_str())),
+                ("operation_kind", semantic.operation_kind.as_deref()),
+                ("stage_category", semantic.stage_category.as_deref()),
+                ("stage_name", semantic.stage_name.as_deref()),
+                ("activity", semantic.activity.as_deref()),
+                ("time_semantics", Some(semantic.time_semantics.as_str())),
+                ("result", semantic.result.as_deref()),
+                ("query_scope", semantic.query_scope.as_deref()),
+                ("query_owner", semantic.query_owner.as_deref()),
+                ("worker_kind", semantic.worker_kind.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    require_display_string("semantic", semantic.semantic_id, field, value)?;
+                }
+            }
+        }
+        for function in &self.functions {
+            for (field, value) in [
+                ("name", Some(function.name.as_str())),
+                ("module_name", function.module_name.as_deref()),
+                ("source_file", function.source_file.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    require_display_string("function", function.function_id, field, value)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate_metadata_and_intervals(&self) -> Result<(), RankedProfileValidationError> {
@@ -694,6 +767,39 @@ impl RankedProfileDocument {
         }
         Ok(())
     }
+}
+
+fn require_collection_bound(
+    record_kind: &'static str,
+    count: usize,
+) -> Result<(), RankedProfileValidationError> {
+    if count > MAX_RECORDS_PER_COLLECTION {
+        return Err(RankedProfileValidationError::TooManyRecords {
+            record_kind,
+            count,
+            limit: MAX_RECORDS_PER_COLLECTION,
+        });
+    }
+    Ok(())
+}
+
+fn require_display_string(
+    record_kind: &'static str,
+    record_id: i64,
+    field: &'static str,
+    value: &str,
+) -> Result<(), RankedProfileValidationError> {
+    let char_count = value.chars().count();
+    if char_count > MAX_DISPLAY_STRING_CHARS {
+        return Err(RankedProfileValidationError::DisplayStringTooLong {
+            record_kind,
+            record_id,
+            field,
+            char_count,
+            limit: MAX_DISPLAY_STRING_CHARS,
+        });
+    }
+    Ok(())
 }
 
 fn require_nonnegative(
@@ -1105,5 +1211,34 @@ mod tests {
             invalid.validate(),
             Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
         ));
+    }
+
+    #[test]
+    fn bounds_aggregate_collections_and_display_strings() {
+        assert!(matches!(
+            require_collection_bound("semantic", MAX_RECORDS_PER_COLLECTION + 1),
+            Err(RankedProfileValidationError::TooManyRecords {
+                record_kind: "semantic",
+                count,
+                limit: MAX_RECORDS_PER_COLLECTION
+            }) if count == MAX_RECORDS_PER_COLLECTION + 1
+        ));
+
+        let mut invalid = document();
+        invalid.functions[0].name = "x".repeat(MAX_DISPLAY_STRING_CHARS + 1);
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::DisplayStringTooLong {
+                record_kind: "function",
+                record_id: 90,
+                field: "name",
+                char_count,
+                limit: MAX_DISPLAY_STRING_CHARS
+            }) if char_count == MAX_DISPLAY_STRING_CHARS + 1
+        ));
+
+        let mut valid = document();
+        valid.functions[0].name = "\u{754c}".repeat(MAX_DISPLAY_STRING_CHARS);
+        assert_eq!(valid.validate(), Ok(()));
     }
 }
