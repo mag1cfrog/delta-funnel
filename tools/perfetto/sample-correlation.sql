@@ -154,7 +154,7 @@ CREATE PERFETTO FUNCTION delta_funnel_sample_attribution(
 )
 RETURNS STRING AS
 SELECT CASE
-  WHEN $operation_count = 1 AND $context_leaf_count = 1 THEN 'direct'
+  WHEN $context_leaf_count = 1 THEN 'direct'
   WHEN $operation_count = 1 AND $context_leaf_count = 0 THEN 'unattributed'
   ELSE 'ambiguous'
 END;
@@ -181,14 +181,12 @@ SELECT
     counts.context_leaf_count
   ) AS attribution,
   CASE
-    WHEN counts.operation_count = 1
-      AND counts.context_leaf_count = 1 THEN min(leaf.operation_id)
+    WHEN counts.context_leaf_count = 1 THEN min(leaf.operation_id)
     WHEN counts.operation_count = 1
       AND counts.context_leaf_count = 0 THEN min(sample.operation_id)
   END AS operation_id,
   CASE
-    WHEN counts.operation_count = 1
-      AND counts.context_leaf_count = 1 THEN min(leaf.context_id)
+    WHEN counts.context_leaf_count = 1 THEN min(leaf.context_id)
   END AS context_leaf_id,
   counts.operation_count,
   counts.context_leaf_count

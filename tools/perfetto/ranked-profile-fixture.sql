@@ -135,7 +135,7 @@ SELECT
   column3 AS context_leaf_count,
   column4 AS expected
 FROM (VALUES
-  (1, 2, 1, 'ambiguous'),
+  (1, 2, 1, 'direct'),
   (2, 2, 0, 'ambiguous'),
   (3, 1, 0, 'unattributed'),
   (4, 1, 2, 'ambiguous'),
