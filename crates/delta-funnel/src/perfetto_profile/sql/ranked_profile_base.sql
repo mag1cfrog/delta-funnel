@@ -626,3 +626,60 @@ GROUP BY semantic_id, function_id;
 
 CREATE PERFETTO INDEX delta_funnel_ranked_function_self_lookup
 ON delta_funnel_ranked_function_self_counts(semantic_id, function_id);
+CREATE PERFETTO TABLE delta_funnel_ranked_function_metadata AS
+WITH RECURSIVE
+  module_names(function_id, value, depth) AS (
+    SELECT id, replace(mapping_name, char(92), '/'), 0
+    FROM delta_funnel_ranked_official_function_frames
+
+    UNION ALL
+
+    SELECT function_id, substr(value, instr(value, '/') + 1), depth + 1
+    FROM module_names
+    WHERE instr(value, '/') > 0
+      AND depth < 64
+  ),
+  source_names(function_id, value, depth) AS (
+    SELECT id, replace(source_file, char(92), '/'), 0
+    FROM delta_funnel_ranked_official_function_frames
+
+    UNION ALL
+
+    SELECT function_id, substr(value, instr(value, '/') + 1), depth + 1
+    FROM source_names
+    WHERE instr(value, '/') > 0
+      AND depth < 64
+  ),
+  modules AS (
+    SELECT
+      function_id,
+      CASE
+        WHEN value GLOB '[A-Za-z]:*' THEN NULL
+        ELSE nullif(substr(value, 1, 255), '')
+      END AS module_name
+    FROM module_names
+    WHERE instr(value, '/') = 0
+  ),
+  sources AS (
+    SELECT
+      function_id,
+      CASE
+        WHEN value GLOB '[A-Za-z]:*' THEN NULL
+        ELSE nullif(substr(value, 1, 255), '')
+      END AS source_file
+    FROM source_names
+    WHERE instr(value, '/') = 0
+  )
+SELECT
+  frame.id AS function_id,
+  frame.parent_id AS parent_function_id,
+  coalesce(nullif(substr(frame.name, 1, 512), ''), '[unresolved]') AS name,
+  module.module_name,
+  source.source_file,
+  frame.line_number
+FROM delta_funnel_ranked_official_function_frames AS frame
+LEFT JOIN modules AS module ON module.function_id = frame.id
+LEFT JOIN sources AS source ON source.function_id = frame.id;
+
+CREATE PERFETTO INDEX delta_funnel_ranked_function_metadata_lookup
+ON delta_funnel_ranked_function_metadata(function_id);

@@ -14,6 +14,7 @@ output=$({
   sed -n '1,$p' "$sql_dir/sample_correlation.sql"
   sed -n '1,$p' "$sql_dir/ranked_profile_base.sql"
   sed -n '1,$p' "$script_dir/ranked-profile.sql"
+  sed -n '1,$p' "$sql_dir/ranked_report.sql"
   sed -n '1,$p' "$script_dir/ranked-profile-fixture.sql"
 } | "$trace_processor" query --query-file - /dev/null)
 printf '%s\n' "$output"
