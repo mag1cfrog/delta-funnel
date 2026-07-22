@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ponytail: This covers the 246,095-node production fixture while bounding
 // report memory. Raise it only with production and browser evidence.
@@ -10,7 +10,7 @@ pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
 
 #[doc(hidden)]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RankedProfileMetadata {
     pub schema_version: u32,
@@ -24,7 +24,7 @@ pub struct RankedProfileMetadata {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RankedSemantic {
     pub semantic_id: i64,
@@ -57,7 +57,7 @@ pub struct RankedSemantic {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RankedFunction {
     pub semantic_id: i64,
     pub function_id: i64,
@@ -71,7 +71,7 @@ pub struct RankedFunction {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RankedProfileDocument {
     pub metadata: RankedProfileMetadata,
     pub semantics: Vec<RankedSemantic>,

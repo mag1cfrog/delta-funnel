@@ -23,6 +23,7 @@ mod ranked_report;
 mod report_aggregate;
 mod report_cli;
 mod report_health;
+mod report_html;
 mod report_trace_processor;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
@@ -41,6 +42,8 @@ pub use report_cli::{
 };
 #[doc(hidden)]
 pub use report_health::validate_ranked_report_capture;
+#[doc(hidden)]
+pub use report_html::render_ranked_profile_html;
 #[doc(hidden)]
 pub use report_trace_processor::run_trace_processor_query;
 
