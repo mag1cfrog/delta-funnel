@@ -2,6 +2,9 @@
 --
 -- tools/perfetto/sample-correlation.sql must run first. This query does not
 -- create presentation intervals or modify the input trace.
+INCLUDE PERFETTO MODULE linux.perf.samples;
+INCLUDE PERFETTO MODULE graphs.search;
+
 CREATE PERFETTO TABLE delta_funnel_ranked_semantics AS
 SELECT
   slice.id AS semantic_id,
@@ -527,4 +530,361 @@ SELECT
     + attribution_conservation_error_count
     + inclusive_conservation_error_count
     + direct_count_reconciliation_error_count AS audit_error_count
+FROM metrics;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_usable_function_samples AS
+SELECT sample.*
+FROM delta_funnel_ranked_sample_ownership AS sample
+WHERE sample.attribution = 'direct'
+  AND sample.callsite_id IS NOT NULL
+  AND sample.unwind_error IS NULL;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_expanded_callstacks AS
+SELECT
+  stack.id AS function_id,
+  stack.parent_id AS parent_function_id,
+  stack.callsite_id,
+  stack.name,
+  stack.mapping_name,
+  stack.source_file,
+  stack.line_number,
+  stack.is_leaf_function_in_callsite_frame AS is_leaf
+FROM _callstacks_for_stack_profile_samples!((
+  SELECT DISTINCT callsite_id
+  FROM delta_funnel_ranked_usable_function_samples
+)) AS stack;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_callsite_leaves AS
+SELECT
+  callsite_id,
+  count(*) AS leaf_count,
+  min(function_id) AS function_id
+FROM delta_funnel_ranked_expanded_callstacks
+WHERE is_leaf
+GROUP BY callsite_id;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_sample_ownership AS
+SELECT
+  sample.sample_id,
+  sample.semantic_id,
+  sample.callsite_id,
+  CASE
+    WHEN sample.callsite_id IS NOT NULL
+      AND sample.unwind_error IS NULL
+      AND leaf.leaf_count = 1 THEN leaf.function_id
+    ELSE -1
+  END AS function_id,
+  CASE
+    WHEN sample.callsite_id IS NOT NULL
+      AND sample.unwind_error IS NULL
+      AND leaf.leaf_count = 1 THEN 'resolved'
+    ELSE 'unresolved'
+  END AS resolution
+FROM delta_funnel_ranked_sample_ownership AS sample
+LEFT JOIN delta_funnel_ranked_callsite_leaves AS leaf USING (callsite_id)
+WHERE sample.attribution = 'direct';
+
+-- These are the same Perfetto macros behind cpu_profiling_summary_tree.
+-- Repeated callsite rows preserve sample multiplicity for reconciliation.
+CREATE PERFETTO TABLE delta_funnel_ranked_official_function_frames AS
+SELECT *
+FROM _callstacks_for_callsites!((
+  SELECT callsite_id
+  FROM delta_funnel_ranked_function_sample_ownership
+  WHERE resolution = 'resolved'
+));
+
+CREATE PERFETTO TABLE delta_funnel_ranked_official_function_summary AS
+SELECT *
+FROM _callstacks_self_to_cumulative!((
+  SELECT id, parent_id, self_count
+  FROM delta_funnel_ranked_official_function_frames
+));
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_self_counts AS
+SELECT semantic_id, function_id, count(*) AS self_sample_count
+FROM delta_funnel_ranked_function_sample_ownership
+GROUP BY semantic_id, function_id;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_roots AS
+SELECT
+  semantic_id,
+  function_id,
+  self_sample_count,
+  coalesce((
+    SELECT max(id)
+    FROM delta_funnel_ranked_official_function_frames
+  ), -1) + row_number() OVER (
+    ORDER BY semantic_id, function_id
+  ) AS root_node_id
+FROM delta_funnel_ranked_function_self_counts
+WHERE function_id != -1;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_graph AS
+SELECT
+  id AS source_node_id,
+  parent_id AS dest_node_id,
+  1 AS edge_weight
+FROM delta_funnel_ranked_official_function_frames
+WHERE parent_id IS NOT NULL
+
+UNION ALL
+
+SELECT root_node_id, function_id, 1
+FROM delta_funnel_ranked_function_roots;
+
+-- A synthetic root represents each semantic/function self-count pair. The
+-- native graph scan preserves that root while walking toward stack roots.
+CREATE PERFETTO TABLE delta_funnel_ranked_function_ancestry AS
+SELECT *
+FROM graph_reachable_weight_bounded_dfs!((
+  SELECT source_node_id, dest_node_id, edge_weight
+  FROM delta_funnel_ranked_function_graph
+), (
+  SELECT
+    root_node_id,
+    (SELECT count(*) + 1 FROM delta_funnel_ranked_official_function_frames)
+      AS root_target_weight
+  FROM delta_funnel_ranked_function_roots
+), 0);
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_inclusive_counts AS
+SELECT
+  root.semantic_id,
+  ancestry.node_id AS function_id,
+  sum(root.self_sample_count) AS inclusive_sample_count
+FROM delta_funnel_ranked_function_ancestry AS ancestry
+JOIN delta_funnel_ranked_function_roots AS root USING (root_node_id)
+JOIN delta_funnel_ranked_official_function_frames AS frame
+  ON frame.id = ancestry.node_id
+GROUP BY root.semantic_id, ancestry.node_id
+
+UNION ALL
+
+SELECT semantic_id, function_id, self_sample_count
+FROM delta_funnel_ranked_function_self_counts
+WHERE function_id = -1;
+
+-- Aggregate metadata never contains unrestricted source or module paths.
+CREATE PERFETTO TABLE delta_funnel_ranked_function_metadata AS
+WITH RECURSIVE
+  module_names(function_id, value, depth) AS (
+    SELECT id, replace(mapping_name, char(92), '/'), 0
+    FROM delta_funnel_ranked_official_function_frames
+
+    UNION ALL
+
+    SELECT function_id, substr(value, instr(value, '/') + 1), depth + 1
+    FROM module_names
+    WHERE instr(value, '/') > 0
+      AND depth < 64
+  ),
+  source_names(function_id, value, depth) AS (
+    SELECT id, replace(source_file, char(92), '/'), 0
+    FROM delta_funnel_ranked_official_function_frames
+
+    UNION ALL
+
+    SELECT function_id, substr(value, instr(value, '/') + 1), depth + 1
+    FROM source_names
+    WHERE instr(value, '/') > 0
+      AND depth < 64
+  ),
+  modules AS (
+    SELECT
+      function_id,
+      CASE
+        WHEN value GLOB '[A-Za-z]:*' THEN NULL
+        ELSE nullif(substr(value, 1, 255), '')
+      END AS module_name
+    FROM module_names
+    WHERE instr(value, '/') = 0
+  ),
+  sources AS (
+    SELECT
+      function_id,
+      CASE
+        WHEN value GLOB '[A-Za-z]:*' THEN NULL
+        ELSE nullif(substr(value, 1, 255), '')
+      END AS source_file
+    FROM source_names
+    WHERE instr(value, '/') = 0
+  )
+SELECT
+  frame.id AS function_id,
+  frame.parent_id AS parent_function_id,
+  coalesce(nullif(substr(frame.name, 1, 512), ''), '[unresolved]') AS name,
+  module.module_name,
+  source.source_file,
+  frame.line_number
+FROM delta_funnel_ranked_official_function_frames AS frame
+LEFT JOIN modules AS module ON module.function_id = frame.id
+LEFT JOIN sources AS source ON source.function_id = frame.id;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_aggregates AS
+SELECT
+  inclusive.semantic_id,
+  inclusive.function_id,
+  metadata.parent_function_id,
+  metadata.name,
+  metadata.module_name,
+  metadata.source_file,
+  metadata.line_number,
+  coalesce(self.self_sample_count, 0) AS self_sample_count,
+  inclusive.inclusive_sample_count
+FROM delta_funnel_ranked_function_inclusive_counts AS inclusive
+JOIN delta_funnel_ranked_function_metadata AS metadata USING (function_id)
+LEFT JOIN delta_funnel_ranked_function_self_counts AS self
+  USING (semantic_id, function_id)
+
+UNION ALL
+
+SELECT
+  self.semantic_id,
+  self.function_id,
+  NULL AS parent_function_id,
+  '[native stack unavailable]' AS name,
+  NULL AS module_name,
+  NULL AS source_file,
+  NULL AS line_number,
+  self.self_sample_count,
+  self.self_sample_count AS inclusive_sample_count
+FROM delta_funnel_ranked_function_self_counts AS self
+WHERE self.function_id = -1;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_cycles AS
+WITH RECURSIVE ancestry(
+  semantic_id,
+  start_function_id,
+  function_id
+) AS (
+  SELECT semantic_id, function_id, parent_function_id
+  FROM delta_funnel_ranked_function_aggregates
+  WHERE parent_function_id IS NOT NULL
+
+  UNION
+
+  SELECT
+    ancestry.semantic_id,
+    ancestry.start_function_id,
+    parent.parent_function_id
+  FROM ancestry
+  JOIN delta_funnel_ranked_function_aggregates AS parent
+    ON parent.semantic_id = ancestry.semantic_id
+    AND parent.function_id = ancestry.function_id
+  WHERE parent.parent_function_id IS NOT NULL
+)
+SELECT DISTINCT semantic_id, start_function_id AS function_id
+FROM ancestry
+WHERE start_function_id = function_id;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_reconciliation AS
+WITH actual AS (
+  SELECT
+    function_id,
+    sum(self_sample_count) AS self_sample_count,
+    sum(inclusive_sample_count) AS cumulative_sample_count
+  FROM delta_funnel_ranked_function_aggregates
+  WHERE function_id != -1
+  GROUP BY function_id
+)
+SELECT
+  official.id AS function_id,
+  official.self_count AS official_self_sample_count,
+  summary.cumulative_count AS official_cumulative_sample_count,
+  coalesce(actual.self_sample_count, 0) AS actual_self_sample_count,
+  coalesce(actual.cumulative_sample_count, 0) AS actual_cumulative_sample_count
+FROM delta_funnel_ranked_official_function_frames AS official
+JOIN delta_funnel_ranked_official_function_summary AS summary USING (id)
+LEFT JOIN actual ON actual.function_id = official.id;
+
+CREATE PERFETTO TABLE delta_funnel_ranked_function_audit AS
+WITH metrics AS (
+SELECT
+  (SELECT audit_error_count FROM delta_funnel_ranked_attribution_audit)
+    AS attribution_audit_error_count,
+  (SELECT count(*) FROM delta_funnel_ranked_function_aggregates)
+    AS aggregate_function_node_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_function_aggregates
+    WHERE name IN ('[unresolved]', '[native stack unavailable]')
+  ) AS unresolved_function_node_count,
+  (SELECT count(*) FROM delta_funnel_ranked_function_sample_ownership)
+    AS function_sample_count,
+  coalesce((
+    SELECT sum(resolution = 'resolved')
+    FROM delta_funnel_ranked_function_sample_ownership
+  ), 0) AS resolved_function_sample_count,
+  coalesce((
+    SELECT sum(resolution = 'unresolved')
+    FROM delta_funnel_ranked_function_sample_ownership
+  ), 0) AS unresolved_function_sample_count,
+  (
+    SELECT count(*)
+    FROM (
+      SELECT semantic_id, function_id
+      FROM delta_funnel_ranked_function_aggregates
+      GROUP BY semantic_id, function_id
+      HAVING count(*) != 1
+    )
+  ) AS duplicate_function_identity_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_function_aggregates AS child
+    LEFT JOIN delta_funnel_ranked_function_aggregates AS parent
+      ON parent.semantic_id = child.semantic_id
+      AND parent.function_id = child.parent_function_id
+    WHERE child.parent_function_id IS NOT NULL
+      AND parent.function_id IS NULL
+  ) AS missing_function_parent_count,
+  (SELECT count(*) FROM delta_funnel_ranked_function_cycles)
+    AS function_cycle_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_function_reconciliation
+    WHERE official_self_sample_count != actual_self_sample_count
+      OR official_cumulative_sample_count != actual_cumulative_sample_count
+  ) AS official_summary_mismatch_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_function_aggregates
+    WHERE coalesce(module_name, '') GLOB '*[\\/]*'
+      OR coalesce(source_file, '') GLOB '*[\\/]*'
+      OR coalesce(module_name, '') GLOB '[A-Za-z]:*'
+      OR coalesce(source_file, '') GLOB '[A-Za-z]:*'
+  ) AS unsafe_path_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_usable_function_samples AS sample
+    LEFT JOIN delta_funnel_ranked_callsite_leaves AS leaf USING (callsite_id)
+    WHERE coalesce(leaf.leaf_count, 0) != 1
+  ) AS invalid_leaf_mapping_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_sample_ownership
+    WHERE attribution = 'direct'
+  ) - (
+    SELECT count(*)
+    FROM delta_funnel_ranked_function_sample_ownership
+  ) AS function_sample_conservation_error_count,
+  (
+    SELECT count(*)
+    FROM delta_funnel_ranked_function_sample_ownership
+  ) - coalesce((
+    SELECT sum(self_sample_count)
+    FROM delta_funnel_ranked_function_self_counts
+  ), 0) AS function_self_conservation_error_count
+)
+SELECT
+  *,
+  attribution_audit_error_count
+    + duplicate_function_identity_count
+    + missing_function_parent_count
+    + function_cycle_count
+    + official_summary_mismatch_count
+    + unsafe_path_count
+    + invalid_leaf_mapping_count
+    + function_sample_conservation_error_count
+    + function_self_conservation_error_count AS audit_error_count
 FROM metrics;
