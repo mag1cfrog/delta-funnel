@@ -159,15 +159,9 @@ impl OperatorActivityRecorder {
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
-        let records_semantic_span = self.context.timeline().is_some();
-        let records_process_span = self.context.process_spans_enabled() && activity == "poll_next";
-        if !records_semantic_span && !records_process_span {
-            return None;
-        }
-        if let Err(limit) = self.context.reserve_operator_activity() {
-            if limit.should_report {
-                self.report_truncation(limit.maximum_spans);
-            }
+        let can_record_timeline = self.context.timeline().is_some();
+        let can_record_process = self.context.process_spans_enabled() && activity == "poll_next";
+        if !can_record_timeline && !can_record_process {
             return None;
         }
 
@@ -189,50 +183,73 @@ impl OperatorActivityRecorder {
                 .is_some_and(|parent| matches_parent(parent) && parent.process_span_active);
             (parent_id, process_parent_active)
         });
+        let records_detail = match self.context.reserve_operator_activity() {
+            Ok(()) => true,
+            Err(limit) => {
+                if limit.should_report {
+                    self.report_truncation(limit.maximum_spans);
+                }
+                false
+            }
+        };
+        let records_semantic_span = can_record_timeline && records_detail;
+        // Once detailed spans are capped, keep only the outermost poll on each
+        // executor task so sampled stacks retain query and worker identity.
+        let records_process_span = can_record_process && (records_detail || !process_parent_active);
+        if !records_semantic_span && !records_process_span {
+            if owns_worker_lane {
+                Self::release_worker_lane(&self.identities, context.worker_lane);
+            }
+            return None;
+        }
         let track_name = context.worker_lane.track_name(self.query_execution_id);
-        let timeline_span = self.context.timeline().map(|timeline| {
-            self.with_query_identity(timeline.start_span(
-                operator_name,
-                OPERATOR_ACTIVITY_CATEGORY,
-                track_name,
-            ))
-            .with_parent_id(parent_id)
-            .with_attribute("worker_lane_id", Value::from(context.worker_lane.id))
-            .with_attribute(
-                "worker_kind",
-                Value::String(context.worker_lane.kind.as_str().to_owned()),
-            )
-            .with_attribute("task_kind", Value::String(context.task_kind.to_owned()))
-            .with_attribute(
-                "runtime_task_id",
-                context
-                    .runtime_task_id
-                    .clone()
-                    .map_or(Value::Null, Value::String),
-            )
-            .with_attribute("execution_stream_id", Value::from(stream_id))
-            .with_attribute("node_id", Value::from(node_id))
-            .with_attribute(
-                "parent_node_id",
-                parent_node_id.map_or(Value::Null, Value::from),
-            )
-            .with_attribute(
-                "operator_partition",
-                Value::from(usize_to_u64_saturating(partition)),
-            )
-            .with_attribute(
-                "worker_thread_id",
-                Value::String(context.worker_thread_id.clone()),
-            )
-            .with_attribute(
-                "worker_thread_name",
-                context
-                    .worker_thread_name
-                    .clone()
-                    .map_or(Value::Null, Value::String),
-            )
-            .with_attribute("activity", Value::String(activity.to_owned()))
-        });
+        let timeline_span = self
+            .context
+            .timeline()
+            .filter(|_| records_detail)
+            .map(|timeline| {
+                self.with_query_identity(timeline.start_span(
+                    operator_name,
+                    OPERATOR_ACTIVITY_CATEGORY,
+                    track_name,
+                ))
+                .with_parent_id(parent_id)
+                .with_attribute("worker_lane_id", Value::from(context.worker_lane.id))
+                .with_attribute(
+                    "worker_kind",
+                    Value::String(context.worker_lane.kind.as_str().to_owned()),
+                )
+                .with_attribute("task_kind", Value::String(context.task_kind.to_owned()))
+                .with_attribute(
+                    "runtime_task_id",
+                    context
+                        .runtime_task_id
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                )
+                .with_attribute("execution_stream_id", Value::from(stream_id))
+                .with_attribute("node_id", Value::from(node_id))
+                .with_attribute(
+                    "parent_node_id",
+                    parent_node_id.map_or(Value::Null, Value::from),
+                )
+                .with_attribute(
+                    "operator_partition",
+                    Value::from(usize_to_u64_saturating(partition)),
+                )
+                .with_attribute(
+                    "worker_thread_id",
+                    Value::String(context.worker_thread_id.clone()),
+                )
+                .with_attribute(
+                    "worker_thread_name",
+                    context
+                        .worker_thread_name
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                )
+                .with_attribute("activity", Value::String(activity.to_owned()))
+            });
         let timeline_span_id = timeline_span
             .as_ref()
             .and_then(OperationTimelineSpanRecorder::id);
@@ -1157,16 +1174,17 @@ mod tests {
             .start_span("FilterExec", 0, None, 0, 1, "poll_next")
             .expect("one logical poll should fit both active outputs")
             .finish("batch", false);
+        let fallback = activity
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            .expect("a capped task root should retain process context");
         assert!(
-            activity
-                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            fallback
+                .in_process_scope(|| {
+                    activity.start_span("ChildExec", 1, Some(0), 0, 2, "poll_next")
+                })
                 .is_none()
         );
-        assert!(
-            activity
-                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
-                .is_none()
-        );
+        fallback.finish("batch", false);
         drop(activity);
 
         let timeline = timeline.finish("test", TimelineSpanStatus::Completed);
@@ -1177,9 +1195,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(semantic_markers.len(), 1);
         assert_eq!(semantic_markers[0].attributes()["maximum_spans"], 1);
+        assert_eq!(
+            timeline
+                .spans()
+                .iter()
+                .filter(|span| span.name() == "FilterExec")
+                .count(),
+            1
+        );
 
-        let process_markers = capture
-            .captured()
+        let captured = capture.captured();
+        assert_eq!(
+            captured
+                .spans()
+                .iter()
+                .filter(|span| span.name == "DataFusion operator poll")
+                .count(),
+            2
+        );
+        let process_markers = captured
             .events()
             .into_iter()
             .filter(|event| event.name == "Operator activity trace truncated")
@@ -1204,13 +1238,21 @@ mod tests {
             .start_span("FilterExec", 0, None, 0, 1, "poll_next")
             .expect("first process activity should fit")
             .finish("batch", false);
-        assert!(
-            activity
-                .start_span("FilterExec", 0, None, 0, 1, "poll_next")
-                .is_none()
-        );
+        activity
+            .start_span("FilterExec", 0, None, 0, 1, "poll_next")
+            .expect("a capped task root should retain process context")
+            .finish("batch", false);
         drop(activity);
 
+        assert_eq!(
+            capture
+                .captured()
+                .spans()
+                .iter()
+                .filter(|span| span.name == "DataFusion operator poll")
+                .count(),
+            2
+        );
         assert_eq!(
             capture
                 .captured()
