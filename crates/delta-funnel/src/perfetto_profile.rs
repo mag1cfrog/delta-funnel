@@ -20,6 +20,7 @@ use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
 mod ranked_report;
+mod report_cli;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
 #[doc(hidden)]
@@ -27,6 +28,8 @@ pub use ranked_report::{
     RankedFunction, RankedProfileDocument, RankedProfileMetadata, RankedProfileValidationError,
     RankedSemantic,
 };
+#[doc(hidden)]
+pub use report_cli::{RankedReportArgumentError, RankedReportCliAction, parse_ranked_report_args};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
