@@ -96,7 +96,6 @@ where
             return;
         };
         if let Some(active) = span.extensions().get::<ActiveProfileSpan>() {
-            active.emit_task_begin();
             active.emit_context_enter();
         }
     }
@@ -105,12 +104,9 @@ where
         let Some(span) = context.span(id) else {
             return;
         };
-        let extensions = span.extensions();
-        let Some(active) = extensions.get::<ActiveProfileSpan>() else {
-            return;
-        };
-        track_event_end!("delta_funnel.profile.context");
-        active.emit_task_end();
+        if span.extensions().get::<ActiveProfileSpan>().is_some() {
+            track_event_end!("delta_funnel.profile.context");
+        }
     }
 
     fn on_close(&self, id: Id, context: Context<'_, S>) {
@@ -521,7 +517,25 @@ impl ActiveProfileSpan {
                 }
             }
             ProfileEvent::Operator { name, worker } => {
-                self.emit_operator_begin(name, worker);
+                if let Ok(name) = CString::new(name.as_str()) {
+                    track_event!(
+                        "delta_funnel.profile",
+                        TrackEventType::SliceBegin(name.as_ptr()),
+                        |context: &mut EventContext| {
+                            worker.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                } else {
+                    track_event_begin!(
+                        "delta_funnel.profile",
+                        "DataFusion operator",
+                        |context: &mut EventContext| {
+                            worker.set_on(context);
+                            self.add_profile_args(context);
+                        }
+                    );
+                }
             }
             ProfileEvent::TaskContext { .. } => {}
         }
@@ -554,49 +568,6 @@ impl ActiveProfileSpan {
                 "delta_funnel.profile.context",
                 "Delta Funnel execution context",
                 |context: &mut EventContext| self.add_profile_args(context)
-            );
-        }
-    }
-
-    fn emit_task_begin(&self) {
-        let ProfileEvent::TaskContext { name } = &self.event else {
-            return;
-        };
-        if let Some(worker) = self.task_track() {
-            self.emit_operator_begin(name, &worker);
-        }
-    }
-
-    fn emit_task_end(&self) {
-        if !matches!(&self.event, ProfileEvent::TaskContext { .. }) {
-            return;
-        }
-        if let Some(worker) = self.task_track() {
-            track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
-                worker.set_on(context);
-                self.add_completion_args(context);
-            });
-        }
-    }
-
-    fn emit_operator_begin(&self, name: &str, worker: &SemanticTrack) {
-        if let Ok(name) = CString::new(name) {
-            track_event!(
-                "delta_funnel.profile",
-                TrackEventType::SliceBegin(name.as_ptr()),
-                |context: &mut EventContext| {
-                    worker.set_on(context);
-                    self.add_profile_args(context);
-                }
-            );
-        } else {
-            track_event_begin!(
-                "delta_funnel.profile",
-                "DataFusion operator",
-                |context: &mut EventContext| {
-                    worker.set_on(context);
-                    self.add_profile_args(context);
-                }
             );
         }
     }
