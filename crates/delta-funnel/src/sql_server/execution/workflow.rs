@@ -929,8 +929,8 @@ where
         .as_ref()
         .and_then(|_| {
             stage_context.start_with_timeline_name(
-                "Write output",
-                format!("Write output: {}", target.output_name()),
+                "Execute output",
+                format!("Execute output: {}", target.output_name()),
                 "delta_funnel.write_all.output",
                 format!("Output: {}", target.output_name()),
             )

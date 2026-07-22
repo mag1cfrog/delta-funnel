@@ -1,12 +1,16 @@
 //! Shared activation and identity state for one profiled operation.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{
     TimelineSpanStatus,
@@ -289,10 +293,6 @@ impl<'a> OperationStageContext<'a> {
         }
     }
 
-    pub(crate) const fn timeline(self) -> Option<&'a OperationTimelineRecorder> {
-        self.timeline
-    }
-
     pub(crate) fn start(
         self,
         name: &'static str,
@@ -391,6 +391,16 @@ impl OperationStageTrace {
             .timeline_span
             .map(|span| span.with_attribute(name, value));
         self
+    }
+
+    pub(crate) async fn instrument_future<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        match &self.process_span {
+            Some(process_span) => future.instrument(process_span.span.clone()).await,
+            None => future.await,
+        }
     }
 
     pub(crate) fn completed(self) {
@@ -865,5 +875,55 @@ mod tests {
                 && stage.exit_count == 0
                 && stage.closed
         }));
+    }
+
+    #[tokio::test]
+    async fn operation_stage_instruments_existing_dependency_spans() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let context =
+            OperationTraceContext::start_for_modes(OperationTraceKind::MssqlWrite, None, true)
+                .expect("process tracing should create a context");
+        let stage = OperationStageTrace::start(
+            Some(&context),
+            None,
+            "Finalize SQL Server writer",
+            "delta_funnel.write.sql_server",
+            "Finalize writer",
+            Some(1),
+        )
+        .expect("the process stage should start");
+        let stage_id = stage
+            .process_span
+            .as_ref()
+            .and_then(|span| span.span.id())
+            .expect("the process stage should be enabled")
+            .into_u64();
+
+        stage
+            .instrument_future(async {
+                let dependency = tracing::info_span!(
+                    target: "tiberius_raw_bulk::protocol",
+                    "protocol.bulk_load.finalize.result"
+                );
+                drop(dependency);
+            })
+            .await;
+        stage.completed();
+        drop(context);
+
+        let spans = capture.captured().spans();
+        let dependency = spans
+            .iter()
+            .find(|span| span.name == "protocol.bulk_load.finalize.result")
+            .expect("the dependency span should be captured");
+        assert_eq!(dependency.parent_id, Some(stage_id));
+        assert!(dependency.closed);
+        let stage = spans
+            .iter()
+            .find(|span| span.id == stage_id)
+            .expect("the process stage should be captured");
+        assert!(stage.enter_count > 0);
+        assert_eq!(stage.exit_count, stage.enter_count);
+        assert!(stage.closed);
     }
 }

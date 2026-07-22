@@ -21,11 +21,12 @@ Perfetto producer.
 
 Use the short standard mode for a brief workload and the streaming standard
 mode when the expected duration exceeds two minutes. Both modes record exact
-begin and end timestamps as semantic Track Events. Their 100 Hz native call
-stacks are statistical samples, so nearby runs can have different sample
-counts. On Linux, native sampling is on-CPU only. Time blocked on I/O, locks,
-or sleep is absent from the sampled stacks; use the deep-system mode only when
-scheduler context is needed.
+begin and end timestamps as semantic Track Events. Short mode samples native
+call stacks at 1000 Hz by default; streaming and deep-system modes default to
+100 Hz. These are statistical samples, so nearby runs can have different
+sample counts. On Linux, native sampling is on-CPU only. Time blocked on I/O,
+locks, or sleep is absent from the sampled stacks; use the deep-system mode
+only when scheduler context is needed.
 
 See the [profiling validation report](profiling-validation-report.md) for the
 canonical 13.4M-row performance comparison, 10-minute streaming result, and
@@ -299,13 +300,19 @@ workload, stops Perfetto, and checks the saved trace. A successful run ends
 with output like:
 
 ```text
-workload_status=0 tracebox_status=0 health_status=0 trace=target/perfetto-captures/query.pftrace
+workload_status=0 tracebox_status=0 health_status=0 sample_hz=1000 trace=target/perfetto-captures/query.pftrace
 ```
 
 `health_status=0` means the printed health row reported
 `capture_complete=1`. The command always exits with the workload's own status.
 A later capture or health failure cannot turn a successful database write into
 a failed workload. Never retry a write only because diagnostics failed.
+
+Short mode defaults to 1000 Hz. Pass `--sample-hz 100` when lower capture
+volume matters more than resolving short native work. The explicit override
+accepts only `100` or `1000` and works with every mode. At 1000 Hz the capture
+tool also drains the kernel sampling buffers more often to avoid losing short
+bursts.
 
 ### 5. Inspect the result
 
@@ -319,25 +326,32 @@ Operation
   Query
     Worker
       Operator and lower-level activity
+  Output owner
+    Output execution stages
 ```
 
-If the trace contains many workers, click the funnel-shaped track filter and
-paste an exact worker token such as `w-00000000000000000001]`. The closing
-bracket prevents worker 1 from also matching worker 10 or worker 14. Expand the
-remaining parent tracks to keep the operation, query, and worker ancestry in
-view.
+To isolate one operation, click the funnel-shaped track filter and paste its
+exact token, including the closing bracket, such as
+`op-00000000000000000003]`. The closing bracket prevents a shorter numeric ID
+from matching a longer one. Use the same technique with a worker token such as
+`w-00000000000000000001]` when a query contains many parallel workers. Expand
+the remaining parent tracks to keep the relevant ancestry in view.
 
-[![Full Perfetto timeline filtered to one logical worker](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
+[![Full Perfetto timeline filtered to one SQL Server write_all operation](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
 
-The full viewport above keeps the 6.33-second wall-clock ruler and complete
-semantic ancestry visible while showing only worker 1.
+The full viewport above shows a real SQL Server `write_all` operation. Each
+output owner contains an end-to-end `Execute output` parent. Its children show
+query setup and the actual SQL Server lifecycle, including connection, target
+preparation, streaming writes, writer finalization, and validation, on the
+same wall-clock ruler.
 
-Drag across the worker track to select the time range you want to investigate.
-Temporarily clear the name filter, check `Process callstacks cpu-clock`, and
-then reapply the worker filter. The toolbar should now say `2 tracks`. Open
-`Current Selection`, choose `Perf sample flamegraph`, and keep `Top Down`
-selected. The semantic tracks show exact wall-clock intervals; the flame graph
-shows statistical on-CPU native samples from the same selected interval.
+Drag across an output owner or worker track to select the time range you want
+to investigate. Temporarily clear the name filter, check
+`Process callstacks cpu-clock`, and then reapply the exact operation or worker
+filter. Open `Current Selection`, choose `Perf sample flamegraph`, and keep
+`Top Down` selected. The semantic tracks show exact wall-clock intervals; the
+flame graph shows statistical on-CPU native samples from the same selected
+interval.
 
 [![Perfetto Top Down native flame graph](../assets/perfetto-native-flamegraph.png)](../assets/perfetto-native-flamegraph.png)
 
@@ -366,12 +380,13 @@ minutes and up to ten minutes:
 Streaming periodically drains its buffers, has a 12-minute safety timeout, and
 caps the saved file at 512 MiB. High event volume can reach the cap sooner.
 Missing tail time in an incomplete trace is unknown activity, not zero
-activity.
+activity. Streaming defaults to 100 Hz; explicitly selecting 1000 Hz can reach
+the file cap much sooner.
 
 ### Add scheduler context
 
 Use deep-system mode only when the question requires scheduler and wakeup
-evidence. It requires tracefs access:
+evidence. It defaults to 100 Hz and requires tracefs access:
 
 ```sh
 test -r /sys/kernel/tracing/events/sched/sched_switch/id

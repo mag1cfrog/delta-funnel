@@ -18,7 +18,7 @@ use perfetto_sdk::{track_event_categories, track_event_category_enabled};
 
 mod profile_layer;
 
-pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer};
+pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);

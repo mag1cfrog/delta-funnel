@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Capture and compare stable and Perfetto exact semantic stages."""
+
+import argparse
+import csv
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+NULL = "[NULL]"
+RESULT_BY_STATUS = {
+    "completed": "ok",
+    "failed": "error",
+    "cancelled": "cancelled",
+}
+SELECTED_CATEGORIES = {
+    "datafusion.execution.activity": "execution_activity",
+    "datafusion.planning.activity": "planning_activity",
+    "delta_funnel.preview.phase": "stage",
+}
+PREVIEW_STAGES = {
+    "DataFrame planning",
+    "Physical planning",
+    "Stream setup",
+    "Execute and collect",
+    "Format text",
+    "Format HTML",
+}
+
+
+def fail(message):
+    raise SystemExit(f"semantic-parity: {message}")
+
+
+def executable(env_name, default):
+    value = os.environ.get(env_name, default)
+    path = shutil.which(value)
+    if path is None:
+        fail(f"required command is unavailable: {value}")
+    return path
+
+
+def nullable(value):
+    return None if value in (None, "", NULL) else value
+
+
+def integer(value):
+    value = nullable(value)
+    return None if value is None else int(value)
+
+
+def identity(event):
+    return (
+        event["kind"],
+        event["name"],
+        event["category"],
+        event["query_execution_id"],
+        event["query_scope"],
+        event["query_owner"],
+        event["operator_partition"],
+        event["execution_stream_id"],
+        event["activity"],
+        event["stage_owner_id"],
+        event["result"],
+        event["time_semantics"],
+    )
+
+
+def stable_events(path):
+    try:
+        document = json.loads(path.read_text())
+        timeline = document["delta_funnel_timeline"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        fail(f"cannot read stable trace {path}: {error}")
+    if timeline.get("name") != "Preview total":
+        fail(f"stable trace is not the parity preview: {timeline.get('name')!r}")
+
+    root = {
+        "id": 0,
+        "parent_id": None,
+        "kind": "operation",
+        "name": "preview",
+        "category": "delta_funnel.operation",
+        "start": 0,
+        "duration": int(timeline["total_duration_micros"]),
+        "query_execution_id": None,
+        "query_scope": None,
+        "query_owner": None,
+        "operator_partition": None,
+        "execution_stream_id": None,
+        "activity": None,
+        "stage_owner_id": None,
+        "result": RESULT_BY_STATUS[timeline["status"]],
+        "time_semantics": "wall_clock",
+    }
+    all_events = {0: root}
+    selected = [root]
+    for span in timeline["spans"]:
+        attributes = span.get("attributes", {})
+        event = {
+            "id": int(span["id"]),
+            "parent_id": span.get("parent_id"),
+            "kind": SELECTED_CATEGORIES.get(span["category"]),
+            "name": span["name"],
+            "category": span["category"],
+            "start": int(span["start_offset_micros"]),
+            "duration": int(span["duration_micros"]),
+            "query_execution_id": attributes.get("query_execution_id"),
+            "query_scope": attributes.get("query_scope"),
+            "query_owner": attributes.get("query_owner"),
+            "operator_partition": attributes.get("operator_partition"),
+            "execution_stream_id": attributes.get("execution_stream_id"),
+            "activity": attributes.get("activity"),
+            "stage_owner_id": attributes.get("stage_owner_id"),
+            "result": attributes.get("result", RESULT_BY_STATUS[span["status"]]),
+            "time_semantics": span["time_semantics"],
+        }
+        all_events[event["id"]] = event
+        if event["kind"] is not None:
+            selected.append(event)
+    return selected, all_events
+
+
+def perfetto_events(trace_processor, sql_path, trace_path):
+    result = subprocess.run(
+        [trace_processor, "query", "--query-file", str(sql_path), str(trace_path)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    rows = list(csv.DictReader(io.StringIO(result.stdout.lstrip())))
+    if not rows:
+        fail("Perfetto query returned no semantic rows")
+
+    operation_ids = {integer(row["operation_id"]) for row in rows}
+    if None in operation_ids or len(operation_ids) != 1:
+        fail(f"Perfetto rows do not share one operation identity: {operation_ids!r}")
+    if any(
+        row["semantic_kind"] == "stage" and row["operation_kind"] != "preview"
+        for row in rows
+    ):
+        fail("Perfetto stage has the wrong operation kind")
+
+    operation_rows = [row for row in rows if row["semantic_kind"] == "operation"]
+    if len(operation_rows) != 1:
+        fail(f"expected one Perfetto operation root, found {len(operation_rows)}")
+    origin = int(operation_rows[0]["ts"])
+
+    all_events = {}
+    selected = []
+    for row in rows:
+        kind = row["semantic_kind"]
+        event = {
+            "id": int(row["id"]),
+            "parent_id": integer(row["parent_id"]),
+            "kind": kind,
+            "name": "preview" if kind == "operation" else row["name"],
+            "category": nullable(row["category"]),
+            "start": (int(row["ts"]) - origin) // 1000,
+            "duration": int(row["dur"]) // 1000,
+            "query_execution_id": integer(row["query_execution_id"]),
+            "query_scope": nullable(row["query_scope"]),
+            "query_owner": nullable(row["query_owner"]),
+            "operator_partition": integer(row["operator_partition"]),
+            "execution_stream_id": integer(row["execution_stream_id"]),
+            "activity": nullable(row["activity"]),
+            "stage_owner_id": integer(row["stage_owner_id"]),
+            "result": nullable(row["result"]),
+            "time_semantics": nullable(row["time_semantics"]),
+        }
+        all_events[event["id"]] = event
+        if kind != "context":
+            selected.append(event)
+    return selected, all_events
+
+
+def grouped(events):
+    groups = defaultdict(list)
+    for event in events:
+        groups[identity(event)].append(event)
+    for group in groups.values():
+        group.sort(key=lambda event: (event["start"], event["id"]))
+    return groups
+
+
+def projected_parent(event, all_events, selected_ids):
+    parent_id = event["parent_id"]
+    while parent_id is not None:
+        if parent_id in selected_ids:
+            return parent_id
+        parent = all_events.get(parent_id)
+        if parent is None:
+            break
+        parent_id = parent["parent_id"]
+    return next(event_id for event_id in selected_ids if all_events[event_id]["kind"] == "operation")
+
+
+def validate_containment(events, root):
+    root_end = root["start"] + root["duration"]
+    for event in events:
+        end = event["start"] + event["duration"]
+        if event["start"] < root["start"] or end > root_end:
+            fail(f"{event['kind']} {event['name']!r} is outside the operation root")
+
+
+def compare(stable, stable_all, perfetto, perfetto_all):
+    kinds = {event["kind"] for event in stable}
+    required_kinds = {"operation", "stage", "planning_activity", "execution_activity"}
+    if missing_kinds := required_kinds - kinds:
+        fail(f"stable trace is missing required semantic kinds: {sorted(missing_kinds)!r}")
+    stage_names = {event["name"] for event in stable if event["kind"] == "stage"}
+    if missing_stages := PREVIEW_STAGES - stage_names:
+        fail(f"stable trace is missing preview stages: {sorted(missing_stages)!r}")
+
+    stable_groups = grouped(stable)
+    perfetto_groups = grouped(perfetto)
+    if stable_groups.keys() != perfetto_groups.keys():
+        missing = stable_groups.keys() - perfetto_groups.keys()
+        extra = perfetto_groups.keys() - stable_groups.keys()
+        fail(f"semantic identities differ; missing={list(missing)!r}, extra={list(extra)!r}")
+
+    pairs = []
+    stable_to_perfetto = {}
+    for key in stable_groups:
+        stable_group = stable_groups[key]
+        perfetto_group = perfetto_groups[key]
+        if len(stable_group) != len(perfetto_group):
+            fail(
+                f"semantic count differs for {key!r}: "
+                f"stable={len(stable_group)}, perfetto={len(perfetto_group)}"
+            )
+        for stable_event, perfetto_event in zip(stable_group, perfetto_group):
+            pairs.append((stable_event, perfetto_event))
+            stable_to_perfetto[stable_event["id"]] = perfetto_event["id"]
+
+    stable_ids = {event["id"] for event in stable}
+    perfetto_ids = {event["id"] for event in perfetto}
+    stable_root = next(event for event in stable if event["kind"] == "operation")
+    perfetto_root = next(event for event in perfetto if event["kind"] == "operation")
+    validate_containment(stable, stable_root)
+    validate_containment(perfetto, perfetto_root)
+    if not any(
+        event["kind"] == "planning_activity"
+        and stable_all[projected_parent(event, stable_all, stable_ids)]["kind"]
+        == "planning_activity"
+        for event in stable
+    ):
+        fail("stable trace has no nested planning activity")
+
+    for stable_event, perfetto_event in pairs:
+        tolerance = max(
+            10_000,
+            (max(stable_event["duration"], perfetto_event["duration"]) + 19) // 20,
+        )
+        if abs(stable_event["duration"] - perfetto_event["duration"]) > tolerance:
+            fail(
+                f"duration differs for {identity(stable_event)!r}: "
+                f"stable={stable_event['duration']}us, "
+                f"perfetto={perfetto_event['duration']}us, tolerance={tolerance}us"
+            )
+        stable_parent = projected_parent(stable_event, stable_all, stable_ids)
+        perfetto_parent = projected_parent(perfetto_event, perfetto_all, perfetto_ids)
+        if stable_to_perfetto[stable_parent] != perfetto_parent:
+            fail(f"semantic parent differs for {identity(stable_event)!r}")
+
+    ordered_stable = sorted(pairs, key=lambda pair: (pair[0]["start"], pair[0]["id"]))
+    for index, (left, _) in enumerate(ordered_stable):
+        left_end = left["start"] + left["duration"]
+        for right, _ in ordered_stable[index + 1 :]:
+            if left_end <= right["start"]:
+                left_perfetto = next(pair[1] for pair in pairs if pair[0] is left)
+                right_perfetto = next(pair[1] for pair in pairs if pair[0] is right)
+                if left_perfetto["start"] > right_perfetto["start"]:
+                    fail(
+                        f"relative ordering differs: {left['name']!r} should precede "
+                        f"{right['name']!r}"
+                    )
+    return len(pairs)
+
+
+def capture_health(capture_health_path, trace_processor, trace_path):
+    result = subprocess.run(
+        [str(capture_health_path), str(trace_path)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        env={**os.environ, "TRACE_PROCESSOR_SHELL": trace_processor},
+    )
+    rows = list(csv.DictReader(io.StringIO(result.stdout.lstrip())))
+    if len(rows) != 1 or rows[0]["capture_complete"] != "1":
+        fail("capture-health did not report capture_complete=1")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--python", default=sys.executable)
+    args = parser.parse_args()
+
+    tracebox = executable("TRACEBOX", "tracebox")
+    trace_processor = executable("TRACE_PROCESSOR_SHELL", "trace_processor_shell")
+    python = executable("PYTHON", args.python)
+    script_dir = Path(__file__).resolve().parent
+    repo_target = script_dir.parents[1] / "target"
+    output_dir = args.output_dir.resolve()
+    if not output_dir.is_relative_to(repo_target):
+        fail(f"output directory must be under {repo_target}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stable_path = output_dir / "semantic-parity.json"
+    perfetto_path = output_dir / "semantic-parity.pftrace"
+    for path in (stable_path, perfetto_path):
+        if path.exists():
+            fail(f"output already exists: {path}")
+
+    subprocess.run(
+        [
+            str(script_dir / "capture-workload"),
+            "--output",
+            str(perfetto_path),
+            "--",
+            python,
+            str(script_dir / "semantic-parity-workload.py"),
+            str(stable_path),
+        ],
+        check=True,
+        env={
+            **os.environ,
+            "TRACEBOX": tracebox,
+            "TRACE_PROCESSOR_SHELL": trace_processor,
+        },
+    )
+    capture_health(script_dir / "capture-health", trace_processor, perfetto_path)
+    stable, stable_all = stable_events(stable_path)
+    perfetto, perfetto_all = perfetto_events(
+        trace_processor,
+        script_dir / "semantic-parity.sql",
+        perfetto_path,
+    )
+    count = compare(stable, stable_all, perfetto, perfetto_all)
+    print(f"semantic parity passed: {count} exact stages")
+    print(f"stable_trace={stable_path}")
+    print(f"perfetto_trace={perfetto_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        fail(f"command failed with status {error.returncode}: {error.cmd[0]}")

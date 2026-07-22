@@ -67,7 +67,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
-    PROFILE_TARGET, PerfettoProfileLayer, initialize_perfetto, wait_for_capture,
+    PerfettoProfileLayer, initialize_perfetto, is_profile_target, wait_for_capture,
 };
 use delta_funnel::{
     DeltaFunnelSession, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
@@ -326,7 +326,7 @@ fn run_benchmark_with_subscriber(config: &BenchmarkRunnerConfig) -> Result<(), B
     wait_for_capture(PERFETTO_CAPTURE_WAIT_TIMEOUT)?;
 
     let perfetto_layer = || {
-        PerfettoProfileLayer.with_filter(filter_fn(|metadata| metadata.target() == PROFILE_TARGET))
+        PerfettoProfileLayer.with_filter(filter_fn(|metadata| is_profile_target(metadata.target())))
     };
     if let Some(trace_output_path) = &config.trace_output_path {
         let writer = TraceFileMakeWriter::new(trace_output_path.clone())?;

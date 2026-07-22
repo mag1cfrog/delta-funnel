@@ -1141,7 +1141,7 @@ mod tests {
                     [
                         ("Plan output schema", "ok"),
                         ("Plan SQL Server target", "ok"),
-                        ("Write output", "ok"),
+                        ("Execute output", "ok"),
                         ("Build query DataFrame", "ok"),
                         ("Build physical plan", "ok"),
                         ("Set up query stream", "ok"),
@@ -1330,10 +1330,10 @@ mod tests {
             let stages = process_write_all_stages(&capture);
             assert!(stages.iter().all(|(name, _, _)| name != "Plan caches"));
             assert!(stages.iter().any(|(name, owner, result)| {
-                name == "Write output" && owner.as_deref() == Some("1") && result == "error"
+                name == "Execute output" && owner.as_deref() == Some("1") && result == "error"
             }));
             assert!(!stages.iter().any(|(name, owner, _)| {
-                name == "Write output" && owner.as_deref() == Some("2")
+                name == "Execute output" && owner.as_deref() == Some("2")
             }));
             {
                 let events = events.lock().map_err(|_| "progress event lock poisoned")?;
@@ -1527,7 +1527,7 @@ mod tests {
             let first_output = timeline
                 .spans()
                 .iter()
-                .find(|span| span.name() == "Write output: big_output")
+                .find(|span| span.name() == "Execute output: big_output")
                 .ok_or("missing first output span")?;
             assert!(
                 install
@@ -1538,7 +1538,7 @@ mod tests {
             let second_output = timeline
                 .spans()
                 .iter()
-                .find(|span| span.name() == "Write output: selected_output")
+                .find(|span| span.name() == "Execute output: selected_output")
                 .ok_or("missing second output span")?;
             let restore = timeline
                 .spans()
@@ -1847,8 +1847,8 @@ mod tests {
             for expected_name in [
                 "Plan outputs",
                 "Execute output workflow",
-                "Write output: first_output",
-                "Write output: second_output",
+                "Execute output: first_output",
+                "Execute output: second_output",
                 "Report sources",
             ] {
                 assert!(
@@ -1862,12 +1862,12 @@ mod tests {
             let first_span = timeline
                 .spans()
                 .iter()
-                .find(|span| span.name() == "Write output: first_output")
+                .find(|span| span.name() == "Execute output: first_output")
                 .ok_or("missing first output span")?;
             let second_span = timeline
                 .spans()
                 .iter()
-                .find(|span| span.name() == "Write output: second_output")
+                .find(|span| span.name() == "Execute output: second_output")
                 .ok_or("missing second output span")?;
             assert!(
                 first_span
@@ -2068,14 +2068,14 @@ mod tests {
             let failed_output_span = timeline
                 .spans()
                 .iter()
-                .find(|span| span.name() == "Write output: second_output")
+                .find(|span| span.name() == "Execute output: second_output")
                 .ok_or("missing failed output span")?;
             assert_eq!(failed_output_span.status().as_str(), "failed");
             assert!(
                 timeline
                     .spans()
                     .iter()
-                    .all(|span| span.name() != "Write output: third_output")
+                    .all(|span| span.name() != "Execute output: third_output")
             );
             assert!(report.to_trace_event_json_value().is_some());
 
@@ -2952,7 +2952,7 @@ mod tests {
                 timeline
                     .spans()
                     .iter()
-                    .all(|span| !span.name().starts_with("Write output:"))
+                    .all(|span| !span.name().starts_with("Execute output:"))
             );
             assert_eq!(
                 failure.to_json_value()["operation_timeline"]["status"],

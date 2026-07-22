@@ -293,9 +293,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-tiberius"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7d43fbc23c0c73f2066a35760162cadb808507f947329a05e016d15be93ac3e"
+checksum = "2197315736145964f9785f9d2e427ec89e011843cf2952fb9127722d40b483ac"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3347,9 +3347,9 @@ dependencies = [
 
 [[package]]
 name = "tiberius-raw-bulk"
-version = "0.12.3-raw-bulk.14"
+version = "0.12.3-raw-bulk.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "221e32630c60212351b7af472e4966c9c331e8ce99dfba0331515efdd7b93195"
+checksum = "6554a4ab84c5ca3948d69f47b2fa3826cc230e68582f4e0c441006806f660e76"
 dependencies = [
  "async-native-tls",
  "async-trait",

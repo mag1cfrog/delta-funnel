@@ -19,15 +19,12 @@ use futures_util::{
 use crate::{
     DeltaFunnelError, PhaseTimingReport, ReportReasonCode, RowCount, ValidationStatus,
     observability,
-    profiling::OperationStageContext,
+    profiling::{OperationStageContext, OperationStageTrace},
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
-    report::{
-        OperationTimelineRecorder, OperationTimelineSpanRecorder,
-        sql_server::{
-            MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
-            MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
-            write::MssqlWriteDiagnostic,
-        },
+    report::sql_server::{
+        MssqlBatchShapingReport, MssqlOutputBatchValidationReport, MssqlTargetCleanupStatus,
+        MssqlWriteFailureContext, MssqlWriteReport, MssqlWriteReportMetrics,
+        write::MssqlWriteDiagnostic,
     },
 };
 
@@ -620,7 +617,6 @@ where
     W: MssqlBulkLoadWriter,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>>,
 {
-    let timeline = stage_context.timeline();
     let mut rows_written = 0_u64;
     let mut batches_written = 0_u64;
     let mut input_rows = 0_u64;
@@ -640,7 +636,7 @@ where
     loop {
         let poll_started_at = Instant::now();
         let poll_span = start_batch_span(
-            timeline,
+            stage_context,
             "Poll query batch",
             "delta_funnel.write.stream",
             "Query stream polling",
@@ -694,7 +690,7 @@ where
 
         let validation_started_at = Instant::now();
         let validation_span = start_batch_span(
-            timeline,
+            stage_context,
             "Validate batch schema",
             "delta_funnel.write.batch",
             "Batch schema validation",
@@ -738,7 +734,7 @@ where
 
         let write_batch_started_at = Instant::now();
         let write_batch_span = start_batch_span(
-            timeline,
+            stage_context,
             "Write batch to SQL Server",
             "delta_funnel.write.batch",
             "SQL Server batch writes",
@@ -798,7 +794,11 @@ where
         "delta_funnel.write.sql_server",
         "Finalize writer",
     );
-    let finish_result = MssqlBulkLoadWriter::finish(writer).await;
+    let finish = MssqlBulkLoadWriter::finish(writer);
+    let finish_result = match &finalize_span {
+        Some(span) => span.instrument_future(finish).await,
+        None => finish.await,
+    };
     let finalize_elapsed = finalize_started_at.elapsed();
     if finish_result.is_ok() {
         if let Some(span) = finalize_span {
@@ -855,17 +855,15 @@ where
 }
 
 fn start_batch_span(
-    timeline: Option<&OperationTimelineRecorder>,
-    name: &str,
-    category: &str,
-    track_name: &str,
+    stage_context: OperationStageContext<'_>,
+    name: &'static str,
+    category: &'static str,
+    track_name: &'static str,
     batch_index: u64,
     row_count: Option<u64>,
-) -> Option<OperationTimelineSpanRecorder> {
-    timeline.map(|timeline| {
-        let span = timeline
-            .start_span(name, category, track_name)
-            .with_attribute("batch_index", batch_index.into());
+) -> Option<OperationStageTrace> {
+    stage_context.start(name, category, track_name).map(|span| {
+        let span = span.with_attribute("batch_index", batch_index.into());
         match row_count {
             Some(row_count) => span.with_attribute("row_count", row_count.into()),
             None => span,
@@ -873,13 +871,13 @@ fn start_batch_span(
     })
 }
 
-fn complete_batch_span(span: Option<OperationTimelineSpanRecorder>) {
+fn complete_batch_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.completed();
     }
 }
 
-fn fail_batch_span(span: Option<OperationTimelineSpanRecorder>) {
+fn fail_batch_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.failed();
     }
@@ -1223,6 +1221,7 @@ mod tests {
         DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
         MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
         PhaseTimingReport, ReportReasonCode, ValidationStatus, plan_mssql_target_for_output,
+        report::OperationTimelineRecorder,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
