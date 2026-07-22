@@ -10,6 +10,8 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(feature = "perfetto-profile")]
+use datafusion::common::runtime::{JoinSetTracer, JoinSetTracerError, set_join_set_tracer};
 use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
     common::Result as DataFusionResult,
@@ -20,6 +22,8 @@ use datafusion::{
     },
 };
 use futures_util::Stream;
+#[cfg(feature = "perfetto-profile")]
+use futures_util::{FutureExt, future::BoxFuture, future::poll_fn};
 use serde_json::Value;
 
 use crate::{
@@ -109,7 +113,7 @@ struct ActivityExecutionContext {
     worker_thread_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ActiveOperatorActivitySpan {
     operation_id: u64,
     query_execution_id: u64,
@@ -117,6 +121,19 @@ struct ActiveOperatorActivitySpan {
     owns_worker_lane: bool,
     timeline_span_id: Option<u64>,
     process_span_active: bool,
+    #[cfg(feature = "perfetto-profile")]
+    task_trace_context: Option<DataFusionTaskTraceContext>,
+}
+
+impl ActiveOperatorActivitySpan {
+    fn same_scope(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.query_execution_id == other.query_execution_id
+            && self.worker_lane == other.worker_lane
+            && self.owns_worker_lane == other.owns_worker_lane
+            && self.timeline_span_id == other.timeline_span_id
+            && self.process_span_active == other.process_span_active
+    }
 }
 
 thread_local! {
@@ -131,6 +148,17 @@ struct OperatorActivityRecorder {
     query_scope: QueryExecutionScope,
     query_owner: Option<Arc<str>>,
     identities: Arc<Mutex<OperatorActivityIdentityState>>,
+}
+
+#[cfg(feature = "perfetto-profile")]
+#[derive(Debug, Clone)]
+struct DataFusionTaskTraceContext {
+    activity: OperatorActivityRecorder,
+    operator_name: Arc<str>,
+    node_id: u64,
+    parent_node_id: Option<u64>,
+    partition: usize,
+    stream_id: u64,
 }
 
 impl OperatorActivityRecorder {
@@ -152,20 +180,21 @@ impl OperatorActivityRecorder {
 
     fn start_span(
         &self,
-        operator_name: &str,
+        operator_name: impl Into<Arc<str>>,
         node_id: u64,
         parent_node_id: Option<u64>,
         partition: usize,
         stream_id: u64,
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
+        let operator_name = operator_name.into();
         let can_record_timeline = self.context.timeline().is_some();
-        let can_record_process = self.context.process_spans_enabled() && activity == "poll_next";
+        let can_record_process = self.context.process_spans_enabled();
         if !can_record_timeline && !can_record_process {
             return None;
         }
 
-        let (context, owns_worker_lane) = self.execution_context(partition);
+        let (context, owns_worker_lane) = self.execution_context(partition, true);
         let (parent_id, process_parent_active) = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
             let active = active.borrow();
             let matches_parent = |parent: &ActiveOperatorActivitySpan| {
@@ -193,8 +222,8 @@ impl OperatorActivityRecorder {
             }
         };
         let records_semantic_span = can_record_timeline && records_detail;
-        // Once detailed spans are capped, keep only the outermost poll on each
-        // executor task so sampled stacks retain query and worker identity.
+        // Once detailed spans are capped, keep only the outermost activity on
+        // each executor task so sampled stacks retain query and worker identity.
         let records_process_span = can_record_process && (records_detail || !process_parent_active);
         if !records_semantic_span && !records_process_span {
             if owns_worker_lane {
@@ -209,7 +238,7 @@ impl OperatorActivityRecorder {
             .filter(|_| records_detail)
             .map(|timeline| {
                 self.with_query_identity(timeline.start_span(
-                    operator_name,
+                    operator_name.as_ref(),
                     OPERATOR_ACTIVITY_CATEGORY,
                     track_name,
                 ))
@@ -255,12 +284,13 @@ impl OperatorActivityRecorder {
             .and_then(OperationTimelineSpanRecorder::id);
         let process_span = records_process_span
             .then(|| {
-                self.process_poll_span(
-                    operator_name,
+                self.process_operator_span(
+                    operator_name.as_ref(),
                     node_id,
                     parent_node_id,
                     partition,
                     stream_id,
+                    activity,
                     &context,
                     process_parent_active,
                 )
@@ -279,8 +309,17 @@ impl OperatorActivityRecorder {
             owns_worker_lane,
             timeline_span_id,
             process_span_active: process_span.is_some(),
+            #[cfg(feature = "perfetto-profile")]
+            task_trace_context: process_span.as_ref().map(|_| DataFusionTaskTraceContext {
+                activity: self.clone(),
+                operator_name,
+                node_id,
+                parent_node_id,
+                partition,
+                stream_id,
+            }),
         };
-        ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active));
+        ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active.clone()));
         Some(OperatorActivitySpanRecorder {
             timeline_span,
             process_span,
@@ -354,13 +393,14 @@ impl OperatorActivityRecorder {
         clippy::too_many_arguments,
         reason = "the process span records the canonical operator activity identity"
     )]
-    fn process_poll_span(
+    fn process_operator_span(
         &self,
         operator_name: &str,
         node_id: u64,
         parent_node_id: Option<u64>,
         partition: usize,
         stream_id: u64,
+        activity: &'static str,
         context: &ActivityExecutionContext,
         process_parent_active: bool,
     ) -> Option<tracing::Span> {
@@ -374,7 +414,7 @@ impl OperatorActivityRecorder {
         let span = tracing::trace_span!(
             target: crate::profiling::PROFILE_TARGET,
             parent: parent,
-            "DataFusion operator poll",
+            "DataFusion operator activity",
             operation_id = self.context.operation_id(),
             query_execution_id = self.query_execution_id,
             query_scope = self.query_scope.as_str(),
@@ -386,7 +426,7 @@ impl OperatorActivityRecorder {
             parent_node_id = tracing::field::Empty,
             operator_partition = usize_to_u64_saturating(partition),
             execution_stream_id = stream_id,
-            activity = "poll_next",
+            activity,
             result = tracing::field::Empty,
             time_semantics = "active",
         );
@@ -406,7 +446,11 @@ impl OperatorActivityRecorder {
         stream_id
     }
 
-    fn execution_context(&self, partition: usize) -> (ActivityExecutionContext, bool) {
+    fn execution_context(
+        &self,
+        partition: usize,
+        allow_coordinator: bool,
+    ) -> (ActivityExecutionContext, bool) {
         let thread = std::thread::current();
         let runtime_task_id = tokio::task::try_id().map(|id| id.to_string());
         let task_kind = if runtime_task_id.is_some() {
@@ -424,7 +468,7 @@ impl OperatorActivityRecorder {
         });
         let (worker_lane, owns_worker_lane) = match inherited_worker_lane {
             Some(worker_lane) => (worker_lane, false),
-            None if runtime_task_id.is_none() && partition == 0 => (
+            None if allow_coordinator && runtime_task_id.is_none() && partition == 0 => (
                 ActivityWorkerLane {
                     id: 0,
                     kind: ActivityWorkerKind::Coordinator,
@@ -604,7 +648,11 @@ impl Drop for OperatorActivitySpanRecorder {
         }
         let _ = ACTIVE_OPERATOR_ACTIVITY_SPANS.try_with(|spans| {
             let popped = spans.borrow_mut().pop();
-            debug_assert_eq!(popped, Some(self.active));
+            debug_assert!(
+                popped
+                    .as_ref()
+                    .is_some_and(|popped| popped.same_scope(&self.active))
+            );
         });
         drop(self.timeline_span.take());
         drop(self.process_span.take());
@@ -615,6 +663,134 @@ impl Drop for OperatorActivitySpanRecorder {
             );
         }
     }
+}
+
+#[cfg(feature = "perfetto-profile")]
+impl DataFusionTaskTraceContext {
+    fn process_span(&self) -> tracing::Span {
+        tracing::trace_span!(
+            target: crate::profiling::PROFILE_TARGET,
+            parent: None,
+            "DataFusion task context",
+            operation_id = self.activity.context.operation_id(),
+            query_execution_id = self.activity.query_execution_id,
+            query_scope = self.activity.query_scope.as_str(),
+            query_owner = self.activity.query_owner.as_deref(),
+            operator_name = self.operator_name.as_ref(),
+            worker_lane_id = tracing::field::Empty,
+            worker_kind = tracing::field::Empty,
+            node_id = self.node_id,
+            parent_node_id = tracing::field::Empty,
+            operator_partition = usize_to_u64_saturating(self.partition),
+            execution_stream_id = self.stream_id,
+            activity = "spawned_task",
+            time_semantics = "active",
+        )
+    }
+
+    fn in_process_scope<T>(&self, span: &tracing::Span, operation: impl FnOnce() -> T) -> T {
+        let (context, owns_worker_lane) = self.activity.execution_context(self.partition, false);
+        span.record("worker_lane_id", context.worker_lane.id);
+        span.record("worker_kind", context.worker_lane.kind.as_str());
+        if let Some(parent_node_id) = self.parent_node_id {
+            span.record("parent_node_id", parent_node_id);
+        }
+        let active = ActiveOperatorActivitySpan {
+            operation_id: self.activity.context.operation_id(),
+            query_execution_id: self.activity.query_execution_id,
+            worker_lane: context.worker_lane,
+            owns_worker_lane,
+            timeline_span_id: None,
+            process_span_active: true,
+            task_trace_context: Some(self.clone()),
+        };
+        ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active.clone()));
+        let guard = DataFusionTaskScope {
+            identities: Arc::clone(&self.activity.identities),
+            active,
+        };
+        let result = span.in_scope(operation);
+        drop(guard);
+        result
+    }
+}
+
+#[cfg(feature = "perfetto-profile")]
+struct DataFusionTaskScope {
+    identities: Arc<Mutex<OperatorActivityIdentityState>>,
+    active: ActiveOperatorActivitySpan,
+}
+
+#[cfg(feature = "perfetto-profile")]
+impl Drop for DataFusionTaskScope {
+    fn drop(&mut self) {
+        let _ = ACTIVE_OPERATOR_ACTIVITY_SPANS.try_with(|spans| {
+            let popped = spans.borrow_mut().pop();
+            debug_assert!(
+                popped
+                    .as_ref()
+                    .is_some_and(|popped| popped.same_scope(&self.active))
+            );
+        });
+        if self.active.owns_worker_lane {
+            OperatorActivityRecorder::release_worker_lane(
+                &self.identities,
+                self.active.worker_lane,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn current_datafusion_task_trace_context() -> Option<DataFusionTaskTraceContext> {
+    ACTIVE_OPERATOR_ACTIVITY_SPANS
+        .try_with(|spans| {
+            spans
+                .borrow()
+                .last()
+                .and_then(|active| active.task_trace_context.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(feature = "perfetto-profile")]
+struct DeltaFunnelDataFusionTaskTracer;
+
+#[cfg(feature = "perfetto-profile")]
+impl JoinSetTracer for DeltaFunnelDataFusionTaskTracer {
+    fn trace_future(
+        &self,
+        mut future: BoxFuture<'static, Box<dyn Any + Send>>,
+    ) -> BoxFuture<'static, Box<dyn Any + Send>> {
+        let Some(context) = current_datafusion_task_trace_context() else {
+            return future;
+        };
+        let span = context.process_span();
+        poll_fn(move |poll_context| {
+            context.in_process_scope(&span, || future.as_mut().poll(poll_context))
+        })
+        .boxed()
+    }
+
+    fn trace_block(
+        &self,
+        operation: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+    ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
+        let Some(context) = current_datafusion_task_trace_context() else {
+            return operation;
+        };
+        let span = context.process_span();
+        Box::new(move || context.in_process_scope(&span, operation))
+    }
+}
+
+#[cfg(feature = "perfetto-profile")]
+static DATAFUSION_TASK_TRACER: DeltaFunnelDataFusionTaskTracer = DeltaFunnelDataFusionTaskTracer;
+
+#[cfg(feature = "perfetto-profile")]
+pub(crate) fn initialize_datafusion_task_tracing() -> Result<(), JoinSetTracerError> {
+    set_join_set_tracer(&DATAFUSION_TASK_TRACER)
 }
 
 /// Adds transparent execute and poll instrumentation to one finalized plan.
@@ -660,8 +836,10 @@ fn instrument_query_execution_node(
     // Instrument only the provider-owned output boundary. Name matching could
     // accidentally include an unrelated third-party plan with the same label.
     let records_delta_scan_output_wait = inner.as_any().is::<DeltaScanPlanningExec>();
+    let operator_name = Arc::<str>::from(inner.name());
     let plan: Arc<dyn ExecutionPlan> = Arc::new(ProfiledOperatorExec {
         inner,
+        operator_name,
         node_id,
         parent_node_id,
         activity: activity.clone(),
@@ -684,6 +862,7 @@ pub(super) fn unprofiled_execution_plan(plan: &dyn ExecutionPlan) -> &dyn Execut
 #[derive(Debug)]
 struct ProfiledOperatorExec {
     inner: Arc<dyn ExecutionPlan>,
+    operator_name: Arc<str>,
     node_id: u64,
     parent_node_id: Option<u64>,
     activity: OperatorActivityRecorder,
@@ -702,7 +881,7 @@ impl DisplayAs for ProfiledOperatorExec {
 
 impl ExecutionPlan for ProfiledOperatorExec {
     fn name(&self) -> &str {
-        self.inner.name()
+        &self.operator_name
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -724,6 +903,7 @@ impl ExecutionPlan for ProfiledOperatorExec {
         let inner = Arc::clone(&self.inner).with_new_children(children)?;
         Ok(Arc::new(Self {
             inner,
+            operator_name: Arc::clone(&self.operator_name),
             node_id: self.node_id,
             parent_node_id: self.parent_node_id,
             activity: self.activity.clone(),
@@ -738,14 +918,17 @@ impl ExecutionPlan for ProfiledOperatorExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let stream_id = self.activity.next_stream_id();
         let span = self.activity.start_span(
-            self.name(),
+            Arc::clone(&self.operator_name),
             self.node_id,
             self.parent_node_id,
             partition,
             stream_id,
             "execute",
         );
-        let result = self.inner.execute(partition, context);
+        let result = match &span {
+            Some(span) => span.in_process_scope(|| self.inner.execute(partition, context)),
+            None => self.inner.execute(partition, context),
+        };
         if let Some(span) = span {
             span.finish(
                 if result.is_ok() { "stream" } else { "error" },
@@ -756,7 +939,7 @@ impl ExecutionPlan for ProfiledOperatorExec {
             Box::pin(ProfiledRecordBatchStream {
                 schema: inner.schema(),
                 inner,
-                operator_name: self.name().to_owned(),
+                operator_name: Arc::clone(&self.operator_name),
                 node_id: self.node_id,
                 parent_node_id: self.parent_node_id,
                 partition,
@@ -776,7 +959,7 @@ impl ExecutionPlan for ProfiledOperatorExec {
 struct ProfiledRecordBatchStream {
     schema: SchemaRef,
     inner: SendableRecordBatchStream,
-    operator_name: String,
+    operator_name: Arc<str>,
     node_id: u64,
     parent_node_id: Option<u64>,
     partition: usize,
@@ -791,7 +974,7 @@ impl Stream for ProfiledRecordBatchStream {
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let span = self.activity.start_span(
-            &self.operator_name,
+            Arc::clone(&self.operator_name),
             self.node_id,
             self.parent_node_id,
             self.partition,
@@ -968,7 +1151,7 @@ mod tests {
         Box::pin(ProfiledRecordBatchStream {
             schema: inner.schema(),
             inner,
-            operator_name: "DeltaScanPlanningExec".to_owned(),
+            operator_name: Arc::from("DeltaScanPlanningExec"),
             node_id: 4,
             parent_node_id: Some(3),
             partition,
@@ -1209,7 +1392,7 @@ mod tests {
             captured
                 .spans()
                 .iter()
-                .filter(|span| span.name == "DataFusion operator poll")
+                .filter(|span| span.name == "DataFusion operator activity")
                 .count(),
             2
         );
@@ -1249,7 +1432,7 @@ mod tests {
                 .captured()
                 .spans()
                 .iter()
-                .filter(|span| span.name == "DataFusion operator poll")
+                .filter(|span| span.name == "DataFusion operator activity")
                 .count(),
             2
         );
@@ -2005,7 +2188,10 @@ mod tests {
             .expect("operation root span should be captured");
         let polls = spans
             .iter()
-            .filter(|span| span.name == "DataFusion operator poll")
+            .filter(|span| {
+                span.name == "DataFusion operator activity"
+                    && span.fields["activity"] == "poll_next"
+            })
             .collect::<Vec<_>>();
         assert!(!polls.is_empty());
         assert!(polls.iter().all(|span| {
@@ -2040,6 +2226,82 @@ mod tests {
                 .any(|span| polls.iter().any(|parent| Some(parent.id) == span.parent_id)),
             "at least one child operator poll should nest under its caller"
         );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datafusion_task_tracer_reenters_operator_identity_for_async_and_blocking_work()
+    -> Result<(), Box<dyn Error>> {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let activity =
+            OperatorActivityRecorder::new(test_trace_identity_with_limit(None, true, 100));
+        let operation_id = activity.context.operation_id();
+
+        let execute = activity
+            .start_span("FutureExec", 4, Some(3), 2, 7, "execute")
+            .ok_or("expected execute process context")?;
+        let future = execute.in_process_scope(|| {
+            DATAFUSION_TASK_TRACER.trace_future(
+                async move {
+                    tokio::task::yield_now().await;
+                    Box::new(()) as Box<dyn Any + Send>
+                }
+                .boxed(),
+            )
+        });
+        execute.finish("stream", false);
+        tokio::spawn(future).await?;
+
+        let poll = activity
+            .start_span("BlockingExec", 5, Some(3), 3, 8, "poll_next")
+            .ok_or("expected poll process context")?;
+        let blocking = poll.in_process_scope(|| {
+            DATAFUSION_TASK_TRACER.trace_block(Box::new(|| Box::new(()) as Box<dyn Any + Send>))
+        });
+        poll.finish("batch", false);
+        tokio::task::spawn_blocking(blocking).await?;
+
+        activity.context.record_process_result("ok");
+        drop(activity);
+
+        let contexts = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .filter(|span| span.name == "DataFusion task context")
+            .collect::<Vec<_>>();
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts.iter().all(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.level == tracing::Level::TRACE
+                && span.parent_id.is_none()
+                && span.fields["operation_id"] == operation_id.to_string()
+                && span.fields["query_execution_id"] == "1"
+                && span.fields["query_scope"] == "preview"
+                && span.fields.contains_key("worker_lane_id")
+                && span.fields.contains_key("worker_kind")
+                && span.fields["activity"] == "spawned_task"
+                && span.fields["time_semantics"] == "active"
+                && span.enter_count >= 1
+                && span.enter_count == span.exit_count
+                && span.closed
+        }));
+        assert!(contexts.iter().any(|span| {
+            span.fields["operator_name"] == "FutureExec"
+                && span.fields["node_id"] == "4"
+                && span.fields["parent_node_id"] == "3"
+                && span.fields["operator_partition"] == "2"
+                && span.fields["execution_stream_id"] == "7"
+        }));
+        assert!(contexts.iter().any(|span| {
+            span.fields["operator_name"] == "BlockingExec"
+                && span.fields["node_id"] == "5"
+                && span.fields["parent_node_id"] == "3"
+                && span.fields["operator_partition"] == "3"
+                && span.fields["execution_stream_id"] == "8"
+        }));
 
         Ok(())
     }

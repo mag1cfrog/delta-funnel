@@ -2530,7 +2530,7 @@ mod tests {
             .ok_or("expected process planning span")?;
         assert_eq!(planning.parent_id, Some(root.id));
         assert!(spans.iter().any(|span| {
-            span.name == "DataFusion operator poll"
+            span.name == "DataFusion operator activity"
                 && (span.parent_id == Some(root.id)
                     || spans.iter().any(|parent| Some(parent.id) == span.parent_id))
         }));

@@ -64,7 +64,7 @@ where
                 let inherited = parent
                     .extensions()
                     .get::<ActiveProfileSpan>()
-                    .map(|active| active.inherit(name));
+                    .and_then(|active| active.inherit(name));
                 if inherited.is_some() {
                     break inherited;
                 }
@@ -96,6 +96,7 @@ where
             return;
         };
         if let Some(active) = span.extensions().get::<ActiveProfileSpan>() {
+            active.emit_task_begin();
             active.emit_context_enter();
         }
     }
@@ -104,9 +105,12 @@ where
         let Some(span) = context.span(id) else {
             return;
         };
-        if span.extensions().get::<ActiveProfileSpan>().is_some() {
-            track_event_end!("delta_funnel.profile.context");
-        }
+        let extensions = span.extensions();
+        let Some(active) = extensions.get::<ActiveProfileSpan>() else {
+            return;
+        };
+        track_event_end!("delta_funnel.profile.context");
+        active.emit_task_end();
     }
 
     fn on_close(&self, id: Id, context: Context<'_, S>) {
@@ -299,7 +303,7 @@ impl ActiveProfileSpan {
                     );
                 ProfileEvent::Stage { name, track }
             }
-            "DataFusion operator poll" => {
+            "DataFusion operator activity" => {
                 let query_execution_id = fields.query_execution_id?;
                 let worker_lane_id = fields.worker_lane_id?;
                 let query = query_track(operation_id, query_execution_id, operation.uuid);
@@ -314,22 +318,37 @@ impl ActiveProfileSpan {
                     ),
                 }
             }
+            "DataFusion task context" => ProfileEvent::TaskContext {
+                name: fields.operator_name.clone()?,
+            },
             _ => return None,
         };
         Some(Self { event, fields })
     }
 
-    fn inherit(&self, name: &str) -> Self {
-        Self {
+    fn inherit(&self, name: &str) -> Option<Self> {
+        let track = match &self.event {
+            ProfileEvent::TaskContext { .. } => self.task_track()?,
+            _ => self.track().clone(),
+        };
+        Some(Self {
             event: ProfileEvent::Detail {
                 name: name.to_owned(),
-                track: self.track().clone(),
+                track,
             },
             fields: self.fields.clone(),
-        }
+        })
     }
 
     fn record(&mut self, fields: ProfileFields) {
+        if matches!(&self.event, ProfileEvent::TaskContext { .. }) {
+            if fields.worker_lane_id.is_some() {
+                self.fields.worker_lane_id = fields.worker_lane_id;
+            }
+            if fields.worker_kind.is_some() {
+                self.fields.worker_kind = fields.worker_kind;
+            }
+        }
         if !matches!(&self.event, ProfileEvent::PlanningActivity { .. })
             && fields.query_owner.is_some()
         {
@@ -502,41 +521,18 @@ impl ActiveProfileSpan {
                 }
             }
             ProfileEvent::Operator { name, worker } => {
-                if let Ok(name) = CString::new(name.as_str()) {
-                    track_event!(
-                        "delta_funnel.profile",
-                        TrackEventType::SliceBegin(name.as_ptr()),
-                        |context: &mut EventContext| {
-                            worker.set_on(context);
-                            self.add_profile_args(context);
-                        }
-                    );
-                } else {
-                    track_event_begin!(
-                        "delta_funnel.profile",
-                        "DataFusion operator",
-                        |context: &mut EventContext| {
-                            worker.set_on(context);
-                            self.add_profile_args(context);
-                        }
-                    );
-                }
+                self.emit_operator_begin(name, worker);
             }
+            ProfileEvent::TaskContext { .. } => {}
         }
     }
 
     fn emit_end(self) {
-        let (track, flush) = match &self.event {
-            ProfileEvent::Operation { operation, .. } => (operation, true),
-            ProfileEvent::Planning { planning, .. }
-            | ProfileEvent::PlanningActivity { planning, .. } => (planning, false),
-            ProfileEvent::ExecutionActivity { output, .. } => (output, false),
-            ProfileEvent::Phase { phases, .. } => (phases, false),
-            ProfileEvent::Stage { track, .. } | ProfileEvent::Detail { track, .. } => {
-                (track, false)
-            }
-            ProfileEvent::Operator { worker, .. } => (worker, false),
-        };
+        if matches!(&self.event, ProfileEvent::TaskContext { .. }) {
+            return;
+        }
+        let flush = matches!(&self.event, ProfileEvent::Operation { .. });
+        let track = self.track();
         track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
             track.set_on(context);
             self.add_completion_args(context);
@@ -560,6 +556,65 @@ impl ActiveProfileSpan {
                 |context: &mut EventContext| self.add_profile_args(context)
             );
         }
+    }
+
+    fn emit_task_begin(&self) {
+        let ProfileEvent::TaskContext { name } = &self.event else {
+            return;
+        };
+        if let Some(worker) = self.task_track() {
+            self.emit_operator_begin(name, &worker);
+        }
+    }
+
+    fn emit_task_end(&self) {
+        if !matches!(&self.event, ProfileEvent::TaskContext { .. }) {
+            return;
+        }
+        if let Some(worker) = self.task_track() {
+            track_event_end!("delta_funnel.profile", |context: &mut EventContext| {
+                worker.set_on(context);
+                self.add_completion_args(context);
+            });
+        }
+    }
+
+    fn emit_operator_begin(&self, name: &str, worker: &SemanticTrack) {
+        if let Ok(name) = CString::new(name) {
+            track_event!(
+                "delta_funnel.profile",
+                TrackEventType::SliceBegin(name.as_ptr()),
+                |context: &mut EventContext| {
+                    worker.set_on(context);
+                    self.add_profile_args(context);
+                }
+            );
+        } else {
+            track_event_begin!(
+                "delta_funnel.profile",
+                "DataFusion operator",
+                |context: &mut EventContext| {
+                    worker.set_on(context);
+                    self.add_profile_args(context);
+                }
+            );
+        }
+    }
+
+    fn task_track(&self) -> Option<SemanticTrack> {
+        let operation_id = self.fields.operation_id?;
+        let query_execution_id = self.fields.query_execution_id?;
+        let worker_lane_id = self.fields.worker_lane_id?;
+        let diagnostics = diagnostics_track(TrackEventTrack::process_track_uuid());
+        let operation = operation_track(operation_id, diagnostics.uuid);
+        let query = query_track(operation_id, query_execution_id, operation.uuid);
+        Some(worker_track(
+            operation_id,
+            query_execution_id,
+            worker_lane_id,
+            query.uuid,
+            worker_lane_id,
+        ))
     }
 
     fn set_operation_on(&self, context: &mut EventContext, operation: &SemanticTrack) {
@@ -654,6 +709,9 @@ impl ActiveProfileSpan {
             ProfileEvent::Phase { phases, .. } => phases,
             ProfileEvent::Stage { track, .. } | ProfileEvent::Detail { track, .. } => track,
             ProfileEvent::Operator { worker, .. } => worker,
+            ProfileEvent::TaskContext { .. } => {
+                unreachable!("a task context does not own a semantic track")
+            }
         }
     }
 }
@@ -693,6 +751,9 @@ enum ProfileEvent {
         name: String,
         worker: SemanticTrack,
     },
+    TaskContext {
+        name: String,
+    },
 }
 
 impl ProfileEvent {
@@ -704,7 +765,8 @@ impl ProfileEvent {
             | Self::ExecutionActivity { name, .. }
             | Self::Stage { name, .. }
             | Self::Detail { name, .. }
-            | Self::Operator { name, .. } => name,
+            | Self::Operator { name, .. }
+            | Self::TaskContext { name } => name,
             Self::Phase { kind, .. } => kind.name(),
         }
     }
@@ -794,12 +856,13 @@ mod tests {
 
     #[test]
     fn canonical_fields_map_to_deterministic_exact_worker_tracks() {
-        let first = ActiveProfileSpan::from_fields("DataFusion operator poll", fields(1, 1, 1))
+        let first = ActiveProfileSpan::from_fields("DataFusion operator activity", fields(1, 1, 1))
             .expect("complete operator identity should map");
-        let duplicate = ActiveProfileSpan::from_fields("DataFusion operator poll", fields(1, 1, 1))
-            .expect("the same operator identity should map");
+        let duplicate =
+            ActiveProfileSpan::from_fields("DataFusion operator activity", fields(1, 1, 1))
+                .expect("the same operator identity should map");
         let worker_10 =
-            ActiveProfileSpan::from_fields("DataFusion operator poll", fields(1, 1, 10))
+            ActiveProfileSpan::from_fields("DataFusion operator activity", fields(1, 1, 10))
                 .expect("a second worker should map");
 
         assert_eq!(first.track(), duplicate.track());
@@ -828,11 +891,40 @@ mod tests {
     }
 
     #[test]
+    fn task_context_accepts_worker_identity_recorded_before_each_poll() {
+        let mut initial = fields(1, 1, 1);
+        initial.worker_lane_id = None;
+        initial.worker_kind = None;
+        initial.activity = Some("spawned_task".to_owned());
+        let mut active = ActiveProfileSpan::from_fields("DataFusion task context", initial)
+            .expect("task creation should not require a worker assignment");
+        assert!(matches!(active.event, ProfileEvent::TaskContext { .. }));
+
+        active.record(ProfileFields {
+            worker_lane_id: Some(4),
+            worker_kind: Some("runtime".to_owned()),
+            ..ProfileFields::default()
+        });
+        let detail = active
+            .inherit("DataFusion dependency")
+            .expect("an entered task context should propagate its worker assignment");
+
+        assert_eq!(active.fields.worker_lane_id, Some(4));
+        assert_eq!(active.fields.worker_kind.as_deref(), Some("runtime"));
+        assert!(
+            detail
+                .track()
+                .name
+                .contains("worker [w-00000000000000000004]")
+        );
+    }
+
+    #[test]
     fn completion_records_preserve_begin_identity_and_update_completion_fields() {
         let mut initial = fields(1, 1, 1);
         initial.query_owner = None;
         initial.parent_node_id = None;
-        let mut active = ActiveProfileSpan::from_fields("DataFusion operator poll", initial)
+        let mut active = ActiveProfileSpan::from_fields("DataFusion operator activity", initial)
             .expect("complete operator identity should map");
 
         active.record(ProfileFields {
@@ -856,8 +948,11 @@ mod tests {
     #[test]
     fn incomplete_or_unknown_spans_are_ignored() {
         assert!(
-            ActiveProfileSpan::from_fields("DataFusion operator poll", ProfileFields::default())
-                .is_none()
+            ActiveProfileSpan::from_fields(
+                "DataFusion operator activity",
+                ProfileFields::default()
+            )
+            .is_none()
         );
         assert!(ActiveProfileSpan::from_fields("application span", fields(1, 1, 1)).is_none());
     }
@@ -877,10 +972,12 @@ mod tests {
         )
         .expect("the semantic parent should map");
 
-        let child = parent.inherit(
-            dependency_span_label(BULK_FINALIZE_RESULT)
-                .expect("the stable dependency span should map"),
-        );
+        let child = parent
+            .inherit(
+                dependency_span_label(BULK_FINALIZE_RESULT)
+                    .expect("the stable dependency span should map"),
+            )
+            .expect("the complete parent identity should propagate");
 
         assert_eq!(child.track(), parent.track());
         assert_eq!(child.fields.operation_id, Some(7));

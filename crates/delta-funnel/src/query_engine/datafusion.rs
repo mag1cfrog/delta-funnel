@@ -19,6 +19,8 @@ mod planning;
 mod planning_activity;
 mod session;
 
+#[cfg(feature = "perfetto-profile")]
+pub(crate) use operator_activity::initialize_datafusion_task_tracing;
 pub(crate) use operator_activity::instrument_query_execution_plan;
 pub(crate) use planning_activity::{
     profile_query_planning_sync_result, with_query_planning_activity,
