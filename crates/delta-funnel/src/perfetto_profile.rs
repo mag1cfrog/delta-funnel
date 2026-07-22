@@ -30,8 +30,9 @@ pub use ranked_report::{
 };
 #[doc(hidden)]
 pub use report_cli::{
-    RankedReportArgumentError, RankedReportCliAction, RankedReportPathError, RankedReportPaths,
-    parse_ranked_report_args, preflight_ranked_report_paths,
+    RankedReportArgumentError, RankedReportCliAction, RankedReportFailure,
+    RankedReportFailurePhase, RankedReportPathError, RankedReportPaths, parse_ranked_report_args,
+    preflight_ranked_report_paths,
 };
 
 const CATEGORY: &str = "delta_funnel.profile";

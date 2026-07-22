@@ -37,6 +37,94 @@ impl fmt::Display for RankedReportArgumentError {
 impl std::error::Error for RankedReportArgumentError {}
 
 #[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RankedReportFailurePhase {
+    Argument,
+    Input,
+    Health,
+    TraceProcessor,
+    Query,
+    AggregateValidation,
+    Serialization,
+    Output,
+}
+
+impl RankedReportFailurePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Argument => "argument",
+            Self::Input => "input",
+            Self::Health => "health",
+            Self::TraceProcessor => "trace_processor",
+            Self::Query => "query",
+            Self::AggregateValidation => "aggregate_validation",
+            Self::Serialization => "serialization",
+            Self::Output => "output",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankedReportFailure {
+    phase: RankedReportFailurePhase,
+    kind: &'static str,
+    message: String,
+}
+
+impl RankedReportFailure {
+    pub(crate) fn new(
+        phase: RankedReportFailurePhase,
+        kind: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase,
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn phase(&self) -> RankedReportFailurePhase {
+        self.phase
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    pub fn machine_line(&self) -> String {
+        serde_json::json!({
+            "phase": self.phase.as_str(),
+            "kind": self.kind,
+            "message": self.message,
+        })
+        .to_string()
+    }
+}
+
+impl fmt::Display for RankedReportFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RankedReportFailure {}
+
+impl From<RankedReportArgumentError> for RankedReportFailure {
+    fn from(error: RankedReportArgumentError) -> Self {
+        let kind = match error {
+            RankedReportArgumentError::MissingInput => "missing_input",
+            RankedReportArgumentError::MissingOutputValue => "missing_output_value",
+            RankedReportArgumentError::DuplicateOutput => "duplicate_output",
+            RankedReportArgumentError::MultipleInputs => "multiple_inputs",
+            RankedReportArgumentError::UnknownOption => "unknown_option",
+        };
+        Self::new(RankedReportFailurePhase::Argument, kind, error.to_string())
+    }
+}
+
+#[doc(hidden)]
 #[derive(Debug)]
 pub enum RankedReportPathError {
     InputUnreadable(io::Error),
@@ -76,6 +164,31 @@ impl std::error::Error for RankedReportPathError {
             Self::InputUnreadable(error) | Self::OutputInspection(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<RankedReportPathError> for RankedReportFailure {
+    fn from(error: RankedReportPathError) -> Self {
+        let (phase, kind) = match &error {
+            RankedReportPathError::InputUnreadable(_) => {
+                (RankedReportFailurePhase::Input, "unreadable")
+            }
+            RankedReportPathError::InputNotFile => (RankedReportFailurePhase::Input, "not_file"),
+            RankedReportPathError::OutputHasNoFileName => {
+                (RankedReportFailurePhase::Output, "missing_file_name")
+            }
+            RankedReportPathError::OutputNotFile => (RankedReportFailurePhase::Output, "not_file"),
+            RankedReportPathError::OutputParentNotDirectory => {
+                (RankedReportFailurePhase::Output, "parent_not_directory")
+            }
+            RankedReportPathError::OutputInspection(_) => {
+                (RankedReportFailurePhase::Output, "inspection_failed")
+            }
+            RankedReportPathError::InputOutputAlias => {
+                (RankedReportFailurePhase::Output, "aliases_input")
+            }
+        };
+        Self::new(phase, kind, error.to_string())
     }
 }
 
@@ -253,6 +366,28 @@ mod tests {
         ] {
             assert_eq!(parse_ranked_report_args(args), Err(expected));
         }
+    }
+
+    #[test]
+    fn failures_expose_stable_machine_readable_fields() {
+        let argument_failure = RankedReportFailure::from(RankedReportArgumentError::MissingInput);
+        assert_eq!(argument_failure.phase(), RankedReportFailurePhase::Argument);
+        assert_eq!(argument_failure.kind(), "missing_input");
+
+        let failure = RankedReportFailure::new(
+            RankedReportFailurePhase::TraceProcessor,
+            "execution_failed",
+            "first line\nsecond line",
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&failure.machine_line()).expect("failure should be valid JSON");
+        assert_eq!(value["phase"], "trace_processor");
+        assert_eq!(value["kind"], "execution_failed");
+        assert_eq!(value["message"], "first line\nsecond line");
+
+        let path_failure = RankedReportFailure::from(RankedReportPathError::InputOutputAlias);
+        assert_eq!(path_failure.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(path_failure.kind(), "aliases_input");
     }
 
     #[test]
