@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -15,6 +16,8 @@ const COMPRESSED_PACKETS_FIELD: u64 = 50;
 const ZSTD_COMPRESSED_PACKETS_FIELD: u64 = 133;
 const SAMPLE_SKIPPED_REASON_FIELD: u64 = 18;
 const PROFILER_SKIP_NOT_IN_SCOPE: u64 = 4;
+const LEGACY_COMPOSED_SEQUENCE_ID: u64 = 4_000_000_000;
+const LEGACY_UNIFIED_CATEGORY_PREFIX: &[u8] = b"delta_funnel.unified.";
 const COMPRESSED_CHUNK_BYTES: usize = 384 * 1024;
 // ponytail: This matches the existing production-tested parser bound. Raise it
 // only when a valid Perfetto trace demonstrates a larger individual packet.
@@ -22,18 +25,32 @@ const MAX_TRACE_PACKET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn sanitize_trace(input: &Path) -> Result<NamedTempFile, RankedReportFailure> {
-    sanitize_trace_inner(input).map_err(|error| {
-        let kind = if error.kind() == io::ErrorKind::InvalidData {
-            "malformed_trace"
-        } else {
-            "sanitize_failed"
-        };
-        RankedReportFailure::new(
+    sanitize_trace_inner(input).map_err(sanitize_failure)
+}
+
+fn sanitize_failure(error: io::Error) -> RankedReportFailure {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<LegacyComposedTrace>())
+    {
+        return RankedReportFailure::new(
+            RankedReportFailurePhase::Health,
+            "legacy_composed_trace",
+            "legacy composed traces are unsupported; generate the ranked report from the raw capture",
+        );
+    }
+    match error.kind() {
+        io::ErrorKind::InvalidData => RankedReportFailure::new(
             RankedReportFailurePhase::Input,
-            kind,
+            "malformed_trace",
             "input trace could not be prepared for ranked analysis",
-        )
-    })
+        ),
+        _ => RankedReportFailure::new(
+            RankedReportFailurePhase::Input,
+            "sanitize_failed",
+            "input trace could not be prepared for ranked analysis",
+        ),
+    }
 }
 
 fn sanitize_trace_inner(input: &Path) -> io::Result<NamedTempFile> {
@@ -102,6 +119,8 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
     let mut compressed = None;
     let mut perf_sample = None;
     let mut only_skip_envelope_fields = true;
+    let mut is_legacy_sequence = false;
+    let mut has_legacy_category = false;
     while offset < packet.len() {
         let field = next_field(packet, &mut offset)?;
         field_count += 1;
@@ -131,11 +150,28 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
                     only_skip_envelope_fields = false;
                 }
             }
-            3 | 8 | 10 | 13 | 42 | 58 | 79 | 87 => {}
+            10 => {
+                is_legacy_sequence |= field.varint == Some(LEGACY_COMPOSED_SEQUENCE_ID);
+            }
+            11 => {
+                has_legacy_category |= field.delimited.is_some_and(|event| {
+                    event
+                        .windows(LEGACY_UNIFIED_CATEGORY_PREFIX.len())
+                        .any(|window| window == LEGACY_UNIFIED_CATEGORY_PREFIX)
+                });
+                only_skip_envelope_fields = false;
+            }
+            3 | 8 | 13 | 42 | 58 | 79 | 87 => {}
             _ => only_skip_envelope_fields = false,
         }
     }
 
+    if is_legacy_sequence && has_legacy_category {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            LegacyComposedTrace,
+        ));
+    }
     if let Some(compressed) = compressed {
         return if field_count == 1 {
             Ok(compressed)
@@ -148,6 +184,17 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
     }
     Ok(PacketAction::Keep)
 }
+
+#[derive(Debug)]
+struct LegacyComposedTrace;
+
+impl fmt::Display for LegacyComposedTrace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("legacy composed trace")
+    }
+}
+
+impl std::error::Error for LegacyComposedTrace {}
 
 fn is_not_in_scope_sample(sample: &[u8]) -> bool {
     let mut offset = 0;
@@ -447,6 +494,31 @@ mod tests {
         assert!(error.to_string().contains("64 MiB"));
     }
 
+    #[test]
+    fn rejects_only_the_retired_composer_identity() -> io::Result<()> {
+        let legacy = legacy_composed_packet(LEGACY_COMPOSED_SEQUENCE_ID, true);
+        let current_sequence = legacy_composed_packet(1, true);
+        let unrelated_category = legacy_composed_packet(LEGACY_COMPOSED_SEQUENCE_ID, false);
+
+        let error = inspect_packet(&legacy)
+            .err()
+            .ok_or_else(|| io::Error::other("legacy composed packet should fail"))?;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            inspect_packet(&current_sequence),
+            Ok(PacketAction::Keep)
+        ));
+        assert!(matches!(
+            inspect_packet(&unrelated_category),
+            Ok(PacketAction::Keep)
+        ));
+
+        let failure = sanitize_failure(error);
+        assert_eq!(failure.phase(), RankedReportFailurePhase::Health);
+        assert_eq!(failure.kind(), "legacy_composed_trace");
+        Ok(())
+    }
+
     fn perf_sample_packet(
         skipped_reason: Option<u64>,
         callstack: bool,
@@ -481,6 +553,23 @@ mod tests {
     fn packet_with_field(field_number: u64, value: &[u8]) -> Vec<u8> {
         let mut packet = Vec::new();
         append_length_delimited_field(&mut packet, field_number, value);
+        packet
+    }
+
+    fn legacy_composed_packet(sequence_id: u64, legacy_category: bool) -> Vec<u8> {
+        let mut event = Vec::new();
+        append_length_delimited_field(
+            &mut event,
+            22,
+            if legacy_category {
+                b"delta_funnel.unified.native_sample"
+            } else {
+                b"delta_funnel.profile"
+            },
+        );
+        let mut packet = Vec::new();
+        append_varint_field(&mut packet, 10, sequence_id);
+        append_length_delimited_field(&mut packet, 11, &event);
         packet
     }
 
