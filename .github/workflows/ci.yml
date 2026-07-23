@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      diagnostics_wheel: ${{ steps.filter.outputs.diagnostics_wheel }}
+      diagnostics: ${{ steps.filter.outputs.diagnostics }}
       release_wheel: ${{ steps.filter.outputs.release_wheel }}
 
     steps:
@@ -37,14 +37,24 @@ jobs:
               - 'crates/**'
               - 'xtask/**'
               - '.github/workflows/ci.yml'
-            diagnostics_wheel:
-              - '.cargo/**'
+            diagnostics:
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - 'crates/delta-funnel/**'
-              - 'crates/delta-funnel-python/**'
+              - 'crates/delta-funnel/Cargo.toml'
+              - 'crates/delta-funnel/src/bin/delta_funnel_perfetto.rs'
+              - 'crates/delta-funnel/src/bin/delta_scan_partition_bench.rs'
+              - 'crates/delta-funnel/src/perfetto_profile.rs'
+              - 'crates/delta-funnel/src/perfetto_profile/**'
+              - 'crates/delta-funnel/src/profiling.rs'
+              - 'crates/delta-funnel/src/query_engine/datafusion.rs'
+              - 'crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs'
+              - 'crates/delta-funnel/src/query_engine/datafusion/operator_activity.rs'
+              - 'crates/delta-funnel/tests/perfetto_ranked_report_cli.rs'
+              - 'crates/delta-funnel-python/Cargo.toml'
+              - 'crates/delta-funnel-python/build.rs'
+              - 'crates/delta-funnel-python/pyproject.toml'
+              - 'crates/delta-funnel-python/src/logging.rs'
               - 'tools/perfetto/**'
-              - 'xtask/Cargo.toml'
               - '.github/workflows/ci.yml'
               - '.github/workflows/testpypi-diagnostics-build.yml'
               - '.github/workflows/testpypi-diagnostics.yml'
@@ -60,20 +70,21 @@ jobs:
               - '.github/workflows/pypi.yml'
 
   rust:
-    name: Rust Checks / ${{ matrix.name }}
+    name: Rust Checks / ${{ matrix.task }}
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Default Tests
-            task: default-tests
-          - name: All Features
-            task: all-features
-          - name: Lints and Docs
-            task: lints-and-docs
+        task: >-
+          ${{
+            fromJSON(
+              needs.changes.outputs.diagnostics == 'true'
+              && '["Default Tests","All Features","Lints and Docs"]'
+              || '["Default Tests","Lints and Docs"]'
+            )
+          }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -109,23 +120,23 @@ jobs:
           python-version: "3.12"
 
       - name: Check formatting
-        if: matrix.task == 'lints-and-docs'
+        if: matrix.task == 'Lints and Docs'
         run: cargo fmt --all --check
 
       - name: Test workspace
-        if: matrix.task == 'default-tests'
+        if: matrix.task == 'Default Tests'
         run: cargo test --workspace
 
       - name: Test workspace with all features
-        if: matrix.task == 'all-features'
+        if: matrix.task == 'All Features'
         run: cargo test --workspace --all-targets --all-features
 
       - name: Lint workspace
-        if: matrix.task == 'lints-and-docs'
+        if: matrix.task == 'Lints and Docs'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Check Rust API documentation
-        if: matrix.task == 'lints-and-docs'
+        if: matrix.task == 'Lints and Docs'
         run: |
           cargo doc --workspace --no-deps
           test ! -e target/doc/delta_funnel/progress/index.html
@@ -135,7 +146,7 @@ jobs:
           fi
 
       - name: Check whitespace
-        if: matrix.task == 'lints-and-docs'
+        if: matrix.task == 'Lints and Docs'
         run: git diff --check
 
   python-package:
@@ -194,7 +205,7 @@ jobs:
   diagnostics_wheel:
     name: Diagnostics Wheel
     needs: changes
-    if: needs.changes.outputs.diagnostics_wheel == 'true'
+    if: needs.changes.outputs.diagnostics == 'true'
     uses: ./.github/workflows/testpypi-diagnostics-build.yml
 
   core-ci:
@@ -222,7 +233,7 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ needs.changes.outputs.diagnostics_wheel }}" = "true" ] &&
+          if [ "${{ needs.changes.outputs.diagnostics }}" = "true" ] &&
              [ "${{ needs.diagnostics_wheel.result }}" != "success" ]; then
             echo "Diagnostics Wheel did not pass: ${{ needs.diagnostics_wheel.result }}"
             exit 1
