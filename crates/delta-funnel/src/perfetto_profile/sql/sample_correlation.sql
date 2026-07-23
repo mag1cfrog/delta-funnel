@@ -19,7 +19,9 @@ WHERE s.category = 'delta_funnel.profile'
 
 -- Task contexts emit their complete identity once. Later entries carry only
 -- this stable ID, so resolve it process-wide rather than assuming one thread.
-CREATE PERFETTO TABLE delta_funnel_profile_context_identities AS
+-- Keep this small point-lookup table in SQLite. Its B-tree index makes the
+-- much larger context table's identity join efficient.
+CREATE TABLE delta_funnel_profile_context_identities AS
 SELECT
   identity_thread.upid,
   extract_arg(s.arg_set_id, 'debug.profile_context_id') AS profile_context_id,
@@ -39,6 +41,9 @@ JOIN thread AS identity_thread ON identity_thread.utid = identity_track.utid
 WHERE s.category = 'delta_funnel.profile.context'
   AND extract_arg(s.arg_set_id, 'debug.profile_context_id') IS NOT NULL
   AND extract_arg(s.arg_set_id, 'debug.operation_id') IS NOT NULL;
+
+CREATE INDEX delta_funnel_profile_context_identity_lookup
+ON delta_funnel_profile_context_identities(upid, profile_context_id);
 
 CREATE PERFETTO TABLE delta_funnel_profile_contexts AS
 SELECT
