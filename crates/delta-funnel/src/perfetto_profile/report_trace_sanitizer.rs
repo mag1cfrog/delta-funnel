@@ -16,6 +16,10 @@ const COMPRESSED_PACKETS_FIELD: u64 = 50;
 const ZSTD_COMPRESSED_PACKETS_FIELD: u64 = 133;
 const SAMPLE_SKIPPED_REASON_FIELD: u64 = 18;
 const PROFILER_SKIP_NOT_IN_SCOPE: u64 = 4;
+const SEQUENCE_FLAGS_FIELD: u64 = 13;
+const SEQUENCE_NEEDS_INCREMENTAL_STATE: u64 = 2;
+const PREVIOUS_PACKET_DROPPED_FIELD: u64 = 42;
+const FIRST_PACKET_ON_SEQUENCE_FIELD: u64 = 87;
 const LEGACY_COMPOSED_SEQUENCE_ID: u64 = 4_000_000_000;
 const LEGACY_UNIFIED_CATEGORY_PREFIX: &[u8] = b"delta_funnel.unified.";
 const COMPRESSED_CHUNK_BYTES: usize = 384 * 1024;
@@ -152,6 +156,7 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
             }
             10 => {
                 is_legacy_sequence |= field.varint == Some(LEGACY_COMPOSED_SEQUENCE_ID);
+                only_skip_envelope_fields &= field.varint.is_some();
             }
             11 => {
                 has_legacy_category |= field.delimited.is_some_and(|event| {
@@ -161,7 +166,15 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
                 });
                 only_skip_envelope_fields = false;
             }
-            3 | 8 | 13 | 42 | 58 | 79 | 87 => {}
+            SEQUENCE_FLAGS_FIELD => {
+                only_skip_envelope_fields &= field
+                    .varint
+                    .is_some_and(|flags| matches!(flags, 0 | SEQUENCE_NEEDS_INCREMENTAL_STATE));
+            }
+            PREVIOUS_PACKET_DROPPED_FIELD | FIRST_PACKET_ON_SEQUENCE_FIELD => {
+                only_skip_envelope_fields &= field.varint == Some(0);
+            }
+            3 | 8 | 58 | 79 => only_skip_envelope_fields &= field.varint.is_some(),
             _ => only_skip_envelope_fields = false,
         }
     }
@@ -517,6 +530,21 @@ mod tests {
         assert_eq!(failure.phase(), RankedReportFailurePhase::Health);
         assert_eq!(failure.kind(), "legacy_composed_trace");
         Ok(())
+    }
+
+    #[test]
+    fn preserves_not_in_scope_samples_with_sequence_control() {
+        const SEQUENCE_INCREMENTAL_STATE_CLEARED: u64 = 1;
+
+        for (field_number, value) in [
+            (SEQUENCE_FLAGS_FIELD, SEQUENCE_INCREMENTAL_STATE_CLEARED),
+            (PREVIOUS_PACKET_DROPPED_FIELD, 1),
+            (FIRST_PACKET_ON_SEQUENCE_FIELD, 1),
+        ] {
+            let mut packet = perf_sample_packet(Some(PROFILER_SKIP_NOT_IN_SCOPE), false, false);
+            append_varint_field(&mut packet, field_number, value);
+            assert!(matches!(inspect_packet(&packet), Ok(PacketAction::Keep)));
+        }
     }
 
     fn perf_sample_packet(
