@@ -147,6 +147,7 @@ perfetto_cli = Path(sys.executable).with_name("delta-funnel-perfetto")
 if not os.access(perfetto_cli, os.X_OK):
     raise SystemExit("installed delta-funnel-perfetto is not executable")
 subprocess.run([perfetto_cli, "--help"], check=True, stdout=subprocess.DEVNULL)
+subprocess.run([perfetto_cli, "help"], check=True, stdout=subprocess.DEVNULL)
 subprocess.run(
     [perfetto_cli, "report", "--help"],
     check=True,

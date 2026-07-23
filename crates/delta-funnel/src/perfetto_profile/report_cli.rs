@@ -1170,6 +1170,10 @@ mod tests {
         assert!(root_help.contains("Generate and inspect Delta Funnel Perfetto diagnostics"));
         assert!(root_help.contains("report"));
         assert!(root_help.contains("inspect"));
+        let bare_root_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help"])
+            .err()
+            .ok_or("bare root help should stop parsing")?;
+        assert_eq!(bare_root_help.kind(), ErrorKind::DisplayHelp);
 
         let report_help =
             PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "--help"])
@@ -1179,6 +1183,11 @@ mod tests {
         let report_help = report_help.to_string();
         assert!(report_help.contains("INPUT.pftrace"));
         assert!(report_help.contains("--output <OUTPUT.profile.html>"));
+        let bare_report_help =
+            PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "report"])
+                .err()
+                .ok_or("bare report help should stop parsing")?;
+        assert_eq!(bare_report_help.kind(), ErrorKind::DisplayHelp);
 
         let default_output =
             PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "capture.pftrace"])?;
@@ -1230,6 +1239,10 @@ mod tests {
         assert!(help.contains("--interactive"));
         assert!(help.contains("--sort <SORT>"));
         assert!(help.contains("--depth <DEPTH>"));
+        let bare_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "inspect"])
+            .err()
+            .ok_or("bare inspect help should stop parsing")?;
+        assert_eq!(bare_help.kind(), ErrorKind::DisplayHelp);
 
         assert_eq!(
             PerfettoCli::try_parse_from([
