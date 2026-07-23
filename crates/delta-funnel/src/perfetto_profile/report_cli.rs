@@ -808,7 +808,7 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
             }
             CliArgumentError::MissingOutputValue
         }
-        ErrorKind::ValueValidation
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
                 Some(ContextValue::String(argument)) if argument.starts_with("--limit")
@@ -816,7 +816,7 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         {
             CliArgumentError::InvalidLimit
         }
-        ErrorKind::ValueValidation
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
                 Some(ContextValue::String(argument)) if argument.starts_with("--depth")
@@ -824,7 +824,7 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         {
             CliArgumentError::InvalidDepth
         }
-        ErrorKind::ValueValidation
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
                 Some(ContextValue::String(argument)) if argument.starts_with("--semantic")
@@ -832,7 +832,7 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         {
             CliArgumentError::InvalidSemanticId
         }
-        ErrorKind::ValueValidation
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
                 Some(ContextValue::String(argument)) if argument.starts_with("--function")
@@ -840,7 +840,7 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         {
             CliArgumentError::InvalidFunctionId
         }
-        ErrorKind::ValueValidation
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
                 Some(ContextValue::String(argument)) if argument.starts_with("--filter")
@@ -1588,6 +1588,54 @@ mod tests {
             (
                 vec![OsString::from("inspect")],
                 CliArgumentError::MissingInput,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                ],
+                CliArgumentError::InvalidLimit,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--depth"),
+                ],
+                CliArgumentError::InvalidDepth,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--semantic"),
+                ],
+                CliArgumentError::InvalidSemanticId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--function"),
+                ],
+                CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--filter"),
+                ],
+                CliArgumentError::InvalidFilter,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--sort"),
+                ],
+                CliArgumentError::InvalidSort,
             ),
             (
                 vec![

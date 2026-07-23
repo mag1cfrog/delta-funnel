@@ -279,6 +279,7 @@ fn render_semantic_view(
     );
     let function_sort = sort.for_functions();
     let mut function_roots = selected_semantic
+        .filter(|_| max_depth > 0)
         .into_iter()
         .flat_map(|semantic| {
             index
@@ -1001,6 +1002,18 @@ mod tests {
             .expect("smaller function root");
         assert!(first < second);
         assert!(semantic.contains("inclusive_context_percent=60.00%"));
+
+        let depth_zero = render_terminal_view(
+            &document,
+            InspectSelection::Semantic(1),
+            InspectSort::Duration,
+            None,
+            10,
+            0,
+        )
+        .expect("depth zero semantic view should render");
+        assert!(depth_zero.contains("depth: 0"));
+        assert!(!depth_zero.contains("function depth="));
 
         let function = render_terminal_view(
             &document,
