@@ -16,7 +16,7 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
     let output = directory.path().join("capture.profile.html");
     let aggregate = directory.path().join("aggregate.csv");
     let trace_processor = directory.path().join("trace_processor_shell");
-    let input_bytes = b"raw trace sentinel";
+    let input_bytes = b"\x0a\x00";
     fs::write(&input, input_bytes)?;
     fs::write(&aggregate, aggregate_output())?;
     write_executable(

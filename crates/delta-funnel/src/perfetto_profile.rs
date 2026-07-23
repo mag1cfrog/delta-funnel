@@ -26,6 +26,7 @@ mod report_cli;
 mod report_health;
 mod report_html;
 mod report_trace_processor;
+mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
 use report_aggregate::load_ranked_profile;

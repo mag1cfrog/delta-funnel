@@ -10,6 +10,7 @@ use super::ranked_report::{
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 use super::report_health::{CAPTURE_HEALTH_SQL, capture_health_input_sql, validate_capture_health};
 use super::report_trace_processor::run_trace_processor_query;
+use super::report_trace_sanitizer::sanitize_trace;
 
 const RECORD_HEADER: &[u8] = b"\"record_hex\"";
 const MAX_RECORD_HEX_CHARS: usize = 64 * 1024;
@@ -82,7 +83,8 @@ pub(super) fn load_ranked_profile(
         RANKED_REPORT_SQL,
     ]
     .join("\n");
-    let output = run_trace_processor_query(input, sql.as_bytes())?;
+    let sanitized = sanitize_trace(input)?;
+    let output = run_trace_processor_query(sanitized.path(), sql.as_bytes())?;
     parse_ranked_report_output(&output)
 }
 
