@@ -39,7 +39,7 @@ pub use report_aggregate::load_ranked_profile;
 pub use report_cli::{
     RankedReportArgumentError, RankedReportCliAction, RankedReportFailure,
     RankedReportFailurePhase, RankedReportPathError, RankedReportPaths, parse_ranked_report_args,
-    preflight_ranked_report_paths,
+    preflight_ranked_report_paths, run_perfetto_diagnostics_cli,
 };
 #[doc(hidden)]
 pub use report_health::validate_ranked_report_capture;

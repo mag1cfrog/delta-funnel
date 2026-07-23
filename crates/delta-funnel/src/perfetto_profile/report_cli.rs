@@ -1,3 +1,4 @@
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
@@ -200,6 +201,80 @@ pub struct RankedReportPaths {
 }
 
 #[doc(hidden)]
+pub fn run_perfetto_diagnostics_cli() -> i32 {
+    run_perfetto_diagnostics_cli_with(env::args_os().skip(1))
+}
+
+fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -> i32 {
+    let mut args = args.into_iter();
+    let Some(command) = args.next() else {
+        return emit_failure(RankedReportFailure::new(
+            RankedReportFailurePhase::Argument,
+            "missing_command",
+            "a diagnostics command is required",
+        ));
+    };
+    match command.to_str() {
+        Some("-h" | "--help") => {
+            print_usage();
+            0
+        }
+        Some("report") => run_report_command(args),
+        _ => emit_failure(RankedReportFailure::new(
+            RankedReportFailurePhase::Argument,
+            "unknown_command",
+            "unknown diagnostics command",
+        )),
+    }
+}
+
+fn run_report_command(args: impl IntoIterator<Item = OsString>) -> i32 {
+    match parse_ranked_report_args(args) {
+        Ok(RankedReportCliAction::Help) => {
+            print_report_usage();
+            0
+        }
+        Ok(RankedReportCliAction::Generate { input, output }) => {
+            match super::generate_ranked_profile_report(&input, &output) {
+                Ok(output) => {
+                    println!("wrote {}", output.display());
+                    0
+                }
+                Err(error) => emit_failure(error),
+            }
+        }
+        Err(error) => emit_failure(error.into()),
+    }
+}
+
+fn emit_failure(error: RankedReportFailure) -> i32 {
+    eprintln!("{}", error.machine_line());
+    failure_exit_code(error.phase())
+}
+
+fn failure_exit_code(phase: RankedReportFailurePhase) -> i32 {
+    match phase {
+        RankedReportFailurePhase::Argument => 64,
+        RankedReportFailurePhase::Health
+        | RankedReportFailurePhase::Query
+        | RankedReportFailurePhase::AggregateValidation => 65,
+        RankedReportFailurePhase::Input => 66,
+        RankedReportFailurePhase::TraceProcessor => 69,
+        RankedReportFailurePhase::Serialization => 70,
+        RankedReportFailurePhase::Output => 73,
+    }
+}
+
+fn print_usage() {
+    const USAGE: &str = "Usage: delta-funnel-perfetto COMMAND [ARG...]\n\nCommands:\n  report    Generate a ranked HTML report from a raw trace\n";
+    print!("{USAGE}");
+}
+
+fn print_report_usage() {
+    println!("Usage: delta-funnel-perfetto report INPUT.pftrace [--output OUTPUT.profile.html]");
+}
+
+#[doc(hidden)]
 pub fn parse_ranked_report_args(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<RankedReportCliAction, RankedReportArgumentError> {
@@ -332,6 +407,33 @@ mod tests {
                 output: PathBuf::from("reports/capture.html"),
             })
         );
+    }
+
+    #[test]
+    fn dispatches_commands_and_maps_failure_phases_to_exit_codes() {
+        assert_eq!(
+            run_perfetto_diagnostics_cli_with([OsString::from("--help")]),
+            0
+        );
+        assert_eq!(
+            run_perfetto_diagnostics_cli_with([OsString::from("report"), OsString::from("--help")]),
+            0
+        );
+        assert_eq!(
+            run_perfetto_diagnostics_cli_with([OsString::from("unknown")]),
+            64
+        );
+        assert_eq!(failure_exit_code(RankedReportFailurePhase::Health), 65);
+        assert_eq!(failure_exit_code(RankedReportFailurePhase::Input), 66);
+        assert_eq!(
+            failure_exit_code(RankedReportFailurePhase::TraceProcessor),
+            69
+        );
+        assert_eq!(
+            failure_exit_code(RankedReportFailurePhase::Serialization),
+            70
+        );
+        assert_eq!(failure_exit_code(RankedReportFailurePhase::Output), 73);
     }
 
     #[test]

@@ -11,6 +11,11 @@ readme = "../../README.md"
 keywords = ["delta", "arrow", "mssql", "sql-server"]
 categories = ["database"]
 
+[[bin]]
+name = "delta-funnel-perfetto"
+path = "src/bin/delta_funnel_perfetto.rs"
+required-features = ["perfetto-profile"]
+
 [lints]
 workspace = true
 
