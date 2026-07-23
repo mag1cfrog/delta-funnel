@@ -406,6 +406,11 @@ pub fn run_perfetto_diagnostics_cli() -> i32 {
 /// Runs the bundled CLI with arguments that exclude the executable name.
 pub fn run_perfetto_diagnostics_cli_with_args(args: impl IntoIterator<Item = OsString>) -> i32 {
     let args = args.into_iter().collect::<Vec<_>>();
+    if args.first().is_some_and(|argument| argument == "report")
+        && let Some(error) = first_report_argument_error(&args[1..])
+    {
+        return emit_failure(error.into());
+    }
     match PerfettoCli::try_parse_from(
         iter::once(OsString::from("delta-funnel-perfetto")).chain(args.iter().cloned()),
     ) {
@@ -770,44 +775,18 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
     if command != "report" && command != "inspect" {
         return CliArgumentError::UnknownCommand;
     }
+    if command == "report"
+        && let Some(error) = first_report_argument_error(&args[1..])
+    {
+        return error;
+    }
     match error.kind() {
         ErrorKind::MissingRequiredArgument => CliArgumentError::MissingInput,
-        ErrorKind::ArgumentConflict if command == "report" => CliArgumentError::DuplicateOutput,
         ErrorKind::ArgumentConflict if is_selector_conflict(error) => {
             CliArgumentError::IncompatibleSelectors
         }
         ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOption,
         ErrorKind::TooManyValues => CliArgumentError::MultipleInputs,
-        ErrorKind::InvalidValue
-            if matches!(
-                error.get(ContextKind::InvalidArg),
-                Some(ContextValue::String(argument)) if argument.starts_with("--output")
-            ) =>
-        {
-            if args.last().is_some_and(|argument| argument == "--output") {
-                let earlier_args = &args[..args.len() - 1];
-                if let Err(earlier_error) = PerfettoCli::try_parse_from(
-                    iter::once(OsString::from("delta-funnel-perfetto"))
-                        .chain(earlier_args.iter().cloned()),
-                ) {
-                    let earlier_error = classify_cli_error(earlier_args, &earlier_error);
-                    if !matches!(
-                        earlier_error,
-                        CliArgumentError::MissingInput | CliArgumentError::MissingOutputValue
-                    ) {
-                        return earlier_error;
-                    }
-                }
-                if earlier_args
-                    .iter()
-                    .skip(1)
-                    .any(|argument| argument == "--output")
-                {
-                    return CliArgumentError::DuplicateOutput;
-                }
-            }
-            CliArgumentError::MissingOutputValue
-        }
         ErrorKind::ValueValidation | ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
@@ -864,6 +843,33 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         },
         _ => CliArgumentError::UnknownOption,
     }
+}
+
+fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
+    let mut args = args.iter();
+    let mut has_input = false;
+    let mut has_output = false;
+    while let Some(argument) = args.next() {
+        if matches!(argument.to_str(), Some("-h" | "--help")) {
+            return None;
+        }
+        if argument == "--output" {
+            if has_output {
+                return Some(CliArgumentError::DuplicateOutput);
+            }
+            has_output = true;
+            if args.next().is_none() {
+                return Some(CliArgumentError::MissingOutputValue);
+            }
+        } else if argument.as_encoded_bytes().starts_with(b"-") {
+            return Some(CliArgumentError::UnknownOption);
+        } else if has_input {
+            return Some(CliArgumentError::MultipleInputs);
+        } else {
+            has_input = true;
+        }
+    }
+    (!has_input).then_some(CliArgumentError::MissingInput)
 }
 
 fn is_selector_conflict(error: &clap::Error) -> bool {
@@ -1548,9 +1554,29 @@ mod tests {
             (
                 vec![
                     OsString::from("report"),
+                    OsString::from("--output"),
+                    OsString::from("first.html"),
+                    OsString::from("--output"),
+                    OsString::from("second.html"),
+                    OsString::from("--unknown"),
+                ],
+                CliArgumentError::DuplicateOutput,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
                     OsString::from("first.pftrace"),
                     OsString::from("second.pftrace"),
                     OsString::from("--output"),
+                ],
+                CliArgumentError::MultipleInputs,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("first.pftrace"),
+                    OsString::from("second.pftrace"),
+                    OsString::from("--help"),
                 ],
                 CliArgumentError::MultipleInputs,
             ),
