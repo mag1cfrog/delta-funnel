@@ -327,7 +327,9 @@ pub fn wait_for_capture(timeout: Duration) -> io::Result<()> {
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error;
+    use std::hash::Hasher;
     use std::hint::black_box;
+    use std::io::Read;
     use std::sync::{Arc, Barrier, mpsc};
     use std::thread::{self, ThreadId};
 
@@ -494,6 +496,47 @@ mod tests {
         assert_eq!(error.kind(), "aliases_input");
         assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires trace_processor_shell and a real raw trace"]
+    fn generates_a_report_without_modifying_a_real_raw_trace() -> Result<(), DynError> {
+        let trace = PathBuf::from(
+            std::env::var_os("DELTA_FUNNEL_TEST_PERFETTO_TRACE")
+                .ok_or("DELTA_FUNNEL_TEST_PERFETTO_TRACE is not set")?,
+        );
+        let before = file_fingerprint(&trace)?;
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("capture.profile.html");
+
+        assert_eq!(generate_ranked_profile_report(&trace, &output)?, output);
+        assert_eq!(file_fingerprint(&trace)?, before);
+        let html = std::fs::read_to_string(output)?;
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("id=\"profile-data\""));
+        assert!(html.contains("Function metrics are sampled on-CPU observations"));
+        assert!(!html.contains(trace.to_string_lossy().as_ref()));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+        Ok(())
+    }
+
+    fn file_fingerprint(path: &Path) -> io::Result<(u64, u64)> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut byte_count = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.write(&buffer[..count]);
+            byte_count = byte_count
+                .checked_add(u64::try_from(count).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("input trace size overflowed"))?;
+        }
+        Ok((byte_count, hasher.finish()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
