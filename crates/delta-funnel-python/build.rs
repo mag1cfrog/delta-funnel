@@ -12,6 +12,8 @@ const PERFETTO_ASSETS: [&str; 5] = [
     "delta-funnel-standard-streaming.pbtx",
     "delta-funnel-standard.pbtx",
 ];
+const PERFETTO_BIN_DIR_ENV: &str = "DELTAFUNNEL_PERFETTO_BIN_DIR";
+const PERFETTO_BINARIES: [&str; 1] = ["delta-funnel-perfetto"];
 
 fn main() -> io::Result<()> {
     let python_version = env!("CARGO_PKG_VERSION").replace("-dev.", ".dev");
@@ -28,6 +30,7 @@ fn main() -> io::Result<()> {
     let destination_dir = out_dir.join("perfetto");
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PERFETTO_PROFILE");
+    println!("cargo:rerun-if-env-changed={PERFETTO_BIN_DIR_ENV}");
     for asset in PERFETTO_ASSETS {
         println!(
             "cargo:rerun-if-changed={}",
@@ -51,6 +54,14 @@ fn main() -> io::Result<()> {
         capture_health_sql,
         destination_dir.join("capture-health.sql"),
     )?;
+    if let Some(binary_dir) = env::var_os(PERFETTO_BIN_DIR_ENV) {
+        let binary_dir = PathBuf::from(binary_dir);
+        for binary in PERFETTO_BINARIES {
+            let source = binary_dir.join(binary);
+            println!("cargo:rerun-if-changed={}", source.display());
+            fs::copy(source, destination_dir.join(binary))?;
+        }
+    }
 
     Ok(())
 }

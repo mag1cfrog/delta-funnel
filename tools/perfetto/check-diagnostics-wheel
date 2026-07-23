@@ -55,6 +55,7 @@ required = {
     "deltafunnel/perfetto/capture-health",
     "deltafunnel/perfetto/capture-health.sql",
     "deltafunnel/perfetto/capture-workload",
+    "deltafunnel/perfetto/delta-funnel-perfetto",
     "deltafunnel/perfetto/delta-funnel-deep-system.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard-streaming.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard.pbtx",
@@ -66,7 +67,7 @@ with zipfile.ZipFile(wheel_path) as wheel:
     if missing:
         raise SystemExit("missing diagnostics assets: " + ", ".join(missing))
 
-    for name in ["capture-health", "capture-workload"]:
+    for name in ["capture-health", "capture-workload", "delta-funnel-perfetto"]:
         asset = wheel.getinfo(f"deltafunnel/perfetto/{name}")
         mode = asset.external_attr >> 16
         if mode & 0o111 == 0:
@@ -105,6 +106,7 @@ required = [
     "capture-health",
     "capture-health.sql",
     "capture-workload",
+    "delta-funnel-perfetto",
     *config_names,
 ]
 for name in required:
@@ -136,6 +138,23 @@ health = assets.joinpath("capture-health")
 if not os.access(health, os.X_OK):
     raise SystemExit("installed capture-health is not executable")
 subprocess.run([health, "--help"], check=True, stdout=subprocess.DEVNULL)
+
+perfetto_cli = assets.joinpath("delta-funnel-perfetto")
+if not os.access(perfetto_cli, os.X_OK):
+    raise SystemExit("installed delta-funnel-perfetto is not executable")
+subprocess.run([perfetto_cli, "--help"], check=True, stdout=subprocess.DEVNULL)
+subprocess.run(
+    [perfetto_cli, "report", "--help"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+invalid_command = subprocess.run(
+    [perfetto_cli, "invalid"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+if invalid_command.returncode != 64:
+    raise SystemExit("delta-funnel-perfetto did not reject an invalid command")
 
 capture = assets.joinpath("capture-workload")
 if not os.access(capture, os.X_OK):
