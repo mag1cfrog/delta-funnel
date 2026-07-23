@@ -74,6 +74,81 @@ impl fmt::Display for TerminalInspectError {
 
 impl std::error::Error for TerminalInspectError {}
 
+pub(super) struct TerminalProfileIndex<'a> {
+    document: &'a RankedProfileDocument,
+    semantics: HashMap<i64, &'a RankedSemantic>,
+    semantic_children: HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
+    functions: HashMap<(i64, i64), &'a RankedFunction>,
+    function_children: HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
+    operation_durations: HashMap<i64, Option<i64>>,
+}
+
+impl<'a> TerminalProfileIndex<'a> {
+    pub(super) fn new(document: &'a RankedProfileDocument) -> Self {
+        let mut semantics = HashMap::with_capacity(document.semantics.len());
+        let mut semantic_children = HashMap::new();
+        let mut operation_durations = HashMap::new();
+        for semantic in &document.semantics {
+            semantics.insert(semantic.semantic_id, semantic);
+            semantic_children
+                .entry(semantic.parent_semantic_id)
+                .or_insert_with(Vec::new)
+                .push(semantic);
+            if semantic.parent_semantic_id.is_none() {
+                operation_durations.insert(semantic.operation_id, semantic.duration_ns);
+            }
+        }
+        let mut functions = HashMap::with_capacity(document.functions.len());
+        let mut function_children = HashMap::new();
+        for function in &document.functions {
+            functions.insert((function.semantic_id, function.function_id), function);
+            function_children
+                .entry((function.semantic_id, function.parent_function_id))
+                .or_insert_with(Vec::new)
+                .push(function);
+        }
+        Self {
+            document,
+            semantics,
+            semantic_children,
+            functions,
+            function_children,
+            operation_durations,
+        }
+    }
+
+    pub(super) fn render(
+        &self,
+        selection: InspectSelection,
+        sort: InspectSort,
+        filter: Option<&str>,
+        limit: usize,
+        max_depth: usize,
+    ) -> Result<String, TerminalInspectError> {
+        match selection {
+            InspectSelection::Root => {
+                render_semantic_view(self, None, sort, filter, limit, max_depth)
+            }
+            InspectSelection::Semantic(semantic_id) => {
+                render_semantic_view(self, Some(semantic_id), sort, filter, limit, max_depth)
+            }
+            InspectSelection::Function {
+                semantic_id,
+                function_id,
+            } => render_function_view(
+                self,
+                semantic_id,
+                function_id,
+                sort,
+                filter,
+                limit,
+                max_depth,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn render_terminal_view(
     document: &RankedProfileDocument,
     selection: InspectSelection,
@@ -82,30 +157,11 @@ pub(super) fn render_terminal_view(
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
-    match selection {
-        InspectSelection::Root => {
-            render_semantic_view(document, None, sort, filter, limit, max_depth)
-        }
-        InspectSelection::Semantic(semantic_id) => {
-            render_semantic_view(document, Some(semantic_id), sort, filter, limit, max_depth)
-        }
-        InspectSelection::Function {
-            semantic_id,
-            function_id,
-        } => render_function_view(
-            document,
-            semantic_id,
-            function_id,
-            sort,
-            filter,
-            limit,
-            max_depth,
-        ),
-    }
+    TerminalProfileIndex::new(document).render(selection, sort, filter, limit, max_depth)
 }
 
 fn render_semantic_view(
-    document: &RankedProfileDocument,
+    index: &TerminalProfileIndex<'_>,
     selected_semantic_id: Option<i64>,
     sort: InspectSort,
     filter: Option<&str>,
@@ -114,38 +170,20 @@ fn render_semantic_view(
 ) -> Result<String, TerminalInspectError> {
     let selected_semantic = selected_semantic_id
         .map(|semantic_id| {
-            document
+            index
                 .semantics
-                .iter()
-                .find(|semantic| semantic.semantic_id == semantic_id)
+                .get(&semantic_id)
+                .copied()
                 .ok_or(TerminalInspectError::SemanticNotFound(semantic_id))
         })
         .transpose()?;
 
-    let mut children = HashMap::<Option<i64>, Vec<&RankedSemantic>>::new();
-    for semantic in &document.semantics {
-        children
-            .entry(semantic.parent_semantic_id)
-            .or_default()
-            .push(semantic);
-    }
-    let included_semantics = filter.map(|filter| {
-        contextual_match_ids(
-            document.semantics.iter().map(|semantic| {
-                (
-                    semantic.semantic_id,
-                    semantic.parent_semantic_id,
-                    semantic_matches(semantic, filter),
-                )
-            }),
-            selected_semantic_id,
-            max_depth,
-        )
-    });
+    let included_semantics = filter
+        .map(|filter| contextual_semantic_matches(index, selected_semantic_id, max_depth, filter));
 
     let first_depth = usize::from(selected_semantic_id.is_some());
     let (semantic_total, semantic_rows) = collect_semantic_rows(
-        &mut children,
+        &index.semantic_children,
         selected_semantic_id,
         first_depth,
         max_depth,
@@ -157,11 +195,15 @@ fn render_semantic_view(
     let mut function_roots = selected_semantic
         .into_iter()
         .flat_map(|semantic| {
-            document.functions.iter().filter(move |function| {
-                function.semantic_id == semantic.semantic_id
-                    && function.parent_function_id.is_none()
-                    && filter.is_none_or(|filter| function_matches(function, filter))
-            })
+            index
+                .function_children
+                .get(&(semantic.semantic_id, None))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(move |function| {
+                    filter.is_none_or(|filter| function_matches(function, filter))
+                })
         })
         .collect::<Vec<_>>();
     function_roots.sort_unstable_by(|left, right| compare_functions(left, right, function_sort));
@@ -173,12 +215,6 @@ fn render_semantic_view(
     let total = semantic_total + function_total;
     let shown = semantic_rows.len() + function_rows.len();
 
-    let operation_durations = children
-        .get(&None)
-        .into_iter()
-        .flatten()
-        .map(|semantic| (semantic.operation_id, semantic.duration_ns))
-        .collect::<HashMap<_, _>>();
     let context = selected_semantic_id.map_or_else(
         || "operation-roots".to_owned(),
         |semantic_id| format!("semantic:{semantic_id}"),
@@ -189,15 +225,16 @@ fn render_semantic_view(
         sort.as_str(),
         shown,
         shown < total,
-        terminal_text(&document.metadata.exact_time_unit),
-        terminal_text(&document.metadata.sample_unit),
+        terminal_text(&index.document.metadata.exact_time_unit),
+        terminal_text(&index.document.metadata.sample_unit),
     );
     for (depth, semantic) in semantic_rows {
         write_semantic_row(
             &mut output,
             depth,
             semantic,
-            operation_durations
+            index
+                .operation_durations
                 .get(&semantic.operation_id)
                 .copied()
                 .flatten(),
@@ -218,61 +255,54 @@ fn render_semantic_view(
     Ok(output)
 }
 
-fn contextual_match_ids(
-    records: impl IntoIterator<Item = (i64, Option<i64>, bool)>,
+fn contextual_semantic_matches(
+    index: &TerminalProfileIndex<'_>,
     selected_id: Option<i64>,
     max_depth: usize,
+    filter: &str,
 ) -> HashSet<i64> {
-    let mut parents = HashMap::new();
-    let mut matches = Vec::new();
-    for (id, parent_id, is_match) in records {
-        parents.insert(id, parent_id);
-        if is_match {
-            matches.push(id);
-        }
+    let first_depth = usize::from(selected_id.is_some());
+    if first_depth > max_depth {
+        return HashSet::new();
     }
+    let mut stack = index
+        .semantic_children
+        .get(&selected_id)
+        .into_iter()
+        .flatten()
+        .map(|semantic| (first_depth, *semantic))
+        .collect::<Vec<_>>();
     let mut included = HashSet::new();
-    for id in matches {
-        if relative_depth(id, selected_id, &parents).is_none_or(|depth| depth > max_depth) {
-            continue;
-        }
-        let mut id = id;
-        loop {
-            if Some(id) == selected_id {
-                break;
+    while let Some((depth, semantic)) = stack.pop() {
+        if semantic_matches(semantic, filter) {
+            let mut id = semantic.semantic_id;
+            loop {
+                if Some(id) == selected_id {
+                    break;
+                }
+                included.insert(id);
+                let Some(parent_id) = index
+                    .semantics
+                    .get(&id)
+                    .and_then(|semantic| semantic.parent_semantic_id)
+                else {
+                    break;
+                };
+                id = parent_id;
             }
-            included.insert(id);
-            let Some(parent_id) = parents.get(&id).copied().flatten() else {
-                break;
-            };
-            id = parent_id;
+        }
+        if depth < max_depth {
+            stack.extend(
+                index
+                    .semantic_children
+                    .get(&Some(semantic.semantic_id))
+                    .into_iter()
+                    .flatten()
+                    .map(|child| (depth + 1, *child)),
+            );
         }
     }
     included
-}
-
-fn relative_depth(
-    id: i64,
-    selected_id: Option<i64>,
-    parents: &HashMap<i64, Option<i64>>,
-) -> Option<usize> {
-    if Some(id) == selected_id {
-        return None;
-    }
-    let mut current_id = id;
-    let mut depth = 0;
-    loop {
-        let parent_id = parents.get(&current_id).copied().flatten();
-        if selected_id.is_none() && parent_id.is_none() {
-            return Some(depth);
-        }
-        if parent_id == selected_id {
-            return Some(depth + 1);
-        }
-        let parent_id = parent_id?;
-        depth += 1;
-        current_id = parent_id;
-    }
 }
 
 fn semantic_matches(semantic: &RankedSemantic, filter: &str) -> bool {
@@ -290,7 +320,7 @@ fn semantic_matches(semantic: &RankedSemantic, filter: &str) -> bool {
 }
 
 fn collect_semantic_rows<'a>(
-    children: &mut HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
+    children: &HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
     parent_semantic_id: Option<i64>,
     first_depth: usize,
     max_depth: usize,
@@ -326,17 +356,18 @@ fn collect_semantic_rows<'a>(
 }
 
 fn push_sorted_siblings<'a>(
-    children: &mut HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
+    children: &HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
     parent_semantic_id: Option<i64>,
     depth: usize,
     sort: InspectSort,
     stack: &mut Vec<(usize, &'a RankedSemantic)>,
 ) {
-    let Some(siblings) = children.get_mut(&parent_semantic_id) else {
+    let Some(siblings) = children.get(&parent_semantic_id) else {
         return;
     };
+    let mut siblings = siblings.clone();
     siblings.sort_unstable_by(|left, right| compare_semantics(left, right, sort));
-    stack.extend(siblings.iter().rev().map(|semantic| (depth, *semantic)));
+    stack.extend(siblings.into_iter().rev().map(|semantic| (depth, semantic)));
 }
 
 fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: InspectSort) -> Ordering {
@@ -355,7 +386,7 @@ fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: Inspec
 }
 
 fn render_function_view(
-    document: &RankedProfileDocument,
+    index: &TerminalProfileIndex<'_>,
     semantic_id: i64,
     function_id: i64,
     sort: InspectSort,
@@ -363,45 +394,20 @@ fn render_function_view(
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
-    let selected = document
+    let selected = index
         .functions
-        .iter()
-        .find(|function| function.semantic_id == semantic_id && function.function_id == function_id)
+        .get(&(semantic_id, function_id))
+        .copied()
         .ok_or(TerminalInspectError::FunctionNotFound {
             semantic_id,
             function_id,
         })?;
-    let mut children = HashMap::<Option<i64>, Vec<&RankedFunction>>::new();
-    for function in document
-        .functions
-        .iter()
-        .filter(|function| function.semantic_id == semantic_id)
-    {
-        children
-            .entry(function.parent_function_id)
-            .or_default()
-            .push(function);
-    }
     let included_functions = filter.map(|filter| {
-        contextual_match_ids(
-            document
-                .functions
-                .iter()
-                .filter(|function| function.semantic_id == semantic_id)
-                .map(|function| {
-                    (
-                        function.function_id,
-                        function.parent_function_id,
-                        function_matches(function, filter),
-                    )
-                }),
-            Some(function_id),
-            max_depth,
-        )
+        contextual_function_matches(index, semantic_id, function_id, max_depth, filter)
     });
     let (total, rows) = collect_function_rows(
-        &mut children,
-        Some(function_id),
+        &index.function_children,
+        (semantic_id, Some(function_id)),
         1,
         max_depth,
         limit,
@@ -414,7 +420,7 @@ fn render_function_view(
         sort.as_str(),
         rows.len(),
         rows.len() < total,
-        terminal_text(&document.metadata.sample_unit),
+        terminal_text(&index.document.metadata.sample_unit),
     );
     for (depth, function) in rows {
         write_function_row(
@@ -425,6 +431,56 @@ fn render_function_view(
         );
     }
     Ok(output)
+}
+
+fn contextual_function_matches(
+    index: &TerminalProfileIndex<'_>,
+    semantic_id: i64,
+    selected_id: i64,
+    max_depth: usize,
+    filter: &str,
+) -> HashSet<i64> {
+    if max_depth == 0 {
+        return HashSet::new();
+    }
+    let mut stack = index
+        .function_children
+        .get(&(semantic_id, Some(selected_id)))
+        .into_iter()
+        .flatten()
+        .map(|function| (1, *function))
+        .collect::<Vec<_>>();
+    let mut included = HashSet::new();
+    while let Some((depth, function)) = stack.pop() {
+        if function_matches(function, filter) {
+            let mut id = function.function_id;
+            loop {
+                if id == selected_id {
+                    break;
+                }
+                included.insert(id);
+                let Some(parent_id) = index
+                    .functions
+                    .get(&(semantic_id, id))
+                    .and_then(|function| function.parent_function_id)
+                else {
+                    break;
+                };
+                id = parent_id;
+            }
+        }
+        if depth < max_depth {
+            stack.extend(
+                index
+                    .function_children
+                    .get(&(semantic_id, Some(function.function_id)))
+                    .into_iter()
+                    .flatten()
+                    .map(|child| (depth + 1, *child)),
+            );
+        }
+    }
+    included
 }
 
 fn function_matches(function: &RankedFunction, filter: &str) -> bool {
@@ -446,19 +502,27 @@ fn function_matches(function: &RankedFunction, filter: &str) -> bool {
 }
 
 fn collect_function_rows<'a>(
-    children: &mut HashMap<Option<i64>, Vec<&'a RankedFunction>>,
-    parent_function_id: Option<i64>,
+    children: &HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
+    parent: (i64, Option<i64>),
     first_depth: usize,
     max_depth: usize,
     limit: usize,
     sort: InspectSort,
     included: Option<&HashSet<i64>>,
 ) -> (usize, Vec<(usize, &'a RankedFunction)>) {
+    let (semantic_id, parent_function_id) = parent;
     if first_depth > max_depth {
         return (0, Vec::new());
     }
     let mut stack = Vec::new();
-    push_sorted_function_siblings(children, parent_function_id, first_depth, sort, &mut stack);
+    push_sorted_function_siblings(
+        children,
+        semantic_id,
+        parent_function_id,
+        first_depth,
+        sort,
+        &mut stack,
+    );
     let mut total = 0;
     let mut rows = Vec::with_capacity(limit);
     while let Some((depth, function)) = stack.pop() {
@@ -471,6 +535,7 @@ fn collect_function_rows<'a>(
         if depth < max_depth {
             push_sorted_function_siblings(
                 children,
+                semantic_id,
                 Some(function.function_id),
                 depth + 1,
                 sort,
@@ -482,17 +547,19 @@ fn collect_function_rows<'a>(
 }
 
 fn push_sorted_function_siblings<'a>(
-    children: &mut HashMap<Option<i64>, Vec<&'a RankedFunction>>,
+    children: &HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
+    semantic_id: i64,
     parent_function_id: Option<i64>,
     depth: usize,
     sort: InspectSort,
     stack: &mut Vec<(usize, &'a RankedFunction)>,
 ) {
-    let Some(siblings) = children.get_mut(&parent_function_id) else {
+    let Some(siblings) = children.get(&(semantic_id, parent_function_id)) else {
         return;
     };
+    let mut siblings = siblings.clone();
     siblings.sort_unstable_by(|left, right| compare_functions(left, right, sort));
-    stack.extend(siblings.iter().rev().map(|function| (depth, *function)));
+    stack.extend(siblings.into_iter().rev().map(|function| (depth, function)));
 }
 
 fn compare_functions(left: &RankedFunction, right: &RankedFunction, sort: InspectSort) -> Ordering {
@@ -698,13 +765,14 @@ mod tests {
 
     #[test]
     fn ranks_and_bounds_operation_roots_with_terminal_safe_text() {
-        let rendered = render_semantic_view(
-            &document(vec![
-                operation(3, "safe lambda", Some(10)),
-                operation(1, "slow\u{1b}[31m\u{2028}\u{202e}\"operation", Some(30)),
-                operation(2, "safe snowman \u{2603}", Some(30)),
-            ]),
-            None,
+        let document = document(vec![
+            operation(3, "safe lambda", Some(10)),
+            operation(1, "slow\u{1b}[31m\u{2028}\u{202e}\"operation", Some(30)),
+            operation(2, "safe snowman \u{2603}", Some(30)),
+        ]);
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Root,
             InspectSort::Duration,
             None,
             2,
@@ -742,9 +810,15 @@ mod tests {
         grandchild.operation_id = 1;
 
         let document = document(vec![first, grandchild, root, second]);
-        let rendered =
-            render_semantic_view(&document, Some(1), InspectSort::InclusiveCpu, None, 10, 2)
-                .expect("selected view should render");
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Semantic(1),
+            InspectSort::InclusiveCpu,
+            None,
+            10,
+            2,
+        )
+        .expect("selected view should render");
 
         assert!(rendered.contains("context: semantic:1"));
         assert!(rendered.contains("showing: 3 of 3; truncated: false"));
@@ -757,7 +831,14 @@ mod tests {
             "id=semantic:3 name=\"second\" kind=\"operation\" duration_ns=80 time_basis=exact:wall_clock operation_wall_percent=80.00%"
         ));
         assert_eq!(
-            render_semantic_view(&document, Some(99), InspectSort::Duration, None, 10, 1),
+            render_terminal_view(
+                &document,
+                InspectSelection::Semantic(99),
+                InspectSort::Duration,
+                None,
+                10,
+                1,
+            ),
             Err(TerminalInspectError::SemanticNotFound(99))
         );
     }

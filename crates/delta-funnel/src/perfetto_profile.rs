@@ -36,6 +36,7 @@ use report_cli::RankedReportFailurePhase;
 pub use report_cli::run_perfetto_diagnostics_cli;
 use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
 use report_html::{render_ranked_profile_html, write_ranked_profile_html};
+#[cfg(test)]
 use report_terminal::render_terminal_view;
 
 fn generate_ranked_profile_report(

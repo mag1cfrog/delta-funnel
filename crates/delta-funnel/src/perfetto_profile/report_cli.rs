@@ -11,7 +11,9 @@ use std::str::FromStr;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 
-use super::report_terminal::{InspectSelection, InspectSort, TerminalInspectError};
+use super::report_terminal::{
+    InspectSelection, InspectSort, TerminalInspectError, TerminalProfileIndex,
+};
 
 const DEFAULT_INSPECT_LIMIT: u16 = 20;
 const MAX_INSPECT_LIMIT: u16 = 200;
@@ -232,12 +234,8 @@ impl InspectNavigation {
 }
 
 impl InspectState {
-    fn render(
-        &self,
-        document: &super::ranked_report::RankedProfileDocument,
-    ) -> Result<String, TerminalInspectError> {
-        super::render_terminal_view(
-            document,
+    fn render(&self, index: &TerminalProfileIndex<'_>) -> Result<String, TerminalInspectError> {
+        index.render(
             self.selection,
             self.sort,
             self.filter.as_deref(),
@@ -582,7 +580,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
                 Err(error) => emit_failure(error),
             }
         }
-        Ok(document) => match state.render(&document) {
+        Ok(document) => match state.render(&TerminalProfileIndex::new(&document)) {
             Ok(output) => {
                 let mut stdout = io::stdout().lock();
                 match stdout
@@ -608,7 +606,8 @@ fn run_interactive_session(
     prompt: bool,
 ) -> Result<(), RankedReportFailure> {
     let navigation = InspectNavigation::new(document);
-    let initial = state.render(document).map_err(RankedReportFailure::from)?;
+    let index = TerminalProfileIndex::new(document);
+    let initial = state.render(&index).map_err(RankedReportFailure::from)?;
     write_interactive_response(output, &initial)?;
     let mut line = Vec::with_capacity(MAX_INTERACTIVE_COMMAND_BYTES);
     loop {
@@ -625,7 +624,7 @@ fn run_interactive_session(
                 write_interactive_response(output, "")?;
             }
             InteractiveLine::Command(command) => {
-                match run_interactive_command(document, &navigation, state, command.trim()) {
+                match run_interactive_command(&index, &navigation, state, command.trim()) {
                     Ok(InteractiveCommandResult::Output(response)) => {
                         write_interactive_response(output, &response)?;
                     }
@@ -649,27 +648,27 @@ enum InteractiveCommandResult {
 }
 
 fn run_interactive_command(
-    document: &super::ranked_report::RankedProfileDocument,
+    index: &TerminalProfileIndex<'_>,
     navigation: &InspectNavigation,
     state: &mut InspectState,
     command: &str,
 ) -> Result<InteractiveCommandResult, &'static str> {
     match command {
         "show" => state
-            .render(document)
+            .render(index)
             .map(InteractiveCommandResult::Output)
             .map_err(|_| "current profile selection does not exist"),
         "up" => {
             state.selection = navigation.up(state.selection)?;
-            render_interactive_selection(document, state)
+            render_interactive_selection(index, state)
         }
         "root" => {
             state.selection = InspectSelection::Root;
-            render_interactive_selection(document, state)
+            render_interactive_selection(index, state)
         }
         "clear" => {
             state.filter = None;
-            render_interactive_selection(document, state)
+            render_interactive_selection(index, state)
         }
         "help" => Ok(InteractiveCommandResult::Output(
             "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, sort METRIC, filter TEXT, clear, limit N, help, quit\n"
@@ -685,7 +684,7 @@ fn run_interactive_command(
                     .parse::<FilterText>()
                     .map_err(|_| "filter must contain between 1 and 128 characters")?;
                 state.filter = Some(filter.0);
-                return render_interactive_selection(document, state);
+                return render_interactive_selection(index, state);
             }
             if command == "sort" || command.starts_with("sort ") {
                 let value = command
@@ -708,7 +707,7 @@ fn run_interactive_command(
                     return Err("function callsites cannot be sorted by exact duration");
                 }
                 state.sort = sort;
-                return render_interactive_selection(document, state);
+                return render_interactive_selection(index, state);
             }
             if command == "limit" || command.starts_with("limit ") {
                 let value = command
@@ -720,7 +719,7 @@ fn run_interactive_command(
                     .filter(|limit| (1..=MAX_INSPECT_LIMIT).contains(limit))
                     .ok_or("limit must be between 1 and 200")?;
                 state.limit = usize::from(limit);
-                return render_interactive_selection(document, state);
+                return render_interactive_selection(index, state);
             }
             let target = command
                 .strip_prefix("open ")
@@ -747,17 +746,17 @@ fn run_interactive_command(
                     "invalid open target; expected semantic:ID or function:SEMANTIC_ID:FUNCTION_ID",
                 );
             }
-            render_interactive_selection(document, state)
+            render_interactive_selection(index, state)
         }
     }
 }
 
 fn render_interactive_selection(
-    document: &super::ranked_report::RankedProfileDocument,
+    index: &TerminalProfileIndex<'_>,
     state: &InspectState,
 ) -> Result<InteractiveCommandResult, &'static str> {
     state
-        .render(document)
+        .render(index)
         .map(InteractiveCommandResult::Output)
         .map_err(|_| "current profile selection does not exist")
 }
@@ -1469,6 +1468,7 @@ mod tests {
     #[test]
     fn interactive_sort_and_limit_validate_before_changing_state() -> Result<(), &'static str> {
         let document = interactive_document();
+        let index = TerminalProfileIndex::new(&document);
         let navigation = InspectNavigation::new(&document);
         let mut state = InspectState {
             selection: InspectSelection::Root,
@@ -1479,11 +1479,11 @@ mod tests {
         };
 
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, "open semantic:1"),
+            run_interactive_command(&index, &navigation, &mut state, "open semantic:1"),
             Ok(InteractiveCommandResult::Output(_))
         ));
         let output = interactive_output(run_interactive_command(
-            &document,
+            &index,
             &navigation,
             &mut state,
             "limit 1",
@@ -1491,13 +1491,13 @@ mod tests {
         assert_eq!(state.limit, 1);
         assert!(output.contains("showing: 1 of 2; truncated: true"));
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, "limit 0"),
+            run_interactive_command(&index, &navigation, &mut state, "limit 0"),
             Err("limit must be between 1 and 200")
         ));
         assert_eq!(state.limit, 1);
 
         let output = interactive_output(run_interactive_command(
-            &document,
+            &index,
             &navigation,
             &mut state,
             "sort name",
@@ -1505,17 +1505,17 @@ mod tests {
         assert_eq!(state.sort, InspectSort::Name);
         assert!(output.contains("sort: name"));
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, "sort unknown"),
+            run_interactive_command(&index, &navigation, &mut state, "sort unknown"),
             Err("invalid sort; expected duration, inclusive-cpu, self-cpu, or name")
         ));
         assert_eq!(state.sort, InspectSort::Name);
 
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, "open function:1:10"),
+            run_interactive_command(&index, &navigation, &mut state, "open function:1:10"),
             Ok(InteractiveCommandResult::Output(_))
         ));
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, "sort duration"),
+            run_interactive_command(&index, &navigation, &mut state, "sort duration"),
             Err("function callsites cannot be sorted by exact duration")
         ));
         assert_eq!(state.sort, InspectSort::Name);
@@ -1525,6 +1525,7 @@ mod tests {
     #[test]
     fn interactive_filter_is_bounded_and_clearable() -> Result<(), &'static str> {
         let document = interactive_document();
+        let index = TerminalProfileIndex::new(&document);
         let navigation = InspectNavigation::new(&document);
         let mut state = InspectState {
             selection: InspectSelection::Semantic(1),
@@ -1535,7 +1536,7 @@ mod tests {
         };
 
         let output = interactive_output(run_interactive_command(
-            &document,
+            &index,
             &navigation,
             &mut state,
             "filter planning",
@@ -1546,18 +1547,18 @@ mod tests {
 
         let oversized = format!("filter {}", "x".repeat(MAX_FILTER_CHARS + 1));
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, &oversized),
+            run_interactive_command(&index, &navigation, &mut state, &oversized),
             Err("filter must contain between 1 and 128 characters")
         ));
         assert_eq!(state.filter.as_deref(), Some("planning"));
         assert!(matches!(
-            run_interactive_command(&document, &navigation, &mut state, "filter"),
+            run_interactive_command(&index, &navigation, &mut state, "filter"),
             Err("filter must contain between 1 and 128 characters")
         ));
         assert_eq!(state.filter.as_deref(), Some("planning"));
 
         let output = interactive_output(run_interactive_command(
-            &document,
+            &index,
             &navigation,
             &mut state,
             "clear",
