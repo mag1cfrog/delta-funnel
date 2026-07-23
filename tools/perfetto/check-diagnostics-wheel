@@ -151,6 +151,11 @@ subprocess.run(
     check=True,
     stdout=subprocess.DEVNULL,
 )
+subprocess.run(
+    [perfetto_cli, "inspect", "--help"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
 invalid_command = subprocess.run(
     [perfetto_cli, "invalid"],
     stdout=subprocess.DEVNULL,
