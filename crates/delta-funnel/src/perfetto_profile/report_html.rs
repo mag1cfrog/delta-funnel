@@ -10,6 +10,7 @@ const HTML_PREFIX: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Delta Funnel profile report</title>
 <style>
 body { color: #202124; font: 15px system-ui, sans-serif; margin: 2rem; }
