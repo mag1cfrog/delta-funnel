@@ -3,6 +3,7 @@
 //! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,19 @@ pub use report_health::validate_ranked_report_capture;
 pub use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[doc(hidden)]
 pub use report_trace_processor::run_trace_processor_query;
+
+#[doc(hidden)]
+pub fn generate_ranked_profile_report(
+    input: &Path,
+    output: &Path,
+) -> Result<PathBuf, RankedReportFailure> {
+    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
+    validate_ranked_report_capture(&paths.input)?;
+    let document = load_ranked_profile(&paths.input)?;
+    let html = render_ranked_profile_html(&document)?;
+    write_ranked_profile_html(&paths.output, &html)?;
+    Ok(paths.output)
+}
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -466,6 +480,20 @@ mod tests {
             .expect_err("an unrepresentable deadline must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn report_generation_rejects_an_input_alias_before_analysis() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("capture.pftrace");
+        std::fs::write(&input, "unchanged trace")?;
+
+        let error = generate_ranked_profile_report(&input, &input)
+            .expect_err("the report must never replace its input trace");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(error.kind(), "aliases_input");
+        assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
