@@ -9,10 +9,9 @@ use serde::{Deserialize, Serialize};
 pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
 
-#[doc(hidden)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RankedProfileMetadata {
+pub(super) struct RankedProfileMetadata {
     pub schema_version: u32,
     pub sample_frequency_hz: u32,
     pub exact_time_unit: String,
@@ -23,10 +22,9 @@ pub struct RankedProfileMetadata {
     pub unattributed_sample_count: i64,
 }
 
-#[doc(hidden)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RankedSemantic {
+pub(super) struct RankedSemantic {
     pub semantic_id: i64,
     pub parent_semantic_id: Option<i64>,
     pub operation_id: i64,
@@ -56,9 +54,8 @@ pub struct RankedSemantic {
     pub inclusive_sample_count: i64,
 }
 
-#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RankedFunction {
+pub(super) struct RankedFunction {
     pub semantic_id: i64,
     pub function_id: i64,
     pub parent_function_id: Option<i64>,
@@ -70,17 +67,15 @@ pub struct RankedFunction {
     pub inclusive_sample_count: i64,
 }
 
-#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RankedProfileDocument {
+pub(super) struct RankedProfileDocument {
     pub metadata: RankedProfileMetadata,
     pub semantics: Vec<RankedSemantic>,
     pub functions: Vec<RankedFunction>,
 }
 
-#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RankedProfileValidationError {
+pub(super) enum RankedProfileValidationError {
     TooManyRecords {
         record_kind: &'static str,
         count: usize,

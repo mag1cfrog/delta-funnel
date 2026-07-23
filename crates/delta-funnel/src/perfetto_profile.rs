@@ -28,28 +28,14 @@ mod report_html;
 mod report_trace_processor;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
-#[doc(hidden)]
-pub use ranked_report::{
-    RankedFunction, RankedProfileDocument, RankedProfileMetadata, RankedProfileValidationError,
-    RankedSemantic,
-};
-#[doc(hidden)]
-pub use report_aggregate::load_ranked_profile;
-#[doc(hidden)]
-pub use report_cli::{
-    RankedReportArgumentError, RankedReportCliAction, RankedReportFailure,
-    RankedReportFailurePhase, RankedReportPathError, RankedReportPaths, parse_ranked_report_args,
-    preflight_ranked_report_paths, run_perfetto_diagnostics_cli,
-};
-#[doc(hidden)]
-pub use report_health::validate_ranked_report_capture;
-#[doc(hidden)]
-pub use report_html::{render_ranked_profile_html, write_ranked_profile_html};
-#[doc(hidden)]
-pub use report_trace_processor::run_trace_processor_query;
+use report_aggregate::load_ranked_profile;
+#[cfg(test)]
+use report_cli::RankedReportFailurePhase;
+pub use report_cli::run_perfetto_diagnostics_cli;
+use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
+use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 
-#[doc(hidden)]
-pub fn generate_ranked_profile_report(
+fn generate_ranked_profile_report(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {

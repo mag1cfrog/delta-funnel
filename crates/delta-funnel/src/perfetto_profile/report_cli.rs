@@ -5,16 +5,14 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RankedReportCliAction {
+enum RankedReportCliAction {
     Help,
     Generate { input: PathBuf, output: PathBuf },
 }
 
-#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RankedReportArgumentError {
+enum RankedReportArgumentError {
     MissingInput,
     MissingOutputValue,
     DuplicateOutput,
@@ -37,9 +35,8 @@ impl fmt::Display for RankedReportArgumentError {
 
 impl std::error::Error for RankedReportArgumentError {}
 
-#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RankedReportFailurePhase {
+pub(super) enum RankedReportFailurePhase {
     Argument,
     Input,
     Health,
@@ -65,16 +62,15 @@ impl RankedReportFailurePhase {
     }
 }
 
-#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RankedReportFailure {
+pub(super) struct RankedReportFailure {
     phase: RankedReportFailurePhase,
     kind: &'static str,
     message: String,
 }
 
 impl RankedReportFailure {
-    pub(crate) fn new(
+    pub(super) fn new(
         phase: RankedReportFailurePhase,
         kind: &'static str,
         message: impl Into<String>,
@@ -90,6 +86,7 @@ impl RankedReportFailure {
         self.phase
     }
 
+    #[cfg(test)]
     pub fn kind(&self) -> &'static str {
         self.kind
     }
@@ -125,9 +122,8 @@ impl From<RankedReportArgumentError> for RankedReportFailure {
     }
 }
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub enum RankedReportPathError {
+pub(super) enum RankedReportPathError {
     InputUnreadable(io::Error),
     InputNotFile,
     OutputHasNoFileName,
@@ -193,14 +189,15 @@ impl From<RankedReportPathError> for RankedReportFailure {
     }
 }
 
-#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RankedReportPaths {
-    pub input: PathBuf,
-    pub output: PathBuf,
+pub(super) struct RankedReportPaths {
+    pub(super) input: PathBuf,
+    pub(super) output: PathBuf,
 }
 
-#[doc(hidden)]
+/// Runs the bundled Perfetto diagnostics command-line interface.
+///
+/// Returns the process exit code without terminating the caller.
 pub fn run_perfetto_diagnostics_cli() -> i32 {
     run_perfetto_diagnostics_cli_with(env::args_os().skip(1))
 }
@@ -274,8 +271,7 @@ fn print_report_usage() {
     println!("Usage: delta-funnel-perfetto report INPUT.pftrace [--output OUTPUT.profile.html]");
 }
 
-#[doc(hidden)]
-pub fn parse_ranked_report_args(
+fn parse_ranked_report_args(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<RankedReportCliAction, RankedReportArgumentError> {
     let mut args = args.into_iter();
@@ -305,8 +301,7 @@ pub fn parse_ranked_report_args(
     Ok(RankedReportCliAction::Generate { input, output })
 }
 
-#[doc(hidden)]
-pub fn preflight_ranked_report_paths(
+pub(super) fn preflight_ranked_report_paths(
     input: &Path,
     output: &Path,
 ) -> Result<RankedReportPaths, RankedReportPathError> {

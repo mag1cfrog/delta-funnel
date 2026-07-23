@@ -10,8 +10,10 @@ use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 // Raise it only with a larger production aggregate and memory evidence.
 const MAX_QUERY_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
-#[doc(hidden)]
-pub fn run_trace_processor_query(input: &Path, sql: &[u8]) -> Result<Vec<u8>, RankedReportFailure> {
+pub(super) fn run_trace_processor_query(
+    input: &Path,
+    sql: &[u8],
+) -> Result<Vec<u8>, RankedReportFailure> {
     let program =
         std::env::var_os("TRACE_PROCESSOR_SHELL").unwrap_or_else(|| "trace_processor_shell".into());
     run_trace_processor_query_with(&program, input, sql, MAX_QUERY_OUTPUT_BYTES)

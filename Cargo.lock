@@ -1266,7 +1266,6 @@ dependencies = [
  "arrow-tiberius",
  "async-trait",
  "chrono",
- "csv",
  "datafusion",
  "delta_kernel",
  "futures-util",

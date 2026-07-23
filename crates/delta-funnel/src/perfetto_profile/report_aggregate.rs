@@ -69,8 +69,9 @@ struct CompactFunctionSelf {
     self_sample_count: i64,
 }
 
-#[doc(hidden)]
-pub fn load_ranked_profile(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {
+pub(super) fn load_ranked_profile(
+    input: &Path,
+) -> Result<RankedProfileDocument, RankedReportFailure> {
     let health_input_sql = capture_health_input_sql(input)?;
     let sql = [
         health_input_sql.as_str(),

@@ -76,8 +76,7 @@ profile.functions
 </html>
 "#;
 
-#[doc(hidden)]
-pub fn render_ranked_profile_html(
+pub(super) fn render_ranked_profile_html(
     document: &RankedProfileDocument,
 ) -> Result<String, RankedReportFailure> {
     let json = serde_json::to_string(document).map_err(|_| {
@@ -94,8 +93,10 @@ pub fn render_ranked_profile_html(
     Ok(html)
 }
 
-#[doc(hidden)]
-pub fn write_ranked_profile_html(output: &Path, html: &str) -> Result<(), RankedReportFailure> {
+pub(super) fn write_ranked_profile_html(
+    output: &Path,
+    html: &str,
+) -> Result<(), RankedReportFailure> {
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -140,8 +141,8 @@ fn push_html_safe_json(output: &mut String, json: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ranked_report::{RankedFunction, RankedProfileMetadata, RankedSemantic};
     use super::*;
-    use crate::perfetto_profile::{RankedFunction, RankedProfileMetadata, RankedSemantic};
 
     #[test]
     fn renders_a_safe_self_contained_report() -> Result<(), Box<dyn std::error::Error>> {
