@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::iter;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -16,6 +16,8 @@ const DEFAULT_INSPECT_LIMIT: u16 = 20;
 const MAX_INSPECT_LIMIT: u16 = 200;
 const MAX_INSPECT_DEPTH: u16 = 32;
 const MAX_FILTER_CHARS: usize = 128;
+const MAX_INTERACTIVE_COMMAND_BYTES: usize = 1024;
+const INTERACTIVE_END_MARKER: &str = "-- end --\n";
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -89,6 +91,10 @@ struct InspectArgs {
         value_parser = clap::value_parser!(u16).range(0..=i64::from(MAX_INSPECT_DEPTH))
     )]
     depth: Option<u16>,
+
+    /// Keep the loaded profile open for line-oriented commands.
+    #[arg(long)]
+    interactive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +114,30 @@ impl FromStr for FilterText {
             return Err("filter must contain between 1 and 128 characters");
         }
         Ok(Self(value.to_owned()))
+    }
+}
+
+struct InspectState {
+    selection: InspectSelection,
+    sort: InspectSort,
+    filter: Option<String>,
+    limit: usize,
+    depth: usize,
+}
+
+impl InspectState {
+    fn render(
+        &self,
+        document: &super::ranked_report::RankedProfileDocument,
+    ) -> Result<String, TerminalInspectError> {
+        super::render_terminal_view(
+            document,
+            self.selection,
+            self.sort,
+            self.filter.as_deref(),
+            self.limit,
+            self.depth,
+        )
     }
 }
 
@@ -414,30 +444,194 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
     if matches!(selection, InspectSelection::Function { .. }) && sort == InspectSort::Duration {
         return emit_failure(CliArgumentError::IncompatibleSort.into());
     }
+    let state = InspectState {
+        selection,
+        sort,
+        filter: args.filter.map(|filter| filter.0),
+        limit: usize::from(args.limit),
+        depth: args.depth.map_or_else(
+            || usize::from(selection != InspectSelection::Root),
+            usize::from,
+        ),
+    };
     let input = match preflight_ranked_profile_input(&args.input) {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
     match super::load_ranked_profile(&input) {
-        Ok(document) => match super::render_terminal_view(
-            &document,
-            selection,
-            sort,
-            args.filter.as_ref().map(|filter| filter.0.as_str()),
-            usize::from(args.limit),
-            args.depth.map_or_else(
-                || usize::from(selection != InspectSelection::Root),
-                usize::from,
-            ),
-        ) {
+        Ok(document) if args.interactive => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            let prompt = stdin.is_terminal() && stdout.is_terminal();
+            let mut input = stdin.lock();
+            let mut output = stdout.lock();
+            let mut error = io::stderr().lock();
+            match run_interactive_session(
+                &document,
+                &state,
+                &mut input,
+                &mut output,
+                &mut error,
+                prompt,
+            ) {
+                Ok(()) => 0,
+                Err(error) => emit_failure(error),
+            }
+        }
+        Ok(document) => match state.render(&document) {
             Ok(output) => {
-                print!("{output}");
-                0
+                let mut stdout = io::stdout().lock();
+                match stdout
+                    .write_all(output.as_bytes())
+                    .and_then(|()| stdout.flush())
+                {
+                    Ok(()) => 0,
+                    Err(_) => emit_failure(terminal_output_failure()),
+                }
             }
             Err(error) => emit_failure(error.into()),
         },
         Err(error) => emit_failure(error),
     }
+}
+
+fn run_interactive_session(
+    document: &super::ranked_report::RankedProfileDocument,
+    state: &InspectState,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    error: &mut impl Write,
+    prompt: bool,
+) -> Result<(), RankedReportFailure> {
+    let initial = state.render(document).map_err(RankedReportFailure::from)?;
+    write_interactive_response(output, &initial)?;
+    let mut line = Vec::with_capacity(MAX_INTERACTIVE_COMMAND_BYTES);
+    loop {
+        if prompt {
+            output
+                .write_all(b"profile> ")
+                .and_then(|()| output.flush())
+                .map_err(|_| terminal_output_failure())?;
+        }
+        match read_interactive_line(input, &mut line).map_err(|_| interactive_input_failure())? {
+            InteractiveLine::Eof => return Ok(()),
+            InteractiveLine::Invalid(message) => {
+                write_interactive_error(error, message)?;
+                write_interactive_response(output, "")?;
+            }
+            InteractiveLine::Command(command) => match command.trim() {
+                "show" => {
+                    let view = state.render(document).map_err(RankedReportFailure::from)?;
+                    write_interactive_response(output, &view)?;
+                }
+                "help" => write_interactive_response(output, "commands: show, help, quit\n")?,
+                "quit" => {
+                    write_interactive_response(output, "")?;
+                    return Ok(());
+                }
+                _ => {
+                    write_interactive_error(error, "unknown interactive command")?;
+                    write_interactive_response(output, "")?;
+                }
+            },
+        }
+    }
+}
+
+enum InteractiveLine {
+    Eof,
+    Command(String),
+    Invalid(&'static str),
+}
+
+fn read_interactive_line(
+    input: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> io::Result<InteractiveLine> {
+    line.clear();
+    let mut read_any = false;
+    let mut exceeded_limit = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        read_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(consumed);
+        if !exceeded_limit {
+            let retained = payload.min(
+                MAX_INTERACTIVE_COMMAND_BYTES
+                    .saturating_add(1)
+                    .saturating_sub(line.len()),
+            );
+            line.extend_from_slice(&available[..retained]);
+            exceeded_limit |= retained != payload || line.len() > MAX_INTERACTIVE_COMMAND_BYTES;
+        }
+        input.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if !read_any {
+        return Ok(InteractiveLine::Eof);
+    }
+    if exceeded_limit {
+        return Ok(InteractiveLine::Invalid(
+            "interactive command exceeds the 1024-byte limit",
+        ));
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    match std::str::from_utf8(line) {
+        Ok(line) => Ok(InteractiveLine::Command(line.to_owned())),
+        Err(_) => Ok(InteractiveLine::Invalid(
+            "interactive command must be valid UTF-8",
+        )),
+    }
+}
+
+fn write_interactive_response(
+    output: &mut impl Write,
+    response: &str,
+) -> Result<(), RankedReportFailure> {
+    output
+        .write_all(response.as_bytes())
+        .and_then(|()| {
+            if !response.is_empty() && !response.ends_with('\n') {
+                output.write_all(b"\n")?;
+            }
+            output.write_all(INTERACTIVE_END_MARKER.as_bytes())
+        })
+        .and_then(|()| output.flush())
+        .map_err(|_| terminal_output_failure())
+}
+
+fn write_interactive_error(
+    error: &mut impl Write,
+    message: &str,
+) -> Result<(), RankedReportFailure> {
+    writeln!(error, "error: {message}")
+        .and_then(|()| error.flush())
+        .map_err(|_| terminal_output_failure())
+}
+
+fn interactive_input_failure() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Input,
+        "interactive_read_failed",
+        "interactive command input could not be read",
+    )
+}
+
+fn terminal_output_failure() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Output,
+        "terminal_write_failed",
+        "terminal output could not be written",
+    )
 }
 
 fn run_report_command(args: RankedReportArgs) -> i32 {
@@ -701,6 +895,55 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn interactive_document() -> super::super::ranked_report::RankedProfileDocument {
+        use super::super::ranked_report::{
+            RankedProfileDocument, RankedProfileMetadata, RankedSemantic,
+        };
+
+        RankedProfileDocument {
+            metadata: RankedProfileMetadata {
+                schema_version: 1,
+                sample_frequency_hz: 100,
+                exact_time_unit: "nanoseconds".to_owned(),
+                sample_unit: "samples".to_owned(),
+                eligible_sample_count: 0,
+                direct_sample_count: 0,
+                ambiguous_sample_count: 0,
+                unattributed_sample_count: 0,
+            },
+            semantics: vec![RankedSemantic {
+                semantic_id: 1,
+                parent_semantic_id: None,
+                operation_id: 1,
+                name: "operation".to_owned(),
+                semantic_kind: "operation".to_owned(),
+                operation_kind: Some("preview".to_owned()),
+                stage_category: None,
+                stage_name: None,
+                activity: None,
+                start_ns: 0,
+                end_ns: Some(10),
+                duration_ns: Some(10),
+                time_semantics: "wall_clock".to_owned(),
+                result: Some("completed".to_owned()),
+                is_complete: true,
+                query_execution_id: None,
+                query_scope: None,
+                query_owner: None,
+                worker_lane_id: None,
+                worker_kind: None,
+                node_id: None,
+                parent_node_id: None,
+                operator_partition: None,
+                execution_stream_id: None,
+                stage_owner_id: None,
+                direct_sample_count: 0,
+                inclusive_sample_count: 0,
+            }],
+            functions: Vec::new(),
+        }
+    }
+
     #[test]
     fn parses_report_arguments_and_generates_help() -> Result<(), Box<dyn std::error::Error>> {
         let root_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "--help"])
@@ -768,6 +1011,7 @@ mod tests {
         assert!(help.contains("--semantic <ID>"));
         assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
         assert!(help.contains("--filter <TEXT>"));
+        assert!(help.contains("--interactive"));
         assert!(help.contains("--sort <SORT>"));
         assert!(help.contains("--depth <DEPTH>"));
 
@@ -786,6 +1030,7 @@ mod tests {
                 "scan",
                 "--depth",
                 "3",
+                "--interactive",
             ])?,
             PerfettoCli {
                 command: PerfettoCommand::Inspect(InspectArgs {
@@ -796,6 +1041,7 @@ mod tests {
                     filter: Some(FilterText("scan".to_owned())),
                     sort: Some(InspectSort::SelfCpu),
                     depth: Some(3),
+                    interactive: true,
                 }),
             }
         );
@@ -819,10 +1065,47 @@ mod tests {
                     filter: None,
                     sort: None,
                     depth: None,
+                    interactive: false,
                 }),
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn interactive_session_is_line_oriented_bounded_and_recoverable() {
+        let document = interactive_document();
+        let state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: 0,
+        };
+        let mut commands = vec![b'a'; MAX_INTERACTIVE_COMMAND_BYTES + 1];
+        commands.extend_from_slice(b"\nshow\nunknown\nhelp\nquit\n");
+        let mut input = io::Cursor::new(commands);
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+
+        run_interactive_session(
+            &document,
+            &state,
+            &mut input,
+            &mut output,
+            &mut error,
+            false,
+        )
+        .expect("recoverable commands should preserve the session");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let error = String::from_utf8(error).expect("errors should be UTF-8");
+        assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 6);
+        assert_eq!(output.matches("context: operation-roots").count(), 2);
+        assert!(output.contains("commands: show, help, quit"));
+        assert!(!output.contains("profile> "));
+        assert!(error.contains("interactive command exceeds the 1024-byte limit"));
+        assert!(error.contains("unknown interactive command"));
     }
 
     #[test]
@@ -854,6 +1137,7 @@ mod tests {
                 filter: None,
                 sort: Some(InspectSort::Duration),
                 depth: None,
+                interactive: false,
             }),
             64
         );
