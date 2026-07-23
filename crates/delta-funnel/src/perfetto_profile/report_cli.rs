@@ -1379,6 +1379,37 @@ mod tests {
     }
 
     #[test]
+    fn interactive_session_recovers_from_invalid_utf8_and_exits_on_eof() {
+        let document = interactive_document();
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+        let mut input = io::Cursor::new([0xff, b'\n']);
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+
+        run_interactive_session(
+            &document,
+            &mut state,
+            &mut input,
+            &mut output,
+            &mut error,
+            true,
+        )
+        .expect("EOF should close a healthy session");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let error = String::from_utf8(error).expect("errors should be UTF-8");
+        assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 2);
+        assert_eq!(output.matches("profile> ").count(), 2);
+        assert!(error.contains("interactive command must be valid UTF-8"));
+    }
+
+    #[test]
     fn interactive_navigation_requires_exact_immediate_children() {
         let document = interactive_document();
         let mut state = InspectState {
