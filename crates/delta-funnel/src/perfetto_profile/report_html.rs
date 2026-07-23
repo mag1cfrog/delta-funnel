@@ -1,3 +1,7 @@
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
 use super::ranked_report::RankedProfileDocument;
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 
@@ -89,6 +93,37 @@ pub fn render_ranked_profile_html(
     Ok(html)
 }
 
+#[doc(hidden)]
+pub fn write_ranked_profile_html(output: &Path, html: &str) -> Result<(), RankedReportFailure> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|_| {
+        output_failure(
+            "create_parent_failed",
+            "report output directory could not be created",
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| {
+        output_failure(
+            "create_temporary_failed",
+            "temporary report file could not be created",
+        )
+    })?;
+    temporary.write_all(html.as_bytes()).map_err(|_| {
+        output_failure("write_failed", "temporary report file could not be written")
+    })?;
+    temporary
+        .persist(output)
+        .map_err(|_| output_failure("persist_failed", "completed report could not be persisted"))?;
+    Ok(())
+}
+
+fn output_failure(kind: &'static str, message: &'static str) -> RankedReportFailure {
+    RankedReportFailure::new(RankedReportFailurePhase::Output, kind, message)
+}
+
 fn push_html_safe_json(output: &mut String, json: &str) {
     for character in json.chars() {
         match character {
@@ -176,6 +211,35 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["name"], dangerous);
+        Ok(())
+    }
+
+    #[test]
+    fn atomically_replaces_output_and_preserves_it_on_failure() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("nested/report.profile.html");
+        write_ranked_profile_html(&output, "first complete report")
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(fs::read_to_string(&output)?, "first complete report");
+        write_ranked_profile_html(&output, "complete report")
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(fs::read_to_string(&output)?, "complete report");
+        assert_eq!(
+            fs::read_dir(output.parent().expect("output has a parent"))?.count(),
+            1
+        );
+
+        let blocked_output = directory.path().join("existing-output");
+        fs::create_dir(&blocked_output)?;
+        fs::write(blocked_output.join("keep-me"), "unchanged")?;
+        let error = write_ranked_profile_html(&blocked_output, "partial report")
+            .expect_err("a report cannot replace an existing directory");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(error.kind(), "persist_failed");
+        assert_eq!(
+            fs::read_to_string(blocked_output.join("keep-me"))?,
+            "unchanged"
+        );
         Ok(())
     }
 }

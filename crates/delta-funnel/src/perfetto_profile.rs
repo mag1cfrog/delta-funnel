@@ -43,7 +43,7 @@ pub use report_cli::{
 #[doc(hidden)]
 pub use report_health::validate_ranked_report_capture;
 #[doc(hidden)]
-pub use report_html::render_ranked_profile_html;
+pub use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[doc(hidden)]
 pub use report_trace_processor::run_trace_processor_query;
 
