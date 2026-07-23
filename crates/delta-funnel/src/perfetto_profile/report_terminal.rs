@@ -1,47 +1,208 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::fmt;
+
+use clap::ValueEnum;
+
 use super::ranked_report::{RankedProfileDocument, RankedSemantic};
 
-pub(super) fn render_operation_roots(document: &RankedProfileDocument, limit: usize) -> String {
-    let mut roots = document
-        .semantics
-        .iter()
-        .filter(|semantic| semantic.parent_semantic_id.is_none())
-        .collect::<Vec<_>>();
-    roots.sort_by(|left, right| {
-        right
-            .duration_ns
-            .unwrap_or_default()
-            .cmp(&left.duration_ns.unwrap_or_default())
-            .then_with(|| left.semantic_id.cmp(&right.semantic_id))
-    });
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub(super) enum InspectSort {
+    #[default]
+    Duration,
+    InclusiveCpu,
+    SelfCpu,
+    Name,
+}
 
-    let shown = roots.len().min(limit);
+impl InspectSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Duration => "duration",
+            Self::InclusiveCpu => "inclusive-cpu",
+            Self::SelfCpu => "self-cpu",
+            Self::Name => "name",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TerminalInspectError {
+    SemanticNotFound(i64),
+}
+
+impl TerminalInspectError {
+    pub(super) const fn kind(self) -> &'static str {
+        match self {
+            Self::SemanticNotFound(_) => "semantic_not_found",
+        }
+    }
+}
+
+impl fmt::Display for TerminalInspectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SemanticNotFound(semantic_id) => {
+                write!(formatter, "semantic:{semantic_id} does not exist")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TerminalInspectError {}
+
+pub(super) fn render_semantic_view(
+    document: &RankedProfileDocument,
+    selected_semantic_id: Option<i64>,
+    sort: InspectSort,
+    limit: usize,
+    max_depth: usize,
+) -> Result<String, TerminalInspectError> {
+    if let Some(semantic_id) = selected_semantic_id
+        && !document
+            .semantics
+            .iter()
+            .any(|semantic| semantic.semantic_id == semantic_id)
+    {
+        return Err(TerminalInspectError::SemanticNotFound(semantic_id));
+    }
+
+    let mut children = HashMap::<Option<i64>, Vec<&RankedSemantic>>::new();
+    for semantic in &document.semantics {
+        children
+            .entry(semantic.parent_semantic_id)
+            .or_default()
+            .push(semantic);
+    }
+
+    let first_depth = usize::from(selected_semantic_id.is_some());
+    let (total, rows) = collect_semantic_rows(
+        &mut children,
+        selected_semantic_id,
+        first_depth,
+        max_depth,
+        limit,
+        sort,
+    );
+
+    let operation_durations = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .map(|semantic| (semantic.operation_id, semantic.duration_ns))
+        .collect::<HashMap<_, _>>();
+    let context = selected_semantic_id.map_or_else(
+        || "operation-roots".to_owned(),
+        |semantic_id| format!("semantic:{semantic_id}"),
+    );
     let mut output = format!(
-        "view: ranked-profile\ncontext: operation-roots\nsort: duration\nfilter: none\nshowing: {shown} of {}; truncated: {}\ntime_unit: {}\nsample_unit: {}\n",
-        roots.len(),
-        shown < roots.len(),
+        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: none\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\n",
+        sort.as_str(),
+        rows.len(),
+        rows.len() < total,
         terminal_text(&document.metadata.exact_time_unit),
         terminal_text(&document.metadata.sample_unit),
     );
-    for root in roots.into_iter().take(shown) {
-        write_semantic_row(&mut output, root);
+    for (depth, semantic) in rows {
+        write_semantic_row(
+            &mut output,
+            depth,
+            semantic,
+            operation_durations
+                .get(&semantic.operation_id)
+                .copied()
+                .flatten(),
+        );
     }
-    output
+    Ok(output)
 }
 
-fn write_semantic_row(output: &mut String, semantic: &RankedSemantic) {
+fn collect_semantic_rows<'a>(
+    children: &mut HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
+    parent_semantic_id: Option<i64>,
+    first_depth: usize,
+    max_depth: usize,
+    limit: usize,
+    sort: InspectSort,
+) -> (usize, Vec<(usize, &'a RankedSemantic)>) {
+    if first_depth > max_depth {
+        return (0, Vec::new());
+    }
+    let mut stack = Vec::new();
+    push_sorted_siblings(children, parent_semantic_id, first_depth, sort, &mut stack);
+    let mut total = 0;
+    let mut rows = Vec::with_capacity(limit);
+    while let Some((depth, semantic)) = stack.pop() {
+        total += 1;
+        if rows.len() < limit {
+            rows.push((depth, semantic));
+        }
+        if depth < max_depth {
+            push_sorted_siblings(
+                children,
+                Some(semantic.semantic_id),
+                depth + 1,
+                sort,
+                &mut stack,
+            );
+        }
+    }
+    (total, rows)
+}
+
+fn push_sorted_siblings<'a>(
+    children: &mut HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
+    parent_semantic_id: Option<i64>,
+    depth: usize,
+    sort: InspectSort,
+    stack: &mut Vec<(usize, &'a RankedSemantic)>,
+) {
+    let Some(siblings) = children.get_mut(&parent_semantic_id) else {
+        return;
+    };
+    siblings.sort_unstable_by(|left, right| compare_semantics(left, right, sort));
+    stack.extend(siblings.iter().rev().map(|semantic| (depth, *semantic)));
+}
+
+fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: InspectSort) -> Ordering {
+    let ordering = match sort {
+        InspectSort::Duration => right
+            .duration_ns
+            .unwrap_or_default()
+            .cmp(&left.duration_ns.unwrap_or_default()),
+        InspectSort::InclusiveCpu => right
+            .inclusive_sample_count
+            .cmp(&left.inclusive_sample_count),
+        InspectSort::SelfCpu => right.direct_sample_count.cmp(&left.direct_sample_count),
+        InspectSort::Name => left.name.cmp(&right.name),
+    };
+    ordering.then_with(|| left.semantic_id.cmp(&right.semantic_id))
+}
+
+fn write_semantic_row(
+    output: &mut String,
+    depth: usize,
+    semantic: &RankedSemantic,
+    operation_duration_ns: Option<i64>,
+) {
     let duration = semantic
         .duration_ns
         .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
-    let wall_percent = semantic
-        .duration_ns
-        .filter(|duration| *duration > 0)
-        .map_or("n/a", |_| "100.00%");
+    let wall_percent = match (semantic.duration_ns, operation_duration_ns) {
+        (Some(duration), Some(operation_duration)) if operation_duration > 0 => {
+            format!(
+                "{:.2}%",
+                duration as f64 * 100.0 / operation_duration as f64
+            )
+        }
+        _ => "n/a".to_owned(),
+    };
     let result = semantic
         .result
         .as_deref()
         .map_or_else(|| "null".to_owned(), quoted_terminal_text);
     output.push_str(&format!(
-        "semantic id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={}",
+        "semantic depth={depth} id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={}",
         semantic.semantic_id,
         quoted_terminal_text(&semantic.name),
         quoted_terminal_text(&semantic.semantic_kind),
@@ -141,14 +302,18 @@ mod tests {
 
     #[test]
     fn ranks_and_bounds_operation_roots_with_terminal_safe_text() {
-        let rendered = render_operation_roots(
+        let rendered = render_semantic_view(
             &document(vec![
                 operation(3, "safe lambda", Some(10)),
                 operation(1, "slow\u{1b}[31m\u{2028}\u{202e}\"operation", Some(30)),
                 operation(2, "safe snowman \u{2603}", Some(30)),
             ]),
+            None,
+            InspectSort::Duration,
             2,
-        );
+            0,
+        )
+        .expect("root view should render");
 
         assert!(rendered.contains("showing: 2 of 3; truncated: true"));
         let first = rendered.find("id=semantic:1").expect("first root");
@@ -159,5 +324,43 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains('\u{2028}'));
         assert!(!rendered.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn selects_exact_semantic_ids_and_sorts_each_bounded_level() {
+        let mut root = operation(1, "operation", Some(100));
+        root.inclusive_sample_count = 20;
+        let mut first = operation(2, "first", Some(60));
+        first.parent_semantic_id = Some(1);
+        first.operation_id = 1;
+        first.direct_sample_count = 5;
+        first.inclusive_sample_count = 8;
+        let mut second = operation(3, "second", Some(80));
+        second.parent_semantic_id = Some(1);
+        second.operation_id = 1;
+        second.direct_sample_count = 2;
+        second.inclusive_sample_count = 10;
+        let mut grandchild = operation(4, "grandchild", Some(20));
+        grandchild.parent_semantic_id = Some(3);
+        grandchild.operation_id = 1;
+
+        let document = document(vec![first, grandchild, root, second]);
+        let rendered = render_semantic_view(&document, Some(1), InspectSort::InclusiveCpu, 10, 2)
+            .expect("selected view should render");
+
+        assert!(rendered.contains("context: semantic:1"));
+        assert!(rendered.contains("showing: 3 of 3; truncated: false"));
+        let second = rendered.find("id=semantic:3").expect("second child");
+        let grandchild = rendered.find("id=semantic:4").expect("grandchild");
+        let first = rendered.find("id=semantic:2").expect("first child");
+        assert!(second < grandchild);
+        assert!(grandchild < first);
+        assert!(rendered.contains(
+            "id=semantic:3 name=\"second\" kind=\"operation\" duration_ns=80 time_basis=exact:wall_clock operation_wall_percent=80.00%"
+        ));
+        assert_eq!(
+            render_semantic_view(&document, Some(99), InspectSort::Duration, 10, 1),
+            Err(TerminalInspectError::SemanticNotFound(99))
+        );
     }
 }

@@ -9,8 +9,11 @@ use std::path::{Component, Path, PathBuf};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 
+use super::report_terminal::{InspectSort, TerminalInspectError};
+
 const DEFAULT_INSPECT_LIMIT: u16 = 20;
 const MAX_INSPECT_LIMIT: u16 = 200;
+const MAX_INSPECT_DEPTH: u16 = 32;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -49,13 +52,28 @@ struct InspectArgs {
     #[arg(value_name = "INPUT.pftrace")]
     input: PathBuf,
 
-    /// Maximum number of operation roots to display.
+    /// Maximum number of rows to display.
     #[arg(
         long,
         default_value_t = DEFAULT_INSPECT_LIMIT,
         value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_INSPECT_LIMIT))
     )]
     limit: u16,
+
+    /// Select one semantic node by its exact numeric identity.
+    #[arg(long, value_name = "ID")]
+    semantic: Option<i64>,
+
+    /// Sort semantic siblings by the selected metric.
+    #[arg(long, value_enum)]
+    sort: Option<InspectSort>,
+
+    /// Maximum descendant depth from the active context.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u16).range(0..=i64::from(MAX_INSPECT_DEPTH))
+    )]
+    depth: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +85,9 @@ enum CliArgumentError {
     DuplicateOutput,
     MultipleInputs,
     InvalidLimit,
+    InvalidDepth,
+    InvalidSemanticId,
+    InvalidSort,
     UnknownOption,
 }
 
@@ -80,6 +101,9 @@ impl fmt::Display for CliArgumentError {
             Self::DuplicateOutput => "--output may be specified only once",
             Self::MultipleInputs => "only one input trace path may be provided",
             Self::InvalidLimit => "limit must be between 1 and 200",
+            Self::InvalidDepth => "depth must be between 0 and 32",
+            Self::InvalidSemanticId => "semantic ID must be a signed integer",
+            Self::InvalidSort => "sort must be duration, inclusive-cpu, self-cpu, or name",
             Self::UnknownOption => "unknown option",
         };
         formatter.write_str(message)
@@ -98,6 +122,9 @@ impl CliArgumentError {
             Self::DuplicateOutput => "duplicate_output",
             Self::MultipleInputs => "multiple_inputs",
             Self::InvalidLimit => "invalid_limit",
+            Self::InvalidDepth => "invalid_depth",
+            Self::InvalidSemanticId => "invalid_semantic_id",
+            Self::InvalidSort => "invalid_sort",
             Self::UnknownOption => "unknown_option",
         }
     }
@@ -179,6 +206,16 @@ impl std::error::Error for RankedReportFailure {}
 
 impl From<CliArgumentError> for RankedReportFailure {
     fn from(error: CliArgumentError) -> Self {
+        Self::new(
+            RankedReportFailurePhase::Argument,
+            error.kind(),
+            error.to_string(),
+        )
+    }
+}
+
+impl From<TerminalInspectError> for RankedReportFailure {
+    fn from(error: TerminalInspectError) -> Self {
         Self::new(
             RankedReportFailurePhase::Argument,
             error.kind(),
@@ -295,13 +332,20 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         Err(error) => return emit_failure(error.into()),
     };
     match super::load_ranked_profile(&input) {
-        Ok(document) => {
-            print!(
-                "{}",
-                super::render_operation_roots(&document, usize::from(args.limit))
-            );
-            0
-        }
+        Ok(document) => match super::render_semantic_view(
+            &document,
+            args.semantic,
+            args.sort.unwrap_or_default(),
+            usize::from(args.limit),
+            args.depth
+                .map_or_else(|| usize::from(args.semantic.is_some()), usize::from),
+        ) {
+            Ok(output) => {
+                print!("{output}");
+                0
+            }
+            Err(error) => emit_failure(error.into()),
+        },
         Err(error) => emit_failure(error),
     }
 }
@@ -345,6 +389,30 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
             ) =>
         {
             CliArgumentError::InvalidLimit
+        }
+        ErrorKind::ValueValidation
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--depth")
+            ) =>
+        {
+            CliArgumentError::InvalidDepth
+        }
+        ErrorKind::ValueValidation
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--semantic")
+            ) =>
+        {
+            CliArgumentError::InvalidSemanticId
+        }
+        ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--sort")
+            ) =>
+        {
+            CliArgumentError::InvalidSort
         }
         ErrorKind::UnknownArgument => match error.get(ContextKind::InvalidArg) {
             Some(ContextValue::String(argument)) if !argument.starts_with('-') => {
@@ -573,6 +641,9 @@ mod tests {
         let help = help.to_string();
         assert!(help.contains("INPUT.pftrace"));
         assert!(help.contains("--limit <LIMIT>"));
+        assert!(help.contains("--semantic <ID>"));
+        assert!(help.contains("--sort <SORT>"));
+        assert!(help.contains("--depth <DEPTH>"));
 
         assert_eq!(
             PerfettoCli::try_parse_from([
@@ -581,11 +652,20 @@ mod tests {
                 "capture.pftrace",
                 "--limit",
                 "7",
+                "--semantic",
+                "42",
+                "--sort",
+                "self-cpu",
+                "--depth",
+                "3",
             ])?,
             PerfettoCli {
                 command: PerfettoCommand::Inspect(InspectArgs {
                     input: PathBuf::from("capture.pftrace"),
                     limit: 7,
+                    semantic: Some(42),
+                    sort: Some(InspectSort::SelfCpu),
+                    depth: Some(3),
                 }),
             }
         );
@@ -678,6 +758,33 @@ mod tests {
                     OsString::from("0"),
                 ],
                 CliArgumentError::InvalidLimit,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--depth"),
+                    OsString::from("33"),
+                ],
+                CliArgumentError::InvalidDepth,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--semantic"),
+                    OsString::from("worker-1"),
+                ],
+                CliArgumentError::InvalidSemanticId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--sort"),
+                    OsString::from("cpu"),
+                ],
+                CliArgumentError::InvalidSort,
             ),
         ] {
             let error = PerfettoCli::try_parse_from(
