@@ -54,7 +54,6 @@ pub fn generate_ranked_profile_report(
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    validate_ranked_report_capture(&paths.input)?;
     let document = load_ranked_profile(&paths.input)?;
     let html = render_ranked_profile_html(&document)?;
     write_ranked_profile_html(&paths.output, &html)?;

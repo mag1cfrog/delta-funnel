@@ -22,6 +22,14 @@ WITH
       hex(json_object(
         'record_kind', 'metadata',
         'record', json_object(
+        'capture_complete', json(CASE
+          WHEN health.capture_complete THEN 'true'
+          ELSE 'false'
+        END),
+        'semantic_complete', json(CASE
+          WHEN health.semantic_complete THEN 'true'
+          ELSE 'false'
+        END),
         'schema_version', 1,
         'sample_frequency_hz', sample_config.sample_frequency_hz,
         'exact_time_unit', 'nanoseconds',
@@ -43,6 +51,7 @@ WITH
       FROM delta_funnel_ranked_sample_ownership
     ) AS coverage
     CROSS JOIN delta_funnel_ranked_attribution_audit AS audit
+    CROSS JOIN delta_funnel_capture_health AS health
 
     UNION ALL
 

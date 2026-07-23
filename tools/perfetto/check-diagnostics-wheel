@@ -165,6 +165,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
         {
             "record_kind": "metadata",
             "record": {
+                "capture_complete": True,
+                "semantic_complete": True,
                 "schema_version": 1,
                 "sample_frequency_hz": 1000,
                 "exact_time_unit": "nanoseconds",
@@ -230,9 +232,9 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "query=$(cat)\n"
-        "if [[ $query == *delta_funnel_capture_health_input* ]]; then\n"
-        "  printf '\"capture_complete\",\"semantic_complete\"\\n1,1\\n'\n"
-        "elif [[ $query == *record_kind* ]]; then\n"
+        "if [[ $query == *delta_funnel_capture_health_input* && "
+        "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
+        "$query == *record_kind* ]]; then\n"
         "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
         "else\n"
         "  exit 65\n"

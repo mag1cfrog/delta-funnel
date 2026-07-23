@@ -8,6 +8,7 @@ use super::ranked_report::{
     RankedSemantic, fold_inclusive_counts,
 };
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
+use super::report_health::{CAPTURE_HEALTH_SQL, capture_health_input_sql, validate_capture_health};
 use super::report_trace_processor::run_trace_processor_query;
 
 const RECORD_HEADER: &[u8] = b"\"record_hex\"";
@@ -34,6 +35,8 @@ enum CompactRecord {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompactMetadata {
+    capture_complete: bool,
+    semantic_complete: bool,
     schema_version: u32,
     sample_frequency_hz: u32,
     exact_time_unit: String,
@@ -68,7 +71,11 @@ struct CompactFunctionSelf {
 
 #[doc(hidden)]
 pub fn load_ranked_profile(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {
+    let health_input_sql = capture_health_input_sql(input)?;
     let sql = [
+        health_input_sql.as_str(),
+        "CREATE PERFETTO TABLE delta_funnel_capture_health AS",
+        CAPTURE_HEALTH_SQL,
         SAMPLE_CORRELATION_SQL,
         RANKED_PROFILE_BASE_SQL,
         RANKED_REPORT_SQL,
@@ -127,6 +134,7 @@ fn build_document(
     frames: Vec<CompactFrame>,
     function_self: Vec<CompactFunctionSelf>,
 ) -> Result<RankedProfileDocument, RankedReportFailure> {
+    validate_capture_health(metadata.capture_complete, metadata.semantic_complete)?;
     if metadata.audit_error_count != 0 {
         return Err(aggregate_failure(
             "audit_failed",
@@ -439,7 +447,7 @@ mod tests {
 
     #[test]
     fn parses_and_folds_compact_ranked_records() -> Result<(), Box<dyn std::error::Error>> {
-        let output = fixture_output(1, 0);
+        let output = fixture_output(1, 0, true);
         let document = parse_ranked_report_output(output.as_bytes())?;
         assert_eq!(document.metadata.direct_sample_count, 1);
         assert_eq!(document.semantics.len(), 1);
@@ -451,7 +459,7 @@ mod tests {
         assert_eq!(document.functions[1].function_id, 11);
         assert_eq!(document.functions[1].self_sample_count, 1);
 
-        let mismatch = parse_ranked_report_output(fixture_output(2, 0).as_bytes())
+        let mismatch = parse_ranked_report_output(fixture_output(2, 0, true).as_bytes())
             .expect_err("mismatched official count should fail");
         assert_eq!(
             mismatch.phase(),
@@ -459,9 +467,14 @@ mod tests {
         );
         assert_eq!(mismatch.kind(), "official_count_mismatch");
 
-        let audit = parse_ranked_report_output(fixture_output(1, 1).as_bytes())
+        let audit = parse_ranked_report_output(fixture_output(1, 1, true).as_bytes())
             .expect_err("failed query audit should fail");
         assert_eq!(audit.kind(), "audit_failed");
+
+        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false).as_bytes())
+            .expect_err("incomplete capture should fail");
+        assert_eq!(incomplete.phase(), RankedReportFailurePhase::Health);
+        assert_eq!(incomplete.kind(), "incomplete_capture");
 
         let malformed = parse_ranked_report_output(b"\"record_hex\"\n\"xyz\"\n")
             .expect_err("invalid hex should fail");
@@ -488,11 +501,17 @@ mod tests {
         Ok(())
     }
 
-    fn fixture_output(official_root_count: i64, audit_error_count: i64) -> String {
+    fn fixture_output(
+        official_root_count: i64,
+        audit_error_count: i64,
+        capture_complete: bool,
+    ) -> String {
         let records = [
             serde_json::json!({
                 "record_kind": "metadata",
                 "record": {
+                    "capture_complete": capture_complete,
+                    "semantic_complete": capture_complete,
                     "schema_version": 1,
                     "sample_frequency_hz": 1000,
                     "exact_time_unit": "nanoseconds",

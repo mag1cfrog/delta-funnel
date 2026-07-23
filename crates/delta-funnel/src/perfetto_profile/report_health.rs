@@ -4,10 +4,17 @@ use std::path::Path;
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 use super::report_trace_processor::run_trace_processor_query;
 
-const CAPTURE_HEALTH_SQL: &str = include_str!("sql/capture_health.sql");
+pub(super) const CAPTURE_HEALTH_SQL: &str = include_str!("sql/capture_health.sql");
 
 #[doc(hidden)]
 pub fn validate_ranked_report_capture(input: &Path) -> Result<(), RankedReportFailure> {
+    let input_sql = capture_health_input_sql(input)?;
+    let sql = format!("{input_sql}\n{CAPTURE_HEALTH_SQL}");
+    let output = run_trace_processor_query(input, sql.as_bytes())?;
+    validate_health_output(&output)
+}
+
+pub(super) fn capture_health_input_sql(input: &Path) -> Result<String, RankedReportFailure> {
     let saved_file_bytes = fs::metadata(input)
         .map_err(|_| {
             RankedReportFailure::new(
@@ -17,14 +24,11 @@ pub fn validate_ranked_report_capture(input: &Path) -> Result<(), RankedReportFa
             )
         })?
         .len();
-    let sql = format!(
+    Ok(format!(
         "CREATE PERFETTO TABLE delta_funnel_capture_health_input AS\n\
          SELECT NULL AS configured_file_cap_bytes,\n\
-         {saved_file_bytes} AS saved_file_bytes;\n\
-         {CAPTURE_HEALTH_SQL}"
-    );
-    let output = run_trace_processor_query(input, sql.as_bytes())?;
-    validate_health_output(&output)
+         {saved_file_bytes} AS saved_file_bytes;"
+    ))
 }
 
 fn validate_health_output(output: &[u8]) -> Result<(), RankedReportFailure> {
@@ -50,6 +54,13 @@ fn validate_health_output(output: &[u8]) -> Result<(), RankedReportFailure> {
     if records.next().is_some() {
         return Err(malformed_health_output());
     }
+    validate_capture_health(is_complete, semantics_are_complete)
+}
+
+pub(super) fn validate_capture_health(
+    is_complete: bool,
+    semantics_are_complete: bool,
+) -> Result<(), RankedReportFailure> {
     if !is_complete || !semantics_are_complete {
         return Err(RankedReportFailure::new(
             RankedReportFailurePhase::Health,
