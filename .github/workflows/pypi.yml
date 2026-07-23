@@ -4,15 +4,7 @@ on:
   release:
     types:
       - published
-  pull_request:
-    paths:
-      - ".github/workflows/pypi.yml"
-      - ".cargo/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/delta-funnel/**"
-      - "crates/delta-funnel-python/**"
-      - "xtask/Cargo.toml"
+  workflow_call:
   workflow_dispatch:
     inputs:
       publish_to:
@@ -31,10 +23,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
 
 jobs:
   build:

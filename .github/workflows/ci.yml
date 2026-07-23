@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      release_wheel: ${{ steps.filter.outputs.release_wheel }}
 
     steps:
       - name: Checkout
@@ -35,6 +36,15 @@ jobs:
               - 'crates/**'
               - 'xtask/**'
               - '.github/workflows/ci.yml'
+            release_wheel:
+              - '.cargo/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/delta-funnel/**'
+              - 'crates/delta-funnel-python/**'
+              - 'xtask/Cargo.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/pypi.yml'
 
   rust:
     name: Rust Checks
@@ -147,12 +157,19 @@ jobs:
       - name: Check Python package
         run: cargo xtask python-package-check
 
+  release_wheels:
+    name: Release Wheels
+    needs: changes
+    if: needs.changes.outputs.release_wheel == 'true'
+    uses: ./.github/workflows/pypi.yml
+
   core-ci:
     name: Core CI
     needs:
       - changes
       - rust
       - python-package
+      - release_wheels
     if: always()
     runs-on: ubuntu-latest
 
@@ -161,6 +178,12 @@ jobs:
         run: |
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "Detect Changes did not pass: ${{ needs.changes.result }}"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.release_wheel }}" = "true" ] &&
+             [ "${{ needs.release_wheels.result }}" != "success" ]; then
+            echo "Release Wheels did not pass: ${{ needs.release_wheels.result }}"
             exit 1
           fi
 
