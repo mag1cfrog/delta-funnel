@@ -1,18 +1,46 @@
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
+use std::iter;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RankedReportCliAction {
-    Help,
-    Generate { input: PathBuf, output: PathBuf },
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{Args, Parser, Subcommand};
+
+#[derive(Debug, Parser, PartialEq, Eq)]
+#[command(
+    name = "delta-funnel-perfetto",
+    about = "Generate and inspect Delta Funnel Perfetto diagnostics",
+    disable_version_flag = true
+)]
+struct PerfettoCli {
+    #[command(subcommand)]
+    command: PerfettoCommand,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+enum PerfettoCommand {
+    /// Generate a ranked HTML report from a raw trace.
+    Report(RankedReportArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+struct RankedReportArgs {
+    /// Raw Perfetto trace to analyze.
+    #[arg(value_name = "INPUT.pftrace")]
+    input: PathBuf,
+
+    /// Report destination. Defaults to INPUT.profile.html.
+    #[arg(long, value_name = "OUTPUT.profile.html", allow_hyphen_values = true)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RankedReportArgumentError {
+enum CliArgumentError {
+    MissingCommand,
+    UnknownCommand,
     MissingInput,
     MissingOutputValue,
     DuplicateOutput,
@@ -20,9 +48,11 @@ enum RankedReportArgumentError {
     UnknownOption,
 }
 
-impl fmt::Display for RankedReportArgumentError {
+impl fmt::Display for CliArgumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::MissingCommand => "a diagnostics command is required",
+            Self::UnknownCommand => "unknown diagnostics command",
             Self::MissingInput => "an input trace path is required",
             Self::MissingOutputValue => "--output requires a path",
             Self::DuplicateOutput => "--output may be specified only once",
@@ -33,7 +63,21 @@ impl fmt::Display for RankedReportArgumentError {
     }
 }
 
-impl std::error::Error for RankedReportArgumentError {}
+impl std::error::Error for CliArgumentError {}
+
+impl CliArgumentError {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingCommand => "missing_command",
+            Self::UnknownCommand => "unknown_command",
+            Self::MissingInput => "missing_input",
+            Self::MissingOutputValue => "missing_output_value",
+            Self::DuplicateOutput => "duplicate_output",
+            Self::MultipleInputs => "multiple_inputs",
+            Self::UnknownOption => "unknown_option",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RankedReportFailurePhase {
@@ -109,16 +153,13 @@ impl fmt::Display for RankedReportFailure {
 
 impl std::error::Error for RankedReportFailure {}
 
-impl From<RankedReportArgumentError> for RankedReportFailure {
-    fn from(error: RankedReportArgumentError) -> Self {
-        let kind = match error {
-            RankedReportArgumentError::MissingInput => "missing_input",
-            RankedReportArgumentError::MissingOutputValue => "missing_output_value",
-            RankedReportArgumentError::DuplicateOutput => "duplicate_output",
-            RankedReportArgumentError::MultipleInputs => "multiple_inputs",
-            RankedReportArgumentError::UnknownOption => "unknown_option",
-        };
-        Self::new(RankedReportFailurePhase::Argument, kind, error.to_string())
+impl From<CliArgumentError> for RankedReportFailure {
+    fn from(error: CliArgumentError) -> Self {
+        Self::new(
+            RankedReportFailurePhase::Argument,
+            error.kind(),
+            error.to_string(),
+        )
     }
 }
 
@@ -203,45 +244,88 @@ pub fn run_perfetto_diagnostics_cli() -> i32 {
 }
 
 fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -> i32 {
-    let mut args = args.into_iter();
-    let Some(command) = args.next() else {
-        return emit_failure(RankedReportFailure::new(
-            RankedReportFailurePhase::Argument,
-            "missing_command",
-            "a diagnostics command is required",
-        ));
-    };
-    match command.to_str() {
-        Some("-h" | "--help") => {
-            print_usage();
-            0
+    let args = args.into_iter().collect::<Vec<_>>();
+    match PerfettoCli::try_parse_from(
+        iter::once(OsString::from("delta-funnel-perfetto")).chain(args.iter().cloned()),
+    ) {
+        Ok(PerfettoCli {
+            command: PerfettoCommand::Report(args),
+        }) => run_report_command(args),
+        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => {
+            if error.print().is_ok() {
+                0
+            } else {
+                70
+            }
         }
-        Some("report") => run_report_command(args),
-        _ => emit_failure(RankedReportFailure::new(
-            RankedReportFailurePhase::Argument,
-            "unknown_command",
-            "unknown diagnostics command",
-        )),
+        Err(error) => emit_failure(cli_failure(&args, &error)),
     }
 }
 
-fn run_report_command(args: impl IntoIterator<Item = OsString>) -> i32 {
-    match parse_ranked_report_args(args) {
-        Ok(RankedReportCliAction::Help) => {
-            print_report_usage();
+fn run_report_command(args: RankedReportArgs) -> i32 {
+    let output = args
+        .output
+        .unwrap_or_else(|| default_report_path(&args.input));
+    match super::generate_ranked_profile_report(&args.input, &output) {
+        Ok(output) => {
+            println!("wrote {}", output.display());
             0
         }
-        Ok(RankedReportCliAction::Generate { input, output }) => {
-            match super::generate_ranked_profile_report(&input, &output) {
-                Ok(output) => {
-                    println!("wrote {}", output.display());
-                    0
-                }
-                Err(error) => emit_failure(error),
-            }
-        }
-        Err(error) => emit_failure(error.into()),
+        Err(error) => emit_failure(error),
     }
+}
+
+fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentError {
+    let Some(command) = args.first() else {
+        return CliArgumentError::MissingCommand;
+    };
+    if command != "report" {
+        return CliArgumentError::UnknownCommand;
+    }
+    if matches!(
+        args.last().and_then(|argument| argument.to_str()),
+        Some("--output")
+    ) {
+        return CliArgumentError::MissingOutputValue;
+    }
+    match error.kind() {
+        ErrorKind::MissingRequiredArgument => CliArgumentError::MissingInput,
+        ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOutput,
+        ErrorKind::TooManyValues => CliArgumentError::MultipleInputs,
+        ErrorKind::UnknownArgument => match error.get(ContextKind::InvalidArg) {
+            Some(ContextValue::String(argument)) if !argument.starts_with('-') => {
+                CliArgumentError::MultipleInputs
+            }
+            _ => CliArgumentError::UnknownOption,
+        },
+        _ => CliArgumentError::UnknownOption,
+    }
+}
+
+fn cli_failure(args: &[OsString], error: &clap::Error) -> RankedReportFailure {
+    let argument_error = classify_cli_error(args, error);
+    let message = clap_suggestion(error).map_or_else(
+        || argument_error.to_string(),
+        |suggestion| format!("{argument_error}; did you mean {suggestion}?"),
+    );
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Argument,
+        argument_error.kind(),
+        message,
+    )
+}
+
+fn clap_suggestion(error: &clap::Error) -> Option<String> {
+    [ContextKind::SuggestedArg, ContextKind::SuggestedSubcommand]
+        .into_iter()
+        .find_map(|kind| {
+            let suggestion = match error.get(kind)? {
+                ContextValue::String(suggestion) => suggestion.clone(),
+                ContextValue::Strings(suggestions) => suggestions.first()?.clone(),
+                _ => return None,
+            };
+            (suggestion.len() <= 64 && suggestion.is_ascii()).then_some(suggestion)
+        })
 }
 
 fn emit_failure(error: RankedReportFailure) -> i32 {
@@ -260,45 +344,6 @@ fn failure_exit_code(phase: RankedReportFailurePhase) -> i32 {
         RankedReportFailurePhase::Serialization => 70,
         RankedReportFailurePhase::Output => 73,
     }
-}
-
-fn print_usage() {
-    const USAGE: &str = "Usage: delta-funnel-perfetto COMMAND [ARG...]\n\nCommands:\n  report    Generate a ranked HTML report from a raw trace\n";
-    print!("{USAGE}");
-}
-
-fn print_report_usage() {
-    println!("Usage: delta-funnel-perfetto report INPUT.pftrace [--output OUTPUT.profile.html]");
-}
-
-fn parse_ranked_report_args(
-    args: impl IntoIterator<Item = OsString>,
-) -> Result<RankedReportCliAction, RankedReportArgumentError> {
-    let mut args = args.into_iter();
-    let mut input = None;
-    let mut output = None;
-    while let Some(argument) = args.next() {
-        if matches!(argument.to_str(), Some("-h" | "--help")) {
-            return Ok(RankedReportCliAction::Help);
-        }
-        if argument == OsStr::new("--output") {
-            if output.is_some() {
-                return Err(RankedReportArgumentError::DuplicateOutput);
-            }
-            output = Some(PathBuf::from(
-                args.next()
-                    .ok_or(RankedReportArgumentError::MissingOutputValue)?,
-            ));
-        } else if argument.as_encoded_bytes().starts_with(b"-") {
-            return Err(RankedReportArgumentError::UnknownOption);
-        } else if input.replace(PathBuf::from(argument)).is_some() {
-            return Err(RankedReportArgumentError::MultipleInputs);
-        }
-    }
-
-    let input = input.ok_or(RankedReportArgumentError::MissingInput)?;
-    let output = output.unwrap_or_else(|| default_report_path(&input));
-    Ok(RankedReportCliAction::Generate { input, output })
 }
 
 pub(super) fn preflight_ranked_report_paths(
@@ -404,29 +449,57 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn parses_help_explicit_output_and_default_sibling_output() {
+    fn parses_report_arguments_and_generates_help() -> Result<(), Box<dyn std::error::Error>> {
+        let root_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "--help"])
+            .err()
+            .ok_or("root help should stop parsing")?;
+        assert_eq!(root_help.kind(), ErrorKind::DisplayHelp);
+        let root_help = root_help.to_string();
+        assert!(root_help.contains("Generate and inspect Delta Funnel Perfetto diagnostics"));
+        assert!(root_help.contains("report"));
+
+        let report_help =
+            PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "--help"])
+                .err()
+                .ok_or("report help should stop parsing")?;
+        assert_eq!(report_help.kind(), ErrorKind::DisplayHelp);
+        let report_help = report_help.to_string();
+        assert!(report_help.contains("INPUT.pftrace"));
+        assert!(report_help.contains("--output <OUTPUT.profile.html>"));
+
+        let default_output =
+            PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "capture.pftrace"])?;
         assert_eq!(
-            parse_ranked_report_args([OsString::from("--help")]),
-            Ok(RankedReportCliAction::Help)
+            default_output,
+            PerfettoCli {
+                command: PerfettoCommand::Report(RankedReportArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    output: None,
+                }),
+            }
+        );
+
+        let explicit_output = PerfettoCli::try_parse_from([
+            "delta-funnel-perfetto",
+            "report",
+            "--output",
+            "reports/capture.html",
+            "traces/capture",
+        ])?;
+        assert_eq!(
+            explicit_output,
+            PerfettoCli {
+                command: PerfettoCommand::Report(RankedReportArgs {
+                    input: PathBuf::from("traces/capture"),
+                    output: Some(PathBuf::from("reports/capture.html")),
+                }),
+            }
         );
         assert_eq!(
-            parse_ranked_report_args([OsString::from("capture.pftrace")]),
-            Ok(RankedReportCliAction::Generate {
-                input: PathBuf::from("capture.pftrace"),
-                output: PathBuf::from("capture.profile.html"),
-            })
+            default_report_path(Path::new("capture.pftrace")),
+            PathBuf::from("capture.profile.html")
         );
-        assert_eq!(
-            parse_ranked_report_args([
-                OsString::from("--output"),
-                OsString::from("reports/capture.html"),
-                OsString::from("traces/capture"),
-            ]),
-            Ok(RankedReportCliAction::Generate {
-                input: PathBuf::from("traces/capture"),
-                output: PathBuf::from("reports/capture.html"),
-            })
-        );
+        Ok(())
     }
 
     #[test]
@@ -457,42 +530,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_argument_shapes() {
+    fn rejects_invalid_argument_shapes_with_stable_kinds() -> Result<(), Box<dyn std::error::Error>>
+    {
         for (args, expected) in [
-            (vec![], RankedReportArgumentError::MissingInput),
+            (vec![], CliArgumentError::MissingCommand),
             (
-                vec![OsString::from("--output")],
-                RankedReportArgumentError::MissingOutputValue,
+                vec![OsString::from("unknown")],
+                CliArgumentError::UnknownCommand,
+            ),
+            (
+                vec![OsString::from("report")],
+                CliArgumentError::MissingInput,
+            ),
+            (
+                vec![OsString::from("report"), OsString::from("--output")],
+                CliArgumentError::MissingOutputValue,
             ),
             (
                 vec![
+                    OsString::from("report"),
                     OsString::from("trace.pftrace"),
                     OsString::from("--output"),
                     OsString::from("first.html"),
                     OsString::from("--output"),
                     OsString::from("second.html"),
                 ],
-                RankedReportArgumentError::DuplicateOutput,
+                CliArgumentError::DuplicateOutput,
             ),
             (
                 vec![
+                    OsString::from("report"),
                     OsString::from("first.pftrace"),
                     OsString::from("second.pftrace"),
                 ],
-                RankedReportArgumentError::MultipleInputs,
+                CliArgumentError::MultipleInputs,
             ),
             (
-                vec![OsString::from("--unknown")],
-                RankedReportArgumentError::UnknownOption,
+                vec![OsString::from("report"), OsString::from("--unknown")],
+                CliArgumentError::UnknownOption,
             ),
         ] {
-            assert_eq!(parse_ranked_report_args(args), Err(expected));
+            let error = PerfettoCli::try_parse_from(
+                iter::once(OsString::from("delta-funnel-perfetto")).chain(args.iter().cloned()),
+            )
+            .err()
+            .ok_or("invalid arguments should fail")?;
+            assert_eq!(classify_cli_error(&args, &error), expected);
         }
+        Ok(())
     }
 
     #[test]
-    fn failures_expose_stable_machine_readable_fields() {
-        let argument_failure = RankedReportFailure::from(RankedReportArgumentError::MissingInput);
+    fn failures_expose_stable_machine_readable_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let argument_failure = RankedReportFailure::from(CliArgumentError::MissingInput);
         assert_eq!(argument_failure.phase(), RankedReportFailurePhase::Argument);
         assert_eq!(argument_failure.kind(), "missing_input");
 
@@ -510,6 +600,15 @@ mod tests {
         let path_failure = RankedReportFailure::from(RankedReportPathError::InputOutputAlias);
         assert_eq!(path_failure.phase(), RankedReportFailurePhase::Output);
         assert_eq!(path_failure.kind(), "aliases_input");
+
+        let typo = vec![OsString::from("reprot")];
+        let typo_error = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "reprot"])
+            .err()
+            .ok_or("misspelled command should fail")?;
+        let typo_failure = cli_failure(&typo, &typo_error);
+        assert_eq!(typo_failure.kind(), "unknown_command");
+        assert!(typo_failure.to_string().contains("did you mean report?"));
+        Ok(())
     }
 
     #[test]
