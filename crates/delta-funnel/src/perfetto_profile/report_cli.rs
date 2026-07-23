@@ -1214,6 +1214,15 @@ mod tests {
         }
     }
 
+    fn interactive_output(
+        result: Result<InteractiveCommandResult, &'static str>,
+    ) -> Result<String, &'static str> {
+        match result? {
+            InteractiveCommandResult::Output(output) => Ok(output),
+            InteractiveCommandResult::Quit => Err("interactive command exited unexpectedly"),
+        }
+    }
+
     #[test]
     fn parses_report_arguments_and_generates_help() -> Result<(), Box<dyn std::error::Error>> {
         let root_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "--help"])
@@ -1458,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_sort_and_limit_validate_before_changing_state() {
+    fn interactive_sort_and_limit_validate_before_changing_state() -> Result<(), &'static str> {
         let document = interactive_document();
         let navigation = InspectNavigation::new(&document);
         let mut state = InspectState {
@@ -1473,11 +1482,12 @@ mod tests {
             run_interactive_command(&document, &navigation, &mut state, "open semantic:1"),
             Ok(InteractiveCommandResult::Output(_))
         ));
-        let Ok(InteractiveCommandResult::Output(output)) =
-            run_interactive_command(&document, &navigation, &mut state, "limit 1")
-        else {
-            panic!("a valid limit should render the current view");
-        };
+        let output = interactive_output(run_interactive_command(
+            &document,
+            &navigation,
+            &mut state,
+            "limit 1",
+        ))?;
         assert_eq!(state.limit, 1);
         assert!(output.contains("showing: 1 of 2; truncated: true"));
         assert!(matches!(
@@ -1486,11 +1496,12 @@ mod tests {
         ));
         assert_eq!(state.limit, 1);
 
-        let Ok(InteractiveCommandResult::Output(output)) =
-            run_interactive_command(&document, &navigation, &mut state, "sort name")
-        else {
-            panic!("a valid sort should render the current view");
-        };
+        let output = interactive_output(run_interactive_command(
+            &document,
+            &navigation,
+            &mut state,
+            "sort name",
+        ))?;
         assert_eq!(state.sort, InspectSort::Name);
         assert!(output.contains("sort: name"));
         assert!(matches!(
@@ -1508,10 +1519,11 @@ mod tests {
             Err("function callsites cannot be sorted by exact duration")
         ));
         assert_eq!(state.sort, InspectSort::Name);
+        Ok(())
     }
 
     #[test]
-    fn interactive_filter_is_bounded_and_clearable() {
+    fn interactive_filter_is_bounded_and_clearable() -> Result<(), &'static str> {
         let document = interactive_document();
         let navigation = InspectNavigation::new(&document);
         let mut state = InspectState {
@@ -1522,11 +1534,12 @@ mod tests {
             depth: None,
         };
 
-        let Ok(InteractiveCommandResult::Output(output)) =
-            run_interactive_command(&document, &navigation, &mut state, "filter planning")
-        else {
-            panic!("a valid filter should render the current view");
-        };
+        let output = interactive_output(run_interactive_command(
+            &document,
+            &navigation,
+            &mut state,
+            "filter planning",
+        ))?;
         assert_eq!(state.filter.as_deref(), Some("planning"));
         assert!(output.contains("filter: \"planning\""));
         assert!(output.contains("id=semantic:2"));
@@ -1543,13 +1556,15 @@ mod tests {
         ));
         assert_eq!(state.filter.as_deref(), Some("planning"));
 
-        let Ok(InteractiveCommandResult::Output(output)) =
-            run_interactive_command(&document, &navigation, &mut state, "clear")
-        else {
-            panic!("clear should render the current view");
-        };
+        let output = interactive_output(run_interactive_command(
+            &document,
+            &navigation,
+            &mut state,
+            "clear",
+        ))?;
         assert_eq!(state.filter, None);
         assert!(output.contains("filter: none"));
+        Ok(())
     }
 
     #[test]
