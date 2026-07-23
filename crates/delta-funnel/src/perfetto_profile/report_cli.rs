@@ -62,18 +62,20 @@ struct InspectArgs {
     #[arg(
         long,
         default_value_t = DEFAULT_INSPECT_LIMIT,
+        allow_negative_numbers = true,
         value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_INSPECT_LIMIT))
     )]
     limit: u16,
 
     /// Select one semantic node by its exact numeric identity.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
     semantic: Option<i64>,
 
     /// Select one function callsite by semantic and function identity.
     #[arg(
         long,
         value_name = "SEMANTIC_ID:FUNCTION_ID",
+        allow_hyphen_values = true,
         conflicts_with = "semantic"
     )]
     function: Option<FunctionSelector>,
@@ -89,6 +91,7 @@ struct InspectArgs {
     /// Maximum descendant depth from the active context.
     #[arg(
         long,
+        allow_negative_numbers = true,
         value_parser = clap::value_parser!(u16).range(0..=i64::from(MAX_INSPECT_DEPTH))
     )]
     depth: Option<u16>,
@@ -837,12 +840,26 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         }
         ErrorKind::UnknownArgument => match error.get(ContextKind::InvalidArg) {
             Some(ContextValue::String(argument)) if !argument.starts_with('-') => {
-                CliArgumentError::MultipleInputs
+                if command == "inspect" && has_invalid_separated_function_value(&args[1..]) {
+                    CliArgumentError::InvalidFunctionId
+                } else {
+                    CliArgumentError::MultipleInputs
+                }
             }
             _ => CliArgumentError::UnknownOption,
         },
         _ => CliArgumentError::UnknownOption,
     }
+}
+
+fn has_invalid_separated_function_value(args: &[OsString]) -> bool {
+    args.iter().enumerate().any(|(index, argument)| {
+        argument == "--function"
+            && args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .is_none_or(|value| value.parse::<FunctionSelector>().is_err())
+    })
 }
 
 fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
@@ -1273,7 +1290,29 @@ mod tests {
                 "delta-funnel-perfetto",
                 "inspect",
                 "capture.pftrace",
+                "--semantic",
+                "-1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
                 "--function=-1:-2",
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--function",
+                "-1:-2",
+                "--limit",
+                "2",
             ])
             .is_ok()
         );
@@ -1714,8 +1753,26 @@ mod tests {
                 vec![
                     OsString::from("inspect"),
                     OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                    OsString::from("-1"),
+                ],
+                CliArgumentError::InvalidLimit,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
                     OsString::from("--depth"),
                     OsString::from("33"),
+                ],
+                CliArgumentError::InvalidDepth,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--depth"),
+                    OsString::from("-1"),
                 ],
                 CliArgumentError::InvalidDepth,
             ),
