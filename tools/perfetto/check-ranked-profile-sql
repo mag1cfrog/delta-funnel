@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+sql_dir=$script_dir/../../crates/delta-funnel/src/perfetto_profile/sql
 trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
 if ! command -v "$trace_processor" >/dev/null 2>&1; then
   printf 'check-ranked-profile-sql: required command is unavailable: %s\n' \
@@ -10,8 +11,13 @@ if ! command -v "$trace_processor" >/dev/null 2>&1; then
 fi
 
 output=$({
-  sed -n '1,$p' "$script_dir/sample-correlation.sql"
+  sed -n '1,$p' "$sql_dir/sample_correlation.sql"
+  sed -n '1,$p' "$sql_dir/ranked_profile_base.sql"
   sed -n '1,$p' "$script_dir/ranked-profile.sql"
+  printf '%s\n' \
+    "CREATE PERFETTO TABLE delta_funnel_capture_health AS" \
+    "SELECT 1 AS capture_complete, 1 AS semantic_complete;"
+  sed -n '1,$p' "$sql_dir/ranked_report.sql"
   sed -n '1,$p' "$script_dir/ranked-profile-fixture.sql"
 } | "$trace_processor" query --query-file - /dev/null)
 printf '%s\n' "$output"

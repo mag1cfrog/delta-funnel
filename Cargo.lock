@@ -1268,18 +1268,23 @@ dependencies = [
  "chrono",
  "datafusion",
  "delta_kernel",
+ "flate2",
  "futures-util",
  "hyper-util",
  "libc",
  "object_store",
  "parquet",
  "perfetto-sdk",
+ "same-file",
+ "serde",
  "serde_json",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+ "zstd",
 ]
 
 [[package]]

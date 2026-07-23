@@ -11,11 +11,24 @@ readme = "../../README.md"
 keywords = ["delta", "arrow", "mssql", "sql-server"]
 categories = ["database"]
 
+[[bin]]
+name = "delta-funnel-perfetto"
+path = "src/bin/delta_funnel_perfetto.rs"
+required-features = ["perfetto-profile"]
+
 [lints]
 workspace = true
 
 [features]
-perfetto-profile = ["dep:hyper-util", "dep:perfetto-sdk"]
+perfetto-profile = [
+    "dep:flate2",
+    "dep:hyper-util",
+    "dep:perfetto-sdk",
+    "dep:same-file",
+    "dep:serde",
+    "dep:tempfile",
+    "dep:zstd",
+]
 
 [dependencies]
 async-trait = "0.1"
@@ -31,16 +44,21 @@ delta_kernel = { version = "0.23.0", default-features = false, features = [
     "internal-api",
 ] }
 futures-util = "0.3"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"], optional = true }
 hyper-util = { version = "0.1.20", default-features = false, features = ["tracing"], optional = true }
 libc = "0.2"
 object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
 perfetto-sdk = { version = "1.0.3", optional = true }
+same-file = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 snafu = "0.9"
 serde_json = "1"
+tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

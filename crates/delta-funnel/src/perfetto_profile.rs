@@ -3,6 +3,7 @@
 //! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -19,8 +20,32 @@ use perfetto_sdk::{track_event_categories, track_event_category_enabled};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
+mod ranked_report;
+mod report_aggregate;
+mod report_cli;
+mod report_health;
+mod report_html;
+mod report_trace_processor;
+mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
+use report_aggregate::load_ranked_profile;
+#[cfg(test)]
+use report_cli::RankedReportFailurePhase;
+pub use report_cli::run_perfetto_diagnostics_cli;
+use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
+use report_html::{render_ranked_profile_html, write_ranked_profile_html};
+
+fn generate_ranked_profile_report(
+    input: &Path,
+    output: &Path,
+) -> Result<PathBuf, RankedReportFailure> {
+    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
+    let document = load_ranked_profile(&paths.input)?;
+    let html = render_ranked_profile_html(&document)?;
+    write_ranked_profile_html(&paths.output, &html)?;
+    Ok(paths.output)
+}
 
 const CATEGORY: &str = "delta_funnel.profile";
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -288,7 +313,9 @@ pub fn wait_for_capture(timeout: Duration) -> io::Result<()> {
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error;
+    use std::hash::Hasher;
     use std::hint::black_box;
+    use std::io::Read;
     use std::sync::{Arc, Barrier, mpsc};
     use std::thread::{self, ThreadId};
 
@@ -441,6 +468,61 @@ mod tests {
             .expect_err("an unrepresentable deadline must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn report_generation_rejects_an_input_alias_before_analysis() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("capture.pftrace");
+        std::fs::write(&input, "unchanged trace")?;
+
+        let error = generate_ranked_profile_report(&input, &input)
+            .expect_err("the report must never replace its input trace");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(error.kind(), "aliases_input");
+        assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires trace_processor_shell and a real raw trace"]
+    fn generates_a_report_without_modifying_a_real_raw_trace() -> Result<(), DynError> {
+        let trace = PathBuf::from(
+            std::env::var_os("DELTA_FUNNEL_TEST_PERFETTO_TRACE")
+                .ok_or("DELTA_FUNNEL_TEST_PERFETTO_TRACE is not set")?,
+        );
+        let before = file_fingerprint(&trace)?;
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("capture.profile.html");
+
+        assert_eq!(generate_ranked_profile_report(&trace, &output)?, output);
+        assert_eq!(file_fingerprint(&trace)?, before);
+        let html = std::fs::read_to_string(output)?;
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("id=\"profile-data\""));
+        assert!(html.contains("Function metrics are sampled on-CPU observations"));
+        assert!(!html.contains(trace.to_string_lossy().as_ref()));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+        Ok(())
+    }
+
+    fn file_fingerprint(path: &Path) -> io::Result<(u64, u64)> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut byte_count = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.write(&buffer[..count]);
+            byte_count = byte_count
+                .checked_add(u64::try_from(count).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("input trace size overflowed"))?;
+        }
+        Ok((byte_count, hasher.finish()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

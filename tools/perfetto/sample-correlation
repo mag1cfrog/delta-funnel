@@ -47,9 +47,11 @@ if ! command -v "$trace_processor" >/dev/null 2>&1; then
 fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+sql_dir=$script_dir/../../crates/delta-funnel/src/perfetto_profile/sql
 output=$({
-  sed -n '1,$p' "$script_dir/sample-correlation.sql"
+  sed -n '1,$p' "$sql_dir/sample_correlation.sql"
   if $ranked_audit; then
+    sed -n '1,$p' "$sql_dir/ranked_profile_base.sql"
     sed -n '1,$p' "$script_dir/ranked-profile.sql"
     printf '%s\n' 'SELECT * FROM delta_funnel_ranked_aggregate_audit;'
   else

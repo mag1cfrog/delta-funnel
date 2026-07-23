@@ -55,6 +55,7 @@ required = {
     "deltafunnel/perfetto/capture-health",
     "deltafunnel/perfetto/capture-health.sql",
     "deltafunnel/perfetto/capture-workload",
+    "deltafunnel/perfetto/delta-funnel-perfetto",
     "deltafunnel/perfetto/delta-funnel-deep-system.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard-streaming.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard.pbtx",
@@ -66,7 +67,7 @@ with zipfile.ZipFile(wheel_path) as wheel:
     if missing:
         raise SystemExit("missing diagnostics assets: " + ", ".join(missing))
 
-    for name in ["capture-health", "capture-workload"]:
+    for name in ["capture-health", "capture-workload", "delta-funnel-perfetto"]:
         asset = wheel.getinfo(f"deltafunnel/perfetto/{name}")
         mode = asset.external_attr >> 16
         if mode & 0o111 == 0:
@@ -79,11 +80,14 @@ venv_python="$work_dir/venv/bin/python"
   --no-deps "$wheel" >/dev/null
 
 native_module=$("$venv_python" - <<'PY'
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from importlib.metadata import version
 from importlib.resources import files
+from pathlib import Path
 
 import deltafunnel
 import deltafunnel.deltafunnel as native
@@ -105,6 +109,7 @@ required = [
     "capture-health",
     "capture-health.sql",
     "capture-workload",
+    "delta-funnel-perfetto",
     *config_names,
 ]
 for name in required:
@@ -136,6 +141,136 @@ health = assets.joinpath("capture-health")
 if not os.access(health, os.X_OK):
     raise SystemExit("installed capture-health is not executable")
 subprocess.run([health, "--help"], check=True, stdout=subprocess.DEVNULL)
+
+perfetto_cli = assets.joinpath("delta-funnel-perfetto")
+if not os.access(perfetto_cli, os.X_OK):
+    raise SystemExit("installed delta-funnel-perfetto is not executable")
+subprocess.run([perfetto_cli, "--help"], check=True, stdout=subprocess.DEVNULL)
+subprocess.run(
+    [perfetto_cli, "report", "--help"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+invalid_command = subprocess.run(
+    [perfetto_cli, "invalid"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+if invalid_command.returncode != 64:
+    raise SystemExit("delta-funnel-perfetto did not reject an invalid command")
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp = Path(temp_dir)
+    records = [
+        {
+            "record_kind": "metadata",
+            "record": {
+                "capture_complete": True,
+                "semantic_complete": True,
+                "schema_version": 1,
+                "sample_frequency_hz": 1000,
+                "exact_time_unit": "nanoseconds",
+                "sample_unit": "samples",
+                "eligible_sample_count": 1,
+                "direct_sample_count": 1,
+                "ambiguous_sample_count": 0,
+                "unattributed_sample_count": 0,
+                "audit_error_count": 0,
+            },
+        },
+        {
+            "record_kind": "semantic",
+            "record": {
+                "semantic_id": 1,
+                "parent_semantic_id": None,
+                "operation_id": 1,
+                "name": "Delta Funnel preview",
+                "semantic_kind": "operation",
+                "operation_kind": "preview",
+                "stage_category": None,
+                "stage_name": None,
+                "activity": None,
+                "start_ns": 10,
+                "end_ns": 20,
+                "duration_ns": 10,
+                "time_semantics": "wall_clock",
+                "result": "ok",
+                "is_complete": True,
+                "query_execution_id": None,
+                "query_scope": None,
+                "query_owner": None,
+                "worker_lane_id": None,
+                "worker_kind": None,
+                "node_id": None,
+                "parent_node_id": None,
+                "operator_partition": None,
+                "execution_stream_id": None,
+                "stage_owner_id": None,
+                "direct_sample_count": 1,
+                "inclusive_sample_count": 0,
+            },
+        },
+        {
+            "record_kind": "function_self",
+            "record": {
+                "semantic_id": 1,
+                "function_id": -1,
+                "self_sample_count": 1,
+            },
+        },
+    ]
+    aggregate = temp.joinpath("aggregate.csv")
+    aggregate.write_text(
+        '"record_hex"\n'
+        + "".join(
+            f'"{json.dumps(record, separators=(",", ":")).encode().hex()}"\n'
+            for record in records
+        )
+    )
+    fake_trace_processor = temp.joinpath("trace_processor_shell")
+    fake_trace_processor.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "query=$(cat)\n"
+        "if [[ $query == *delta_funnel_capture_health_input* && "
+        "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
+        "$query == *record_kind* ]]; then\n"
+        "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
+        "else\n"
+        "  exit 65\n"
+        "fi\n"
+    )
+    fake_trace_processor.chmod(0o700)
+    trace = temp.joinpath("capture.pftrace")
+    trace_bytes = b"\x0a\x00"
+    trace.write_bytes(trace_bytes)
+    report = temp.joinpath("capture.profile.html")
+    generated = subprocess.run(
+        [perfetto_cli, "report", trace, "--output", report],
+        env={
+            **os.environ,
+            "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
+            "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if not generated.stdout.startswith("wrote "):
+        raise SystemExit("ranked report command did not report its output")
+    if trace.read_bytes() != trace_bytes:
+        raise SystemExit("ranked report command modified its input trace")
+    html = report.read_text()
+    for marker in [
+        "<!doctype html>",
+        'id="profile-data"',
+        "Delta Funnel preview",
+        "Function metrics are sampled on-CPU observations",
+    ]:
+        if marker not in html:
+            raise SystemExit(f"ranked report is missing {marker!r}")
+    if trace_bytes.decode() in html or "http://" in html or "https://" in html:
+        raise SystemExit("ranked report contains forbidden external or raw data")
 
 capture = assets.joinpath("capture-workload")
 if not os.access(capture, os.X_OK):
