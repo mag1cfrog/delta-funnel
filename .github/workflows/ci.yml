@@ -80,13 +80,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Lint workspace
-        run: |
-          cargo build \
-            --package delta-funnel \
-            --features perfetto-profile \
-            --bin delta-funnel-perfetto
-          DELTAFUNNEL_PERFETTO_BIN_DIR="$PWD/target/debug" \
-            cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Check Rust API documentation
         run: |

@@ -400,10 +400,11 @@ pub(super) struct RankedReportPaths {
 ///
 /// Returns the process exit code without terminating the caller.
 pub fn run_perfetto_diagnostics_cli() -> i32 {
-    run_perfetto_diagnostics_cli_with(env::args_os().skip(1))
+    run_perfetto_diagnostics_cli_with_args(env::args_os().skip(1))
 }
 
-fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -> i32 {
+/// Runs the bundled CLI with arguments that exclude the executable name.
+pub fn run_perfetto_diagnostics_cli_with_args(args: impl IntoIterator<Item = OsString>) -> i32 {
     let args = args.into_iter().collect::<Vec<_>>();
     match PerfettoCli::try_parse_from(
         iter::once(OsString::from("delta-funnel-perfetto")).chain(args.iter().cloned()),
@@ -1445,15 +1446,18 @@ mod tests {
     #[test]
     fn dispatches_commands_and_maps_failure_phases_to_exit_codes() {
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([OsString::from("--help")]),
+            run_perfetto_diagnostics_cli_with_args([OsString::from("--help")]),
             0
         );
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([OsString::from("report"), OsString::from("--help")]),
+            run_perfetto_diagnostics_cli_with_args([
+                OsString::from("report"),
+                OsString::from("--help"),
+            ]),
             0
         );
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([
+            run_perfetto_diagnostics_cli_with_args([
                 OsString::from("inspect"),
                 OsString::from("--help")
             ]),
@@ -1476,7 +1480,7 @@ mod tests {
             64
         );
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([OsString::from("unknown")]),
+            run_perfetto_diagnostics_cli_with_args([OsString::from("unknown")]),
             64
         );
         assert_eq!(failure_exit_code(RankedReportFailurePhase::Health), 65);

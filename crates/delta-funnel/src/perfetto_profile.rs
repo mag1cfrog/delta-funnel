@@ -33,8 +33,8 @@ pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target}
 use report_aggregate::load_ranked_profile;
 #[cfg(test)]
 use report_cli::RankedReportFailurePhase;
-pub use report_cli::run_perfetto_diagnostics_cli;
 use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
+pub use report_cli::{run_perfetto_diagnostics_cli, run_perfetto_diagnostics_cli_with_args};
 use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;

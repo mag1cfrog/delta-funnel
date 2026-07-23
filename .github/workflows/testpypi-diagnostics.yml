@@ -117,17 +117,7 @@ jobs:
           rust-toolchain: ${{ steps.rust-version.outputs.version }}
           manylinux: "2_28"
           sccache: "true"
-          docker-options: >-
-            -e DELTAFUNNEL_PERFETTO_BIN_DIR=/io/target/release
-          before-script-linux: >-
-            dnf install -y openssl-devel &&
-            cargo build
-            --release
-            --package delta-funnel
-            --features perfetto-profile
-            --bin delta-funnel-perfetto
-            --target-dir target &&
-            strip target/release/delta-funnel-perfetto
+          before-script-linux: dnf install -y openssl-devel
           args: >-
             --release
             --out dist

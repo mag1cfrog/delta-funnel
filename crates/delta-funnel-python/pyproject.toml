@@ -21,6 +21,9 @@ classifiers = [
 ]
 dependencies = ["rich>=14,<15"]
 
+[project.scripts]
+delta-funnel-perfetto = "deltafunnel.deltafunnel:_run_perfetto_cli"
+
 [project.urls]
 Homepage = "https://mag1cfrog.github.io/delta-funnel/"
 Documentation = "https://mag1cfrog.github.io/delta-funnel/"
