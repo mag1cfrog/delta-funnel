@@ -759,8 +759,10 @@ fn run_report_command(args: RankedReportArgs) -> i32 {
         .unwrap_or_else(|| default_report_path(&args.input));
     match super::generate_ranked_profile_report(&args.input, &output) {
         Ok(output) => {
-            println!("wrote {}", output.display());
-            0
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "wrote {}", output.display())
+                .and_then(|()| stdout.flush())
+                .map_or_else(|_| emit_failure(terminal_output_failure()), |()| 0)
         }
         Err(error) => emit_failure(error),
     }
