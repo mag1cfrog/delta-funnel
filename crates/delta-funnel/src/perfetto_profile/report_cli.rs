@@ -770,14 +770,6 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
     if command != "report" && command != "inspect" {
         return CliArgumentError::UnknownCommand;
     }
-    if command == "report"
-        && matches!(
-            args.last().and_then(|argument| argument.to_str()),
-            Some("--output")
-        )
-    {
-        return CliArgumentError::MissingOutputValue;
-    }
     match error.kind() {
         ErrorKind::MissingRequiredArgument => CliArgumentError::MissingInput,
         ErrorKind::ArgumentConflict if command == "report" => CliArgumentError::DuplicateOutput,
@@ -786,6 +778,36 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         }
         ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOption,
         ErrorKind::TooManyValues => CliArgumentError::MultipleInputs,
+        ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--output")
+            ) =>
+        {
+            if args.last().is_some_and(|argument| argument == "--output") {
+                let earlier_args = &args[..args.len() - 1];
+                if let Err(earlier_error) = PerfettoCli::try_parse_from(
+                    iter::once(OsString::from("delta-funnel-perfetto"))
+                        .chain(earlier_args.iter().cloned()),
+                ) {
+                    let earlier_error = classify_cli_error(earlier_args, &earlier_error);
+                    if !matches!(
+                        earlier_error,
+                        CliArgumentError::MissingInput | CliArgumentError::MissingOutputValue
+                    ) {
+                        return earlier_error;
+                    }
+                }
+                if earlier_args
+                    .iter()
+                    .skip(1)
+                    .any(|argument| argument == "--output")
+                {
+                    return CliArgumentError::DuplicateOutput;
+                }
+            }
+            CliArgumentError::MissingOutputValue
+        }
         ErrorKind::ValueValidation
             if matches!(
                 error.get(ContextKind::InvalidArg),
@@ -1512,6 +1534,33 @@ mod tests {
             (
                 vec![OsString::from("report"), OsString::from("--output")],
                 CliArgumentError::MissingOutputValue,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("trace.pftrace"),
+                    OsString::from("--output"),
+                    OsString::from("first.html"),
+                    OsString::from("--output"),
+                ],
+                CliArgumentError::DuplicateOutput,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("first.pftrace"),
+                    OsString::from("second.pftrace"),
+                    OsString::from("--output"),
+                ],
+                CliArgumentError::MultipleInputs,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("--unknown"),
+                    OsString::from("--output"),
+                ],
+                CliArgumentError::UnknownOption,
             ),
             (
                 vec![
