@@ -1,6 +1,16 @@
 name: TestPyPI diagnostics
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/testpypi-diagnostics.yml"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/delta-funnel/**"
+      - "crates/delta-funnel-python/**"
+      - "tools/perfetto/**"
+      - "xtask/Cargo.toml"
   push:
     branches:
       - main
@@ -19,8 +29,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: testpypi-diagnostics
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -180,6 +190,7 @@ jobs:
   publish:
     name: Publish diagnostics wheel to TestPyPI
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: testpypi-diagnostics
