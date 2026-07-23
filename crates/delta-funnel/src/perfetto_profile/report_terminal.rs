@@ -4,7 +4,7 @@ use std::fmt;
 
 use clap::ValueEnum;
 
-use super::ranked_report::{RankedProfileDocument, RankedSemantic};
+use super::ranked_report::{RankedFunction, RankedProfileDocument, RankedSemantic};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub(super) enum InspectSort {
@@ -24,17 +24,33 @@ impl InspectSort {
             Self::Name => "name",
         }
     }
+
+    fn for_functions(self) -> Self {
+        match self {
+            Self::Duration => Self::InclusiveCpu,
+            sort => sort,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InspectSelection {
+    Root,
+    Semantic(i64),
+    Function { semantic_id: i64, function_id: i64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TerminalInspectError {
     SemanticNotFound(i64),
+    FunctionNotFound { semantic_id: i64, function_id: i64 },
 }
 
 impl TerminalInspectError {
     pub(super) const fn kind(self) -> &'static str {
         match self {
             Self::SemanticNotFound(_) => "semantic_not_found",
+            Self::FunctionNotFound { .. } => "function_not_found",
         }
     }
 }
@@ -45,27 +61,54 @@ impl fmt::Display for TerminalInspectError {
             Self::SemanticNotFound(semantic_id) => {
                 write!(formatter, "semantic:{semantic_id} does not exist")
             }
+            Self::FunctionNotFound {
+                semantic_id,
+                function_id,
+            } => write!(
+                formatter,
+                "function:{semantic_id}:{function_id} does not exist"
+            ),
         }
     }
 }
 
 impl std::error::Error for TerminalInspectError {}
 
-pub(super) fn render_semantic_view(
+pub(super) fn render_terminal_view(
+    document: &RankedProfileDocument,
+    selection: InspectSelection,
+    sort: InspectSort,
+    limit: usize,
+    max_depth: usize,
+) -> Result<String, TerminalInspectError> {
+    match selection {
+        InspectSelection::Root => render_semantic_view(document, None, sort, limit, max_depth),
+        InspectSelection::Semantic(semantic_id) => {
+            render_semantic_view(document, Some(semantic_id), sort, limit, max_depth)
+        }
+        InspectSelection::Function {
+            semantic_id,
+            function_id,
+        } => render_function_view(document, semantic_id, function_id, sort, limit, max_depth),
+    }
+}
+
+fn render_semantic_view(
     document: &RankedProfileDocument,
     selected_semantic_id: Option<i64>,
     sort: InspectSort,
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
-    if let Some(semantic_id) = selected_semantic_id
-        && !document
-            .semantics
-            .iter()
-            .any(|semantic| semantic.semantic_id == semantic_id)
-    {
-        return Err(TerminalInspectError::SemanticNotFound(semantic_id));
-    }
+    let selected_semantic = selected_semantic_id
+        .map(|semantic_id| {
+            document
+                .semantics
+                .iter()
+                .find(|semantic| semantic.semantic_id == semantic_id)
+                .ok_or(TerminalInspectError::SemanticNotFound(semantic_id))
+        })
+        .transpose()?;
 
     let mut children = HashMap::<Option<i64>, Vec<&RankedSemantic>>::new();
     for semantic in &document.semantics {
@@ -76,7 +119,7 @@ pub(super) fn render_semantic_view(
     }
 
     let first_depth = usize::from(selected_semantic_id.is_some());
-    let (total, rows) = collect_semantic_rows(
+    let (semantic_total, semantic_rows) = collect_semantic_rows(
         &mut children,
         selected_semantic_id,
         first_depth,
@@ -84,6 +127,24 @@ pub(super) fn render_semantic_view(
         limit,
         sort,
     );
+    let function_sort = sort.for_functions();
+    let mut function_roots = selected_semantic
+        .into_iter()
+        .flat_map(|semantic| {
+            document.functions.iter().filter(move |function| {
+                function.semantic_id == semantic.semantic_id
+                    && function.parent_function_id.is_none()
+            })
+        })
+        .collect::<Vec<_>>();
+    function_roots.sort_unstable_by(|left, right| compare_functions(left, right, function_sort));
+    let function_total = function_roots.len();
+    let function_rows = function_roots
+        .into_iter()
+        .take(limit.saturating_sub(semantic_rows.len()))
+        .collect::<Vec<_>>();
+    let total = semantic_total + function_total;
+    let shown = semantic_rows.len() + function_rows.len();
 
     let operation_durations = children
         .get(&None)
@@ -98,12 +159,12 @@ pub(super) fn render_semantic_view(
     let mut output = format!(
         "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: none\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\n",
         sort.as_str(),
-        rows.len(),
-        rows.len() < total,
+        shown,
+        shown < total,
         terminal_text(&document.metadata.exact_time_unit),
         terminal_text(&document.metadata.sample_unit),
     );
-    for (depth, semantic) in rows {
+    for (depth, semantic) in semantic_rows {
         write_semantic_row(
             &mut output,
             depth,
@@ -113,6 +174,18 @@ pub(super) fn render_semantic_view(
                 .copied()
                 .flatten(),
         );
+    }
+    if let Some(semantic) = selected_semantic {
+        output.push_str(&format!(
+            "transition: semantic:{} -> function-roots; sort: {}; showing: {} of {function_total}; truncated: {}; sample_basis: sampled-cpu\n",
+            semantic.semantic_id,
+            function_sort.as_str(),
+            function_rows.len(),
+            function_rows.len() < function_total,
+        ));
+        for function in function_rows {
+            write_function_row(&mut output, 1, function, semantic.direct_sample_count);
+        }
     }
     Ok(output)
 }
@@ -177,6 +250,153 @@ fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: Inspec
         InspectSort::Name => left.name.cmp(&right.name),
     };
     ordering.then_with(|| left.semantic_id.cmp(&right.semantic_id))
+}
+
+fn render_function_view(
+    document: &RankedProfileDocument,
+    semantic_id: i64,
+    function_id: i64,
+    sort: InspectSort,
+    limit: usize,
+    max_depth: usize,
+) -> Result<String, TerminalInspectError> {
+    let selected = document
+        .functions
+        .iter()
+        .find(|function| function.semantic_id == semantic_id && function.function_id == function_id)
+        .ok_or(TerminalInspectError::FunctionNotFound {
+            semantic_id,
+            function_id,
+        })?;
+    let mut children = HashMap::<Option<i64>, Vec<&RankedFunction>>::new();
+    for function in document
+        .functions
+        .iter()
+        .filter(|function| function.semantic_id == semantic_id)
+    {
+        children
+            .entry(function.parent_function_id)
+            .or_default()
+            .push(function);
+    }
+    let (total, rows) =
+        collect_function_rows(&mut children, Some(function_id), 1, max_depth, limit, sort);
+    let mut output = format!(
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: none\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        sort.as_str(),
+        rows.len(),
+        rows.len() < total,
+        terminal_text(&document.metadata.sample_unit),
+    );
+    for (depth, function) in rows {
+        write_function_row(
+            &mut output,
+            depth,
+            function,
+            selected.inclusive_sample_count,
+        );
+    }
+    Ok(output)
+}
+
+fn collect_function_rows<'a>(
+    children: &mut HashMap<Option<i64>, Vec<&'a RankedFunction>>,
+    parent_function_id: Option<i64>,
+    first_depth: usize,
+    max_depth: usize,
+    limit: usize,
+    sort: InspectSort,
+) -> (usize, Vec<(usize, &'a RankedFunction)>) {
+    if first_depth > max_depth {
+        return (0, Vec::new());
+    }
+    let mut stack = Vec::new();
+    push_sorted_function_siblings(children, parent_function_id, first_depth, sort, &mut stack);
+    let mut total = 0;
+    let mut rows = Vec::with_capacity(limit);
+    while let Some((depth, function)) = stack.pop() {
+        total += 1;
+        if rows.len() < limit {
+            rows.push((depth, function));
+        }
+        if depth < max_depth {
+            push_sorted_function_siblings(
+                children,
+                Some(function.function_id),
+                depth + 1,
+                sort,
+                &mut stack,
+            );
+        }
+    }
+    (total, rows)
+}
+
+fn push_sorted_function_siblings<'a>(
+    children: &mut HashMap<Option<i64>, Vec<&'a RankedFunction>>,
+    parent_function_id: Option<i64>,
+    depth: usize,
+    sort: InspectSort,
+    stack: &mut Vec<(usize, &'a RankedFunction)>,
+) {
+    let Some(siblings) = children.get_mut(&parent_function_id) else {
+        return;
+    };
+    siblings.sort_unstable_by(|left, right| compare_functions(left, right, sort));
+    stack.extend(siblings.iter().rev().map(|function| (depth, *function)));
+}
+
+fn compare_functions(left: &RankedFunction, right: &RankedFunction, sort: InspectSort) -> Ordering {
+    let ordering = match sort {
+        InspectSort::Duration | InspectSort::InclusiveCpu => right
+            .inclusive_sample_count
+            .cmp(&left.inclusive_sample_count),
+        InspectSort::SelfCpu => right.self_sample_count.cmp(&left.self_sample_count),
+        InspectSort::Name => left.name.cmp(&right.name),
+    };
+    ordering
+        .then_with(|| left.semantic_id.cmp(&right.semantic_id))
+        .then_with(|| left.function_id.cmp(&right.function_id))
+}
+
+fn write_function_row(
+    output: &mut String,
+    depth: usize,
+    function: &RankedFunction,
+    context_sample_count: i64,
+) {
+    let module = function
+        .module_name
+        .as_deref()
+        .map_or_else(|| "null".to_owned(), quoted_terminal_text);
+    let source = function
+        .source_file
+        .as_deref()
+        .map_or_else(|| "null".to_owned(), quoted_terminal_text);
+    let line = function
+        .line_number
+        .map_or_else(|| "null".to_owned(), |line| line.to_string());
+    output.push_str(&format!(
+        "function depth={depth} id=function:{}:{} symbol={} module={module} source={source} line={line} inclusive_cpu_samples={} inclusive_context_percent={} self_cpu_samples={} self_context_percent={}\n",
+        function.semantic_id,
+        function.function_id,
+        quoted_terminal_text(&function.name),
+        function.inclusive_sample_count,
+        sample_percent(function.inclusive_sample_count, context_sample_count),
+        function.self_sample_count,
+        sample_percent(function.self_sample_count, context_sample_count),
+    ));
+}
+
+fn sample_percent(sample_count: i64, context_sample_count: i64) -> String {
+    if context_sample_count > 0 {
+        format!(
+            "{:.2}%",
+            sample_count as f64 * 100.0 / context_sample_count as f64
+        )
+    } else {
+        "n/a".to_owned()
+    }
 }
 
 fn write_semantic_row(
@@ -249,7 +469,9 @@ fn is_unsafe_terminal_character(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perfetto_profile::ranked_report::{RankedProfileMetadata, RankedSemantic};
+    use crate::perfetto_profile::ranked_report::{
+        RankedFunction, RankedProfileMetadata, RankedSemantic,
+    };
 
     fn operation(semantic_id: i64, name: &str, duration_ns: Option<i64>) -> RankedSemantic {
         RankedSemantic {
@@ -297,6 +519,27 @@ mod tests {
             },
             semantics,
             functions: Vec::new(),
+        }
+    }
+
+    fn function(
+        semantic_id: i64,
+        function_id: i64,
+        parent_function_id: Option<i64>,
+        name: &str,
+        self_sample_count: i64,
+        inclusive_sample_count: i64,
+    ) -> RankedFunction {
+        RankedFunction {
+            semantic_id,
+            function_id,
+            parent_function_id,
+            name: name.to_owned(),
+            module_name: Some("delta_funnel".to_owned()),
+            source_file: Some("src/lib.rs".to_owned()),
+            line_number: Some(42),
+            self_sample_count,
+            inclusive_sample_count,
         }
     }
 
@@ -361,6 +604,75 @@ mod tests {
         assert_eq!(
             render_semantic_view(&document, Some(99), InspectSort::Duration, 10, 1),
             Err(TerminalInspectError::SemanticNotFound(99))
+        );
+    }
+
+    #[test]
+    fn transitions_from_semantics_to_exact_function_callsites() {
+        let mut root = operation(1, "operation", Some(100));
+        root.direct_sample_count = 10;
+        root.inclusive_sample_count = 10;
+        let mut document = document(vec![root]);
+        document.functions = vec![
+            function(1, 20, None, "second root", 4, 4),
+            function(1, 12, Some(11), "leaf", 3, 3),
+            function(1, 10, None, "first root", 1, 6),
+            function(1, 11, Some(10), "child\u{1b}", 2, 5),
+        ];
+
+        let semantic = render_terminal_view(
+            &document,
+            InspectSelection::Semantic(1),
+            InspectSort::Duration,
+            10,
+            1,
+        )
+        .expect("semantic functions should render");
+        assert!(semantic.contains(
+            "transition: semantic:1 -> function-roots; sort: inclusive-cpu; showing: 2 of 2; truncated: false; sample_basis: sampled-cpu"
+        ));
+        let first = semantic
+            .find("id=function:1:10")
+            .expect("largest function root");
+        let second = semantic
+            .find("id=function:1:20")
+            .expect("smaller function root");
+        assert!(first < second);
+        assert!(semantic.contains("inclusive_context_percent=60.00%"));
+
+        let function = render_terminal_view(
+            &document,
+            InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 10,
+            },
+            InspectSort::InclusiveCpu,
+            10,
+            2,
+        )
+        .expect("function children should render");
+        assert!(function.contains("context: function:1:10"));
+        assert!(function.contains("metric_basis: sampled-cpu; exact_wall_time: not-applicable"));
+        assert!(function.contains("id=function:1:11"));
+        assert!(function.contains("id=function:1:12"));
+        assert!(function.contains("inclusive_context_percent=83.33%"));
+        assert!(function.contains(r#"symbol="child\u{1B}""#));
+
+        assert_eq!(
+            render_terminal_view(
+                &document,
+                InspectSelection::Function {
+                    semantic_id: 2,
+                    function_id: 10,
+                },
+                InspectSort::InclusiveCpu,
+                10,
+                1,
+            ),
+            Err(TerminalInspectError::FunctionNotFound {
+                semantic_id: 2,
+                function_id: 10,
+            })
         );
     }
 }

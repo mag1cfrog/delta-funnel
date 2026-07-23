@@ -5,11 +5,12 @@ use std::fs::{self, File};
 use std::io;
 use std::iter;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 
-use super::report_terminal::{InspectSort, TerminalInspectError};
+use super::report_terminal::{InspectSelection, InspectSort, TerminalInspectError};
 
 const DEFAULT_INSPECT_LIMIT: u16 = 20;
 const MAX_INSPECT_LIMIT: u16 = 200;
@@ -64,7 +65,16 @@ struct InspectArgs {
     #[arg(long, value_name = "ID")]
     semantic: Option<i64>,
 
-    /// Sort semantic siblings by the selected metric.
+    /// Select one function callsite by semantic and function identity.
+    #[arg(
+        long,
+        value_name = "SEMANTIC_ID:FUNCTION_ID",
+        conflicts_with = "semantic",
+        allow_hyphen_values = true
+    )]
+    function: Option<FunctionSelector>,
+
+    /// Sort sibling rows by the selected metric.
     #[arg(long, value_enum)]
     sort: Option<InspectSort>,
 
@@ -74,6 +84,30 @@ struct InspectArgs {
         value_parser = clap::value_parser!(u16).range(0..=i64::from(MAX_INSPECT_DEPTH))
     )]
     depth: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FunctionSelector {
+    semantic_id: i64,
+    function_id: i64,
+}
+
+impl FromStr for FunctionSelector {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (semantic_id, function_id) = value
+            .split_once(':')
+            .ok_or("function identity must contain one colon")?;
+        Ok(Self {
+            semantic_id: semantic_id
+                .parse()
+                .map_err(|_| "semantic function owner must be a signed integer")?,
+            function_id: function_id
+                .parse()
+                .map_err(|_| "function ID must be a signed integer")?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +121,11 @@ enum CliArgumentError {
     InvalidLimit,
     InvalidDepth,
     InvalidSemanticId,
+    InvalidFunctionId,
     InvalidSort,
+    IncompatibleSelectors,
+    IncompatibleSort,
+    DuplicateOption,
     UnknownOption,
 }
 
@@ -103,7 +141,13 @@ impl fmt::Display for CliArgumentError {
             Self::InvalidLimit => "limit must be between 1 and 200",
             Self::InvalidDepth => "depth must be between 0 and 32",
             Self::InvalidSemanticId => "semantic ID must be a signed integer",
+            Self::InvalidFunctionId => {
+                "function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"
+            }
             Self::InvalidSort => "sort must be duration, inclusive-cpu, self-cpu, or name",
+            Self::IncompatibleSelectors => "--semantic and --function cannot be used together",
+            Self::IncompatibleSort => "function callsites cannot be sorted by exact duration",
+            Self::DuplicateOption => "option may be specified only once",
             Self::UnknownOption => "unknown option",
         };
         formatter.write_str(message)
@@ -124,7 +168,11 @@ impl CliArgumentError {
             Self::InvalidLimit => "invalid_limit",
             Self::InvalidDepth => "invalid_depth",
             Self::InvalidSemanticId => "invalid_semantic_id",
+            Self::InvalidFunctionId => "invalid_function_id",
             Self::InvalidSort => "invalid_sort",
+            Self::IncompatibleSelectors => "incompatible_selectors",
+            Self::IncompatibleSort => "incompatible_sort",
+            Self::DuplicateOption => "duplicate_option",
             Self::UnknownOption => "unknown_option",
         }
     }
@@ -327,18 +375,37 @@ fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -
 }
 
 fn run_inspect_command(args: InspectArgs) -> i32 {
+    let selection = if let Some(function) = args.function {
+        InspectSelection::Function {
+            semantic_id: function.semantic_id,
+            function_id: function.function_id,
+        }
+    } else if let Some(semantic_id) = args.semantic {
+        InspectSelection::Semantic(semantic_id)
+    } else {
+        InspectSelection::Root
+    };
+    let sort = args.sort.unwrap_or(match selection {
+        InspectSelection::Function { .. } => InspectSort::InclusiveCpu,
+        InspectSelection::Root | InspectSelection::Semantic(_) => InspectSort::Duration,
+    });
+    if matches!(selection, InspectSelection::Function { .. }) && sort == InspectSort::Duration {
+        return emit_failure(CliArgumentError::IncompatibleSort.into());
+    }
     let input = match preflight_ranked_profile_input(&args.input) {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
     match super::load_ranked_profile(&input) {
-        Ok(document) => match super::render_semantic_view(
+        Ok(document) => match super::render_terminal_view(
             &document,
-            args.semantic,
-            args.sort.unwrap_or_default(),
+            selection,
+            sort,
             usize::from(args.limit),
-            args.depth
-                .map_or_else(|| usize::from(args.semantic.is_some()), usize::from),
+            args.depth.map_or_else(
+                || usize::from(selection != InspectSelection::Root),
+                usize::from,
+            ),
         ) {
             Ok(output) => {
                 print!("{output}");
@@ -380,7 +447,11 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
     }
     match error.kind() {
         ErrorKind::MissingRequiredArgument => CliArgumentError::MissingInput,
-        ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOutput,
+        ErrorKind::ArgumentConflict if command == "report" => CliArgumentError::DuplicateOutput,
+        ErrorKind::ArgumentConflict if is_selector_conflict(error) => {
+            CliArgumentError::IncompatibleSelectors
+        }
+        ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOption,
         ErrorKind::TooManyValues => CliArgumentError::MultipleInputs,
         ErrorKind::ValueValidation
             if matches!(
@@ -406,6 +477,14 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         {
             CliArgumentError::InvalidSemanticId
         }
+        ErrorKind::ValueValidation
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--function")
+            ) =>
+        {
+            CliArgumentError::InvalidFunctionId
+        }
         ErrorKind::InvalidValue
             if matches!(
                 error.get(ContextKind::InvalidArg),
@@ -422,6 +501,20 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
         },
         _ => CliArgumentError::UnknownOption,
     }
+}
+
+fn is_selector_conflict(error: &clap::Error) -> bool {
+    let arguments = [
+        error.get(ContextKind::InvalidArg),
+        error.get(ContextKind::PriorArg),
+    ];
+    let contains_semantic = arguments.into_iter().flatten().any(|value| {
+        matches!(value, ContextValue::String(argument) if argument.starts_with("--semantic"))
+    });
+    let contains_function = arguments.into_iter().flatten().any(|value| {
+        matches!(value, ContextValue::String(argument) if argument.starts_with("--function"))
+    });
+    contains_semantic && contains_function
 }
 
 fn cli_failure(args: &[OsString], error: &clap::Error) -> RankedReportFailure {
@@ -642,6 +735,7 @@ mod tests {
         assert!(help.contains("INPUT.pftrace"));
         assert!(help.contains("--limit <LIMIT>"));
         assert!(help.contains("--semantic <ID>"));
+        assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
         assert!(help.contains("--sort <SORT>"));
         assert!(help.contains("--depth <DEPTH>"));
 
@@ -664,8 +758,31 @@ mod tests {
                     input: PathBuf::from("capture.pftrace"),
                     limit: 7,
                     semantic: Some(42),
+                    function: None,
                     sort: Some(InspectSort::SelfCpu),
                     depth: Some(3),
+                }),
+            }
+        );
+        assert_eq!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--function",
+                "42:7",
+            ])?,
+            PerfettoCli {
+                command: PerfettoCommand::Inspect(InspectArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    limit: DEFAULT_INSPECT_LIMIT,
+                    semantic: None,
+                    function: Some(FunctionSelector {
+                        semantic_id: 42,
+                        function_id: 7,
+                    }),
+                    sort: None,
+                    depth: None,
                 }),
             }
         );
@@ -688,6 +805,20 @@ mod tests {
                 OsString::from("--help")
             ]),
             0
+        );
+        assert_eq!(
+            run_inspect_command(InspectArgs {
+                input: PathBuf::from("missing.pftrace"),
+                limit: DEFAULT_INSPECT_LIMIT,
+                semantic: None,
+                function: Some(FunctionSelector {
+                    semantic_id: 1,
+                    function_id: 2,
+                }),
+                sort: Some(InspectSort::Duration),
+                depth: None,
+            }),
+            64
         );
         assert_eq!(
             run_perfetto_diagnostics_cli_with([OsString::from("unknown")]),
@@ -781,10 +912,41 @@ mod tests {
                 vec![
                     OsString::from("inspect"),
                     OsString::from("capture.pftrace"),
+                    OsString::from("--function"),
+                    OsString::from("42"),
+                ],
+                CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
                     OsString::from("--sort"),
                     OsString::from("cpu"),
                 ],
                 CliArgumentError::InvalidSort,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--semantic"),
+                    OsString::from("42"),
+                    OsString::from("--function"),
+                    OsString::from("42:7"),
+                ],
+                CliArgumentError::IncompatibleSelectors,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                    OsString::from("10"),
+                    OsString::from("--limit"),
+                    OsString::from("20"),
+                ],
+                CliArgumentError::DuplicateOption,
             ),
         ] {
             let error = PerfettoCli::try_parse_from(
