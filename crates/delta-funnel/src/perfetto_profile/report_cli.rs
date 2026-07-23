@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,13 +326,38 @@ pub fn preflight_ranked_report_paths(
         return Err(RankedReportPathError::OutputHasNoFileName);
     }
     inspect_output_path(&output)?;
-    match same_file::is_same_file(&input, &output) {
+    let output_identity =
+        resolve_output_identity(&output).map_err(RankedReportPathError::OutputInspection)?;
+    match same_file::is_same_file(&input, &output_identity) {
         Ok(true) => return Err(RankedReportPathError::InputOutputAlias),
         Ok(false) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
     }
     Ok(RankedReportPaths { input, output })
+}
+
+fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(segment) => {
+                resolved.push(segment);
+                match resolved.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
@@ -550,6 +575,23 @@ mod tests {
             preflight_ranked_report_paths(&input, &output),
             Err(RankedReportPathError::InputOutputAlias)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_input_alias_through_a_missing_parent_and_dot_dot() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("capture.pftrace");
+        File::create(&input)?.write_all(b"trace")?;
+        let missing_parent = directory.path().join("missing");
+        let output = missing_parent.join("../capture.pftrace");
+
+        assert!(matches!(
+            preflight_ranked_report_paths(&input, &output),
+            Err(RankedReportPathError::InputOutputAlias)
+        ));
+        assert_eq!(fs::read(&input)?, b"trace");
+        assert!(!missing_parent.exists());
         Ok(())
     }
 
