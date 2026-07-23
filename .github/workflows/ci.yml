@@ -46,6 +46,7 @@ jobs:
               - 'tools/perfetto/**'
               - 'xtask/Cargo.toml'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/testpypi-diagnostics-build.yml'
               - '.github/workflows/testpypi-diagnostics.yml'
             release_wheel:
               - '.cargo/**'
@@ -55,6 +56,7 @@ jobs:
               - 'crates/delta-funnel-python/**'
               - 'xtask/Cargo.toml'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/pypi-build.yml'
               - '.github/workflows/pypi.yml'
 
   rust:
@@ -172,13 +174,13 @@ jobs:
     name: Release Wheels
     needs: changes
     if: needs.changes.outputs.release_wheel == 'true'
-    uses: ./.github/workflows/pypi.yml
+    uses: ./.github/workflows/pypi-build.yml
 
   diagnostics_wheel:
     name: Diagnostics Wheel
     needs: changes
     if: needs.changes.outputs.diagnostics_wheel == 'true'
-    uses: ./.github/workflows/testpypi-diagnostics.yml
+    uses: ./.github/workflows/testpypi-diagnostics-build.yml
 
   core-ci:
     name: Core CI
