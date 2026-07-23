@@ -41,6 +41,7 @@ pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(feature = "perfetto-profile")]
 #[pyfunction]
 fn _run_perfetto_cli(py: Python<'_>) -> PyResult<i32> {
+    // Python console scripts normalize away the interpreter and script path here.
     let args = py
         .import("sys")?
         .getattr("argv")?

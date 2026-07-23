@@ -74,13 +74,12 @@ struct InspectArgs {
     #[arg(
         long,
         value_name = "SEMANTIC_ID:FUNCTION_ID",
-        conflicts_with = "semantic",
-        allow_hyphen_values = true
+        conflicts_with = "semantic"
     )]
     function: Option<FunctionSelector>,
 
     /// Retain matching rows and their contextual ancestors.
-    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    #[arg(long, value_name = "TEXT")]
     filter: Option<FilterText>,
 
     /// Sort sibling rows by the selected metric.
@@ -403,7 +402,10 @@ pub fn run_perfetto_diagnostics_cli() -> i32 {
     run_perfetto_diagnostics_cli_with_args(env::args_os().skip(1))
 }
 
-/// Runs the bundled CLI with arguments that exclude the executable name.
+/// Runs the bundled CLI with host-normalized arguments that exclude the executable name.
+///
+/// This supports wrappers such as Python console scripts whose process arguments
+/// include launcher details that are absent from their language-level argument list.
 pub fn run_perfetto_diagnostics_cli_with_args(args: impl IntoIterator<Item = OsString>) -> i32 {
     let args = args.into_iter().collect::<Vec<_>>();
     if args.first().is_some_and(|argument| argument == "report")
@@ -420,13 +422,9 @@ pub fn run_perfetto_diagnostics_cli_with_args(args: impl IntoIterator<Item = OsS
         Ok(PerfettoCli {
             command: PerfettoCommand::Inspect(args),
         }) => run_inspect_command(args),
-        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => {
-            if error.print().is_ok() {
-                0
-            } else {
-                70
-            }
-        }
+        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => error
+            .print()
+            .map_or_else(|_| emit_failure(terminal_output_failure()), |()| 0),
         Err(error) => emit_failure(cli_failure(&args, &error)),
     }
 }
@@ -1268,6 +1266,24 @@ mod tests {
                 }),
             }
         );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--function=-1:-2",
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--filter=--scan",
+            ])
+            .is_ok()
+        );
         Ok(())
     }
 
@@ -1651,7 +1667,27 @@ mod tests {
                 vec![
                     OsString::from("inspect"),
                     OsString::from("capture.pftrace"),
+                    OsString::from("--function"),
+                    OsString::from("--limit"),
+                    OsString::from("2"),
+                ],
+                CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
                     OsString::from("--filter"),
+                ],
+                CliArgumentError::InvalidFilter,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--filter"),
+                    OsString::from("--limit"),
+                    OsString::from("2"),
                 ],
                 CliArgumentError::InvalidFilter,
             ),

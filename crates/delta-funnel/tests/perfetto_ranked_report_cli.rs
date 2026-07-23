@@ -3,10 +3,14 @@
 #![cfg(all(feature = "perfetto-profile", unix))]
 
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 #[test]
 fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dyn std::error::Error>>
@@ -51,6 +55,21 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
     assert!(html.contains("Function metrics are sampled on-CPU observations"));
     assert!(!html.contains("http://"));
     assert!(!html.contains("https://"));
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn reports_help_output_failures_with_stable_diagnostics() -> Result<(), Box<dyn std::error::Error>>
+{
+    let result = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("--help")
+        .stdout(Stdio::from(File::options().write(true).open("/dev/full")?))
+        .output()?;
+    assert_eq!(result.status.code(), Some(73));
+    let failure: serde_json::Value = serde_json::from_slice(&result.stderr)?;
+    assert_eq!(failure["phase"], "output");
+    assert_eq!(failure["kind"], "terminal_write_failed");
     Ok(())
 }
 
