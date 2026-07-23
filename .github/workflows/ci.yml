@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      diagnostics_wheel: ${{ steps.filter.outputs.diagnostics_wheel }}
       release_wheel: ${{ steps.filter.outputs.release_wheel }}
 
     steps:
@@ -36,6 +37,16 @@ jobs:
               - 'crates/**'
               - 'xtask/**'
               - '.github/workflows/ci.yml'
+            diagnostics_wheel:
+              - '.cargo/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/delta-funnel/**'
+              - 'crates/delta-funnel-python/**'
+              - 'tools/perfetto/**'
+              - 'xtask/Cargo.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/testpypi-diagnostics.yml'
             release_wheel:
               - '.cargo/**'
               - 'Cargo.toml'
@@ -163,6 +174,12 @@ jobs:
     if: needs.changes.outputs.release_wheel == 'true'
     uses: ./.github/workflows/pypi.yml
 
+  diagnostics_wheel:
+    name: Diagnostics Wheel
+    needs: changes
+    if: needs.changes.outputs.diagnostics_wheel == 'true'
+    uses: ./.github/workflows/testpypi-diagnostics.yml
+
   core-ci:
     name: Core CI
     needs:
@@ -170,6 +187,7 @@ jobs:
       - rust
       - python-package
       - release_wheels
+      - diagnostics_wheel
     if: always()
     runs-on: ubuntu-latest
 
@@ -184,6 +202,12 @@ jobs:
           if [ "${{ needs.changes.outputs.release_wheel }}" = "true" ] &&
              [ "${{ needs.release_wheels.result }}" != "success" ]; then
             echo "Release Wheels did not pass: ${{ needs.release_wheels.result }}"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.diagnostics_wheel }}" = "true" ] &&
+             [ "${{ needs.diagnostics_wheel.result }}" != "success" ]; then
+            echo "Diagnostics Wheel did not pass: ${{ needs.diagnostics_wheel.result }}"
             exit 1
           fi
 
