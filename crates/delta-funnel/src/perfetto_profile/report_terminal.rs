@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use clap::ValueEnum;
@@ -78,18 +78,29 @@ pub(super) fn render_terminal_view(
     document: &RankedProfileDocument,
     selection: InspectSelection,
     sort: InspectSort,
+    filter: Option<&str>,
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
     match selection {
-        InspectSelection::Root => render_semantic_view(document, None, sort, limit, max_depth),
+        InspectSelection::Root => {
+            render_semantic_view(document, None, sort, filter, limit, max_depth)
+        }
         InspectSelection::Semantic(semantic_id) => {
-            render_semantic_view(document, Some(semantic_id), sort, limit, max_depth)
+            render_semantic_view(document, Some(semantic_id), sort, filter, limit, max_depth)
         }
         InspectSelection::Function {
             semantic_id,
             function_id,
-        } => render_function_view(document, semantic_id, function_id, sort, limit, max_depth),
+        } => render_function_view(
+            document,
+            semantic_id,
+            function_id,
+            sort,
+            filter,
+            limit,
+            max_depth,
+        ),
     }
 }
 
@@ -97,6 +108,7 @@ fn render_semantic_view(
     document: &RankedProfileDocument,
     selected_semantic_id: Option<i64>,
     sort: InspectSort,
+    filter: Option<&str>,
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
@@ -117,6 +129,19 @@ fn render_semantic_view(
             .or_default()
             .push(semantic);
     }
+    let included_semantics = filter.map(|filter| {
+        contextual_match_ids(
+            document.semantics.iter().map(|semantic| {
+                (
+                    semantic.semantic_id,
+                    semantic.parent_semantic_id,
+                    semantic_matches(semantic, filter),
+                )
+            }),
+            selected_semantic_id,
+            max_depth,
+        )
+    });
 
     let first_depth = usize::from(selected_semantic_id.is_some());
     let (semantic_total, semantic_rows) = collect_semantic_rows(
@@ -126,6 +151,7 @@ fn render_semantic_view(
         max_depth,
         limit,
         sort,
+        included_semantics.as_ref(),
     );
     let function_sort = sort.for_functions();
     let mut function_roots = selected_semantic
@@ -134,6 +160,7 @@ fn render_semantic_view(
             document.functions.iter().filter(move |function| {
                 function.semantic_id == semantic.semantic_id
                     && function.parent_function_id.is_none()
+                    && filter.is_none_or(|filter| function_matches(function, filter))
             })
         })
         .collect::<Vec<_>>();
@@ -156,8 +183,9 @@ fn render_semantic_view(
         || "operation-roots".to_owned(),
         |semantic_id| format!("semantic:{semantic_id}"),
     );
+    let filter = filter_label(filter);
     let mut output = format!(
-        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: none\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\n",
+        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\n",
         sort.as_str(),
         shown,
         shown < total,
@@ -190,6 +218,77 @@ fn render_semantic_view(
     Ok(output)
 }
 
+fn contextual_match_ids(
+    records: impl IntoIterator<Item = (i64, Option<i64>, bool)>,
+    selected_id: Option<i64>,
+    max_depth: usize,
+) -> HashSet<i64> {
+    let mut parents = HashMap::new();
+    let mut matches = Vec::new();
+    for (id, parent_id, is_match) in records {
+        parents.insert(id, parent_id);
+        if is_match {
+            matches.push(id);
+        }
+    }
+    let mut included = HashSet::new();
+    for id in matches {
+        if relative_depth(id, selected_id, &parents).is_none_or(|depth| depth > max_depth) {
+            continue;
+        }
+        let mut id = id;
+        loop {
+            if Some(id) == selected_id {
+                break;
+            }
+            included.insert(id);
+            let Some(parent_id) = parents.get(&id).copied().flatten() else {
+                break;
+            };
+            id = parent_id;
+        }
+    }
+    included
+}
+
+fn relative_depth(
+    id: i64,
+    selected_id: Option<i64>,
+    parents: &HashMap<i64, Option<i64>>,
+) -> Option<usize> {
+    if Some(id) == selected_id {
+        return None;
+    }
+    let mut current_id = id;
+    let mut depth = 0;
+    loop {
+        let parent_id = parents.get(&current_id).copied().flatten();
+        if selected_id.is_none() && parent_id.is_none() {
+            return Some(depth);
+        }
+        if parent_id == selected_id {
+            return Some(depth + 1);
+        }
+        let parent_id = parent_id?;
+        depth += 1;
+        current_id = parent_id;
+    }
+}
+
+fn semantic_matches(semantic: &RankedSemantic, filter: &str) -> bool {
+    if let Some(id) = filter.strip_prefix("semantic:") {
+        return id.parse::<i64>() == Ok(semantic.semantic_id);
+    }
+    [
+        Some(semantic.name.as_str()),
+        Some(semantic.semantic_kind.as_str()),
+        semantic.result.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.contains(filter))
+}
+
 fn collect_semantic_rows<'a>(
     children: &mut HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
     parent_semantic_id: Option<i64>,
@@ -197,6 +296,7 @@ fn collect_semantic_rows<'a>(
     max_depth: usize,
     limit: usize,
     sort: InspectSort,
+    included: Option<&HashSet<i64>>,
 ) -> (usize, Vec<(usize, &'a RankedSemantic)>) {
     if first_depth > max_depth {
         return (0, Vec::new());
@@ -206,9 +306,11 @@ fn collect_semantic_rows<'a>(
     let mut total = 0;
     let mut rows = Vec::with_capacity(limit);
     while let Some((depth, semantic)) = stack.pop() {
-        total += 1;
-        if rows.len() < limit {
-            rows.push((depth, semantic));
+        if included.is_none_or(|included| included.contains(&semantic.semantic_id)) {
+            total += 1;
+            if rows.len() < limit {
+                rows.push((depth, semantic));
+            }
         }
         if depth < max_depth {
             push_sorted_siblings(
@@ -257,6 +359,7 @@ fn render_function_view(
     semantic_id: i64,
     function_id: i64,
     sort: InspectSort,
+    filter: Option<&str>,
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
@@ -279,10 +382,35 @@ fn render_function_view(
             .or_default()
             .push(function);
     }
-    let (total, rows) =
-        collect_function_rows(&mut children, Some(function_id), 1, max_depth, limit, sort);
+    let included_functions = filter.map(|filter| {
+        contextual_match_ids(
+            document
+                .functions
+                .iter()
+                .filter(|function| function.semantic_id == semantic_id)
+                .map(|function| {
+                    (
+                        function.function_id,
+                        function.parent_function_id,
+                        function_matches(function, filter),
+                    )
+                }),
+            Some(function_id),
+            max_depth,
+        )
+    });
+    let (total, rows) = collect_function_rows(
+        &mut children,
+        Some(function_id),
+        1,
+        max_depth,
+        limit,
+        sort,
+        included_functions.as_ref(),
+    );
+    let filter = filter_label(filter);
     let mut output = format!(
-        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: none\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
         sort.as_str(),
         rows.len(),
         rows.len() < total,
@@ -299,6 +427,24 @@ fn render_function_view(
     Ok(output)
 }
 
+fn function_matches(function: &RankedFunction, filter: &str) -> bool {
+    if let Some(identity) = filter.strip_prefix("function:") {
+        let Some((semantic_id, function_id)) = identity.split_once(':') else {
+            return false;
+        };
+        return semantic_id.parse::<i64>() == Ok(function.semantic_id)
+            && function_id.parse::<i64>() == Ok(function.function_id);
+    }
+    [
+        Some(function.name.as_str()),
+        function.module_name.as_deref(),
+        function.source_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.contains(filter))
+}
+
 fn collect_function_rows<'a>(
     children: &mut HashMap<Option<i64>, Vec<&'a RankedFunction>>,
     parent_function_id: Option<i64>,
@@ -306,6 +452,7 @@ fn collect_function_rows<'a>(
     max_depth: usize,
     limit: usize,
     sort: InspectSort,
+    included: Option<&HashSet<i64>>,
 ) -> (usize, Vec<(usize, &'a RankedFunction)>) {
     if first_depth > max_depth {
         return (0, Vec::new());
@@ -315,9 +462,11 @@ fn collect_function_rows<'a>(
     let mut total = 0;
     let mut rows = Vec::with_capacity(limit);
     while let Some((depth, function)) = stack.pop() {
-        total += 1;
-        if rows.len() < limit {
-            rows.push((depth, function));
+        if included.is_none_or(|included| included.contains(&function.function_id)) {
+            total += 1;
+            if rows.len() < limit {
+                rows.push((depth, function));
+            }
         }
         if depth < max_depth {
             push_sorted_function_siblings(
@@ -438,6 +587,10 @@ fn quoted_terminal_text(value: &str) -> String {
     format!("\"{}\"", terminal_text(value))
 }
 
+fn filter_label(filter: Option<&str>) -> String {
+    filter.map_or_else(|| "none".to_owned(), quoted_terminal_text)
+}
+
 fn terminal_text(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for character in value.chars() {
@@ -553,6 +706,7 @@ mod tests {
             ]),
             None,
             InspectSort::Duration,
+            None,
             2,
             0,
         )
@@ -588,8 +742,9 @@ mod tests {
         grandchild.operation_id = 1;
 
         let document = document(vec![first, grandchild, root, second]);
-        let rendered = render_semantic_view(&document, Some(1), InspectSort::InclusiveCpu, 10, 2)
-            .expect("selected view should render");
+        let rendered =
+            render_semantic_view(&document, Some(1), InspectSort::InclusiveCpu, None, 10, 2)
+                .expect("selected view should render");
 
         assert!(rendered.contains("context: semantic:1"));
         assert!(rendered.contains("showing: 3 of 3; truncated: false"));
@@ -602,9 +757,47 @@ mod tests {
             "id=semantic:3 name=\"second\" kind=\"operation\" duration_ns=80 time_basis=exact:wall_clock operation_wall_percent=80.00%"
         ));
         assert_eq!(
-            render_semantic_view(&document, Some(99), InspectSort::Duration, 10, 1),
+            render_semantic_view(&document, Some(99), InspectSort::Duration, None, 10, 1),
             Err(TerminalInspectError::SemanticNotFound(99))
         );
+    }
+
+    #[test]
+    fn filters_exact_identities_and_retains_contextual_ancestors() {
+        let root = operation(1, "operation", Some(100));
+        let other_root = operation(10, "other operation", Some(90));
+        let mut parent = operation(2, "parent", Some(60));
+        parent.parent_semantic_id = Some(1);
+        parent.operation_id = 1;
+        let mut match_node = operation(3, "needle", Some(20));
+        match_node.parent_semantic_id = Some(2);
+        match_node.operation_id = 1;
+        let document = document(vec![root, other_root, parent, match_node]);
+
+        let contextual = render_terminal_view(
+            &document,
+            InspectSelection::Semantic(1),
+            InspectSort::Duration,
+            Some("needle"),
+            10,
+            2,
+        )
+        .expect("filtered semantics should render");
+        assert!(contextual.contains("filter: \"needle\""));
+        assert!(contextual.contains("id=semantic:2 "));
+        assert!(contextual.contains("id=semantic:3 "));
+
+        let exact = render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            Some("semantic:1"),
+            10,
+            0,
+        )
+        .expect("exact identity filter should render");
+        assert!(exact.contains("id=semantic:1 "));
+        assert!(!exact.contains("id=semantic:10 "));
     }
 
     #[test]
@@ -618,12 +811,14 @@ mod tests {
             function(1, 12, Some(11), "leaf", 3, 3),
             function(1, 10, None, "first root", 1, 6),
             function(1, 11, Some(10), "child\u{1b}", 2, 5),
+            function(1, 13, Some(10), "other child", 0, 0),
         ];
 
         let semantic = render_terminal_view(
             &document,
             InspectSelection::Semantic(1),
             InspectSort::Duration,
+            None,
             10,
             1,
         )
@@ -647,6 +842,7 @@ mod tests {
                 function_id: 10,
             },
             InspectSort::InclusiveCpu,
+            None,
             10,
             2,
         )
@@ -658,6 +854,38 @@ mod tests {
         assert!(function.contains("inclusive_context_percent=83.33%"));
         assert!(function.contains(r#"symbol="child\u{1B}""#));
 
+        let filtered = render_terminal_view(
+            &document,
+            InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 10,
+            },
+            InspectSort::InclusiveCpu,
+            Some("leaf"),
+            10,
+            2,
+        )
+        .expect("filtered function children should render");
+        assert!(filtered.contains("id=function:1:11 "));
+        assert!(filtered.contains("id=function:1:12 "));
+        assert!(!filtered.contains("id=function:1:13 "));
+
+        let exact = render_terminal_view(
+            &document,
+            InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 10,
+            },
+            InspectSort::InclusiveCpu,
+            Some("function:1:11"),
+            10,
+            2,
+        )
+        .expect("exact function filter should render");
+        assert!(exact.contains("id=function:1:11 "));
+        assert!(!exact.contains("id=function:1:12 "));
+        assert!(!exact.contains("id=function:1:13 "));
+
         assert_eq!(
             render_terminal_view(
                 &document,
@@ -666,6 +894,7 @@ mod tests {
                     function_id: 10,
                 },
                 InspectSort::InclusiveCpu,
+                None,
                 10,
                 1,
             ),

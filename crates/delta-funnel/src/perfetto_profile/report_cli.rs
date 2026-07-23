@@ -15,6 +15,7 @@ use super::report_terminal::{InspectSelection, InspectSort, TerminalInspectError
 const DEFAULT_INSPECT_LIMIT: u16 = 20;
 const MAX_INSPECT_LIMIT: u16 = 200;
 const MAX_INSPECT_DEPTH: u16 = 32;
+const MAX_FILTER_CHARS: usize = 128;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
@@ -74,6 +75,10 @@ struct InspectArgs {
     )]
     function: Option<FunctionSelector>,
 
+    /// Retain matching rows and their contextual ancestors.
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    filter: Option<FilterText>,
+
     /// Sort sibling rows by the selected metric.
     #[arg(long, value_enum)]
     sort: Option<InspectSort>,
@@ -90,6 +95,20 @@ struct InspectArgs {
 struct FunctionSelector {
     semantic_id: i64,
     function_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterText(String);
+
+impl FromStr for FilterText {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() || value.chars().count() > MAX_FILTER_CHARS {
+            return Err("filter must contain between 1 and 128 characters");
+        }
+        Ok(Self(value.to_owned()))
+    }
 }
 
 impl FromStr for FunctionSelector {
@@ -122,6 +141,7 @@ enum CliArgumentError {
     InvalidDepth,
     InvalidSemanticId,
     InvalidFunctionId,
+    InvalidFilter,
     InvalidSort,
     IncompatibleSelectors,
     IncompatibleSort,
@@ -144,6 +164,7 @@ impl fmt::Display for CliArgumentError {
             Self::InvalidFunctionId => {
                 "function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"
             }
+            Self::InvalidFilter => "filter must contain between 1 and 128 characters",
             Self::InvalidSort => "sort must be duration, inclusive-cpu, self-cpu, or name",
             Self::IncompatibleSelectors => "--semantic and --function cannot be used together",
             Self::IncompatibleSort => "function callsites cannot be sorted by exact duration",
@@ -169,6 +190,7 @@ impl CliArgumentError {
             Self::InvalidDepth => "invalid_depth",
             Self::InvalidSemanticId => "invalid_semantic_id",
             Self::InvalidFunctionId => "invalid_function_id",
+            Self::InvalidFilter => "invalid_filter",
             Self::InvalidSort => "invalid_sort",
             Self::IncompatibleSelectors => "incompatible_selectors",
             Self::IncompatibleSort => "incompatible_sort",
@@ -401,6 +423,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
             &document,
             selection,
             sort,
+            args.filter.as_ref().map(|filter| filter.0.as_str()),
             usize::from(args.limit),
             args.depth.map_or_else(
                 || usize::from(selection != InspectSelection::Root),
@@ -484,6 +507,14 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
             ) =>
         {
             CliArgumentError::InvalidFunctionId
+        }
+        ErrorKind::ValueValidation
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--filter")
+            ) =>
+        {
+            CliArgumentError::InvalidFilter
         }
         ErrorKind::InvalidValue
             if matches!(
@@ -736,6 +767,7 @@ mod tests {
         assert!(help.contains("--limit <LIMIT>"));
         assert!(help.contains("--semantic <ID>"));
         assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
+        assert!(help.contains("--filter <TEXT>"));
         assert!(help.contains("--sort <SORT>"));
         assert!(help.contains("--depth <DEPTH>"));
 
@@ -750,6 +782,8 @@ mod tests {
                 "42",
                 "--sort",
                 "self-cpu",
+                "--filter",
+                "scan",
                 "--depth",
                 "3",
             ])?,
@@ -759,6 +793,7 @@ mod tests {
                     limit: 7,
                     semantic: Some(42),
                     function: None,
+                    filter: Some(FilterText("scan".to_owned())),
                     sort: Some(InspectSort::SelfCpu),
                     depth: Some(3),
                 }),
@@ -781,6 +816,7 @@ mod tests {
                         semantic_id: 42,
                         function_id: 7,
                     }),
+                    filter: None,
                     sort: None,
                     depth: None,
                 }),
@@ -815,6 +851,7 @@ mod tests {
                     semantic_id: 1,
                     function_id: 2,
                 }),
+                filter: None,
                 sort: Some(InspectSort::Duration),
                 depth: None,
             }),
@@ -916,6 +953,15 @@ mod tests {
                     OsString::from("42"),
                 ],
                 CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--filter"),
+                    OsString::new(),
+                ],
+                CliArgumentError::InvalidFilter,
             ),
             (
                 vec![
