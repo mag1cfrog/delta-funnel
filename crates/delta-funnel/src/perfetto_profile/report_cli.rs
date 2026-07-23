@@ -9,6 +9,9 @@ use std::path::{Component, Path, PathBuf};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 
+const DEFAULT_INSPECT_LIMIT: u16 = 20;
+const MAX_INSPECT_LIMIT: u16 = 200;
+
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
     name = "delta-funnel-perfetto",
@@ -24,6 +27,9 @@ struct PerfettoCli {
 enum PerfettoCommand {
     /// Generate a ranked HTML report from a raw trace.
     Report(RankedReportArgs),
+
+    /// Inspect ranked profiling data in the terminal.
+    Inspect(InspectArgs),
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -37,6 +43,21 @@ struct RankedReportArgs {
     output: Option<PathBuf>,
 }
 
+#[derive(Args, Debug, PartialEq, Eq)]
+struct InspectArgs {
+    /// Raw Perfetto trace to inspect.
+    #[arg(value_name = "INPUT.pftrace")]
+    input: PathBuf,
+
+    /// Maximum number of operation roots to display.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_INSPECT_LIMIT,
+        value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_INSPECT_LIMIT))
+    )]
+    limit: u16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CliArgumentError {
     MissingCommand,
@@ -45,6 +66,7 @@ enum CliArgumentError {
     MissingOutputValue,
     DuplicateOutput,
     MultipleInputs,
+    InvalidLimit,
     UnknownOption,
 }
 
@@ -57,6 +79,7 @@ impl fmt::Display for CliArgumentError {
             Self::MissingOutputValue => "--output requires a path",
             Self::DuplicateOutput => "--output may be specified only once",
             Self::MultipleInputs => "only one input trace path may be provided",
+            Self::InvalidLimit => "limit must be between 1 and 200",
             Self::UnknownOption => "unknown option",
         };
         formatter.write_str(message)
@@ -74,6 +97,7 @@ impl CliArgumentError {
             Self::MissingOutputValue => "missing_output_value",
             Self::DuplicateOutput => "duplicate_output",
             Self::MultipleInputs => "multiple_inputs",
+            Self::InvalidLimit => "invalid_limit",
             Self::UnknownOption => "unknown_option",
         }
     }
@@ -251,6 +275,9 @@ fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -
         Ok(PerfettoCli {
             command: PerfettoCommand::Report(args),
         }) => run_report_command(args),
+        Ok(PerfettoCli {
+            command: PerfettoCommand::Inspect(args),
+        }) => run_inspect_command(args),
         Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => {
             if error.print().is_ok() {
                 0
@@ -259,6 +286,23 @@ fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -
             }
         }
         Err(error) => emit_failure(cli_failure(&args, &error)),
+    }
+}
+
+fn run_inspect_command(args: InspectArgs) -> i32 {
+    let input = match preflight_ranked_profile_input(&args.input) {
+        Ok(input) => input,
+        Err(error) => return emit_failure(error.into()),
+    };
+    match super::load_ranked_profile(&input) {
+        Ok(document) => {
+            print!(
+                "{}",
+                super::render_operation_roots(&document, usize::from(args.limit))
+            );
+            0
+        }
+        Err(error) => emit_failure(error),
     }
 }
 
@@ -279,19 +323,29 @@ fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentErro
     let Some(command) = args.first() else {
         return CliArgumentError::MissingCommand;
     };
-    if command != "report" {
+    if command != "report" && command != "inspect" {
         return CliArgumentError::UnknownCommand;
     }
-    if matches!(
-        args.last().and_then(|argument| argument.to_str()),
-        Some("--output")
-    ) {
+    if command == "report"
+        && matches!(
+            args.last().and_then(|argument| argument.to_str()),
+            Some("--output")
+        )
+    {
         return CliArgumentError::MissingOutputValue;
     }
     match error.kind() {
         ErrorKind::MissingRequiredArgument => CliArgumentError::MissingInput,
         ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOutput,
         ErrorKind::TooManyValues => CliArgumentError::MultipleInputs,
+        ErrorKind::ValueValidation
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--limit")
+            ) =>
+        {
+            CliArgumentError::InvalidLimit
+        }
         ErrorKind::UnknownArgument => match error.get(ContextKind::InvalidArg) {
             Some(ContextValue::String(argument)) if !argument.starts_with('-') => {
                 CliArgumentError::MultipleInputs
@@ -350,17 +404,7 @@ pub(super) fn preflight_ranked_report_paths(
     input: &Path,
     output: &Path,
 ) -> Result<RankedReportPaths, RankedReportPathError> {
-    let input_file = File::open(input).map_err(RankedReportPathError::InputUnreadable)?;
-    if !input_file
-        .metadata()
-        .map_err(RankedReportPathError::InputUnreadable)?
-        .is_file()
-    {
-        return Err(RankedReportPathError::InputNotFile);
-    }
-    let input = input
-        .canonicalize()
-        .map_err(RankedReportPathError::InputUnreadable)?;
+    let input = preflight_ranked_profile_input(input)?;
     let output = absolute_path(output).map_err(RankedReportPathError::OutputInspection)?;
     if output.file_name().is_none() {
         return Err(RankedReportPathError::OutputHasNoFileName);
@@ -375,6 +419,23 @@ pub(super) fn preflight_ranked_report_paths(
         Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
     }
     Ok(RankedReportPaths { input, output })
+}
+
+pub(super) fn preflight_ranked_profile_input(
+    input: &Path,
+) -> Result<PathBuf, RankedReportPathError> {
+    let input_file = File::open(input).map_err(RankedReportPathError::InputUnreadable)?;
+    if !input_file
+        .metadata()
+        .map_err(RankedReportPathError::InputUnreadable)?
+        .is_file()
+    {
+        return Err(RankedReportPathError::InputNotFile);
+    }
+    let input = input
+        .canonicalize()
+        .map_err(RankedReportPathError::InputUnreadable)?;
+    Ok(input)
 }
 
 fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
@@ -457,6 +518,7 @@ mod tests {
         let root_help = root_help.to_string();
         assert!(root_help.contains("Generate and inspect Delta Funnel Perfetto diagnostics"));
         assert!(root_help.contains("report"));
+        assert!(root_help.contains("inspect"));
 
         let report_help =
             PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "--help"])
@@ -503,6 +565,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_inspect_arguments_and_generates_help() -> Result<(), Box<dyn std::error::Error>> {
+        let help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "inspect", "--help"])
+            .err()
+            .ok_or("inspect help should stop parsing")?;
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        assert!(help.contains("INPUT.pftrace"));
+        assert!(help.contains("--limit <LIMIT>"));
+
+        assert_eq!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--limit",
+                "7",
+            ])?,
+            PerfettoCli {
+                command: PerfettoCommand::Inspect(InspectArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    limit: 7,
+                }),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dispatches_commands_and_maps_failure_phases_to_exit_codes() {
         assert_eq!(
             run_perfetto_diagnostics_cli_with([OsString::from("--help")]),
@@ -510,6 +600,13 @@ mod tests {
         );
         assert_eq!(
             run_perfetto_diagnostics_cli_with([OsString::from("report"), OsString::from("--help")]),
+            0
+        );
+        assert_eq!(
+            run_perfetto_diagnostics_cli_with([
+                OsString::from("inspect"),
+                OsString::from("--help")
+            ]),
             0
         );
         assert_eq!(
@@ -568,6 +665,19 @@ mod tests {
             (
                 vec![OsString::from("report"), OsString::from("--unknown")],
                 CliArgumentError::UnknownOption,
+            ),
+            (
+                vec![OsString::from("inspect")],
+                CliArgumentError::MissingInput,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                    OsString::from("0"),
+                ],
+                CliArgumentError::InvalidLimit,
             ),
         ] {
             let error = PerfettoCli::try_parse_from(

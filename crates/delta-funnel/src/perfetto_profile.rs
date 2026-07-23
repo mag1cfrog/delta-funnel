@@ -25,6 +25,7 @@ mod report_aggregate;
 mod report_cli;
 mod report_health;
 mod report_html;
+mod report_terminal;
 mod report_trace_processor;
 mod report_trace_sanitizer;
 
@@ -35,6 +36,7 @@ use report_cli::RankedReportFailurePhase;
 pub use report_cli::run_perfetto_diagnostics_cli;
 use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
 use report_html::{render_ranked_profile_html, write_ranked_profile_html};
+use report_terminal::render_operation_roots;
 
 fn generate_ranked_profile_report(
     input: &Path,
