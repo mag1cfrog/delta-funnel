@@ -60,10 +60,20 @@ jobs:
               - '.github/workflows/pypi.yml'
 
   rust:
-    name: Rust Checks
+    name: Rust Checks / ${{ matrix.name }}
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Default Tests
+            task: default-tests
+          - name: All Features
+            task: all-features
+          - name: Lints and Docs
+            task: lints-and-docs
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -99,21 +109,23 @@ jobs:
           python-version: "3.12"
 
       - name: Check formatting
+        if: matrix.task == 'lints-and-docs'
         run: cargo fmt --all --check
 
-      - name: Check workspace
-        run: cargo check --workspace
-
       - name: Test workspace
+        if: matrix.task == 'default-tests'
         run: cargo test --workspace
 
       - name: Test workspace with all features
+        if: matrix.task == 'all-features'
         run: cargo test --workspace --all-targets --all-features
 
       - name: Lint workspace
+        if: matrix.task == 'lints-and-docs'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Check Rust API documentation
+        if: matrix.task == 'lints-and-docs'
         run: |
           cargo doc --workspace --no-deps
           test ! -e target/doc/delta_funnel/progress/index.html
@@ -123,6 +135,7 @@ jobs:
           fi
 
       - name: Check whitespace
+        if: matrix.task == 'lints-and-docs'
         run: git diff --check
 
   python-package:
