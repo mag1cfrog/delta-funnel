@@ -871,12 +871,14 @@ fn safe_basename(value: &str) -> Option<&str> {
 }
 
 fn is_safe_path_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && !matches!(segment, "." | ".." | "~")
-        && !segment.starts_with('~')
-        && !(segment.len() >= 2
-            && segment.as_bytes()[0].is_ascii_alphabetic()
-            && segment.as_bytes()[1] == b':')
+    if segment.is_empty() || matches!(segment, "." | "..") || segment.starts_with('~') {
+        return false;
+    }
+    let bytes = segment.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    true
 }
 
 fn is_absolute_path(value: &str) -> bool {
