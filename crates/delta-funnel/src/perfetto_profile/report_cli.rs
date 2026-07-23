@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -126,111 +125,6 @@ struct InspectState {
     filter: Option<String>,
     limit: usize,
     depth: Option<usize>,
-}
-
-struct InspectNavigation {
-    semantic_parents: HashMap<i64, Option<i64>>,
-    function_parents: HashMap<(i64, i64), Option<i64>>,
-}
-
-impl InspectNavigation {
-    fn new(document: &super::ranked_report::RankedProfileDocument) -> Self {
-        Self {
-            semantic_parents: document
-                .semantics
-                .iter()
-                .map(|semantic| (semantic.semantic_id, semantic.parent_semantic_id))
-                .collect(),
-            function_parents: document
-                .functions
-                .iter()
-                .map(|function| {
-                    (
-                        (function.semantic_id, function.function_id),
-                        function.parent_function_id,
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    fn open_semantic(
-        &self,
-        selection: InspectSelection,
-        semantic_id: i64,
-    ) -> Result<InspectSelection, &'static str> {
-        let parent = match selection {
-            InspectSelection::Root => None,
-            InspectSelection::Semantic(parent) => Some(parent),
-            InspectSelection::Function { .. } => {
-                return Err("semantic target is not an immediate child");
-            }
-        };
-        if self.semantic_parents.get(&semantic_id).copied() != Some(parent) {
-            return Err("semantic target is not an immediate child");
-        }
-        Ok(InspectSelection::Semantic(semantic_id))
-    }
-
-    fn open_function(
-        &self,
-        selection: InspectSelection,
-        semantic_id: i64,
-        function_id: i64,
-    ) -> Result<InspectSelection, &'static str> {
-        let parent = match selection {
-            InspectSelection::Semantic(owner) if owner == semantic_id => None,
-            InspectSelection::Function {
-                semantic_id: owner,
-                function_id: parent,
-            } if owner == semantic_id => Some(parent),
-            InspectSelection::Root
-            | InspectSelection::Semantic(_)
-            | InspectSelection::Function { .. } => {
-                return Err("function target is not an immediate child");
-            }
-        };
-        if self
-            .function_parents
-            .get(&(semantic_id, function_id))
-            .copied()
-            != Some(parent)
-        {
-            return Err("function target is not an immediate child");
-        }
-        Ok(InspectSelection::Function {
-            semantic_id,
-            function_id,
-        })
-    }
-
-    fn up(&self, selection: InspectSelection) -> Result<InspectSelection, &'static str> {
-        match selection {
-            InspectSelection::Root => Err("already at operation roots"),
-            InspectSelection::Semantic(semantic_id) => self
-                .semantic_parents
-                .get(&semantic_id)
-                .copied()
-                .map(|parent| parent.map_or(InspectSelection::Root, InspectSelection::Semantic))
-                .ok_or("current semantic selection does not exist"),
-            InspectSelection::Function {
-                semantic_id,
-                function_id,
-            } => self
-                .function_parents
-                .get(&(semantic_id, function_id))
-                .copied()
-                .map(|parent| {
-                    parent.map_or(InspectSelection::Semantic(semantic_id), |function_id| {
-                        InspectSelection::Function {
-                            semantic_id,
-                            function_id,
-                        }
-                    })
-                })
-                .ok_or("current function selection does not exist"),
-        }
-    }
 }
 
 impl InspectState {
@@ -605,7 +499,6 @@ fn run_interactive_session(
     error: &mut impl Write,
     prompt: bool,
 ) -> Result<(), RankedReportFailure> {
-    let navigation = InspectNavigation::new(document);
     let index = TerminalProfileIndex::new(document);
     let initial = state.render(&index).map_err(RankedReportFailure::from)?;
     write_interactive_response(output, &initial)?;
@@ -624,7 +517,7 @@ fn run_interactive_session(
                 write_interactive_response(output, "")?;
             }
             InteractiveLine::Command(command) => {
-                match run_interactive_command(&index, &navigation, state, command.trim()) {
+                match run_interactive_command(&index, state, command.trim()) {
                     Ok(InteractiveCommandResult::Output(response)) => {
                         write_interactive_response(output, &response)?;
                     }
@@ -649,7 +542,6 @@ enum InteractiveCommandResult {
 
 fn run_interactive_command(
     index: &TerminalProfileIndex<'_>,
-    navigation: &InspectNavigation,
     state: &mut InspectState,
     command: &str,
 ) -> Result<InteractiveCommandResult, &'static str> {
@@ -659,7 +551,7 @@ fn run_interactive_command(
             .map(InteractiveCommandResult::Output)
             .map_err(|_| "current profile selection does not exist"),
         "up" => {
-            state.selection = navigation.up(state.selection)?;
+            state.selection = index.up(state.selection)?;
             render_interactive_selection(index, state)
         }
         "root" => {
@@ -728,12 +620,12 @@ fn run_interactive_command(
                 let semantic_id = semantic_id
                     .parse()
                     .map_err(|_| "invalid semantic identity; expected semantic:ID")?;
-                state.selection = navigation.open_semantic(state.selection, semantic_id)?;
+                state.selection = index.open_semantic(state.selection, semantic_id)?;
             } else if let Some(function) = target.strip_prefix("function:") {
                 let function = function.parse::<FunctionSelector>().map_err(|_| {
                     "invalid function identity; expected function:SEMANTIC_ID:FUNCTION_ID"
                 })?;
-                state.selection = navigation.open_function(
+                state.selection = index.open_function(
                     state.selection,
                     function.semantic_id,
                     function.function_id,
@@ -1469,7 +1361,6 @@ mod tests {
     fn interactive_sort_and_limit_validate_before_changing_state() -> Result<(), &'static str> {
         let document = interactive_document();
         let index = TerminalProfileIndex::new(&document);
-        let navigation = InspectNavigation::new(&document);
         let mut state = InspectState {
             selection: InspectSelection::Root,
             sort: InspectSort::Duration,
@@ -1479,43 +1370,33 @@ mod tests {
         };
 
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, "open semantic:1"),
+            run_interactive_command(&index, &mut state, "open semantic:1"),
             Ok(InteractiveCommandResult::Output(_))
         ));
-        let output = interactive_output(run_interactive_command(
-            &index,
-            &navigation,
-            &mut state,
-            "limit 1",
-        ))?;
+        let output = interactive_output(run_interactive_command(&index, &mut state, "limit 1"))?;
         assert_eq!(state.limit, 1);
         assert!(output.contains("showing: 1 of 2; truncated: true"));
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, "limit 0"),
+            run_interactive_command(&index, &mut state, "limit 0"),
             Err("limit must be between 1 and 200")
         ));
         assert_eq!(state.limit, 1);
 
-        let output = interactive_output(run_interactive_command(
-            &index,
-            &navigation,
-            &mut state,
-            "sort name",
-        ))?;
+        let output = interactive_output(run_interactive_command(&index, &mut state, "sort name"))?;
         assert_eq!(state.sort, InspectSort::Name);
         assert!(output.contains("sort: name"));
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, "sort unknown"),
+            run_interactive_command(&index, &mut state, "sort unknown"),
             Err("invalid sort; expected duration, inclusive-cpu, self-cpu, or name")
         ));
         assert_eq!(state.sort, InspectSort::Name);
 
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, "open function:1:10"),
+            run_interactive_command(&index, &mut state, "open function:1:10"),
             Ok(InteractiveCommandResult::Output(_))
         ));
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, "sort duration"),
+            run_interactive_command(&index, &mut state, "sort duration"),
             Err("function callsites cannot be sorted by exact duration")
         ));
         assert_eq!(state.sort, InspectSort::Name);
@@ -1526,7 +1407,6 @@ mod tests {
     fn interactive_filter_is_bounded_and_clearable() -> Result<(), &'static str> {
         let document = interactive_document();
         let index = TerminalProfileIndex::new(&document);
-        let navigation = InspectNavigation::new(&document);
         let mut state = InspectState {
             selection: InspectSelection::Semantic(1),
             sort: InspectSort::Duration,
@@ -1537,7 +1417,6 @@ mod tests {
 
         let output = interactive_output(run_interactive_command(
             &index,
-            &navigation,
             &mut state,
             "filter planning",
         ))?;
@@ -1547,22 +1426,17 @@ mod tests {
 
         let oversized = format!("filter {}", "x".repeat(MAX_FILTER_CHARS + 1));
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, &oversized),
+            run_interactive_command(&index, &mut state, &oversized),
             Err("filter must contain between 1 and 128 characters")
         ));
         assert_eq!(state.filter.as_deref(), Some("planning"));
         assert!(matches!(
-            run_interactive_command(&index, &navigation, &mut state, "filter"),
+            run_interactive_command(&index, &mut state, "filter"),
             Err("filter must contain between 1 and 128 characters")
         ));
         assert_eq!(state.filter.as_deref(), Some("planning"));
 
-        let output = interactive_output(run_interactive_command(
-            &index,
-            &navigation,
-            &mut state,
-            "clear",
-        ))?;
+        let output = interactive_output(run_interactive_command(&index, &mut state, "clear"))?;
         assert_eq!(state.filter, None);
         assert!(output.contains("filter: none"));
         Ok(())

@@ -146,6 +146,92 @@ impl<'a> TerminalProfileIndex<'a> {
             ),
         }
     }
+
+    pub(super) fn open_semantic(
+        &self,
+        selection: InspectSelection,
+        semantic_id: i64,
+    ) -> Result<InspectSelection, &'static str> {
+        let parent = match selection {
+            InspectSelection::Root => None,
+            InspectSelection::Semantic(parent) => Some(parent),
+            InspectSelection::Function { .. } => {
+                return Err("semantic target is not an immediate child");
+            }
+        };
+        if self
+            .semantics
+            .get(&semantic_id)
+            .map(|semantic| semantic.parent_semantic_id)
+            != Some(parent)
+        {
+            return Err("semantic target is not an immediate child");
+        }
+        Ok(InspectSelection::Semantic(semantic_id))
+    }
+
+    pub(super) fn open_function(
+        &self,
+        selection: InspectSelection,
+        semantic_id: i64,
+        function_id: i64,
+    ) -> Result<InspectSelection, &'static str> {
+        let parent = match selection {
+            InspectSelection::Semantic(owner) if owner == semantic_id => None,
+            InspectSelection::Function {
+                semantic_id: owner,
+                function_id: parent,
+            } if owner == semantic_id => Some(parent),
+            InspectSelection::Root
+            | InspectSelection::Semantic(_)
+            | InspectSelection::Function { .. } => {
+                return Err("function target is not an immediate child");
+            }
+        };
+        if self
+            .functions
+            .get(&(semantic_id, function_id))
+            .map(|function| function.parent_function_id)
+            != Some(parent)
+        {
+            return Err("function target is not an immediate child");
+        }
+        Ok(InspectSelection::Function {
+            semantic_id,
+            function_id,
+        })
+    }
+
+    pub(super) fn up(&self, selection: InspectSelection) -> Result<InspectSelection, &'static str> {
+        match selection {
+            InspectSelection::Root => Err("already at operation roots"),
+            InspectSelection::Semantic(semantic_id) => self
+                .semantics
+                .get(&semantic_id)
+                .map(|semantic| {
+                    semantic
+                        .parent_semantic_id
+                        .map_or(InspectSelection::Root, InspectSelection::Semantic)
+                })
+                .ok_or("current semantic selection does not exist"),
+            InspectSelection::Function {
+                semantic_id,
+                function_id,
+            } => self
+                .functions
+                .get(&(semantic_id, function_id))
+                .map(|function| {
+                    function.parent_function_id.map_or(
+                        InspectSelection::Semantic(semantic_id),
+                        |function_id| InspectSelection::Function {
+                            semantic_id,
+                            function_id,
+                        },
+                    )
+                })
+                .ok_or("current function selection does not exist"),
+        }
+    }
 }
 
 #[cfg(test)]
