@@ -667,12 +667,26 @@ fn run_interactive_command(
             state.selection = InspectSelection::Root;
             render_interactive_selection(document, state)
         }
+        "clear" => {
+            state.filter = None;
+            render_interactive_selection(document, state)
+        }
         "help" => Ok(InteractiveCommandResult::Output(
-            "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, sort METRIC, limit N, help, quit\n"
+            "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, sort METRIC, filter TEXT, clear, limit N, help, quit\n"
                 .to_owned(),
         )),
         "quit" => Ok(InteractiveCommandResult::Quit),
         _ => {
+            if command == "filter" || command.starts_with("filter ") {
+                let value = command
+                    .strip_prefix("filter ")
+                    .ok_or("filter must contain between 1 and 128 characters")?;
+                let filter = value
+                    .parse::<FilterText>()
+                    .map_err(|_| "filter must contain between 1 and 128 characters")?;
+                state.filter = Some(filter.0);
+                return render_interactive_selection(document, state);
+            }
             if command == "sort" || command.starts_with("sort ") {
                 let value = command
                     .strip_prefix("sort ")
@@ -1463,6 +1477,48 @@ mod tests {
             Err("function callsites cannot be sorted by exact duration")
         ));
         assert_eq!(state.sort, InspectSort::Name);
+    }
+
+    #[test]
+    fn interactive_filter_is_bounded_and_clearable() {
+        let document = interactive_document();
+        let navigation = InspectNavigation::new(&document);
+        let mut state = InspectState {
+            selection: InspectSelection::Semantic(1),
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+
+        let Ok(InteractiveCommandResult::Output(output)) =
+            run_interactive_command(&document, &navigation, &mut state, "filter planning")
+        else {
+            panic!("a valid filter should render the current view");
+        };
+        assert_eq!(state.filter.as_deref(), Some("planning"));
+        assert!(output.contains("filter: \"planning\""));
+        assert!(output.contains("id=semantic:2"));
+
+        let oversized = format!("filter {}", "x".repeat(MAX_FILTER_CHARS + 1));
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, &oversized),
+            Err("filter must contain between 1 and 128 characters")
+        ));
+        assert_eq!(state.filter.as_deref(), Some("planning"));
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, "filter"),
+            Err("filter must contain between 1 and 128 characters")
+        ));
+        assert_eq!(state.filter.as_deref(), Some("planning"));
+
+        let Ok(InteractiveCommandResult::Output(output)) =
+            run_interactive_command(&document, &navigation, &mut state, "clear")
+        else {
+            panic!("clear should render the current view");
+        };
+        assert_eq!(state.filter, None);
+        assert!(output.contains("filter: none"));
     }
 
     #[test]
