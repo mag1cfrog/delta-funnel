@@ -1,3 +1,9 @@
+//! Bounded pre-processing for ranked report traces.
+//!
+//! This module inspects only protobuf framing, compression wrappers, and the
+//! skip and sequence-control fields below. Trace Processor remains the
+//! authoritative semantic event, sample, and callstack parser.
+
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -6,20 +12,30 @@ use std::path::Path;
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use perfetto_sdk::protos::trace::trace::TraceFieldNumber;
+use perfetto_sdk::protos::trace::trace_packet::{TracePacketFieldNumber, TracePacketSequenceFlags};
 use tempfile::NamedTempFile;
 
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 
-const TRACE_PACKET_TAG: u64 = 1 << 3 | 2;
+const TRACE_PACKET_TAG: u64 = (TraceFieldNumber::Packet as u64) << 3 | 2;
 const PERF_SAMPLE_FIELD: u64 = 66;
 const COMPRESSED_PACKETS_FIELD: u64 = 50;
 const ZSTD_COMPRESSED_PACKETS_FIELD: u64 = 133;
 const SAMPLE_SKIPPED_REASON_FIELD: u64 = 18;
 const PROFILER_SKIP_NOT_IN_SCOPE: u64 = 4;
-const SEQUENCE_FLAGS_FIELD: u64 = 13;
-const SEQUENCE_NEEDS_INCREMENTAL_STATE: u64 = 2;
+const SEQUENCE_FLAGS_FIELD: u64 = TracePacketFieldNumber::SequenceFlags as u64;
+const SEQUENCE_NEEDS_INCREMENTAL_STATE: u64 =
+    TracePacketSequenceFlags::SeqNeedsIncrementalState as u64;
 const PREVIOUS_PACKET_DROPPED_FIELD: u64 = 42;
-const FIRST_PACKET_ON_SEQUENCE_FIELD: u64 = 87;
+const FIRST_PACKET_ON_SEQUENCE_FIELD: u64 = TracePacketFieldNumber::FirstPacketOnSequence as u64;
+const TIMESTAMP_FIELD: u64 = TracePacketFieldNumber::Timestamp as u64;
+const TIMESTAMP_CLOCK_ID_FIELD: u64 = TracePacketFieldNumber::TimestampClockId as u64;
+const TRACK_EVENT_FIELD: u64 = TracePacketFieldNumber::TrackEvent as u64;
+const TRUSTED_PACKET_SEQUENCE_ID_FIELD: u64 =
+    TracePacketFieldNumber::TrustedPacketSequenceId as u64;
+const TRUSTED_PID_FIELD: u64 = TracePacketFieldNumber::TrustedPid as u64;
+const TRUSTED_UID_FIELD: u64 = TracePacketFieldNumber::TrustedUid as u64;
 const LEGACY_COMPOSED_SEQUENCE_ID: u64 = 4_000_000_000;
 const LEGACY_UNIFIED_CATEGORY_PREFIX: &[u8] = b"delta_funnel.unified.";
 const COMPRESSED_CHUNK_BYTES: usize = 384 * 1024;
@@ -154,11 +170,11 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
                     only_skip_envelope_fields = false;
                 }
             }
-            10 => {
+            TRUSTED_PACKET_SEQUENCE_ID_FIELD => {
                 is_legacy_sequence |= field.varint == Some(LEGACY_COMPOSED_SEQUENCE_ID);
                 only_skip_envelope_fields &= field.varint.is_some();
             }
-            11 => {
+            TRACK_EVENT_FIELD => {
                 has_legacy_category |= field.delimited.is_some_and(|event| {
                     event
                         .windows(LEGACY_UNIFIED_CATEGORY_PREFIX.len())
@@ -174,7 +190,9 @@ fn inspect_packet(packet: &[u8]) -> io::Result<PacketAction<'_>> {
             PREVIOUS_PACKET_DROPPED_FIELD | FIRST_PACKET_ON_SEQUENCE_FIELD => {
                 only_skip_envelope_fields &= field.varint == Some(0);
             }
-            3 | 8 | 58 | 79 => only_skip_envelope_fields &= field.varint.is_some(),
+            TRUSTED_UID_FIELD | TIMESTAMP_FIELD | TIMESTAMP_CLOCK_ID_FIELD | TRUSTED_PID_FIELD => {
+                only_skip_envelope_fields &= field.varint.is_some()
+            }
             _ => only_skip_envelope_fields = false,
         }
     }
