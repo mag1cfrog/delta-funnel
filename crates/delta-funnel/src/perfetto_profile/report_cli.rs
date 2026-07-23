@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -122,7 +123,112 @@ struct InspectState {
     sort: InspectSort,
     filter: Option<String>,
     limit: usize,
-    depth: usize,
+    depth: Option<usize>,
+}
+
+struct InspectNavigation {
+    semantic_parents: HashMap<i64, Option<i64>>,
+    function_parents: HashMap<(i64, i64), Option<i64>>,
+}
+
+impl InspectNavigation {
+    fn new(document: &super::ranked_report::RankedProfileDocument) -> Self {
+        Self {
+            semantic_parents: document
+                .semantics
+                .iter()
+                .map(|semantic| (semantic.semantic_id, semantic.parent_semantic_id))
+                .collect(),
+            function_parents: document
+                .functions
+                .iter()
+                .map(|function| {
+                    (
+                        (function.semantic_id, function.function_id),
+                        function.parent_function_id,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn open_semantic(
+        &self,
+        selection: InspectSelection,
+        semantic_id: i64,
+    ) -> Result<InspectSelection, &'static str> {
+        let parent = match selection {
+            InspectSelection::Root => None,
+            InspectSelection::Semantic(parent) => Some(parent),
+            InspectSelection::Function { .. } => {
+                return Err("semantic target is not an immediate child");
+            }
+        };
+        if self.semantic_parents.get(&semantic_id).copied() != Some(parent) {
+            return Err("semantic target is not an immediate child");
+        }
+        Ok(InspectSelection::Semantic(semantic_id))
+    }
+
+    fn open_function(
+        &self,
+        selection: InspectSelection,
+        semantic_id: i64,
+        function_id: i64,
+    ) -> Result<InspectSelection, &'static str> {
+        let parent = match selection {
+            InspectSelection::Semantic(owner) if owner == semantic_id => None,
+            InspectSelection::Function {
+                semantic_id: owner,
+                function_id: parent,
+            } if owner == semantic_id => Some(parent),
+            InspectSelection::Root
+            | InspectSelection::Semantic(_)
+            | InspectSelection::Function { .. } => {
+                return Err("function target is not an immediate child");
+            }
+        };
+        if self
+            .function_parents
+            .get(&(semantic_id, function_id))
+            .copied()
+            != Some(parent)
+        {
+            return Err("function target is not an immediate child");
+        }
+        Ok(InspectSelection::Function {
+            semantic_id,
+            function_id,
+        })
+    }
+
+    fn up(&self, selection: InspectSelection) -> Result<InspectSelection, &'static str> {
+        match selection {
+            InspectSelection::Root => Err("already at operation roots"),
+            InspectSelection::Semantic(semantic_id) => self
+                .semantic_parents
+                .get(&semantic_id)
+                .copied()
+                .map(|parent| parent.map_or(InspectSelection::Root, InspectSelection::Semantic))
+                .ok_or("current semantic selection does not exist"),
+            InspectSelection::Function {
+                semantic_id,
+                function_id,
+            } => self
+                .function_parents
+                .get(&(semantic_id, function_id))
+                .copied()
+                .map(|parent| {
+                    parent.map_or(InspectSelection::Semantic(semantic_id), |function_id| {
+                        InspectSelection::Function {
+                            semantic_id,
+                            function_id,
+                        }
+                    })
+                })
+                .ok_or("current function selection does not exist"),
+        }
+    }
 }
 
 impl InspectState {
@@ -136,7 +242,8 @@ impl InspectState {
             self.sort,
             self.filter.as_deref(),
             self.limit,
-            self.depth,
+            self.depth
+                .unwrap_or_else(|| usize::from(self.selection != InspectSelection::Root)),
         )
     }
 }
@@ -444,15 +551,12 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
     if matches!(selection, InspectSelection::Function { .. }) && sort == InspectSort::Duration {
         return emit_failure(CliArgumentError::IncompatibleSort.into());
     }
-    let state = InspectState {
+    let mut state = InspectState {
         selection,
         sort,
         filter: args.filter.map(|filter| filter.0),
         limit: usize::from(args.limit),
-        depth: args.depth.map_or_else(
-            || usize::from(selection != InspectSelection::Root),
-            usize::from,
-        ),
+        depth: args.depth.map(usize::from),
     };
     let input = match preflight_ranked_profile_input(&args.input) {
         Ok(input) => input,
@@ -468,7 +572,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
             let mut error = io::stderr().lock();
             match run_interactive_session(
                 &document,
-                &state,
+                &mut state,
                 &mut input,
                 &mut output,
                 &mut error,
@@ -497,12 +601,13 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
 
 fn run_interactive_session(
     document: &super::ranked_report::RankedProfileDocument,
-    state: &InspectState,
+    state: &mut InspectState,
     input: &mut impl BufRead,
     output: &mut impl Write,
     error: &mut impl Write,
     prompt: bool,
 ) -> Result<(), RankedReportFailure> {
+    let navigation = InspectNavigation::new(document);
     let initial = state.render(document).map_err(RankedReportFailure::from)?;
     write_interactive_response(output, &initial)?;
     let mut line = Vec::with_capacity(MAX_INTERACTIVE_COMMAND_BYTES);
@@ -519,23 +624,93 @@ fn run_interactive_session(
                 write_interactive_error(error, message)?;
                 write_interactive_response(output, "")?;
             }
-            InteractiveLine::Command(command) => match command.trim() {
-                "show" => {
-                    let view = state.render(document).map_err(RankedReportFailure::from)?;
-                    write_interactive_response(output, &view)?;
+            InteractiveLine::Command(command) => {
+                match run_interactive_command(document, &navigation, state, command.trim()) {
+                    Ok(InteractiveCommandResult::Output(response)) => {
+                        write_interactive_response(output, &response)?;
+                    }
+                    Ok(InteractiveCommandResult::Quit) => {
+                        write_interactive_response(output, "")?;
+                        return Ok(());
+                    }
+                    Err(message) => {
+                        write_interactive_error(error, message)?;
+                        write_interactive_response(output, "")?;
+                    }
                 }
-                "help" => write_interactive_response(output, "commands: show, help, quit\n")?,
-                "quit" => {
-                    write_interactive_response(output, "")?;
-                    return Ok(());
-                }
-                _ => {
-                    write_interactive_error(error, "unknown interactive command")?;
-                    write_interactive_response(output, "")?;
-                }
-            },
+            }
         }
     }
+}
+
+enum InteractiveCommandResult {
+    Output(String),
+    Quit,
+}
+
+fn run_interactive_command(
+    document: &super::ranked_report::RankedProfileDocument,
+    navigation: &InspectNavigation,
+    state: &mut InspectState,
+    command: &str,
+) -> Result<InteractiveCommandResult, &'static str> {
+    match command {
+        "show" => state
+            .render(document)
+            .map(InteractiveCommandResult::Output)
+            .map_err(|_| "current profile selection does not exist"),
+        "up" => {
+            state.selection = navigation.up(state.selection)?;
+            render_interactive_selection(document, state)
+        }
+        "root" => {
+            state.selection = InspectSelection::Root;
+            render_interactive_selection(document, state)
+        }
+        "help" => Ok(InteractiveCommandResult::Output(
+            "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, help, quit\n"
+                .to_owned(),
+        )),
+        "quit" => Ok(InteractiveCommandResult::Quit),
+        _ => {
+            let target = command
+                .strip_prefix("open ")
+                .ok_or("unknown interactive command")?;
+            if let Some(semantic_id) = target.strip_prefix("semantic:") {
+                let semantic_id = semantic_id
+                    .parse()
+                    .map_err(|_| "invalid semantic identity; expected semantic:ID")?;
+                state.selection = navigation.open_semantic(state.selection, semantic_id)?;
+            } else if let Some(function) = target.strip_prefix("function:") {
+                let function = function.parse::<FunctionSelector>().map_err(|_| {
+                    "invalid function identity; expected function:SEMANTIC_ID:FUNCTION_ID"
+                })?;
+                state.selection = navigation.open_function(
+                    state.selection,
+                    function.semantic_id,
+                    function.function_id,
+                )?;
+                if state.sort == InspectSort::Duration {
+                    state.sort = InspectSort::InclusiveCpu;
+                }
+            } else {
+                return Err(
+                    "invalid open target; expected semantic:ID or function:SEMANTIC_ID:FUNCTION_ID",
+                );
+            }
+            render_interactive_selection(document, state)
+        }
+    }
+}
+
+fn render_interactive_selection(
+    document: &super::ranked_report::RankedProfileDocument,
+    state: &InspectState,
+) -> Result<InteractiveCommandResult, &'static str> {
+    state
+        .render(document)
+        .map(InteractiveCommandResult::Output)
+        .map_err(|_| "current profile selection does not exist")
 }
 
 enum InteractiveLine {
@@ -897,7 +1072,7 @@ mod tests {
 
     fn interactive_document() -> super::super::ranked_report::RankedProfileDocument {
         use super::super::ranked_report::{
-            RankedProfileDocument, RankedProfileMetadata, RankedSemantic,
+            RankedFunction, RankedProfileDocument, RankedProfileMetadata,
         };
 
         RankedProfileDocument {
@@ -911,36 +1086,82 @@ mod tests {
                 ambiguous_sample_count: 0,
                 unattributed_sample_count: 0,
             },
-            semantics: vec![RankedSemantic {
-                semantic_id: 1,
-                parent_semantic_id: None,
-                operation_id: 1,
-                name: "operation".to_owned(),
-                semantic_kind: "operation".to_owned(),
-                operation_kind: Some("preview".to_owned()),
-                stage_category: None,
-                stage_name: None,
-                activity: None,
-                start_ns: 0,
-                end_ns: Some(10),
-                duration_ns: Some(10),
-                time_semantics: "wall_clock".to_owned(),
-                result: Some("completed".to_owned()),
-                is_complete: true,
-                query_execution_id: None,
-                query_scope: None,
-                query_owner: None,
-                worker_lane_id: None,
-                worker_kind: None,
-                node_id: None,
-                parent_node_id: None,
-                operator_partition: None,
-                execution_stream_id: None,
-                stage_owner_id: None,
-                direct_sample_count: 0,
-                inclusive_sample_count: 0,
-            }],
-            functions: Vec::new(),
+            semantics: vec![
+                interactive_semantic(1, None, "operation"),
+                interactive_semantic(2, Some(1), "planning"),
+                interactive_semantic(3, Some(2), "metadata"),
+            ],
+            functions: vec![
+                RankedFunction {
+                    semantic_id: 1,
+                    function_id: 10,
+                    parent_function_id: None,
+                    name: "root_function".to_owned(),
+                    module_name: None,
+                    source_file: None,
+                    line_number: None,
+                    self_sample_count: 1,
+                    inclusive_sample_count: 2,
+                },
+                RankedFunction {
+                    semantic_id: 1,
+                    function_id: 11,
+                    parent_function_id: Some(10),
+                    name: "child_function".to_owned(),
+                    module_name: None,
+                    source_file: None,
+                    line_number: None,
+                    self_sample_count: 1,
+                    inclusive_sample_count: 1,
+                },
+                RankedFunction {
+                    semantic_id: 2,
+                    function_id: 20,
+                    parent_function_id: None,
+                    name: "other_semantic_function".to_owned(),
+                    module_name: None,
+                    source_file: None,
+                    line_number: None,
+                    self_sample_count: 1,
+                    inclusive_sample_count: 1,
+                },
+            ],
+        }
+    }
+
+    fn interactive_semantic(
+        semantic_id: i64,
+        parent_semantic_id: Option<i64>,
+        name: &str,
+    ) -> super::super::ranked_report::RankedSemantic {
+        super::super::ranked_report::RankedSemantic {
+            semantic_id,
+            parent_semantic_id,
+            operation_id: 1,
+            name: name.to_owned(),
+            semantic_kind: name.to_owned(),
+            operation_kind: Some("preview".to_owned()),
+            stage_category: None,
+            stage_name: None,
+            activity: None,
+            start_ns: 0,
+            end_ns: Some(10),
+            duration_ns: Some(10),
+            time_semantics: "wall_clock".to_owned(),
+            result: Some("completed".to_owned()),
+            is_complete: true,
+            query_execution_id: None,
+            query_scope: None,
+            query_owner: None,
+            worker_lane_id: None,
+            worker_kind: None,
+            node_id: None,
+            parent_node_id: None,
+            operator_partition: None,
+            execution_stream_id: None,
+            stage_owner_id: None,
+            direct_sample_count: 2,
+            inclusive_sample_count: 4,
         }
     }
 
@@ -1075,12 +1296,12 @@ mod tests {
     #[test]
     fn interactive_session_is_line_oriented_bounded_and_recoverable() {
         let document = interactive_document();
-        let state = InspectState {
+        let mut state = InspectState {
             selection: InspectSelection::Root,
             sort: InspectSort::Duration,
             filter: None,
             limit: 20,
-            depth: 0,
+            depth: None,
         };
         let mut commands = vec![b'a'; MAX_INTERACTIVE_COMMAND_BYTES + 1];
         commands.extend_from_slice(b"\nshow\nunknown\nhelp\nquit\n");
@@ -1090,7 +1311,7 @@ mod tests {
 
         run_interactive_session(
             &document,
-            &state,
+            &mut state,
             &mut input,
             &mut output,
             &mut error,
@@ -1102,10 +1323,58 @@ mod tests {
         let error = String::from_utf8(error).expect("errors should be UTF-8");
         assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 6);
         assert_eq!(output.matches("context: operation-roots").count(), 2);
-        assert!(output.contains("commands: show, help, quit"));
+        assert!(output.contains("open semantic:ID"));
         assert!(!output.contains("profile> "));
         assert!(error.contains("interactive command exceeds the 1024-byte limit"));
         assert!(error.contains("unknown interactive command"));
+    }
+
+    #[test]
+    fn interactive_navigation_requires_exact_immediate_children() {
+        let document = interactive_document();
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+        let commands = b"open semantic:2\nopen semantic:1\nopen function:1:11\nopen function:2:20\nopen function:1:10\nopen function:1:11\nup\nup\nopen semantic:2\nroot\nup\nquit\n";
+        let mut input = io::Cursor::new(commands);
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+
+        run_interactive_session(
+            &document,
+            &mut state,
+            &mut input,
+            &mut output,
+            &mut error,
+            false,
+        )
+        .expect("navigation errors should preserve the session");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let error = String::from_utf8(error).expect("errors should be UTF-8");
+        assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 13);
+        assert_eq!(output.matches("context: operation-roots").count(), 2);
+        assert_eq!(output.matches("context: semantic:1").count(), 2);
+        assert_eq!(output.matches("context: function:1:10").count(), 2);
+        assert_eq!(output.matches("context: function:1:11").count(), 1);
+        assert_eq!(output.matches("context: semantic:2").count(), 1);
+        assert_eq!(
+            error
+                .matches("semantic target is not an immediate child")
+                .count(),
+            1
+        );
+        assert_eq!(
+            error
+                .matches("function target is not an immediate child")
+                .count(),
+            2
+        );
+        assert!(error.contains("already at operation roots"));
     }
 
     #[test]
