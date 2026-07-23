@@ -668,11 +668,46 @@ fn run_interactive_command(
             render_interactive_selection(document, state)
         }
         "help" => Ok(InteractiveCommandResult::Output(
-            "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, help, quit\n"
+            "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, sort METRIC, limit N, help, quit\n"
                 .to_owned(),
         )),
         "quit" => Ok(InteractiveCommandResult::Quit),
         _ => {
+            if command == "sort" || command.starts_with("sort ") {
+                let value = command
+                    .strip_prefix("sort ")
+                    .ok_or("invalid sort; expected sort METRIC")?;
+                let sort = match value {
+                    "duration" => InspectSort::Duration,
+                    "inclusive-cpu" => InspectSort::InclusiveCpu,
+                    "self-cpu" => InspectSort::SelfCpu,
+                    "name" => InspectSort::Name,
+                    _ => {
+                        return Err(
+                            "invalid sort; expected duration, inclusive-cpu, self-cpu, or name",
+                        );
+                    }
+                };
+                if sort == InspectSort::Duration
+                    && matches!(state.selection, InspectSelection::Function { .. })
+                {
+                    return Err("function callsites cannot be sorted by exact duration");
+                }
+                state.sort = sort;
+                return render_interactive_selection(document, state);
+            }
+            if command == "limit" || command.starts_with("limit ") {
+                let value = command
+                    .strip_prefix("limit ")
+                    .ok_or("invalid limit; expected limit N")?;
+                let limit = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|limit| (1..=MAX_INSPECT_LIMIT).contains(limit))
+                    .ok_or("limit must be between 1 and 200")?;
+                state.limit = usize::from(limit);
+                return render_interactive_selection(document, state);
+            }
             let target = command
                 .strip_prefix("open ")
                 .ok_or("unknown interactive command")?;
@@ -1375,6 +1410,59 @@ mod tests {
             2
         );
         assert!(error.contains("already at operation roots"));
+    }
+
+    #[test]
+    fn interactive_sort_and_limit_validate_before_changing_state() {
+        let document = interactive_document();
+        let navigation = InspectNavigation::new(&document);
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, "open semantic:1"),
+            Ok(InteractiveCommandResult::Output(_))
+        ));
+        let Ok(InteractiveCommandResult::Output(output)) =
+            run_interactive_command(&document, &navigation, &mut state, "limit 1")
+        else {
+            panic!("a valid limit should render the current view");
+        };
+        assert_eq!(state.limit, 1);
+        assert!(output.contains("showing: 1 of 2; truncated: true"));
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, "limit 0"),
+            Err("limit must be between 1 and 200")
+        ));
+        assert_eq!(state.limit, 1);
+
+        let Ok(InteractiveCommandResult::Output(output)) =
+            run_interactive_command(&document, &navigation, &mut state, "sort name")
+        else {
+            panic!("a valid sort should render the current view");
+        };
+        assert_eq!(state.sort, InspectSort::Name);
+        assert!(output.contains("sort: name"));
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, "sort unknown"),
+            Err("invalid sort; expected duration, inclusive-cpu, self-cpu, or name")
+        ));
+        assert_eq!(state.sort, InspectSort::Name);
+
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, "open function:1:10"),
+            Ok(InteractiveCommandResult::Output(_))
+        ));
+        assert!(matches!(
+            run_interactive_command(&document, &navigation, &mut state, "sort duration"),
+            Err("function callsites cannot be sorted by exact duration")
+        ));
+        assert_eq!(state.sort, InspectSort::Name);
     }
 
     #[test]
