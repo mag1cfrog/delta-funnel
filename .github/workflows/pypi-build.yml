@@ -108,6 +108,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: pypi-${{ matrix.artifact }}
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Set up sccache
         if: matrix.host_sccache == 'true'
