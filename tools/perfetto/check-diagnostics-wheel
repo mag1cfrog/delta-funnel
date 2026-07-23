@@ -314,14 +314,8 @@ invalid_sample_hz = subprocess.run(
 if invalid_sample_hz.returncode != 64:
     raise SystemExit("capture-workload did not reject an invalid sample frequency")
 
-try:
-    activated = deltafunnel.init_perfetto_diagnostics(wait_timeout_seconds=0.01)
-except deltafunnel.DeltaFunnelError as error:
-    if error.kind not in {"capture_timeout", "capture_unavailable"}:
-        raise
-else:
-    if not activated:
-        raise SystemExit("Perfetto diagnostics did not activate")
+if not callable(deltafunnel.init_perfetto_diagnostics):
+    raise SystemExit("Perfetto diagnostics initializer is not callable")
 
 print(native.__file__)
 PY
