@@ -7,12 +7,18 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      diagnostics: ${{ steps.filter.outputs.diagnostics }}
+      release_wheel: ${{ steps.filter.outputs.release_wheel }}
 
     steps:
       - name: Checkout
@@ -31,12 +37,54 @@ jobs:
               - 'crates/**'
               - 'xtask/**'
               - '.github/workflows/ci.yml'
+            diagnostics:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/delta-funnel/Cargo.toml'
+              - 'crates/delta-funnel/src/bin/delta_funnel_perfetto.rs'
+              - 'crates/delta-funnel/src/bin/delta_scan_partition_bench.rs'
+              - 'crates/delta-funnel/src/perfetto_profile.rs'
+              - 'crates/delta-funnel/src/perfetto_profile/**'
+              - 'crates/delta-funnel/src/profiling.rs'
+              - 'crates/delta-funnel/src/query_engine/datafusion.rs'
+              - 'crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs'
+              - 'crates/delta-funnel/src/query_engine/datafusion/operator_activity.rs'
+              - 'crates/delta-funnel/tests/perfetto_ranked_report_cli.rs'
+              - 'crates/delta-funnel-python/Cargo.toml'
+              - 'crates/delta-funnel-python/build.rs'
+              - 'crates/delta-funnel-python/pyproject.toml'
+              - 'crates/delta-funnel-python/src/logging.rs'
+              - 'tools/perfetto/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/testpypi-diagnostics-build.yml'
+              - '.github/workflows/testpypi-diagnostics.yml'
+            release_wheel:
+              - '.cargo/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/delta-funnel/**'
+              - 'crates/delta-funnel-python/**'
+              - 'xtask/Cargo.toml'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/pypi-build.yml'
+              - '.github/workflows/pypi.yml'
 
   rust:
-    name: Rust Checks
+    name: Rust Checks / ${{ matrix.task }}
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        task: >-
+          ${{
+            fromJSON(
+              needs.changes.outputs.diagnostics == 'true'
+              && '["Default Tests","All Features","Lints and Docs"]'
+              || '["Default Tests","Lints and Docs"]'
+            )
+          }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -61,6 +109,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: core-ci
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -71,24 +120,23 @@ jobs:
           python-version: "3.12"
 
       - name: Check formatting
+        if: matrix.task == 'Lints and Docs'
         run: cargo fmt --all --check
 
-      - name: Check workspace
-        run: cargo check --workspace
-
       - name: Test workspace
+        if: matrix.task == 'Default Tests'
         run: cargo test --workspace
 
+      - name: Test workspace with all features
+        if: matrix.task == 'All Features'
+        run: cargo test --workspace --all-targets --all-features
+
       - name: Lint workspace
-        run: |
-          cargo build \
-            --package delta-funnel \
-            --features perfetto-profile \
-            --bin delta-funnel-perfetto
-          DELTAFUNNEL_PERFETTO_BIN_DIR="$PWD/target/debug" \
-            cargo clippy --workspace --all-targets --all-features -- -D warnings
+        if: matrix.task == 'Lints and Docs'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Check Rust API documentation
+        if: matrix.task == 'Lints and Docs'
         run: |
           cargo doc --workspace --no-deps
           test ! -e target/doc/delta_funnel/progress/index.html
@@ -98,6 +146,7 @@ jobs:
           fi
 
       - name: Check whitespace
+        if: matrix.task == 'Lints and Docs'
         run: git diff --check
 
   python-package:
@@ -129,6 +178,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: core-ci
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -146,12 +196,26 @@ jobs:
       - name: Check Python package
         run: cargo xtask python-package-check
 
+  release_wheels:
+    name: Release Wheels
+    needs: changes
+    if: needs.changes.outputs.release_wheel == 'true'
+    uses: ./.github/workflows/pypi-build.yml
+
+  diagnostics_wheel:
+    name: Diagnostics Wheel
+    needs: changes
+    if: needs.changes.outputs.diagnostics == 'true'
+    uses: ./.github/workflows/testpypi-diagnostics-build.yml
+
   core-ci:
     name: Core CI
     needs:
       - changes
       - rust
       - python-package
+      - release_wheels
+      - diagnostics_wheel
     if: always()
     runs-on: ubuntu-latest
 
@@ -160,6 +224,18 @@ jobs:
         run: |
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "Detect Changes did not pass: ${{ needs.changes.result }}"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.release_wheel }}" = "true" ] &&
+             [ "${{ needs.release_wheels.result }}" != "success" ]; then
+            echo "Release Wheels did not pass: ${{ needs.release_wheels.result }}"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.diagnostics }}" = "true" ] &&
+             [ "${{ needs.diagnostics_wheel.result }}" != "success" ]; then
+            echo "Diagnostics Wheel did not pass: ${{ needs.diagnostics_wheel.result }}"
             exit 1
           fi
 

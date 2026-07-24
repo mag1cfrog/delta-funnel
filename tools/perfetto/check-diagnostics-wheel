@@ -55,7 +55,6 @@ required = {
     "deltafunnel/perfetto/capture-health",
     "deltafunnel/perfetto/capture-health.sql",
     "deltafunnel/perfetto/capture-workload",
-    "deltafunnel/perfetto/delta-funnel-perfetto",
     "deltafunnel/perfetto/delta-funnel-deep-system.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard-streaming.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard.pbtx",
@@ -67,11 +66,14 @@ with zipfile.ZipFile(wheel_path) as wheel:
     if missing:
         raise SystemExit("missing diagnostics assets: " + ", ".join(missing))
 
-    for name in ["capture-health", "capture-workload", "delta-funnel-perfetto"]:
+    for name in ["capture-health", "capture-workload"]:
         asset = wheel.getinfo(f"deltafunnel/perfetto/{name}")
         mode = asset.external_attr >> 16
         if mode & 0o111 == 0:
             raise SystemExit(f"{name} is not executable in the wheel")
+
+    if "deltafunnel/perfetto/delta-funnel-perfetto" in names:
+        raise SystemExit("diagnostics CLI must not be duplicated as package data")
 PY
 
 "$python" -m venv "$work_dir/venv"
@@ -109,7 +111,6 @@ required = [
     "capture-health",
     "capture-health.sql",
     "capture-workload",
-    "delta-funnel-perfetto",
     *config_names,
 ]
 for name in required:
@@ -142,12 +143,18 @@ if not os.access(health, os.X_OK):
     raise SystemExit("installed capture-health is not executable")
 subprocess.run([health, "--help"], check=True, stdout=subprocess.DEVNULL)
 
-perfetto_cli = assets.joinpath("delta-funnel-perfetto")
+perfetto_cli = Path(sys.executable).with_name("delta-funnel-perfetto")
 if not os.access(perfetto_cli, os.X_OK):
     raise SystemExit("installed delta-funnel-perfetto is not executable")
 subprocess.run([perfetto_cli, "--help"], check=True, stdout=subprocess.DEVNULL)
+subprocess.run([perfetto_cli, "help"], check=True, stdout=subprocess.DEVNULL)
 subprocess.run(
     [perfetto_cli, "report", "--help"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+)
+subprocess.run(
+    [perfetto_cli, "inspect", "--help"],
     check=True,
     stdout=subprocess.DEVNULL,
 )
@@ -307,14 +314,8 @@ invalid_sample_hz = subprocess.run(
 if invalid_sample_hz.returncode != 64:
     raise SystemExit("capture-workload did not reject an invalid sample frequency")
 
-try:
-    activated = deltafunnel.init_perfetto_diagnostics(wait_timeout_seconds=0.01)
-except deltafunnel.DeltaFunnelError as error:
-    if error.kind not in {"capture_timeout", "capture_unavailable"}:
-        raise
-else:
-    if not activated:
-        raise SystemExit("Perfetto diagnostics did not activate")
+if not callable(deltafunnel.init_perfetto_diagnostics):
+    raise SystemExit("Perfetto diagnostics initializer is not callable")
 
 print(native.__file__)
 PY

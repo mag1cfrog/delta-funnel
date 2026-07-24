@@ -51,6 +51,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: sqlserver-integration
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10

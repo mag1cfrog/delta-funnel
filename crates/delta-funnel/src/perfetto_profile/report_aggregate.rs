@@ -488,7 +488,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires trace_processor_shell and a real raw trace"]
-    fn loads_a_real_raw_trace_when_requested() -> Result<(), Box<dyn std::error::Error>> {
+    fn loads_and_renders_a_real_raw_trace_when_requested() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::super::report_terminal::{InspectSelection, InspectSort};
+
         let trace = std::env::var_os("DELTA_FUNNEL_TEST_PERFETTO_TRACE")
             .ok_or("DELTA_FUNNEL_TEST_PERFETTO_TRACE is not set")?;
         let document = load_ranked_profile(Path::new(&trace))?;
@@ -501,6 +504,17 @@ mod tests {
                 .map(|semantic| semantic.direct_sample_count)
                 .sum::<i64>()
         );
+        let output = super::super::render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            20,
+            0,
+        )?;
+        assert!(output.starts_with("view: ranked-profile\ncontext: operation-roots\n"));
+        assert!(output.contains("time_basis=exact:"));
+        assert!(output.contains("sample_unit: samples"));
         Ok(())
     }
 

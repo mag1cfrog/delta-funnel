@@ -5,11 +5,14 @@ use std::env;
 use std::fmt;
 #[cfg(feature = "perfetto-profile")]
 use std::io;
+#[cfg(feature = "perfetto-profile")]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
-    PerfettoProfileLayer, initialize_perfetto, is_profile_target, wait_for_capture,
+    PerfettoProfileLayer, initialize_perfetto, is_profile_target,
+    run_perfetto_diagnostics_cli_with_args, wait_for_capture,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModuleMethods};
@@ -31,7 +34,32 @@ const PERFETTO_DIAGNOSTICS_PHASE: &str = "perfetto_diagnostics";
 pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(init_logging, module)?)?;
     module.add_function(wrap_pyfunction!(init_perfetto_diagnostics, module)?)?;
+    module.add_function(wrap_pyfunction!(_run_perfetto_cli, module)?)?;
     Ok(())
+}
+
+#[cfg(feature = "perfetto-profile")]
+#[pyfunction]
+fn _run_perfetto_cli(py: Python<'_>) -> PyResult<i32> {
+    // Python console scripts normalize away the interpreter and script path here.
+    let args = py
+        .import("sys")?
+        .getattr("argv")?
+        .extract::<Vec<PathBuf>>()?;
+    Ok(py.detach(move || {
+        run_perfetto_diagnostics_cli_with_args(
+            args.into_iter().skip(1).map(PathBuf::into_os_string),
+        )
+    }))
+}
+
+#[cfg(not(feature = "perfetto-profile"))]
+#[pyfunction]
+fn _run_perfetto_cli() -> i32 {
+    eprintln!(
+        "delta-funnel-perfetto: this deltafunnel build does not include Perfetto diagnostics"
+    );
+    69
 }
 
 #[pyfunction]
@@ -338,6 +366,7 @@ mod tests {
 
             assert!(module.hasattr("init_logging")?);
             assert!(module.hasattr("init_perfetto_diagnostics")?);
+            assert!(module.hasattr("_run_perfetto_cli")?);
 
             Ok(())
         })

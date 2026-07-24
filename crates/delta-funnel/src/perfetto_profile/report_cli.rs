@@ -1,39 +1,235 @@
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::iter;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RankedReportCliAction {
-    Help,
-    Generate { input: PathBuf, output: PathBuf },
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{Args, Parser, Subcommand};
+
+use super::report_terminal::{
+    InspectSelection, InspectSort, TerminalInspectError, TerminalProfileIndex,
+};
+
+const DEFAULT_INSPECT_LIMIT: u16 = 20;
+const MAX_INSPECT_LIMIT: u16 = 200;
+const MAX_INSPECT_DEPTH: u16 = 32;
+const MAX_FILTER_CHARS: usize = 128;
+const MAX_INTERACTIVE_COMMAND_BYTES: usize = 1024;
+const INTERACTIVE_END_MARKER: &str = "-- end --\n";
+
+#[derive(Debug, Parser, PartialEq, Eq)]
+#[command(
+    name = "delta-funnel-perfetto",
+    about = "Generate and inspect Delta Funnel Perfetto diagnostics",
+    disable_version_flag = true
+)]
+struct PerfettoCli {
+    #[command(subcommand)]
+    command: PerfettoCommand,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+enum PerfettoCommand {
+    /// Generate a ranked HTML report from a raw trace.
+    Report(RankedReportArgs),
+
+    /// Inspect ranked profiling data in the terminal.
+    Inspect(InspectArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+struct RankedReportArgs {
+    /// Raw Perfetto trace to analyze.
+    #[arg(value_name = "INPUT.pftrace")]
+    input: PathBuf,
+
+    /// Report destination. Defaults to INPUT.profile.html.
+    #[arg(long, value_name = "OUTPUT.profile.html", allow_hyphen_values = true)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+struct InspectArgs {
+    /// Raw Perfetto trace to inspect.
+    #[arg(value_name = "INPUT.pftrace")]
+    input: PathBuf,
+
+    /// Maximum number of rows to display.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_INSPECT_LIMIT,
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_INSPECT_LIMIT))
+    )]
+    limit: u16,
+
+    /// Select one semantic node by its exact numeric identity.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    semantic: Option<i64>,
+
+    /// Select one function callsite by semantic and function identity.
+    #[arg(
+        long,
+        value_name = "SEMANTIC_ID:FUNCTION_ID",
+        allow_hyphen_values = true,
+        conflicts_with = "semantic"
+    )]
+    function: Option<FunctionSelector>,
+
+    /// Retain matching rows and their contextual ancestors.
+    #[arg(long, value_name = "TEXT")]
+    filter: Option<FilterText>,
+
+    /// Sort sibling rows by the selected metric.
+    #[arg(long, value_enum)]
+    sort: Option<InspectSort>,
+
+    /// Maximum descendant depth from the active context.
+    #[arg(
+        long,
+        allow_negative_numbers = true,
+        value_parser = clap::value_parser!(u16).range(0..=i64::from(MAX_INSPECT_DEPTH))
+    )]
+    depth: Option<u16>,
+
+    /// Keep the loaded profile open for line-oriented commands.
+    #[arg(long)]
+    interactive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RankedReportArgumentError {
+struct FunctionSelector {
+    semantic_id: i64,
+    function_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterText(String);
+
+impl FromStr for FilterText {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() || value.chars().count() > MAX_FILTER_CHARS {
+            return Err("filter must contain between 1 and 128 characters");
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+struct InspectState {
+    selection: InspectSelection,
+    sort: InspectSort,
+    filter: Option<String>,
+    limit: usize,
+    depth: Option<usize>,
+}
+
+impl InspectState {
+    fn render(&self, index: &TerminalProfileIndex<'_>) -> Result<String, TerminalInspectError> {
+        index.render(
+            self.selection,
+            self.sort,
+            self.filter.as_deref(),
+            self.limit,
+            self.depth
+                .unwrap_or_else(|| usize::from(self.selection != InspectSelection::Root)),
+        )
+    }
+}
+
+impl FromStr for FunctionSelector {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (semantic_id, function_id) = value
+            .split_once(':')
+            .ok_or("function identity must contain one colon")?;
+        Ok(Self {
+            semantic_id: semantic_id
+                .parse()
+                .map_err(|_| "semantic function owner must be a signed integer")?,
+            function_id: function_id
+                .parse()
+                .map_err(|_| "function ID must be a signed integer")?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliArgumentError {
+    MissingCommand,
+    UnknownCommand,
     MissingInput,
     MissingOutputValue,
     DuplicateOutput,
     MultipleInputs,
+    InvalidLimit,
+    InvalidDepth,
+    InvalidSemanticId,
+    InvalidFunctionId,
+    InvalidFilter,
+    InvalidSort,
+    IncompatibleSelectors,
+    IncompatibleSort,
+    DuplicateOption,
     UnknownOption,
 }
 
-impl fmt::Display for RankedReportArgumentError {
+impl fmt::Display for CliArgumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::MissingCommand => "a diagnostics command is required",
+            Self::UnknownCommand => "unknown diagnostics command",
             Self::MissingInput => "an input trace path is required",
             Self::MissingOutputValue => "--output requires a path",
             Self::DuplicateOutput => "--output may be specified only once",
             Self::MultipleInputs => "only one input trace path may be provided",
+            Self::InvalidLimit => "limit must be between 1 and 200",
+            Self::InvalidDepth => "depth must be between 0 and 32",
+            Self::InvalidSemanticId => "semantic ID must be a signed integer",
+            Self::InvalidFunctionId => {
+                "function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"
+            }
+            Self::InvalidFilter => "filter must contain between 1 and 128 characters",
+            Self::InvalidSort => "sort must be duration, inclusive-cpu, self-cpu, or name",
+            Self::IncompatibleSelectors => "--semantic and --function cannot be used together",
+            Self::IncompatibleSort => "function callsites cannot be sorted by exact duration",
+            Self::DuplicateOption => "option may be specified only once",
             Self::UnknownOption => "unknown option",
         };
         formatter.write_str(message)
     }
 }
 
-impl std::error::Error for RankedReportArgumentError {}
+impl std::error::Error for CliArgumentError {}
+
+impl CliArgumentError {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::MissingCommand => "missing_command",
+            Self::UnknownCommand => "unknown_command",
+            Self::MissingInput => "missing_input",
+            Self::MissingOutputValue => "missing_output_value",
+            Self::DuplicateOutput => "duplicate_output",
+            Self::MultipleInputs => "multiple_inputs",
+            Self::InvalidLimit => "invalid_limit",
+            Self::InvalidDepth => "invalid_depth",
+            Self::InvalidSemanticId => "invalid_semantic_id",
+            Self::InvalidFunctionId => "invalid_function_id",
+            Self::InvalidFilter => "invalid_filter",
+            Self::InvalidSort => "invalid_sort",
+            Self::IncompatibleSelectors => "incompatible_selectors",
+            Self::IncompatibleSort => "incompatible_sort",
+            Self::DuplicateOption => "duplicate_option",
+            Self::UnknownOption => "unknown_option",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RankedReportFailurePhase {
@@ -109,16 +305,23 @@ impl fmt::Display for RankedReportFailure {
 
 impl std::error::Error for RankedReportFailure {}
 
-impl From<RankedReportArgumentError> for RankedReportFailure {
-    fn from(error: RankedReportArgumentError) -> Self {
-        let kind = match error {
-            RankedReportArgumentError::MissingInput => "missing_input",
-            RankedReportArgumentError::MissingOutputValue => "missing_output_value",
-            RankedReportArgumentError::DuplicateOutput => "duplicate_output",
-            RankedReportArgumentError::MultipleInputs => "multiple_inputs",
-            RankedReportArgumentError::UnknownOption => "unknown_option",
-        };
-        Self::new(RankedReportFailurePhase::Argument, kind, error.to_string())
+impl From<CliArgumentError> for RankedReportFailure {
+    fn from(error: CliArgumentError) -> Self {
+        Self::new(
+            RankedReportFailurePhase::Argument,
+            error.kind(),
+            error.to_string(),
+        )
+    }
+}
+
+impl From<TerminalInspectError> for RankedReportFailure {
+    fn from(error: TerminalInspectError) -> Self {
+        Self::new(
+            RankedReportFailurePhase::Argument,
+            error.kind(),
+            error.to_string(),
+        )
     }
 }
 
@@ -199,49 +402,531 @@ pub(super) struct RankedReportPaths {
 ///
 /// Returns the process exit code without terminating the caller.
 pub fn run_perfetto_diagnostics_cli() -> i32 {
-    run_perfetto_diagnostics_cli_with(env::args_os().skip(1))
+    run_perfetto_diagnostics_cli_with_args(env::args_os().skip(1))
 }
 
-fn run_perfetto_diagnostics_cli_with(args: impl IntoIterator<Item = OsString>) -> i32 {
-    let mut args = args.into_iter();
-    let Some(command) = args.next() else {
-        return emit_failure(RankedReportFailure::new(
-            RankedReportFailurePhase::Argument,
-            "missing_command",
-            "a diagnostics command is required",
-        ));
-    };
-    match command.to_str() {
-        Some("-h" | "--help") => {
-            print_usage();
-            0
+/// Runs the bundled CLI with host-normalized arguments that exclude the executable name.
+///
+/// This supports wrappers such as Python console scripts whose process arguments
+/// include launcher details that are absent from their language-level argument list.
+pub fn run_perfetto_diagnostics_cli_with_args(args: impl IntoIterator<Item = OsString>) -> i32 {
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.first().is_some_and(|argument| argument == "report")
+        && let Some(error) = first_report_argument_error(&args[1..])
+    {
+        return emit_failure(error.into());
+    }
+    match PerfettoCli::try_parse_from(
+        iter::once(OsString::from("delta-funnel-perfetto")).chain(args.iter().cloned()),
+    ) {
+        Ok(PerfettoCli {
+            command: PerfettoCommand::Report(args),
+        }) => run_report_command(args),
+        Ok(PerfettoCli {
+            command: PerfettoCommand::Inspect(args),
+        }) => run_inspect_command(args),
+        Err(error) if matches!(error.kind(), ErrorKind::DisplayHelp) => error
+            .print()
+            .map_or_else(|_| emit_failure(terminal_output_failure()), |()| 0),
+        Err(error) => emit_failure(cli_failure(&args, &error)),
+    }
+}
+
+fn run_inspect_command(args: InspectArgs) -> i32 {
+    let selection = if let Some(function) = args.function {
+        InspectSelection::Function {
+            semantic_id: function.semantic_id,
+            function_id: function.function_id,
         }
-        Some("report") => run_report_command(args),
-        _ => emit_failure(RankedReportFailure::new(
-            RankedReportFailurePhase::Argument,
-            "unknown_command",
-            "unknown diagnostics command",
+    } else if let Some(semantic_id) = args.semantic {
+        InspectSelection::Semantic(semantic_id)
+    } else {
+        InspectSelection::Root
+    };
+    let sort = args.sort.unwrap_or(match selection {
+        InspectSelection::Function { .. } => InspectSort::InclusiveCpu,
+        InspectSelection::Root | InspectSelection::Semantic(_) => InspectSort::Duration,
+    });
+    if matches!(selection, InspectSelection::Function { .. }) && sort == InspectSort::Duration {
+        return emit_failure(CliArgumentError::IncompatibleSort.into());
+    }
+    let mut state = InspectState {
+        selection,
+        sort,
+        filter: args.filter.map(|filter| filter.0),
+        limit: usize::from(args.limit),
+        depth: args.depth.map(usize::from),
+    };
+    let input = match preflight_ranked_profile_input(&args.input) {
+        Ok(input) => input,
+        Err(error) => return emit_failure(error.into()),
+    };
+    match super::load_ranked_profile(&input) {
+        Ok(document) if args.interactive => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            let prompt = stdin.is_terminal() && stdout.is_terminal();
+            let mut input = stdin.lock();
+            let mut output = stdout.lock();
+            let mut error = io::stderr().lock();
+            match run_interactive_session(
+                &document,
+                &mut state,
+                &mut input,
+                &mut output,
+                &mut error,
+                prompt,
+            ) {
+                Ok(()) => 0,
+                Err(error) => emit_failure(error),
+            }
+        }
+        Ok(document) => match state.render(&TerminalProfileIndex::new(&document)) {
+            Ok(output) => {
+                let mut stdout = io::stdout().lock();
+                match stdout
+                    .write_all(output.as_bytes())
+                    .and_then(|()| stdout.flush())
+                {
+                    Ok(()) => 0,
+                    Err(_) => emit_failure(terminal_output_failure()),
+                }
+            }
+            Err(error) => emit_failure(error.into()),
+        },
+        Err(error) => emit_failure(error),
+    }
+}
+
+fn run_interactive_session(
+    document: &super::ranked_report::RankedProfileDocument,
+    state: &mut InspectState,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    error: &mut impl Write,
+    prompt: bool,
+) -> Result<(), RankedReportFailure> {
+    let index = TerminalProfileIndex::new(document);
+    let initial = state.render(&index).map_err(RankedReportFailure::from)?;
+    write_interactive_response(output, &initial)?;
+    let mut line = Vec::with_capacity(MAX_INTERACTIVE_COMMAND_BYTES);
+    loop {
+        if prompt {
+            output
+                .write_all(b"profile> ")
+                .and_then(|()| output.flush())
+                .map_err(|_| terminal_output_failure())?;
+        }
+        match read_interactive_line(input, &mut line).map_err(|_| interactive_input_failure())? {
+            InteractiveLine::Eof => return Ok(()),
+            InteractiveLine::Invalid(message) => {
+                write_interactive_error(error, message)?;
+                write_interactive_response(output, "")?;
+            }
+            InteractiveLine::Command(command) => {
+                match run_interactive_command(&index, state, command.trim()) {
+                    Ok(InteractiveCommandResult::Output(response)) => {
+                        write_interactive_response(output, &response)?;
+                    }
+                    Ok(InteractiveCommandResult::Quit) => {
+                        write_interactive_response(output, "")?;
+                        return Ok(());
+                    }
+                    Err(message) => {
+                        write_interactive_error(error, message)?;
+                        write_interactive_response(output, "")?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum InteractiveCommandResult {
+    Output(String),
+    Quit,
+}
+
+fn run_interactive_command(
+    index: &TerminalProfileIndex<'_>,
+    state: &mut InspectState,
+    command: &str,
+) -> Result<InteractiveCommandResult, &'static str> {
+    match command {
+        "show" => state
+            .render(index)
+            .map(InteractiveCommandResult::Output)
+            .map_err(|_| "current profile selection does not exist"),
+        "up" => {
+            state.selection = index.up(state.selection)?;
+            render_interactive_selection(index, state)
+        }
+        "root" => {
+            state.selection = InspectSelection::Root;
+            render_interactive_selection(index, state)
+        }
+        "clear" => {
+            state.filter = None;
+            render_interactive_selection(index, state)
+        }
+        "help" => Ok(InteractiveCommandResult::Output(
+            "commands: show, open semantic:ID, open function:SEMANTIC_ID:FUNCTION_ID, up, root, sort METRIC, filter TEXT, clear, limit N, help, quit\n"
+                .to_owned(),
+        )),
+        "quit" => Ok(InteractiveCommandResult::Quit),
+        _ => {
+            if command == "filter" || command.starts_with("filter ") {
+                let value = command
+                    .strip_prefix("filter ")
+                    .ok_or("filter must contain between 1 and 128 characters")?;
+                let filter = value
+                    .parse::<FilterText>()
+                    .map_err(|_| "filter must contain between 1 and 128 characters")?;
+                state.filter = Some(filter.0);
+                return render_interactive_selection(index, state);
+            }
+            if command == "sort" || command.starts_with("sort ") {
+                let value = command
+                    .strip_prefix("sort ")
+                    .ok_or("invalid sort; expected sort METRIC")?;
+                let sort = match value {
+                    "duration" => InspectSort::Duration,
+                    "inclusive-cpu" => InspectSort::InclusiveCpu,
+                    "self-cpu" => InspectSort::SelfCpu,
+                    "name" => InspectSort::Name,
+                    _ => {
+                        return Err(
+                            "invalid sort; expected duration, inclusive-cpu, self-cpu, or name",
+                        );
+                    }
+                };
+                if sort == InspectSort::Duration
+                    && matches!(state.selection, InspectSelection::Function { .. })
+                {
+                    return Err("function callsites cannot be sorted by exact duration");
+                }
+                state.sort = sort;
+                return render_interactive_selection(index, state);
+            }
+            if command == "limit" || command.starts_with("limit ") {
+                let value = command
+                    .strip_prefix("limit ")
+                    .ok_or("invalid limit; expected limit N")?;
+                let limit = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|limit| (1..=MAX_INSPECT_LIMIT).contains(limit))
+                    .ok_or("limit must be between 1 and 200")?;
+                state.limit = usize::from(limit);
+                return render_interactive_selection(index, state);
+            }
+            let target = command
+                .strip_prefix("open ")
+                .ok_or("unknown interactive command")?;
+            if let Some(semantic_id) = target.strip_prefix("semantic:") {
+                let semantic_id = semantic_id
+                    .parse()
+                    .map_err(|_| "invalid semantic identity; expected semantic:ID")?;
+                state.selection = index.open_semantic(state.selection, semantic_id)?;
+            } else if let Some(function) = target.strip_prefix("function:") {
+                let function = function.parse::<FunctionSelector>().map_err(|_| {
+                    "invalid function identity; expected function:SEMANTIC_ID:FUNCTION_ID"
+                })?;
+                state.selection = index.open_function(
+                    state.selection,
+                    function.semantic_id,
+                    function.function_id,
+                )?;
+                if state.sort == InspectSort::Duration {
+                    state.sort = InspectSort::InclusiveCpu;
+                }
+            } else {
+                return Err(
+                    "invalid open target; expected semantic:ID or function:SEMANTIC_ID:FUNCTION_ID",
+                );
+            }
+            render_interactive_selection(index, state)
+        }
+    }
+}
+
+fn render_interactive_selection(
+    index: &TerminalProfileIndex<'_>,
+    state: &InspectState,
+) -> Result<InteractiveCommandResult, &'static str> {
+    state
+        .render(index)
+        .map(InteractiveCommandResult::Output)
+        .map_err(|_| "current profile selection does not exist")
+}
+
+enum InteractiveLine {
+    Eof,
+    Command(String),
+    Invalid(&'static str),
+}
+
+fn read_interactive_line(
+    input: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> io::Result<InteractiveLine> {
+    line.clear();
+    let mut read_any = false;
+    let mut exceeded_limit = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        read_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(consumed);
+        if !exceeded_limit {
+            let retained = payload.min(
+                MAX_INTERACTIVE_COMMAND_BYTES
+                    .saturating_add(1)
+                    .saturating_sub(line.len()),
+            );
+            line.extend_from_slice(&available[..retained]);
+            exceeded_limit |= retained != payload || line.len() > MAX_INTERACTIVE_COMMAND_BYTES;
+        }
+        input.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if !read_any {
+        return Ok(InteractiveLine::Eof);
+    }
+    if exceeded_limit {
+        return Ok(InteractiveLine::Invalid(
+            "interactive command exceeds the 1024-byte limit",
+        ));
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    match std::str::from_utf8(line) {
+        Ok(line) => Ok(InteractiveLine::Command(line.to_owned())),
+        Err(_) => Ok(InteractiveLine::Invalid(
+            "interactive command must be valid UTF-8",
         )),
     }
 }
 
-fn run_report_command(args: impl IntoIterator<Item = OsString>) -> i32 {
-    match parse_ranked_report_args(args) {
-        Ok(RankedReportCliAction::Help) => {
-            print_report_usage();
-            0
-        }
-        Ok(RankedReportCliAction::Generate { input, output }) => {
-            match super::generate_ranked_profile_report(&input, &output) {
-                Ok(output) => {
-                    println!("wrote {}", output.display());
-                    0
-                }
-                Err(error) => emit_failure(error),
+fn write_interactive_response(
+    output: &mut impl Write,
+    response: &str,
+) -> Result<(), RankedReportFailure> {
+    output
+        .write_all(response.as_bytes())
+        .and_then(|()| {
+            if !response.is_empty() && !response.ends_with('\n') {
+                output.write_all(b"\n")?;
             }
+            output.write_all(INTERACTIVE_END_MARKER.as_bytes())
+        })
+        .and_then(|()| output.flush())
+        .map_err(|_| terminal_output_failure())
+}
+
+fn write_interactive_error(
+    error: &mut impl Write,
+    message: &str,
+) -> Result<(), RankedReportFailure> {
+    writeln!(error, "error: {message}")
+        .and_then(|()| error.flush())
+        .map_err(|_| terminal_output_failure())
+}
+
+fn interactive_input_failure() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Input,
+        "interactive_read_failed",
+        "interactive command input could not be read",
+    )
+}
+
+fn terminal_output_failure() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Output,
+        "terminal_write_failed",
+        "terminal output could not be written",
+    )
+}
+
+fn run_report_command(args: RankedReportArgs) -> i32 {
+    let output = args
+        .output
+        .unwrap_or_else(|| default_report_path(&args.input));
+    match super::generate_ranked_profile_report(&args.input, &output) {
+        Ok(output) => {
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "wrote {}", output.display())
+                .and_then(|()| stdout.flush())
+                .map_or_else(|_| emit_failure(terminal_output_failure()), |()| 0)
         }
-        Err(error) => emit_failure(error.into()),
+        Err(error) => emit_failure(error),
     }
+}
+
+fn classify_cli_error(args: &[OsString], error: &clap::Error) -> CliArgumentError {
+    let Some(command) = args.first() else {
+        return CliArgumentError::MissingCommand;
+    };
+    if command != "report" && command != "inspect" {
+        return CliArgumentError::UnknownCommand;
+    }
+    if command == "report"
+        && let Some(error) = first_report_argument_error(&args[1..])
+    {
+        return error;
+    }
+    match error.kind() {
+        ErrorKind::MissingRequiredArgument => CliArgumentError::MissingInput,
+        ErrorKind::ArgumentConflict if is_selector_conflict(error) => {
+            CliArgumentError::IncompatibleSelectors
+        }
+        ErrorKind::ArgumentConflict => CliArgumentError::DuplicateOption,
+        ErrorKind::TooManyValues => CliArgumentError::MultipleInputs,
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--limit")
+            ) =>
+        {
+            CliArgumentError::InvalidLimit
+        }
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--depth")
+            ) =>
+        {
+            CliArgumentError::InvalidDepth
+        }
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--semantic")
+            ) =>
+        {
+            CliArgumentError::InvalidSemanticId
+        }
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--function")
+            ) =>
+        {
+            CliArgumentError::InvalidFunctionId
+        }
+        ErrorKind::ValueValidation | ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--filter")
+            ) =>
+        {
+            CliArgumentError::InvalidFilter
+        }
+        ErrorKind::InvalidValue
+            if matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument.starts_with("--sort")
+            ) =>
+        {
+            CliArgumentError::InvalidSort
+        }
+        ErrorKind::UnknownArgument => match error.get(ContextKind::InvalidArg) {
+            Some(ContextValue::String(argument)) if !argument.starts_with('-') => {
+                if command == "inspect" && has_invalid_separated_function_value(&args[1..]) {
+                    CliArgumentError::InvalidFunctionId
+                } else {
+                    CliArgumentError::MultipleInputs
+                }
+            }
+            _ => CliArgumentError::UnknownOption,
+        },
+        _ => CliArgumentError::UnknownOption,
+    }
+}
+
+fn has_invalid_separated_function_value(args: &[OsString]) -> bool {
+    args.iter().enumerate().any(|(index, argument)| {
+        argument == "--function"
+            && args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .is_none_or(|value| value.parse::<FunctionSelector>().is_err())
+    })
+}
+
+fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
+    let mut args = args.iter();
+    let mut has_input = false;
+    let mut has_output = false;
+    while let Some(argument) = args.next() {
+        if matches!(argument.to_str(), Some("-h" | "--help")) {
+            return None;
+        }
+        if argument == "--output" {
+            if has_output {
+                return Some(CliArgumentError::DuplicateOutput);
+            }
+            has_output = true;
+            if args.next().is_none() {
+                return Some(CliArgumentError::MissingOutputValue);
+            }
+        } else if argument.as_encoded_bytes().starts_with(b"-") {
+            return Some(CliArgumentError::UnknownOption);
+        } else if has_input {
+            return Some(CliArgumentError::MultipleInputs);
+        } else {
+            has_input = true;
+        }
+    }
+    (!has_input).then_some(CliArgumentError::MissingInput)
+}
+
+fn is_selector_conflict(error: &clap::Error) -> bool {
+    let arguments = [
+        error.get(ContextKind::InvalidArg),
+        error.get(ContextKind::PriorArg),
+    ];
+    let contains_semantic = arguments.into_iter().flatten().any(|value| {
+        matches!(value, ContextValue::String(argument) if argument.starts_with("--semantic"))
+    });
+    let contains_function = arguments.into_iter().flatten().any(|value| {
+        matches!(value, ContextValue::String(argument) if argument.starts_with("--function"))
+    });
+    contains_semantic && contains_function
+}
+
+fn cli_failure(args: &[OsString], error: &clap::Error) -> RankedReportFailure {
+    let argument_error = classify_cli_error(args, error);
+    let message = clap_suggestion(error).map_or_else(
+        || argument_error.to_string(),
+        |suggestion| format!("{argument_error}; did you mean {suggestion}?"),
+    );
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Argument,
+        argument_error.kind(),
+        message,
+    )
+}
+
+fn clap_suggestion(error: &clap::Error) -> Option<String> {
+    [ContextKind::SuggestedArg, ContextKind::SuggestedSubcommand]
+        .into_iter()
+        .find_map(|kind| {
+            let suggestion = match error.get(kind)? {
+                ContextValue::String(suggestion) => suggestion.clone(),
+                ContextValue::Strings(suggestions) => suggestions.first()?.clone(),
+                _ => return None,
+            };
+            (suggestion.len() <= 64 && suggestion.is_ascii()).then_some(suggestion)
+        })
 }
 
 fn emit_failure(error: RankedReportFailure) -> i32 {
@@ -262,60 +947,11 @@ fn failure_exit_code(phase: RankedReportFailurePhase) -> i32 {
     }
 }
 
-fn print_usage() {
-    const USAGE: &str = "Usage: delta-funnel-perfetto COMMAND [ARG...]\n\nCommands:\n  report    Generate a ranked HTML report from a raw trace\n";
-    print!("{USAGE}");
-}
-
-fn print_report_usage() {
-    println!("Usage: delta-funnel-perfetto report INPUT.pftrace [--output OUTPUT.profile.html]");
-}
-
-fn parse_ranked_report_args(
-    args: impl IntoIterator<Item = OsString>,
-) -> Result<RankedReportCliAction, RankedReportArgumentError> {
-    let mut args = args.into_iter();
-    let mut input = None;
-    let mut output = None;
-    while let Some(argument) = args.next() {
-        if matches!(argument.to_str(), Some("-h" | "--help")) {
-            return Ok(RankedReportCliAction::Help);
-        }
-        if argument == OsStr::new("--output") {
-            if output.is_some() {
-                return Err(RankedReportArgumentError::DuplicateOutput);
-            }
-            output = Some(PathBuf::from(
-                args.next()
-                    .ok_or(RankedReportArgumentError::MissingOutputValue)?,
-            ));
-        } else if argument.as_encoded_bytes().starts_with(b"-") {
-            return Err(RankedReportArgumentError::UnknownOption);
-        } else if input.replace(PathBuf::from(argument)).is_some() {
-            return Err(RankedReportArgumentError::MultipleInputs);
-        }
-    }
-
-    let input = input.ok_or(RankedReportArgumentError::MissingInput)?;
-    let output = output.unwrap_or_else(|| default_report_path(&input));
-    Ok(RankedReportCliAction::Generate { input, output })
-}
-
 pub(super) fn preflight_ranked_report_paths(
     input: &Path,
     output: &Path,
 ) -> Result<RankedReportPaths, RankedReportPathError> {
-    let input_file = File::open(input).map_err(RankedReportPathError::InputUnreadable)?;
-    if !input_file
-        .metadata()
-        .map_err(RankedReportPathError::InputUnreadable)?
-        .is_file()
-    {
-        return Err(RankedReportPathError::InputNotFile);
-    }
-    let input = input
-        .canonicalize()
-        .map_err(RankedReportPathError::InputUnreadable)?;
+    let input = preflight_ranked_profile_input(input)?;
     let output = absolute_path(output).map_err(RankedReportPathError::OutputInspection)?;
     if output.file_name().is_none() {
         return Err(RankedReportPathError::OutputHasNoFileName);
@@ -330,6 +966,23 @@ pub(super) fn preflight_ranked_report_paths(
         Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
     }
     Ok(RankedReportPaths { input, output })
+}
+
+pub(super) fn preflight_ranked_profile_input(
+    input: &Path,
+) -> Result<PathBuf, RankedReportPathError> {
+    let input_file = File::open(input).map_err(RankedReportPathError::InputUnreadable)?;
+    if !input_file
+        .metadata()
+        .map_err(RankedReportPathError::InputUnreadable)?
+        .is_file()
+    {
+        return Err(RankedReportPathError::InputNotFile);
+    }
+    let input = input
+        .canonicalize()
+        .map_err(RankedReportPathError::InputUnreadable)?;
+    Ok(input)
 }
 
 fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
@@ -403,44 +1056,529 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn interactive_document() -> super::super::ranked_report::RankedProfileDocument {
+        use super::super::ranked_report::{
+            RankedFunction, RankedProfileDocument, RankedProfileMetadata,
+        };
+
+        RankedProfileDocument {
+            metadata: RankedProfileMetadata {
+                schema_version: 1,
+                sample_frequency_hz: 100,
+                exact_time_unit: "nanoseconds".to_owned(),
+                sample_unit: "samples".to_owned(),
+                eligible_sample_count: 0,
+                direct_sample_count: 0,
+                ambiguous_sample_count: 0,
+                unattributed_sample_count: 0,
+            },
+            semantics: vec![
+                interactive_semantic(1, None, "operation"),
+                interactive_semantic(2, Some(1), "planning"),
+                interactive_semantic(3, Some(2), "metadata"),
+            ],
+            functions: vec![
+                RankedFunction {
+                    semantic_id: 1,
+                    function_id: 10,
+                    parent_function_id: None,
+                    name: "root_function".to_owned(),
+                    module_name: None,
+                    source_file: None,
+                    line_number: None,
+                    self_sample_count: 1,
+                    inclusive_sample_count: 2,
+                },
+                RankedFunction {
+                    semantic_id: 1,
+                    function_id: 11,
+                    parent_function_id: Some(10),
+                    name: "child_function".to_owned(),
+                    module_name: None,
+                    source_file: None,
+                    line_number: None,
+                    self_sample_count: 1,
+                    inclusive_sample_count: 1,
+                },
+                RankedFunction {
+                    semantic_id: 2,
+                    function_id: 20,
+                    parent_function_id: None,
+                    name: "other_semantic_function".to_owned(),
+                    module_name: None,
+                    source_file: None,
+                    line_number: None,
+                    self_sample_count: 1,
+                    inclusive_sample_count: 1,
+                },
+            ],
+        }
+    }
+
+    fn interactive_semantic(
+        semantic_id: i64,
+        parent_semantic_id: Option<i64>,
+        name: &str,
+    ) -> super::super::ranked_report::RankedSemantic {
+        super::super::ranked_report::RankedSemantic {
+            semantic_id,
+            parent_semantic_id,
+            operation_id: 1,
+            name: name.to_owned(),
+            semantic_kind: name.to_owned(),
+            operation_kind: Some("preview".to_owned()),
+            stage_category: None,
+            stage_name: None,
+            activity: None,
+            start_ns: 0,
+            end_ns: Some(10),
+            duration_ns: Some(10),
+            time_semantics: "wall_clock".to_owned(),
+            result: Some("completed".to_owned()),
+            is_complete: true,
+            query_execution_id: None,
+            query_scope: None,
+            query_owner: None,
+            worker_lane_id: None,
+            worker_kind: None,
+            node_id: None,
+            parent_node_id: None,
+            operator_partition: None,
+            execution_stream_id: None,
+            stage_owner_id: None,
+            direct_sample_count: 2,
+            inclusive_sample_count: 4,
+        }
+    }
+
+    fn interactive_output(
+        result: Result<InteractiveCommandResult, &'static str>,
+    ) -> Result<String, &'static str> {
+        match result? {
+            InteractiveCommandResult::Output(output) => Ok(output),
+            InteractiveCommandResult::Quit => Err("interactive command exited unexpectedly"),
+        }
+    }
+
     #[test]
-    fn parses_help_explicit_output_and_default_sibling_output() {
+    fn parses_report_arguments_and_generates_help() -> Result<(), Box<dyn std::error::Error>> {
+        let root_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "--help"])
+            .err()
+            .ok_or("root help should stop parsing")?;
+        assert_eq!(root_help.kind(), ErrorKind::DisplayHelp);
+        let root_help = root_help.to_string();
+        assert!(root_help.contains("Generate and inspect Delta Funnel Perfetto diagnostics"));
+        assert!(root_help.contains("report"));
+        assert!(root_help.contains("inspect"));
+        let bare_root_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help"])
+            .err()
+            .ok_or("bare root help should stop parsing")?;
+        assert_eq!(bare_root_help.kind(), ErrorKind::DisplayHelp);
+
+        let report_help =
+            PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "--help"])
+                .err()
+                .ok_or("report help should stop parsing")?;
+        assert_eq!(report_help.kind(), ErrorKind::DisplayHelp);
+        let report_help = report_help.to_string();
+        assert!(report_help.contains("INPUT.pftrace"));
+        assert!(report_help.contains("--output <OUTPUT.profile.html>"));
+        let bare_report_help =
+            PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "report"])
+                .err()
+                .ok_or("bare report help should stop parsing")?;
+        assert_eq!(bare_report_help.kind(), ErrorKind::DisplayHelp);
+
+        let default_output =
+            PerfettoCli::try_parse_from(["delta-funnel-perfetto", "report", "capture.pftrace"])?;
         assert_eq!(
-            parse_ranked_report_args([OsString::from("--help")]),
-            Ok(RankedReportCliAction::Help)
+            default_output,
+            PerfettoCli {
+                command: PerfettoCommand::Report(RankedReportArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    output: None,
+                }),
+            }
+        );
+
+        let explicit_output = PerfettoCli::try_parse_from([
+            "delta-funnel-perfetto",
+            "report",
+            "--output",
+            "reports/capture.html",
+            "traces/capture",
+        ])?;
+        assert_eq!(
+            explicit_output,
+            PerfettoCli {
+                command: PerfettoCommand::Report(RankedReportArgs {
+                    input: PathBuf::from("traces/capture"),
+                    output: Some(PathBuf::from("reports/capture.html")),
+                }),
+            }
         );
         assert_eq!(
-            parse_ranked_report_args([OsString::from("capture.pftrace")]),
-            Ok(RankedReportCliAction::Generate {
-                input: PathBuf::from("capture.pftrace"),
-                output: PathBuf::from("capture.profile.html"),
-            })
+            default_report_path(Path::new("capture.pftrace")),
+            PathBuf::from("capture.profile.html")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_inspect_arguments_and_generates_help() -> Result<(), Box<dyn std::error::Error>> {
+        let help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "inspect", "--help"])
+            .err()
+            .ok_or("inspect help should stop parsing")?;
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        assert!(help.contains("INPUT.pftrace"));
+        assert!(help.contains("--limit <LIMIT>"));
+        assert!(help.contains("--semantic <ID>"));
+        assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
+        assert!(help.contains("--filter <TEXT>"));
+        assert!(help.contains("--interactive"));
+        assert!(help.contains("--sort <SORT>"));
+        assert!(help.contains("--depth <DEPTH>"));
+        let bare_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "inspect"])
+            .err()
+            .ok_or("bare inspect help should stop parsing")?;
+        assert_eq!(bare_help.kind(), ErrorKind::DisplayHelp);
+
+        assert_eq!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--limit",
+                "7",
+                "--semantic",
+                "42",
+                "--sort",
+                "self-cpu",
+                "--filter",
+                "scan",
+                "--depth",
+                "3",
+                "--interactive",
+            ])?,
+            PerfettoCli {
+                command: PerfettoCommand::Inspect(InspectArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    limit: 7,
+                    semantic: Some(42),
+                    function: None,
+                    filter: Some(FilterText("scan".to_owned())),
+                    sort: Some(InspectSort::SelfCpu),
+                    depth: Some(3),
+                    interactive: true,
+                }),
+            }
         );
         assert_eq!(
-            parse_ranked_report_args([
-                OsString::from("--output"),
-                OsString::from("reports/capture.html"),
-                OsString::from("traces/capture"),
-            ]),
-            Ok(RankedReportCliAction::Generate {
-                input: PathBuf::from("traces/capture"),
-                output: PathBuf::from("reports/capture.html"),
-            })
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--function",
+                "42:7",
+            ])?,
+            PerfettoCli {
+                command: PerfettoCommand::Inspect(InspectArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    limit: DEFAULT_INSPECT_LIMIT,
+                    semantic: None,
+                    function: Some(FunctionSelector {
+                        semantic_id: 42,
+                        function_id: 7,
+                    }),
+                    filter: None,
+                    sort: None,
+                    depth: None,
+                    interactive: false,
+                }),
+            }
         );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--semantic",
+                "-1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--function=-1:-2",
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--function",
+                "-1:-2",
+                "--limit",
+                "2",
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerfettoCli::try_parse_from([
+                "delta-funnel-perfetto",
+                "inspect",
+                "capture.pftrace",
+                "--filter=--scan",
+            ])
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_session_is_line_oriented_bounded_and_recoverable() {
+        let document = interactive_document();
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+        let mut commands = vec![b'a'; MAX_INTERACTIVE_COMMAND_BYTES + 1];
+        commands.extend_from_slice(b"\nshow\nunknown\nhelp\nquit\n");
+        let mut input = io::Cursor::new(commands);
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+
+        run_interactive_session(
+            &document,
+            &mut state,
+            &mut input,
+            &mut output,
+            &mut error,
+            false,
+        )
+        .expect("recoverable commands should preserve the session");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let error = String::from_utf8(error).expect("errors should be UTF-8");
+        assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 6);
+        assert_eq!(output.matches("context: operation-roots").count(), 2);
+        assert!(output.contains("open semantic:ID"));
+        assert!(!output.contains("profile> "));
+        assert!(error.contains("interactive command exceeds the 1024-byte limit"));
+        assert!(error.contains("unknown interactive command"));
+    }
+
+    #[test]
+    fn interactive_session_recovers_from_invalid_utf8_and_exits_on_eof() {
+        let document = interactive_document();
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+        let mut input = io::Cursor::new([0xff, b'\n']);
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+
+        run_interactive_session(
+            &document,
+            &mut state,
+            &mut input,
+            &mut output,
+            &mut error,
+            true,
+        )
+        .expect("EOF should close a healthy session");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let error = String::from_utf8(error).expect("errors should be UTF-8");
+        assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 2);
+        assert_eq!(output.matches("profile> ").count(), 2);
+        assert!(error.contains("interactive command must be valid UTF-8"));
+    }
+
+    #[test]
+    fn interactive_navigation_requires_exact_immediate_children() {
+        let document = interactive_document();
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+        let commands = b"open semantic:2\nopen semantic:1\nopen function:1:11\nopen function:2:20\nopen function:1:10\nopen function:1:11\nup\nup\nopen semantic:2\nroot\nup\nquit\n";
+        let mut input = io::Cursor::new(commands);
+        let mut output = Vec::new();
+        let mut error = Vec::new();
+
+        run_interactive_session(
+            &document,
+            &mut state,
+            &mut input,
+            &mut output,
+            &mut error,
+            false,
+        )
+        .expect("navigation errors should preserve the session");
+
+        let output = String::from_utf8(output).expect("output should be UTF-8");
+        let error = String::from_utf8(error).expect("errors should be UTF-8");
+        assert_eq!(output.matches(INTERACTIVE_END_MARKER).count(), 13);
+        assert_eq!(output.matches("context: operation-roots").count(), 2);
+        assert_eq!(output.matches("context: semantic:1").count(), 2);
+        assert_eq!(output.matches("context: function:1:10").count(), 2);
+        assert_eq!(output.matches("context: function:1:11").count(), 1);
+        assert_eq!(output.matches("context: semantic:2").count(), 1);
+        assert_eq!(
+            error
+                .matches("semantic target is not an immediate child")
+                .count(),
+            1
+        );
+        assert_eq!(
+            error
+                .matches("function target is not an immediate child")
+                .count(),
+            2
+        );
+        assert!(error.contains("already at operation roots"));
+    }
+
+    #[test]
+    fn interactive_sort_and_limit_validate_before_changing_state() -> Result<(), &'static str> {
+        let document = interactive_document();
+        let index = TerminalProfileIndex::new(&document);
+        let mut state = InspectState {
+            selection: InspectSelection::Root,
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, "open semantic:1"),
+            Ok(InteractiveCommandResult::Output(_))
+        ));
+        let output = interactive_output(run_interactive_command(&index, &mut state, "limit 1"))?;
+        assert_eq!(state.limit, 1);
+        assert!(output.contains("showing: 1 of 2; truncated: true"));
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, "limit 0"),
+            Err("limit must be between 1 and 200")
+        ));
+        assert_eq!(state.limit, 1);
+
+        let output = interactive_output(run_interactive_command(&index, &mut state, "sort name"))?;
+        assert_eq!(state.sort, InspectSort::Name);
+        assert!(output.contains("sort: name"));
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, "sort unknown"),
+            Err("invalid sort; expected duration, inclusive-cpu, self-cpu, or name")
+        ));
+        assert_eq!(state.sort, InspectSort::Name);
+
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, "open function:1:10"),
+            Ok(InteractiveCommandResult::Output(_))
+        ));
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, "sort duration"),
+            Err("function callsites cannot be sorted by exact duration")
+        ));
+        assert_eq!(state.sort, InspectSort::Name);
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_filter_is_bounded_and_clearable() -> Result<(), &'static str> {
+        let document = interactive_document();
+        let index = TerminalProfileIndex::new(&document);
+        let mut state = InspectState {
+            selection: InspectSelection::Semantic(1),
+            sort: InspectSort::Duration,
+            filter: None,
+            limit: 20,
+            depth: None,
+        };
+
+        let output = interactive_output(run_interactive_command(
+            &index,
+            &mut state,
+            "filter planning",
+        ))?;
+        assert_eq!(state.filter.as_deref(), Some("planning"));
+        assert!(output.contains("filter: \"planning\""));
+        assert!(output.contains("id=semantic:2"));
+
+        let oversized = format!("filter {}", "x".repeat(MAX_FILTER_CHARS + 1));
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, &oversized),
+            Err("filter must contain between 1 and 128 characters")
+        ));
+        assert_eq!(state.filter.as_deref(), Some("planning"));
+        assert!(matches!(
+            run_interactive_command(&index, &mut state, "filter"),
+            Err("filter must contain between 1 and 128 characters")
+        ));
+        assert_eq!(state.filter.as_deref(), Some("planning"));
+
+        let output = interactive_output(run_interactive_command(&index, &mut state, "clear"))?;
+        assert_eq!(state.filter, None);
+        assert!(output.contains("filter: none"));
+        Ok(())
     }
 
     #[test]
     fn dispatches_commands_and_maps_failure_phases_to_exit_codes() {
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([OsString::from("--help")]),
+            run_perfetto_diagnostics_cli_with_args([OsString::from("--help")]),
             0
         );
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([OsString::from("report"), OsString::from("--help")]),
+            run_perfetto_diagnostics_cli_with_args([
+                OsString::from("report"),
+                OsString::from("--help"),
+            ]),
             0
         );
         assert_eq!(
-            run_perfetto_diagnostics_cli_with([OsString::from("unknown")]),
+            run_perfetto_diagnostics_cli_with_args([
+                OsString::from("inspect"),
+                OsString::from("--help")
+            ]),
+            0
+        );
+        assert_eq!(
+            run_inspect_command(InspectArgs {
+                input: PathBuf::from("missing.pftrace"),
+                limit: DEFAULT_INSPECT_LIMIT,
+                semantic: None,
+                function: Some(FunctionSelector {
+                    semantic_id: 1,
+                    function_id: 2,
+                }),
+                filter: None,
+                sort: Some(InspectSort::Duration),
+                depth: None,
+                interactive: false,
+            }),
+            64
+        );
+        assert_eq!(
+            run_perfetto_diagnostics_cli_with_args([OsString::from("unknown")]),
             64
         );
         assert_eq!(failure_exit_code(RankedReportFailurePhase::Health), 65);
@@ -457,42 +1595,272 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_argument_shapes() {
+    fn rejects_invalid_argument_shapes_with_stable_kinds() -> Result<(), Box<dyn std::error::Error>>
+    {
         for (args, expected) in [
-            (vec![], RankedReportArgumentError::MissingInput),
+            (vec![], CliArgumentError::MissingCommand),
             (
-                vec![OsString::from("--output")],
-                RankedReportArgumentError::MissingOutputValue,
+                vec![OsString::from("unknown")],
+                CliArgumentError::UnknownCommand,
+            ),
+            (
+                vec![OsString::from("report")],
+                CliArgumentError::MissingInput,
+            ),
+            (
+                vec![OsString::from("report"), OsString::from("--output")],
+                CliArgumentError::MissingOutputValue,
             ),
             (
                 vec![
+                    OsString::from("report"),
+                    OsString::from("trace.pftrace"),
+                    OsString::from("--output"),
+                    OsString::from("first.html"),
+                    OsString::from("--output"),
+                ],
+                CliArgumentError::DuplicateOutput,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("--output"),
+                    OsString::from("first.html"),
+                    OsString::from("--output"),
+                    OsString::from("second.html"),
+                    OsString::from("--unknown"),
+                ],
+                CliArgumentError::DuplicateOutput,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("first.pftrace"),
+                    OsString::from("second.pftrace"),
+                    OsString::from("--output"),
+                ],
+                CliArgumentError::MultipleInputs,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("first.pftrace"),
+                    OsString::from("second.pftrace"),
+                    OsString::from("--help"),
+                ],
+                CliArgumentError::MultipleInputs,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("--unknown"),
+                    OsString::from("--output"),
+                ],
+                CliArgumentError::UnknownOption,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
                     OsString::from("trace.pftrace"),
                     OsString::from("--output"),
                     OsString::from("first.html"),
                     OsString::from("--output"),
                     OsString::from("second.html"),
                 ],
-                RankedReportArgumentError::DuplicateOutput,
+                CliArgumentError::DuplicateOutput,
             ),
             (
                 vec![
+                    OsString::from("report"),
                     OsString::from("first.pftrace"),
                     OsString::from("second.pftrace"),
                 ],
-                RankedReportArgumentError::MultipleInputs,
+                CliArgumentError::MultipleInputs,
             ),
             (
-                vec![OsString::from("--unknown")],
-                RankedReportArgumentError::UnknownOption,
+                vec![OsString::from("report"), OsString::from("--unknown")],
+                CliArgumentError::UnknownOption,
+            ),
+            (
+                vec![OsString::from("inspect")],
+                CliArgumentError::MissingInput,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                ],
+                CliArgumentError::InvalidLimit,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--depth"),
+                ],
+                CliArgumentError::InvalidDepth,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--semantic"),
+                ],
+                CliArgumentError::InvalidSemanticId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--function"),
+                ],
+                CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--function"),
+                    OsString::from("--limit"),
+                    OsString::from("2"),
+                ],
+                CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--filter"),
+                ],
+                CliArgumentError::InvalidFilter,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--filter"),
+                    OsString::from("--limit"),
+                    OsString::from("2"),
+                ],
+                CliArgumentError::InvalidFilter,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--sort"),
+                ],
+                CliArgumentError::InvalidSort,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                    OsString::from("0"),
+                ],
+                CliArgumentError::InvalidLimit,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                    OsString::from("-1"),
+                ],
+                CliArgumentError::InvalidLimit,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--depth"),
+                    OsString::from("33"),
+                ],
+                CliArgumentError::InvalidDepth,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--depth"),
+                    OsString::from("-1"),
+                ],
+                CliArgumentError::InvalidDepth,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--semantic"),
+                    OsString::from("worker-1"),
+                ],
+                CliArgumentError::InvalidSemanticId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--function"),
+                    OsString::from("42"),
+                ],
+                CliArgumentError::InvalidFunctionId,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--filter"),
+                    OsString::new(),
+                ],
+                CliArgumentError::InvalidFilter,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--sort"),
+                    OsString::from("cpu"),
+                ],
+                CliArgumentError::InvalidSort,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--semantic"),
+                    OsString::from("42"),
+                    OsString::from("--function"),
+                    OsString::from("42:7"),
+                ],
+                CliArgumentError::IncompatibleSelectors,
+            ),
+            (
+                vec![
+                    OsString::from("inspect"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--limit"),
+                    OsString::from("10"),
+                    OsString::from("--limit"),
+                    OsString::from("20"),
+                ],
+                CliArgumentError::DuplicateOption,
             ),
         ] {
-            assert_eq!(parse_ranked_report_args(args), Err(expected));
+            let error = PerfettoCli::try_parse_from(
+                iter::once(OsString::from("delta-funnel-perfetto")).chain(args.iter().cloned()),
+            )
+            .err()
+            .ok_or("invalid arguments should fail")?;
+            assert_eq!(classify_cli_error(&args, &error), expected);
         }
+        Ok(())
     }
 
     #[test]
-    fn failures_expose_stable_machine_readable_fields() {
-        let argument_failure = RankedReportFailure::from(RankedReportArgumentError::MissingInput);
+    fn failures_expose_stable_machine_readable_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let argument_failure = RankedReportFailure::from(CliArgumentError::MissingInput);
         assert_eq!(argument_failure.phase(), RankedReportFailurePhase::Argument);
         assert_eq!(argument_failure.kind(), "missing_input");
 
@@ -510,6 +1878,15 @@ mod tests {
         let path_failure = RankedReportFailure::from(RankedReportPathError::InputOutputAlias);
         assert_eq!(path_failure.phase(), RankedReportFailurePhase::Output);
         assert_eq!(path_failure.kind(), "aliases_input");
+
+        let typo = vec![OsString::from("reprot")];
+        let typo_error = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "reprot"])
+            .err()
+            .ok_or("misspelled command should fail")?;
+        let typo_failure = cli_failure(&typo, &typo_error);
+        assert_eq!(typo_failure.kind(), "unknown_command");
+        assert!(typo_failure.to_string().contains("did you mean report?"));
+        Ok(())
     }
 
     #[test]

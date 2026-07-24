@@ -21,6 +21,7 @@ workspace = true
 
 [features]
 perfetto-profile = [
+    "dep:clap",
     "dep:flate2",
     "dep:hyper-util",
     "dep:perfetto-sdk",
@@ -35,6 +36,7 @@ async-trait = "0.1"
 arrow-schema = "58.3.0"
 arrow-tiberius = "0.2.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.6.4", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"], optional = true }
 datafusion = { version = "53.1.0", default-features = false, features = [
     "sql",
 ] }
