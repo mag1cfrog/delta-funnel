@@ -63,6 +63,7 @@ tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
+url = "2"
 zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]

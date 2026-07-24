@@ -51,9 +51,7 @@ fn scan_file_paths(
     scan: &DeltaScanPlanningExec,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let scan_plan = scan.scan_plan();
-    scan_plan
-        .kernel_scan()
-        .scan_file_paths(&scan_plan.table_uri, &scan_plan.storage_options)
+    scan_plan.kernel_scan().scan_file_paths()
 }
 
 fn scan_partition_file_paths(scan: &DeltaScanPlanningExec) -> Vec<Vec<String>> {

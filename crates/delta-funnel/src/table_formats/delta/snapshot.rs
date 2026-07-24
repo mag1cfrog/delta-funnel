@@ -1,14 +1,19 @@
 //! Delta source snapshot loading.
 
+use std::sync::Arc;
+
 use crate::{
     DeltaFunnelError,
     error::{DeltaSnapshotLoadSnafu, DeltaSourceEngineSnafu, InvalidSourceUriSnafu},
     support::{sanitize_text_for_display, sanitize_uri_for_display},
 };
+use object_store::ObjectStore;
+use url::Url;
 
 use super::DeltaStorageOptions;
 use super::kernel::{
-    DefaultEngineBuilder, Snapshot, SnapshotRef, Version, store_from_url_opts, try_parse_uri,
+    DefaultEngineBuilder, Engine, Snapshot, SnapshotRef, Version, store_from_url_opts,
+    try_parse_uri,
 };
 use super::uri::normalize_delta_table_uri;
 
@@ -43,15 +48,15 @@ impl S3AuthModeHint {
 /// owns the source-side state that later protocol and DataFusion provider
 /// slices can consume without reloading the snapshot.
 pub(crate) struct LoadedDeltaTableSnapshot {
-    table_uri: String,
     snapshot: SnapshotRef,
+    engine_context: Arc<DeltaKernelEngineContext>,
 }
 
 impl LoadedDeltaTableSnapshot {
     /// Normalized Delta table URI used to load the snapshot.
     #[must_use]
     pub(crate) fn table_uri(&self) -> &str {
-        &self.table_uri
+        self.engine_context.table_url().as_str()
     }
 
     /// Loaded Delta table version.
@@ -63,13 +68,20 @@ impl LoadedDeltaTableSnapshot {
     pub(crate) fn kernel_snapshot(&self) -> &SnapshotRef {
         &self.snapshot
     }
+
+    pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
+        &self.engine_context
+    }
 }
 
-struct DeltaKernelEngine {
-    inner: Box<dyn delta_kernel::Engine + Send + Sync>,
+/// Owned Delta Kernel infrastructure for one loaded source.
+pub(crate) struct DeltaKernelEngineContext {
+    table_url: Url,
+    object_store: Arc<dyn ObjectStore>,
+    engine: Arc<dyn Engine + Send + Sync>,
 }
 
-impl DeltaKernelEngine {
+impl DeltaKernelEngineContext {
     fn build(
         table_uri: &str,
         storage_options: &DeltaStorageOptions,
@@ -97,14 +109,26 @@ impl DeltaKernelEngine {
                 .fail();
             }
         };
+        let engine = Arc::new(DefaultEngineBuilder::new(Arc::clone(&store)).build());
 
         Ok(Self {
-            inner: Box::new(DefaultEngineBuilder::new(store).build()),
+            table_url,
+            object_store: store,
+            engine,
         })
     }
 
-    fn as_kernel_engine(&self) -> &dyn delta_kernel::Engine {
-        self.inner.as_ref()
+    pub(crate) fn table_url(&self) -> &Url {
+        &self.table_url
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.object_store)
+    }
+
+    pub(crate) fn as_kernel_engine(&self) -> &dyn Engine {
+        self.engine.as_ref()
     }
 }
 
@@ -127,14 +151,17 @@ pub(crate) fn load_delta_table_snapshot(
 ) -> Result<LoadedDeltaTableSnapshot, DeltaFunnelError> {
     let table_uri = normalize_delta_table_uri(table_uri)?;
     let s3_auth_mode_hint = s3_auth_mode_hint_for_source(&table_uri, storage_options);
-    let engine = DeltaKernelEngine::build(&table_uri, storage_options)?;
+    let engine_context = Arc::new(DeltaKernelEngineContext::build(
+        &table_uri,
+        storage_options,
+    )?);
 
-    let mut builder = Snapshot::builder_for(&table_uri);
+    let mut builder = Snapshot::builder_for(engine_context.table_url().as_str());
     if let Some(version) = version {
         builder = builder.at_version(version);
     }
 
-    let snapshot = match builder.build(engine.as_kernel_engine()) {
+    let snapshot = match builder.build(engine_context.as_kernel_engine()) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return DeltaSnapshotLoadSnafu {
@@ -145,8 +172,8 @@ pub(crate) fn load_delta_table_snapshot(
     };
 
     Ok(LoadedDeltaTableSnapshot {
-        table_uri,
         snapshot,
+        engine_context,
     })
 }
 
