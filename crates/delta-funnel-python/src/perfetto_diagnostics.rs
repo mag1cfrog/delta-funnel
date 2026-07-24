@@ -9,7 +9,7 @@ use std::{io, path::PathBuf};
 
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
-    PerfettoProfileLayer, initialize_perfetto, is_profile_target,
+    PerfettoProfileLayer, initialize_perfetto, is_profile_capture_active, is_profile_target,
     run_perfetto_diagnostics_cli_with_args, wait_for_capture,
 };
 use pyo3::prelude::*;
@@ -141,7 +141,7 @@ fn init_perfetto_diagnostics_inner(
 }
 
 #[cfg(feature = "perfetto-profile")]
-fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
+pub(super) fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
     tracing::subscriber::set_global_default(perfetto_diagnostics_subscriber(filter, logger)).is_ok()
 }
 
@@ -151,8 +151,9 @@ fn perfetto_diagnostics_subscriber(
     logger: String,
 ) -> impl Subscriber + Send + Sync + 'static {
     let logging_layer = python_logging_layer(logger).with_filter(filter);
-    let perfetto_layer = PerfettoProfileLayer
-        .with_filter(filter_fn(|metadata| is_profile_target(metadata.target())));
+    let perfetto_layer = PerfettoProfileLayer.with_filter(filter_fn(|metadata| {
+        is_profile_target(metadata.target()) && is_profile_capture_active()
+    }));
     Registry::default().with(logging_layer).with(perfetto_layer)
 }
 
@@ -470,11 +471,11 @@ mod tests {
             );
 
             tracing::subscriber::with_default(subscriber, || {
-                assert!(tracing::enabled!(
+                assert!(!tracing::enabled!(
                     target: "delta_funnel::profile",
                     Level::TRACE
                 ));
-                assert!(tracing::enabled!(
+                assert!(!tracing::enabled!(
                     target: "tiberius_raw_bulk::protocol",
                     Level::INFO
                 ));

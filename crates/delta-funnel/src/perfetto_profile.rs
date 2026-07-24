@@ -282,6 +282,11 @@ pub fn initialize_perfetto() -> io::Result<()> {
     }
 }
 
+/// Returns whether an external capture currently accepts Delta Funnel profile events.
+pub fn is_profile_capture_active() -> bool {
+    track_event_category_enabled!("delta_funnel.profile")
+}
+
 /// Waits up to `timeout` for an external system capture to enable the profile category.
 ///
 /// # Errors
@@ -295,7 +300,7 @@ pub fn wait_for_capture(timeout: Duration) -> io::Result<()> {
             format!("Perfetto capture wait timeout {timeout:?} is too large"),
         )
     })?;
-    while !track_event_category_enabled!("delta_funnel.profile") {
+    while !is_profile_capture_active() {
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(
