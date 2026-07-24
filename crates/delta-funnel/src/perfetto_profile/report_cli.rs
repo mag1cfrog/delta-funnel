@@ -474,7 +474,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
-    match super::load_ranked_profile(&input) {
+    match super::load_ranked_profile(&input, None) {
         Ok(document) if args.interactive => {
             let stdin = io::stdin();
             let stdout = io::stdout();

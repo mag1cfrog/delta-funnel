@@ -15,7 +15,9 @@ use perfetto_sdk::protos::trace::track_event::track_descriptor::{
 use perfetto_sdk::track_event::{
     EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTrack,
 };
-use perfetto_sdk::{track_event_categories, track_event_category_enabled};
+use perfetto_sdk::{
+    track_event_begin, track_event_categories, track_event_category_enabled, track_event_end,
+};
 
 use crate::profiling::{allocate_id, in_operation_capture_scope};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
@@ -51,8 +53,31 @@ pub fn generate_ranked_profile_report(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_report_for_scope(input, output, None)
+}
+
+/// Generates one ranked HTML report for a host-selected operation capture.
+///
+/// # Errors
+///
+/// Returns a structured failure when the selected operation is unavailable or
+/// normal ranked report generation fails.
+#[doc(hidden)]
+pub fn generate_operation_ranked_profile_report(
+    input: &Path,
+    output: &Path,
+    capture_scope: &OperationCaptureScope,
+) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_report_for_scope(input, output, Some(capture_scope.id))
+}
+
+fn generate_ranked_profile_report_for_scope(
+    input: &Path,
+    output: &Path,
+    capture_scope_id: Option<u64>,
+) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = load_ranked_profile(&paths.input)?;
+    let document = load_ranked_profile(&paths.input, capture_scope_id)?;
     let html = render_ranked_profile_html(&document)?;
     write_ranked_profile_html(&paths.output, &html)?;
     Ok(paths.output)
@@ -78,17 +103,33 @@ pub struct OperationCaptureScope {
 impl OperationCaptureScope {
     /// Allocates one process-unique operation capture scope.
     pub fn allocate() -> Option<Self> {
-        allocate_id(&NEXT_OPERATION_CAPTURE_SCOPE_ID).map(|id| Self { id })
-    }
-
-    /// Returns the stable scope identity recorded on the operation root.
-    pub const fn id(&self) -> u64 {
-        self.id
+        allocate_id(&NEXT_OPERATION_CAPTURE_SCOPE_ID)
+            .filter(|id| i64::try_from(*id).is_ok())
+            .map(|id| Self { id })
     }
 
     /// Runs the operation entry point inside this capture scope.
     pub fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        track_event_begin!(
+            "delta_funnel.profile.context",
+            "Delta Funnel operation capture scope",
+            |context: &mut EventContext| {
+                context.add_debug_arg(
+                    "capture_scope_id",
+                    perfetto_sdk::track_event::TrackEventDebugArg::Uint64(self.id),
+                );
+            }
+        );
+        let _context = OperationCaptureContext;
         in_operation_capture_scope(self.id, operation)
+    }
+}
+
+struct OperationCaptureContext;
+
+impl Drop for OperationCaptureContext {
+    fn drop(&mut self) {
+        track_event_end!("delta_funnel.profile.context");
     }
 }
 

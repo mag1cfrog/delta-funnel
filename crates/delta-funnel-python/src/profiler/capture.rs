@@ -117,9 +117,13 @@ impl OperationCapture {
         crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         drop(self.reservation.take());
         stop_result?;
-        delta_funnel::perfetto_profile::generate_ranked_profile_report(&self.trace, &self.output)
-            .map(|_| ())
-            .map_err(|error| ProfilerFailure::new(error.kind(), error.to_string()))
+        delta_funnel::perfetto_profile::generate_operation_ranked_profile_report(
+            &self.trace,
+            &self.output,
+            &self.scope,
+        )
+        .map(|_| ())
+        .map_err(|error| ProfilerFailure::new(error.kind(), error.to_string()))
     }
 }
 

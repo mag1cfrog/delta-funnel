@@ -37,6 +37,9 @@ The capture starts immediately before `preview` executes and stops when that
 call reaches its terminal result. Other Python work before or after the call is
 not included. Passing `profiler` automatically enables the existing detailed
 semantic and operator profile; `profile=True` is not also required.
+Concurrent Delta Funnel operations are excluded from the semantic and native
+function rankings. Process samples without a matching target-operation context
+remain visible only in the report's unattributed coverage count.
 
 Use the same configuration type for one SQL Server write:
 

@@ -45,6 +45,10 @@ FROM slice
 JOIN track ON track.id = slice.track_id
 WHERE slice.category = 'delta_funnel.profile'
   AND extract_arg(slice.arg_set_id, 'debug.operation_id') IS NOT NULL
+  AND extract_arg(slice.arg_set_id, 'debug.operation_id') IN (
+    SELECT operation_id
+    FROM delta_funnel_profile_operations
+  )
   AND extract_arg(slice.arg_set_id, 'debug.time_semantics') IN (
     'wall_clock',
     'lifecycle'
@@ -404,7 +408,14 @@ JOIN delta_funnel_ranked_semantics AS semantic
     OR semantic.stage_owner_id = sample.stage_owner_id
   )
 JOIN delta_funnel_ranked_semantic_depths AS depth USING (semantic_id)
-WHERE sample.attribution != 'ambiguous';
+WHERE sample.attribution != 'ambiguous'
+  AND (
+    (
+      SELECT capture_scope_id
+      FROM delta_funnel_report_selection
+    ) IS NULL
+    OR sample.attribution = 'direct'
+  );
 
 CREATE PERFETTO INDEX delta_funnel_ranked_candidate_lookup
 ON delta_funnel_ranked_sample_semantic_candidates(sample_id, semantic_id);
