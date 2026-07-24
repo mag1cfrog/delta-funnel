@@ -7,6 +7,7 @@ mod json;
 mod logging;
 mod output;
 mod perfetto_diagnostics;
+mod profiler;
 mod progress;
 mod session;
 mod table;
@@ -31,6 +32,7 @@ fn deltafunnel(module: &Bound<'_, PyModule>) -> PyResult<()> {
     exception::add_exception(module)?;
     logging::add_logging(module)?;
     output::add_output(module)?;
+    profiler::add_profiler(module)?;
     session::add_session(module)?;
     table::add_table(module)?;
     module.add("__version__", env!("DELTAFUNNEL_PY_VERSION"))?;
