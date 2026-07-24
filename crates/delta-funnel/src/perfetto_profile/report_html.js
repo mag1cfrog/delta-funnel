@@ -61,6 +61,10 @@ const semanticKey = semantic => `s:${semantic.semantic_id}`;
 const functionKey = fn => `f:${fn.semantic_id}:${fn.function_id}`;
 const functionParentKey = (semanticId, functionId) =>
   `${semanticId}:${functionId}`;
+const functionSourceLocation = fn =>
+  fn.source_file === null
+    ? null
+    : `${fn.source_file}${fn.line_number === null ? "" : `:${fn.line_number}`}`;
 const semanticChildren = new Map();
 const functionRoots = new Map();
 const functionChildren = new Map();
@@ -316,9 +320,7 @@ const functionRow = (fn, depth) => {
   const owner = semanticsById.get(fn.semantic_id);
   const location = [
     fn.module_name,
-    fn.source_file === null
-      ? null
-      : `${fn.source_file}${fn.line_number === null ? "" : `:${fn.line_number}`}`
+    functionSourceLocation(fn)
   ].filter(Boolean).join(" - ");
   const row = document.createElement("tr");
   row.className = match === "Context"
@@ -614,7 +616,7 @@ const applyFilter = () => {
         const matches = [
           record.name,
           record.module_name,
-          record.source_file
+          functionSourceLocation(record)
         ].some(
           value => value !== null && containsFilter(value.toLowerCase())
         );
