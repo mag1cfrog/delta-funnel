@@ -47,7 +47,7 @@ vizviewer preview-trace.json
 
 The same file can be imported into Perfetto or another viewer that accepts
 Chrome Trace Event JSON. No VizTracer instrumentation is required because
-DeltaFunnel writes the trace document directly.
+Delta Funnel writes the trace document directly.
 
 The first complete `X` event is `Preview total`. It starts at zero and spans the
 entire preview wall clock, including DataFrame planning, physical planning,
@@ -302,7 +302,7 @@ written after a successful call. Rust callers can inspect
 `MssqlWriteReport::operation_timeline()` and export the same document with
 `MssqlWriteReport::to_trace_event_json_value()`.
 
-DeltaFunnel opens the trace destination before SQL Server work starts. An open
+Delta Funnel opens the trace destination before SQL Server work starts. An open
 failure therefore prevents the database operation. If final serialization or
 writing still fails after SQL Server succeeds, the Python error carries
 `deltafunnel_operation_status="completed"` and the sanitized report in

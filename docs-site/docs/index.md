@@ -51,7 +51,7 @@ Follow these steps in order:
 
 ## Reference
 
-- [API references](reference/api.md): find the Rust and Python API entry
+- [API reference](reference/api.md): find the Rust and Python API entry
   points.
 - [Diagnostics reference](reference/diagnostics.md): look up tracing events,
   operation phases, stream outcomes, and cache lifecycle fields.

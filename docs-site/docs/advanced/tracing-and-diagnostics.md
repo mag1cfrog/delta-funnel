@@ -37,7 +37,7 @@ report and then drill down:
   `connect`, `prepare_target_lifecycle`, `initialize_writer`,
   `poll_batch_stream`, `validate_batch_schema`, `write_batch`, `finalize`,
   `validation`, `swap_target`, or `cleanup`.
-- `partial_write_possible` means DeltaFunnel cannot claim the target table is
+- `partial_write_possible` means Delta Funnel cannot claim the target table is
   unchanged. Treat the target as needing operator review before retrying.
 - `cleanup` reports whether cleanup was not applicable, not attempted,
   succeeded, or failed.
@@ -54,7 +54,7 @@ phase timings, and cleanup status.
 
 ## Enable safe tracing
 
-For Python, follow [Python logging](python-logging.md) to route DeltaFunnel
+For Python, follow [Python logging](python-logging.md) to route Delta Funnel
 tracing through standard-library `logging`. The application remains responsible
 for handlers, formatters, levels, files, and external exporters.
 
@@ -63,7 +63,7 @@ debugging because it can show which credential-provider path was selected. Keep
 those logs in a restricted location and sanitize them before sharing.
 
 For Rust, enable tracing in the application or test harness that calls
-DeltaFunnel. Use target filters that include DeltaFunnel workflow events, Arrow
+Delta Funnel. Use target filters that include Delta Funnel workflow events, Arrow
 writer events, and raw bulk protocol events:
 
 ```rust
@@ -85,7 +85,7 @@ delta_funnel=debug,arrow_tiberius=debug,tiberius_raw_bulk::protocol=debug
 
 The tracing targets are:
 
-- `delta_funnel` for DeltaFunnel workflow, source, output, validation, and
+- `delta_funnel` for Delta Funnel workflow, source, output, validation, and
   DataFusion batch-stream events
 - `object_store` for object-store builder and credential-provider debug events
 - `arrow_tiberius` for Arrow-to-SQL Server writer lifecycle events
@@ -142,7 +142,7 @@ connection strings, storage option values, and row values.
 
 Include the smallest safe set of facts that explains where the workload failed:
 
-- DeltaFunnel crate version or commit
+- Delta Funnel crate version or commit
 - whether the run was dry-run or execute mode
 - validation mode: `disabled`, `validate_if_possible`, or `require`
 - workflow counts and output names
@@ -155,5 +155,5 @@ Include the smallest safe set of facts that explains where the workload failed:
   `tiberius_raw_bulk::protocol`
 
 For SQL Server engine analysis, use SQL Server tooling such as DMVs, Extended
-Events, Query Store, or separate profiling. DeltaFunnel reports do not replace
+Events, Query Store, or separate profiling. Delta Funnel reports do not replace
 SQL Server's own execution diagnostics.

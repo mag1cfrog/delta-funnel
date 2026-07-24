@@ -1,4 +1,4 @@
-# Dry Runs, Validation, And Reports
+# Dry Runs, Validation, and Reports
 
 Use dry runs to validate a plan before writing rows to SQL Server. Use execute
 reports to confirm what the workflow wrote and whether target validation

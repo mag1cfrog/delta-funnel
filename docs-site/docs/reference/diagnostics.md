@@ -72,7 +72,7 @@ CPU, syscall, scheduler, stack, or kernel profiling.
 `query_execution_profile_terminal` is one bounded `DEBUG` summary on the
 `delta_funnel` tracing target for an execution that registered a detailed
 profile consumer. Profiling is opt-in. When `ExecutionProfileMode` remains at
-its default `Disabled` value, DeltaFunnel does not allocate a profile result,
+its default `Disabled` value, Delta Funnel does not allocate a profile result,
 retain a plan for profiling, collect DataFusion metrics, or emit this event.
 
 The event fields are:

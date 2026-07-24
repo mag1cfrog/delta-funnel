@@ -4,7 +4,7 @@ Delta DataFusion provider scan planning derives a file task partition target
 before Delta scan metadata expansion. The target is passed to metadata-only file
 task grouping after Delta Kernel has selected the active files.
 
-This policy decides how many provider scan partitions DeltaFunnel asks for. It
+This policy decides how many provider scan partitions Delta Funnel asks for. It
 does not read Parquet data, create Arrow `RecordBatch` values, or execute file
 reads.
 
@@ -13,7 +13,7 @@ reads.
 The production policy is:
 
 1. Use `DeltaTableProviderConfig::scan_target_partitions` when it is `Some`.
-   This source-local DeltaFunnel override must be greater than zero.
+   This source-local Delta Funnel override must be greater than zero.
 2. Otherwise, build a fallback baseline from
    `DeltaExecutionEnvironmentProfile::available_parallelism *
    parallelism_multiplier`.
@@ -23,13 +23,13 @@ The production policy is:
    - Unix fd soft limit, when available.
    - Available memory hint, when available.
 
-Explicit DeltaFunnel override wins over all caps. It is the most specific user
+An explicit Delta Funnel override wins over all caps. It is the most specific user
 choice and applies only to Delta scan file task grouping for the configured
 source.
 
 DataFusion `target_partitions` is broader. It is a session execution target, and
 DataFusion exposes a non-null default even when the user did not explicitly tune
-DeltaFunnel. DeltaFunnel records it as diagnostic input and uses it as an upper
+Delta Funnel. Delta Funnel records it as diagnostic input and uses it as an upper
 cap for automatic fallback, not as the source winner.
 
 ## Execution Environment Profile

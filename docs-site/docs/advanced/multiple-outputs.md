@@ -1,4 +1,4 @@
-# Multiple Outputs And Shared Caching
+# Multiple Outputs and Shared Caching
 
 Use `Session.write_all(...)` when one workflow writes several related lazy
 tables to SQL Server. Shared lazy SQL dependencies can be cached so common

@@ -139,10 +139,11 @@ Each `provider_read_stats` object in a JSON source report describes one retained
 physical Delta scan. It is not a total across repeated executions, multiple
 outputs, or cache materialization. The current report envelope cannot represent
 partitioned cache-materialization scans as one snapshot without losing their
-boundaries. Terminal tracing for those executions belongs to a separate
-implementation slice.
+boundaries. For per-scan terminal tracing across preview, output, and cache
+executions, see
+[Terminal Parquet I/O](../reference/diagnostics.md#inspect-terminal-parquet-io).
 
-## Backpressure And Cancellation
+## Backpressure and Cancellation
 
 Provider execution builds a DataFusion `RecordBatchReceiverStream` with bounded
 channel capacity. If downstream drops the stream or stops accepting output,
@@ -170,7 +171,7 @@ tests.
 ## Known Limitations
 
 The official-kernel sync iterator may internally fan one provider file handoff
-into multiple object-store requests. DeltaFunnel does not claim request-level,
+into multiple object-store requests. Delta Funnel does not claim request-level,
 range-level, or row-group-level fairness for that hidden work. The provider
 keeps file-level bounds conservative for this backend.
 
