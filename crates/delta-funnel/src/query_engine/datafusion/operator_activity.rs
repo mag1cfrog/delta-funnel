@@ -10,8 +10,6 @@ use std::{
     task::{Context, Poll},
 };
 
-#[cfg(feature = "perfetto-profile")]
-use datafusion::common::runtime::{JoinSetTracer, JoinSetTracerError, set_join_set_tracer};
 use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
     common::Result as DataFusionResult,
@@ -22,12 +20,7 @@ use datafusion::{
     },
 };
 use futures_util::Stream;
-#[cfg(feature = "perfetto-profile")]
-use futures_util::{FutureExt, future::BoxFuture, future::poll_fn};
 use serde_json::Value;
-
-#[cfg(feature = "perfetto-profile")]
-use crate::profiling::{OBJECT_STORE_TRANSPORT_ACTIVITY, OBJECT_STORE_TRANSPORT_CONTEXT_NAME};
 
 use crate::{
     QueryExecutionScope,
@@ -37,6 +30,16 @@ use crate::{
 };
 
 use super::{QueryTraceIdentity, execution::DeltaScanPlanningExec};
+
+#[cfg(feature = "perfetto-profile")]
+mod task_tracing;
+
+#[cfg(feature = "perfetto-profile")]
+use task_tracing::DataFusionTaskTraceContext;
+#[cfg(feature = "perfetto-profile")]
+pub(crate) use task_tracing::{
+    current_datafusion_object_store_transport_span, initialize_datafusion_task_tracing,
+};
 
 const OPERATOR_ACTIVITY_CATEGORY: &str = "datafusion.operator.activity";
 const DELTA_SCAN_OUTPUT_WAIT_CATEGORY: &str = "datafusion.execution.activity";
@@ -151,17 +154,6 @@ struct OperatorActivityRecorder {
     query_scope: QueryExecutionScope,
     query_owner: Option<Arc<str>>,
     identities: Arc<Mutex<OperatorActivityIdentityState>>,
-}
-
-#[cfg(feature = "perfetto-profile")]
-#[derive(Debug, Clone)]
-struct DataFusionTaskTraceContext {
-    activity: OperatorActivityRecorder,
-    operator_name: Arc<str>,
-    node_id: u64,
-    parent_node_id: Option<u64>,
-    partition: usize,
-    stream_id: u64,
 }
 
 impl OperatorActivityRecorder {
@@ -313,13 +305,15 @@ impl OperatorActivityRecorder {
             timeline_span_id,
             process_span_active: process_span.is_some(),
             #[cfg(feature = "perfetto-profile")]
-            task_trace_context: process_span.as_ref().map(|_| DataFusionTaskTraceContext {
-                activity: self.clone(),
-                operator_name,
-                node_id,
-                parent_node_id,
-                partition,
-                stream_id,
+            task_trace_context: process_span.as_ref().map(|_| {
+                DataFusionTaskTraceContext::new(
+                    self.clone(),
+                    operator_name,
+                    node_id,
+                    parent_node_id,
+                    partition,
+                    stream_id,
+                )
             }),
         };
         ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active.clone()));
@@ -668,151 +662,6 @@ impl Drop for OperatorActivitySpanRecorder {
     }
 }
 
-#[cfg(feature = "perfetto-profile")]
-impl DataFusionTaskTraceContext {
-    fn process_span(&self) -> tracing::Span {
-        tracing::trace_span!(
-            target: crate::profiling::PROFILE_TARGET,
-            parent: None,
-            "DataFusion task context",
-            operation_id = self.activity.context.operation_id(),
-            query_execution_id = self.activity.query_execution_id,
-            query_scope = self.activity.query_scope.as_str(),
-            query_owner = self.activity.query_owner.as_deref(),
-            operator_name = self.operator_name.as_ref(),
-            worker_lane_id = tracing::field::Empty,
-            worker_kind = tracing::field::Empty,
-            node_id = self.node_id,
-            parent_node_id = tracing::field::Empty,
-            operator_partition = usize_to_u64_saturating(self.partition),
-            execution_stream_id = self.stream_id,
-            activity = "spawned_task",
-            time_semantics = "active",
-        )
-    }
-
-    fn in_process_scope<T>(&self, span: &tracing::Span, operation: impl FnOnce() -> T) -> T {
-        let (context, owns_worker_lane) = self.activity.execution_context(self.partition, false);
-        span.record("worker_lane_id", context.worker_lane.id);
-        span.record("worker_kind", context.worker_lane.kind.as_str());
-        if let Some(parent_node_id) = self.parent_node_id {
-            span.record("parent_node_id", parent_node_id);
-        }
-        let active = ActiveOperatorActivitySpan {
-            operation_id: self.activity.context.operation_id(),
-            query_execution_id: self.activity.query_execution_id,
-            worker_lane: context.worker_lane,
-            owns_worker_lane,
-            timeline_span_id: None,
-            process_span_active: true,
-            task_trace_context: Some(self.clone()),
-        };
-        ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active.clone()));
-        let guard = DataFusionTaskScope {
-            identities: Arc::clone(&self.activity.identities),
-            active,
-        };
-        let result = span.in_scope(operation);
-        drop(guard);
-        result
-    }
-
-    fn object_store_transport_span(&self) -> tracing::Span {
-        tracing::trace_span!(
-            target: crate::profiling::PROFILE_TARGET,
-            parent: None,
-            OBJECT_STORE_TRANSPORT_CONTEXT_NAME,
-            operation_id = self.activity.context.operation_id(),
-            query_execution_id = self.activity.query_execution_id,
-            execution_stream_id = self.stream_id,
-            activity = OBJECT_STORE_TRANSPORT_ACTIVITY,
-        )
-    }
-}
-
-#[cfg(feature = "perfetto-profile")]
-struct DataFusionTaskScope {
-    identities: Arc<Mutex<OperatorActivityIdentityState>>,
-    active: ActiveOperatorActivitySpan,
-}
-
-#[cfg(feature = "perfetto-profile")]
-impl Drop for DataFusionTaskScope {
-    fn drop(&mut self) {
-        let _ = ACTIVE_OPERATOR_ACTIVITY_SPANS.try_with(|spans| {
-            let popped = spans.borrow_mut().pop();
-            debug_assert!(
-                popped
-                    .as_ref()
-                    .is_some_and(|popped| popped.same_scope(&self.active))
-            );
-        });
-        if self.active.owns_worker_lane {
-            OperatorActivityRecorder::release_worker_lane(
-                &self.identities,
-                self.active.worker_lane,
-            );
-        }
-    }
-}
-
-#[cfg(feature = "perfetto-profile")]
-fn current_datafusion_task_trace_context() -> Option<DataFusionTaskTraceContext> {
-    ACTIVE_OPERATOR_ACTIVITY_SPANS
-        .try_with(|spans| {
-            spans
-                .borrow()
-                .last()
-                .and_then(|active| active.task_trace_context.clone())
-        })
-        .ok()
-        .flatten()
-}
-
-#[cfg(feature = "perfetto-profile")]
-pub(crate) fn current_datafusion_object_store_transport_span() -> Option<tracing::Span> {
-    current_datafusion_task_trace_context().map(|context| context.object_store_transport_span())
-}
-
-#[cfg(feature = "perfetto-profile")]
-struct DeltaFunnelDataFusionTaskTracer;
-
-#[cfg(feature = "perfetto-profile")]
-impl JoinSetTracer for DeltaFunnelDataFusionTaskTracer {
-    fn trace_future(
-        &self,
-        mut future: BoxFuture<'static, Box<dyn Any + Send>>,
-    ) -> BoxFuture<'static, Box<dyn Any + Send>> {
-        let Some(context) = current_datafusion_task_trace_context() else {
-            return future;
-        };
-        let span = context.process_span();
-        poll_fn(move |poll_context| {
-            context.in_process_scope(&span, || future.as_mut().poll(poll_context))
-        })
-        .boxed()
-    }
-
-    fn trace_block(
-        &self,
-        operation: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
-    ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
-        let Some(context) = current_datafusion_task_trace_context() else {
-            return operation;
-        };
-        let span = context.process_span();
-        Box::new(move || context.in_process_scope(&span, operation))
-    }
-}
-
-#[cfg(feature = "perfetto-profile")]
-static DATAFUSION_TASK_TRACER: DeltaFunnelDataFusionTaskTracer = DeltaFunnelDataFusionTaskTracer;
-
-#[cfg(feature = "perfetto-profile")]
-pub(crate) fn initialize_datafusion_task_tracing() -> Result<(), JoinSetTracerError> {
-    set_join_set_tracer(&DATAFUSION_TASK_TRACER)
-}
-
 /// Adds transparent execute and poll instrumentation to one finalized plan.
 pub(crate) fn instrument_query_execution_plan(
     root: Arc<dyn ExecutionPlan>,
@@ -1060,6 +909,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(feature = "perfetto-profile")]
+    use datafusion::common::runtime::JoinSetTracer;
     use datafusion::{
         arrow::datatypes::Schema,
         common::DataFusionError,
@@ -1069,6 +920,8 @@ mod tests {
         },
         prelude::SessionContext,
     };
+    #[cfg(feature = "perfetto-profile")]
+    use futures_util::FutureExt;
     use futures_util::StreamExt;
 
     use crate::{
@@ -1082,6 +935,8 @@ mod tests {
         report::OperationTimelineRecorder,
     };
 
+    #[cfg(feature = "perfetto-profile")]
+    use super::task_tracing::DATAFUSION_TASK_TRACER;
     use super::*;
 
     fn test_trace_identity(timeline: OperationTimelineRecorder) -> QueryTraceIdentity {

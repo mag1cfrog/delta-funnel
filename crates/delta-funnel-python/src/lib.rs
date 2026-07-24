@@ -6,6 +6,7 @@ mod exception;
 mod json;
 mod logging;
 mod output;
+mod perfetto_diagnostics;
 mod progress;
 mod session;
 mod table;

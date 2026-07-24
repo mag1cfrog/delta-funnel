@@ -9,7 +9,7 @@ use datafusion::physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
 };
 
-use crate::{DeltaFunnelError, QueryExecutionScope, profiling::OperationTraceContext};
+use crate::DeltaFunnelError;
 
 mod catalog;
 mod execution;
@@ -17,6 +17,8 @@ pub(crate) mod execution_profile;
 mod operator_activity;
 mod planning;
 mod planning_activity;
+mod profiled_execution;
+mod profiled_object_store;
 mod session;
 
 #[cfg(feature = "perfetto-profile")]
@@ -24,6 +26,9 @@ pub(crate) use operator_activity::initialize_datafusion_task_tracing;
 pub(crate) use operator_activity::instrument_query_execution_plan;
 pub(crate) use planning_activity::{
     profile_query_planning_sync_result, with_query_planning_activity,
+};
+pub(crate) use profiled_execution::{
+    QueryTraceIdentity, profiled_datafusion_query_output_stream_with_effective_root,
 };
 
 pub use catalog::registration::{
@@ -44,57 +49,6 @@ pub use planning::partition_target::{
     derive_delta_scan_partition_target_diagnostic,
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
-
-/// Shared identity for the planning and execution events of one query.
-#[derive(Debug, Clone)]
-pub(crate) struct QueryTraceIdentity {
-    context: OperationTraceContext,
-    query_execution_id: u64,
-    query_scope: QueryExecutionScope,
-    query_owner: Option<Arc<str>>,
-}
-
-impl QueryTraceIdentity {
-    pub(crate) fn new(
-        context: OperationTraceContext,
-        query_scope: QueryExecutionScope,
-        query_owner: Option<&str>,
-    ) -> Option<Self> {
-        debug_assert_ne!(context.operation_id(), 0);
-        debug_assert!(context.timeline().is_some() || context.process_spans_enabled());
-        let query_execution_id = context.next_query_execution_id()?;
-        Some(Self {
-            context,
-            query_execution_id,
-            query_scope,
-            query_owner: query_owner.map(Arc::<str>::from),
-        })
-    }
-
-    const fn timeline(&self) -> Option<&crate::report::OperationTimelineRecorder> {
-        self.context.timeline()
-    }
-
-    const fn operation_id(&self) -> u64 {
-        self.context.operation_id()
-    }
-
-    fn process_root_span(&self) -> Option<&tracing::Span> {
-        self.context.process_root_span()
-    }
-
-    const fn query_execution_id(&self) -> u64 {
-        self.query_execution_id
-    }
-
-    const fn query_scope(&self) -> QueryExecutionScope {
-        self.query_scope
-    }
-
-    fn query_owner(&self) -> Option<&str> {
-        self.query_owner.as_deref()
-    }
-}
 
 /// Shared live read counters for one physical Delta scan.
 pub(crate) type DeltaProviderReadStatsHandle = Arc<execution::read_stats::DeltaProviderReadStats>;
@@ -198,53 +152,36 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
 ) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
-    datafusion_query_output_stream_with_effective_root_impl(plan, task_context, None)
+    let (effective_profile_root, execute) = prepare_datafusion_query_output(plan);
+    execute_datafusion_query_output(effective_profile_root, execute, task_context)
 }
 
-pub(crate) fn profiled_datafusion_query_output_stream_with_effective_root(
+pub(super) fn prepare_datafusion_query_output(
     plan: Arc<dyn ExecutionPlan>,
-    task_context: Arc<TaskContext>,
-    trace_identity: QueryTraceIdentity,
-) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
-    datafusion_query_output_stream_with_effective_root_impl(
-        plan,
-        task_context,
-        Some(trace_identity),
-    )
-}
-
-fn datafusion_query_output_stream_with_effective_root_impl(
-    plan: Arc<dyn ExecutionPlan>,
-    task_context: Arc<TaskContext>,
-    trace_identity: Option<QueryTraceIdentity>,
-) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
+) -> (Arc<dyn ExecutionPlan>, bool) {
     // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
-    let (effective_profile_root, execute) =
-        match plan.properties().output_partitioning().partition_count() {
-            // DataFusion returns an empty stream without executing a partition, but
-            // profiling still needs the real planned root.
-            0 => (plan, false),
-            // The only output partition has the zero-based index 0.
-            1 => (plan, true),
-            2.. => {
-                // The wrapper exposes one output partition at index 0 and consumes
-                // every output partition from the original plan.
-                (
-                    Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>,
-                    true,
-                )
-            }
-        };
-    let effective_profile_root = match trace_identity {
-        Some(trace_identity) => {
-            instrument_query_execution_plan(Arc::clone(&effective_profile_root), trace_identity)
-                .map_err(|source| DFQueryExecutionSetupError {
-                    source,
-                    effective_profile_root,
-                })?
+    match plan.properties().output_partitioning().partition_count() {
+        // DataFusion returns an empty stream without executing a partition, but
+        // profiling still needs the real planned root.
+        0 => (plan, false),
+        // The only output partition has the zero-based index 0.
+        1 => (plan, true),
+        2.. => {
+            // The wrapper exposes one output partition at index 0 and consumes
+            // every output partition from the original plan.
+            (
+                Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>,
+                true,
+            )
         }
-        None => effective_profile_root,
-    };
+    }
+}
+
+pub(super) fn execute_datafusion_query_output(
+    effective_profile_root: Arc<dyn ExecutionPlan>,
+    execute: bool,
+    task_context: Arc<TaskContext>,
+) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
     let stream = if execute {
         effective_profile_root
             .execute(0, task_context)
