@@ -136,6 +136,6 @@ For multi-output dry runs, shared caching, and partial failure reports, see
 [Multiple outputs and shared caching](advanced/multiple-outputs.md).
 
 For interpreting failures and collecting safe diagnostics, see
-[Tracing and diagnostics](advanced/tracing-and-diagnostics.md).
+[Troubleshoot a failed run](advanced/tracing-and-diagnostics.md).
 
 For application diagnostics, see [Python logging](advanced/python-logging.md).

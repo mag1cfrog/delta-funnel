@@ -87,7 +87,7 @@ document with `TablePreview::to_trace_event_json_value()` and inspect the
 underlying relative spans with `TablePreview::operation_timeline()`. The
 lower-level `QueryExecutionProfile::to_trace_event_json_value()` remains
 available for execution-only operator traces. See
-[Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#export-a-preview-trace)
+[Export and inspect execution profiles](../advanced/execution-profiling.md#export-a-preview-trace)
 for export steps and event interpretation.
 
 Rust callers opt in with `PreviewOptions` and the option-bearing session or
@@ -120,7 +120,7 @@ Python exposes the same data on `DeltaFunnelError` with `phase="preview"`,
 timeline is available at `error.context["operation_timeline"]`; Rust reads it
 with `PreviewFailureContext::operation_timeline()`.
 
-See [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-preview-diagnostics)
+See [Export and inspect execution profiles](../advanced/execution-profiling.md#inspect-returned-preview-diagnostics)
 for phase boundaries and interpretation. See the execution profile model below
 for the profile schema.
 
@@ -189,7 +189,7 @@ if let Some(trace) = report.to_trace_event_json_value() {
 
 The existing `write_to_mssql` methods remain default-disabled. For query phase
 boundaries, outcome interpretation, and failure-context access, see
-[returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics).
+[returned SQL Server output diagnostics](../advanced/execution-profiling.md#inspect-returned-sql-server-output-diagnostics).
 
 ## Multi-Output SQL Server Profiling
 
@@ -277,7 +277,7 @@ The profile outcome describes the output query stream, not the final SQL
 Server result. Normal end-of-stream is `success`, an upstream DataFusion error
 is `error`, and dropping the stream before end-of-stream is `cancelled`. A
 later SQL Server failure can therefore retain a `success` profile. See
-[returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics)
+[returned SQL Server output diagnostics](../advanced/execution-profiling.md#inspect-returned-sql-server-output-diagnostics)
 for the shared stream-outcome semantics.
 
 A cache profile has `scope="write_all_cache_alias"` and describes only the
@@ -302,9 +302,9 @@ The default `write_all` methods and `WriteAllOptions::default()` keep profiling
 disabled. Profiling composes with either `WriteAllCacheMode`; cache selection
 does not change per-output profile ownership. Each available profile also
 supplies one bounded `query_execution_profile_terminal` event. See
-[terminal execution profiles](../advanced/tracing-and-diagnostics.md#inspect-terminal-execution-profiles)
+[terminal execution profiles](diagnostics.md#inspect-terminal-execution-profiles)
 for its tracing contract and
-[returned write-all cache diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-write-all-cache-diagnostics)
+[returned write-all cache diagnostics](diagnostics.md#inspect-returned-write-all-cache-diagnostics)
 for cache lifecycle and failure interpretation. The shared profile model,
 terminal consumer, and cache lifecycle are owned by
 [#450](https://github.com/mag1cfrog/delta-funnel/issues/450),

@@ -39,18 +39,22 @@ Follow these steps in order:
 
 - [Python logging](advanced/python-logging.md): route diagnostic events through
   standard-library logging.
-- [Tracing and diagnostics](advanced/tracing-and-diagnostics.md): observe lifecycle
-  events, interpret reports, and collect safe troubleshooting information.
+- [Troubleshoot a failed run](advanced/tracing-and-diagnostics.md): inspect
+  failure reports and collect safe troubleshooting information.
 
 ## Profile performance
 
 - [Choose a profiling method](contributing/profiling.md): select a semantic
   trace, Samply, or Perfetto based on the question you need to answer.
+- [Export execution profiles](advanced/execution-profiling.md): inspect preview
+  and SQL Server operations on a shared wall-clock timeline.
 
 ## Reference
 
 - [API references](reference/api.md): find the Rust and Python API entry
   points.
+- [Diagnostics reference](reference/diagnostics.md): look up tracing events,
+  operation phases, stream outcomes, and cache lifecycle fields.
 
 ## About Delta Funnel
 
