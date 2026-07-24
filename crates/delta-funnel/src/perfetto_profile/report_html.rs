@@ -13,64 +13,153 @@ const HTML_PREFIX: &str = r#"<!doctype html>
 <link rel="icon" href="data:,">
 <title>Delta Funnel profile report</title>
 <style>
-body { color: #202124; font: 15px system-ui, sans-serif; margin: 2rem; }
-h1, h2 { margin-bottom: .5rem; }
-p { max-width: 80rem; }
-table { border-collapse: collapse; margin-bottom: 2rem; width: 100%; }
-th, td { border-bottom: 1px solid #dadce0; padding: .5rem; text-align: left; }
-th { background: #f8f9fa; }
-.number { font-variant-numeric: tabular-nums; text-align: right; }
+:root {
+  color-scheme: light dark;
+  font: 15px system-ui, sans-serif;
+}
+body {
+  background: Canvas;
+  color: CanvasText;
+  margin: 0;
+}
+main {
+  margin: 0 auto;
+  max-width: 100rem;
+  padding: 2rem;
+}
+h1, h2 { margin: 0 0 .5rem; }
+p { line-height: 1.5; margin: .5rem 0 1rem; max-width: 80rem; }
+.summary {
+  display: grid;
+  gap: .75rem;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  margin: 1.5rem 0 2rem;
+}
+.summary-item {
+  border: 1px solid GrayText;
+  border-radius: .4rem;
+  padding: .75rem;
+}
+.summary-label { display: block; font-size: .8rem; }
+.summary-value { display: block; font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; min-width: 58rem; width: 100%; }
+th, td { border-bottom: 1px solid GrayText; padding: .65rem; text-align: left; }
+th { background: color-mix(in srgb, CanvasText 8%, Canvas); }
+tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
+.name { font-weight: 650; }
+.detail { display: block; font-size: .8rem; margin-top: .2rem; }
+.number { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.empty { border: 1px dashed GrayText; padding: 1rem; }
+.help { margin-top: 2rem; max-width: 80rem; }
+.help summary { cursor: pointer; font-weight: 650; }
+@media (max-width: 40rem) {
+  main { padding: 1rem; }
+}
 </style>
 </head>
 <body>
+<main>
 <h1>Delta Funnel profile report</h1>
 <p>Semantic durations are exact wall-clock or lifecycle measurements. Function metrics are sampled on-CPU observations, not exact elapsed time.</p>
-<p id="summary"></p>
-<h2>Operations</h2>
-<table><thead><tr><th>Name</th><th>Time basis</th><th class="number">Duration (ns)</th><th class="number">Direct CPU samples</th><th class="number">Inclusive CPU samples</th></tr></thead><tbody id="operations"></tbody></table>
-<h2>Function callsites</h2>
-<p>Top 20 callsites by sampled inclusive CPU across the report.</p>
-<table><thead><tr><th>Function</th><th class="number">Semantic ID</th><th class="number">Self CPU samples</th><th class="number">Inclusive CPU samples</th></tr></thead><tbody id="functions"></tbody></table>
+<div id="summary" class="summary" role="status" aria-live="polite"></div>
+<section aria-labelledby="operations-heading">
+<h2 id="operations-heading">Operations</h2>
+<p>Operation roots are ranked by exact duration. CPU columns contain sampled observations.</p>
+<div class="table-wrap">
+<table role="treegrid" aria-label="Ranked operations">
+<thead><tr>
+<th scope="col">Operation</th>
+<th scope="col">State and time basis</th>
+<th scope="col" class="number">Exact duration</th>
+<th scope="col" class="number">Operation wall %</th>
+<th scope="col" class="number">Direct CPU samples</th>
+<th scope="col" class="number">Inclusive CPU samples</th>
+</tr></thead>
+<tbody id="operations"></tbody>
+</table>
+</div>
+<p id="operations-empty" class="empty" hidden>No operation records are available.</p>
+</section>
+<details class="help">
+<summary>How to read these metrics</summary>
+<p>Exact duration is measured wall-clock or lifecycle time. Parallel semantic children may overlap and are not additive. Direct CPU samples belong to one semantic node. Inclusive CPU samples also include its semantic descendants. Sampling observes on-CPU work and does not prove why a thread was off-CPU.</p>
+</details>
+</main>
 <script id="profile-data" type="application/json">"#;
 
 const HTML_SUFFIX: &str = r#"</script>
 <script>
 const profile = JSON.parse(document.getElementById("profile-data").textContent);
-const addRow = (body, values, textColumns = 1) => {
+const summary = document.getElementById("summary");
+const addSummary = (label, value) => {
+  const item = document.createElement("div");
+  item.className = "summary-item";
+  const itemLabel = document.createElement("span");
+  itemLabel.className = "summary-label";
+  itemLabel.textContent = label;
+  const itemValue = document.createElement("strong");
+  itemValue.className = "summary-value";
+  itemValue.textContent = String(value);
+  item.append(itemLabel, itemValue);
+  summary.appendChild(item);
+};
+const formatDuration = value => {
+  if (value === null) return "Incomplete";
+  if (value >= 1e9) return `${(value / 1e9).toFixed(3)} s`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(3)} ms`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(3)} us`;
+  return `${value} ns`;
+};
+const formatPercent = (value, total) =>
+  total > 0 ? `${(value * 100 / total).toFixed(1)}%` : "N/A";
+const addOperation = (body, operation) => {
   const row = document.createElement("tr");
+  row.setAttribute("aria-level", "1");
+  const values = [
+    operation.name,
+    operation.is_complete ? (operation.result || "Complete") : "Incomplete",
+    formatDuration(operation.duration_ns),
+    formatPercent(operation.duration_ns || 0, operation.duration_ns || 0),
+    String(operation.direct_sample_count),
+    String(operation.inclusive_sample_count)
+  ];
   values.forEach((value, index) => {
     const cell = document.createElement("td");
     cell.textContent = value;
-    if (index >= textColumns) cell.className = "number";
+    if (index === 0) {
+      cell.className = "name";
+      const detail = document.createElement("span");
+      detail.className = "detail";
+      detail.textContent = operation.operation_kind || operation.semantic_kind;
+      cell.appendChild(detail);
+    } else if (index === 1) {
+      const detail = document.createElement("span");
+      detail.className = "detail";
+      detail.textContent =
+        operation.time_semantics === "wall_clock" ? "Exact wall clock" : "Lifecycle";
+      cell.appendChild(detail);
+    } else {
+      cell.className = "number";
+    }
     row.appendChild(cell);
   });
   body.appendChild(row);
 };
-document.getElementById("summary").textContent =
-  `${profile.semantics.length} semantic records and ${profile.functions.length} function callsites. ` +
-  `At ${profile.metadata.sample_frequency_hz} Hz: ${profile.metadata.eligible_sample_count} eligible, ` +
-  `${profile.metadata.direct_sample_count} directly attributed, ${profile.metadata.ambiguous_sample_count} ambiguous, ` +
-  `${profile.metadata.unattributed_sample_count} unattributed CPU samples.`;
-profile.semantics
+addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
+addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);
+addSummary("Directly attributed", profile.metadata.direct_sample_count);
+addSummary("Ambiguous", profile.metadata.ambiguous_sample_count);
+addSummary("Unattributed", profile.metadata.unattributed_sample_count);
+const operations = profile.semantics
   .filter(item => item.parent_semantic_id === null)
-  .sort((left, right) => (right.duration_ns || 0) - (left.duration_ns || 0) || left.semantic_id - right.semantic_id)
-  .forEach(item => addRow(document.getElementById("operations"), [
-    item.name,
-    item.time_semantics,
-    item.duration_ns === null ? "incomplete" : String(item.duration_ns),
-    String(item.direct_sample_count),
-    String(item.inclusive_sample_count)
-  ], 2));
-profile.functions
-  .slice()
-  .sort((left, right) => right.inclusive_sample_count - left.inclusive_sample_count || left.semantic_id - right.semantic_id || left.function_id - right.function_id)
-  .slice(0, 20)
-  .forEach(item => addRow(document.getElementById("functions"), [
-    item.name,
-    String(item.semantic_id),
-    String(item.self_sample_count),
-    String(item.inclusive_sample_count)
-  ]));
+  .sort((left, right) =>
+    (right.duration_ns || 0) - (left.duration_ns || 0) ||
+    left.semantic_id - right.semantic_id
+  );
+const operationsBody = document.getElementById("operations");
+operations.forEach(operation => addOperation(operationsBody, operation));
+document.getElementById("operations-empty").hidden = operations.length !== 0;
 </script>
 </body>
 </html>
@@ -210,6 +299,10 @@ mod tests {
         assert!(!html.contains(dangerous));
         assert!(!html.contains("https://"));
         assert!(!html.contains("http://"));
+        assert!(html.contains(r#"role="treegrid""#));
+        assert!(html.contains(r#"aria-label="Ranked operations""#));
+        assert!(html.contains(r#"id="operations-empty""#));
+        assert!(!html.contains(r#"id="functions""#));
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["name"], dangerous);
