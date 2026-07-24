@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 #[cfg(feature = "perfetto-profile")]
 use tracing_subscriber::filter::filter_fn;
 #[cfg(feature = "perfetto-profile")]
-use tracing_subscriber::{Layer, Registry, prelude::*};
+use tracing_subscriber::{Layer, Registry, layer::Filter, prelude::*};
 
 #[cfg(feature = "perfetto-profile")]
 use crate::logging::python_logging_layer;
@@ -187,10 +187,24 @@ fn perfetto_diagnostics_subscriber(
     logger: String,
 ) -> impl Subscriber + Send + Sync + 'static {
     let logging_layer = python_logging_layer(logger).with_filter(filter);
-    let perfetto_layer = PerfettoProfileLayer.with_filter(filter_fn(|metadata| {
-        is_profile_target(metadata.target()) && is_profile_capture_active()
-    }));
+    let perfetto_layer =
+        PerfettoProfileLayer.with_filter(perfetto_capture_filter(is_profile_capture_active));
     Registry::default().with(logging_layer).with(perfetto_layer)
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn perfetto_capture_filter<S>(
+    capture_active: impl Fn() -> bool + Send + Sync + 'static,
+) -> impl Filter<S>
+where
+    S: Subscriber,
+{
+    filter_fn(move |metadata| is_profile_target(metadata.target()) && capture_active())
+}
+
+#[cfg(feature = "perfetto-profile")]
+pub(super) fn refresh_perfetto_capture_filter() {
+    tracing::callsite::rebuild_interest_cache();
 }
 
 #[cfg(feature = "perfetto-profile")]
@@ -248,6 +262,10 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -493,6 +511,53 @@ mod tests {
         assert_eq!(readiness_waits.get(), 1);
         assert_eq!(subscriber_installations.get(), 1);
         Ok(())
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn perfetto_filter_rechecks_capture_state_for_the_same_callsite() {
+        let active = Arc::new(AtomicBool::new(false));
+        let event_count = Arc::new(AtomicUsize::new(0));
+        let capture_active = Arc::clone(&active);
+        let subscriber =
+            Registry::default().with(EventCounter(Arc::clone(&event_count)).with_filter(
+                perfetto_capture_filter(move || capture_active.load(Ordering::Acquire)),
+            ));
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_profile_callsite();
+            assert_eq!(event_count.load(Ordering::Acquire), 0);
+            active.store(true, Ordering::Release);
+            refresh_perfetto_capture_filter();
+            emit_profile_callsite();
+            assert_eq!(event_count.load(Ordering::Acquire), 1);
+            active.store(false, Ordering::Release);
+            refresh_perfetto_capture_filter();
+            emit_profile_callsite();
+            assert_eq!(event_count.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    fn emit_profile_callsite() {
+        tracing::trace!(target: "delta_funnel::profile", "profile state transition");
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    struct EventCounter(Arc<AtomicUsize>);
+
+    #[cfg(feature = "perfetto-profile")]
+    impl<S> Layer<S> for EventCounter
+    where
+        S: Subscriber,
+    {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
     }
 
     #[cfg(feature = "perfetto-profile")]

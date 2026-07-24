@@ -83,6 +83,7 @@ impl OperationCapture {
             delta_funnel::perfetto_profile::initialize_perfetto,
             delta_funnel::perfetto_profile::wait_for_capture,
         )?;
+        crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         Ok(Self {
             output,
             trace,
@@ -100,6 +101,7 @@ impl OperationCapture {
             )
         })?;
         let stop_result = stop_tracebox(child);
+        crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         drop(self.reservation.take());
         stop_result?;
         delta_funnel::perfetto_profile::generate_ranked_profile_report(&self.trace, &self.output)
@@ -112,6 +114,7 @@ impl Drop for OperationCapture {
     fn drop(&mut self) {
         if let Some(child) = self.child.take() {
             let _ = stop_tracebox(child);
+            crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         }
     }
 }
