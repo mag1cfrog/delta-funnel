@@ -20,7 +20,7 @@ workspace = true
 perfetto-profile = ["delta-funnel/perfetto-profile"]
 
 [dependencies]
-delta-funnel = { path = "../delta-funnel", version = "0.3.3" }
+delta-funnel = { path = "../delta-funnel", version = "0.3.4" }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 serde_json = "1"
 tracing = "0.1"
