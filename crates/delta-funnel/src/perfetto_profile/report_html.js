@@ -516,18 +516,41 @@ const renderRows = (focusKey = null, focusPaginationKey = null) => {
       });
       rowCount += 1;
       if (rendered.hasChildren && rendered.isExpanded) {
-        const children = [
-          ...rendered.children.map(value => ({ kind: "semantic", value })),
-          ...rendered.functions.map(value => ({ kind: "function", value }))
-        ];
-        pushPagedEntries(
-          stack,
-          children,
-          entry.depth + 1,
-          rendered.key,
-          { kind: "semantic", value: entry.value },
-          `${entry.value.name} children`
-        );
+        const owner = { kind: "semantic", value: entry.value };
+        if (
+          rendered.children.length >= siblingPageSize &&
+          rendered.functions.length !== 0
+        ) {
+          pushPagedEntries(
+            stack,
+            rendered.children.map(value => ({ kind: "semantic", value })),
+            entry.depth + 1,
+            `${rendered.key}:semantics`,
+            owner,
+            `${entry.value.name} semantic children`
+          );
+          pushPagedEntries(
+            stack,
+            rendered.functions.map(value => ({ kind: "function", value })),
+            entry.depth + 1,
+            `${rendered.key}:functions`,
+            owner,
+            `${entry.value.name} native callsites`
+          );
+        } else {
+          const children = [
+            ...rendered.children.map(value => ({ kind: "semantic", value })),
+            ...rendered.functions.map(value => ({ kind: "function", value }))
+          ];
+          pushPagedEntries(
+            stack,
+            children,
+            entry.depth + 1,
+            rendered.key,
+            owner,
+            `${entry.value.name} children`
+          );
+        }
       }
     } else {
       const rendered = functionRow(entry.value, entry.depth);

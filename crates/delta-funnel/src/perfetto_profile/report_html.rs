@@ -405,7 +405,11 @@ mod tests {
             ));
             deep_parent_id = semantic_id;
         }
-        semantics.push(semantic(3_000, Some(1), "Distributed cases"));
+        let mut distributed_cases = semantic(3_000, Some(1), "Distributed cases");
+        distributed_cases.direct_sample_count = 1;
+        distributed_cases.inclusive_sample_count = 1;
+        semantics[0].inclusive_sample_count = 1;
+        semantics.push(distributed_cases);
         let mut distributed_id = 3_001;
         for case in 0..100 {
             let mut parent_id = 3_000;
@@ -420,6 +424,7 @@ mod tests {
                 distributed_id += 1;
             }
         }
+        semantics.push(semantic(4_500, Some(3_000), "Distributed overflow child"));
         let mut oversized_parent_id = 3_000;
         for semantic_id in 5_000..6_000 {
             let name = if semantic_id == 5_999 {
@@ -446,8 +451,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         functions.push(function(102, Some(1), "nested target"));
+        let mut wide_owner_function = function(103, None, "wide owner native root");
+        wide_owner_function.semantic_id = 3_000;
+        wide_owner_function.self_sample_count = 1;
+        wide_owner_function.inclusive_sample_count = 1;
+        functions.push(wide_owner_function);
+        let mut profile_metadata = metadata();
+        profile_metadata.eligible_sample_count = 1;
+        profile_metadata.direct_sample_count = 1;
         let document = RankedProfileDocument {
-            metadata: metadata(),
+            metadata: profile_metadata,
             semantics,
             functions,
         };
@@ -521,6 +534,35 @@ mod tests {
     );
     pagination.querySelector("button").click();
     check(operationsBody.rows.length === 102, "previous sibling page was incorrect");
+
+    const distributedCasesRow = Array.from(
+      operationsBody.querySelectorAll(".semantic-row")
+    ).find(row => row.textContent.includes("Distributed cases"));
+    check(distributedCasesRow !== undefined, "wide semantic owner was not rendered");
+    distributedCasesRow.querySelector(".disclosure").click();
+    const wideOwnerFunction = Array.from(
+      operationsBody.querySelectorAll(".function-row")
+    ).find(row => row.textContent.includes("wide owner native root"));
+    check(
+      wideOwnerFunction !== undefined,
+      "wide semantic owner did not reveal its native function root"
+    );
+    const wideSemanticPagination = Array.from(
+      operationsBody.querySelectorAll(".pagination-row")
+    ).find(row =>
+      row.getAttribute("aria-label") ===
+        "Distributed cases semantic children pagination"
+    );
+    check(
+      wideSemanticPagination !== undefined &&
+        wideSemanticPagination.textContent.includes("1-100 of 102"),
+      "wide semantic children were not paged independently"
+    );
+    check(
+      wideOwnerFunction.rowIndex < wideSemanticPagination.rowIndex,
+      "native function roots were hidden behind semantic pagination"
+    );
+    distributedCasesRow.querySelector(".disclosure").click();
 
     let functionRootRow = Array.from(
       operationsBody.querySelectorAll(".function-row")
@@ -613,14 +655,14 @@ mod tests {
     filterInput.value = "delta_funnel";
     applyFilter();
     check(
-      filterResults.length === 102 &&
+      filterResults.length === 103 &&
         filterResults.every(result => result.function_id !== undefined),
       "module metadata was not searchable"
     );
     filterInput.value = "src/lib.rs:42";
     applyFilter();
     check(
-      filterResults.length === 102 &&
+      filterResults.length === 103 &&
         filterResults.every(result => result.function_id !== undefined),
       "source metadata was not searchable"
     );
