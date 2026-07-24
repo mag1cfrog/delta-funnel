@@ -281,7 +281,7 @@ mod tests {
         assert!(html.contains(r#"data-sort="duration""#));
         assert!(!html.contains(r#"id="functions""#));
         assert!(html.contains(r#"button.setAttribute("aria-expanded""#));
-        assert!(html.contains(r#"entry.row.setAttribute("aria-selected""#));
+        assert!(html.contains(r#""aria-selected","#));
         assert!(html.contains("const maximumBulkSubtreeRows = 1000"));
         assert!(html.contains("const maximumRenderedRows = 1000"));
         assert!(html.contains("const maximumIndentDepth = 32"));
@@ -478,6 +478,33 @@ mod tests {
     check(
       pagination.textContent.includes("1-100 of 114"),
       "first sibling page status was incorrect"
+    );
+    check(
+      pagination.getAttribute("aria-label") === "Root operation children pagination",
+      "pagination row did not identify its sibling group"
+    );
+    check(
+      pagination.querySelectorAll("button")[1].getAttribute("aria-label") ===
+        "Next page for Root operation children",
+      "pagination button did not identify its sibling group"
+    );
+    const lastFirstPageRow = operationsBody.rows[100];
+    lastFirstPageRow.focus();
+    lastFirstPageRow.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowDown",
+      bubbles: true
+    }));
+    check(
+      document.activeElement === pagination && pagination.tabIndex === 0,
+      "Arrow Down did not reach sibling pagination"
+    );
+    pagination.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowUp",
+      bubbles: true
+    }));
+    check(
+      document.activeElement === lastFirstPageRow,
+      "Arrow Up did not leave sibling pagination"
     );
     pagination.querySelectorAll("button")[1].click();
     check(operationsBody.rows.length === 16, "second sibling page was incorrect");

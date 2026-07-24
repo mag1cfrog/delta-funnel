@@ -121,8 +121,8 @@ const maximumRenderedRows = 1000;
 const maximumIndentDepth = 32;
 const siblingPageSize = 100;
 const siblingPages = new Map();
-const paginationRows = new Map();
 const rootPageKey = "roots";
+const paginationEntryKey = key => `p:${key}`;
 const bulkSubtreeLimitMessage =
   `The selected subtree exceeds ${maximumBulkSubtreeRows} nodes. Select a narrower branch.`;
 const filterPageSize = 100;
@@ -330,6 +330,7 @@ const paginationRow = (pagination, depth) => {
   const row = document.createElement("tr");
   row.className = "pagination-row";
   row.setAttribute("aria-level", String(depth));
+  row.setAttribute("aria-label", `${pagination.label} pagination`);
   row.tabIndex = -1;
   const cell = document.createElement("td");
   cell.colSpan = 6;
@@ -347,18 +348,22 @@ const paginationRow = (pagination, depth) => {
   previous.type = "button";
   previous.className = "filter-page";
   previous.textContent = `Previous ${siblingPageSize}`;
+  previous.setAttribute(
+    "aria-label",
+    `Previous page for ${pagination.label}`
+  );
   previous.disabled = pagination.page === 0;
   previous.addEventListener("click", () => changePage(pagination.page - 1));
   const next = document.createElement("button");
   next.type = "button";
   next.className = "filter-page";
   next.textContent = `Next ${siblingPageSize}`;
+  next.setAttribute("aria-label", `Next page for ${pagination.label}`);
   next.disabled = pagination.page + 1 >= pagination.pageCount;
   next.addEventListener("click", () => changePage(pagination.page + 1));
   controls.append(previous, next, status);
   cell.appendChild(controls);
   row.appendChild(cell);
-  paginationRows.set(pagination.key, row);
   return row;
 };
 const semanticRow = (semantic, depth) => {
@@ -461,7 +466,6 @@ const functionRow = (fn, depth) => {
 };
 const renderRows = (focusKey = null, focusPaginationKey = null) => {
   disclosureButtons.clear();
-  paginationRows.clear();
   const fragment = document.createDocumentFragment();
   const renderedRows = [];
   const stack = [];
@@ -489,7 +493,17 @@ const renderRows = (focusKey = null, focusPaginationKey = null) => {
   while (stack.length !== 0 && rowCount < maximumRenderedRows) {
     const entry = stack.pop();
     if (entry.kind === "pagination") {
-      fragment.appendChild(paginationRow(entry.value, entry.depth));
+      const row = paginationRow(entry.value, entry.depth);
+      fragment.appendChild(row);
+      renderedRows.push({
+        kind: "pagination",
+        value: entry.value,
+        depth: entry.depth,
+        key: paginationEntryKey(entry.value.key),
+        row,
+        hasChildren: false,
+        isExpanded: false
+      });
       rowCount += 1;
     } else if (entry.kind === "semantic") {
       const rendered = semanticRow(entry.value, entry.depth);
@@ -541,42 +555,60 @@ const renderRows = (focusKey = null, focusPaginationKey = null) => {
   operationsEmpty.textContent = isFilterActive()
     ? "No profile rows match this filter."
     : "No operation records are available.";
-  operationsEmpty.hidden = renderedRows.length !== 0;
+  operationsEmpty.hidden = renderedRows.some(
+    entry => entry.kind !== "pagination"
+  );
   renderLimitStatus.textContent = filterOversizedResult !== null
     ? `Ancestor context was omitted because the complete context for this match exceeds the ${maximumRenderedRows}-row visible limit.`
     : stack.length === 0
       ? ""
       : `Showing the first ${maximumRenderedRows} visible rows. Collapse a branch or filter the profile to continue.`;
-  configureRenderedRows(renderedRows, focusKey);
-  if (focusPaginationKey !== null) {
-    paginationRows.get(focusPaginationKey)?.focus();
-  }
+  configureRenderedRows(renderedRows, focusKey, focusPaginationKey);
 };
-const configureRenderedRows = (rows, focusKey) => {
+const configureRenderedRows = (rows, focusKey, focusPaginationKey) => {
   let selectedKey = selectedNode === null ? null : entryKey(selectedNode);
-  if (!rows.some(entry => entry.key === selectedKey) && rows.length !== 0) {
-    selectedNode = { kind: rows[0].kind, value: rows[0].value };
-    selectedKey = rows[0].key;
+  const selectableRows = rows.filter(entry => entry.kind !== "pagination");
+  if (
+    !selectableRows.some(entry => entry.key === selectedKey) &&
+    selectableRows.length !== 0
+  ) {
+    selectedNode = {
+      kind: selectableRows[0].kind,
+      value: selectableRows[0].value
+    };
+    selectedKey = selectableRows[0].key;
   }
-  const updateSelection = (selectedIndex, focus) => {
-    const selected = rows[selectedIndex];
-    selectedNode = { kind: selected.kind, value: selected.value };
+  const requestedFocusKey = focusPaginationKey === null
+    ? focusKey
+    : paginationEntryKey(focusPaginationKey);
+  let activeIndex = requestedFocusKey === null
+    ? -1
+    : rows.findIndex(entry => entry.key === requestedFocusKey);
+  if (activeIndex === -1) {
+    activeIndex = rows.findIndex(entry => entry.key === selectedKey);
+  }
+  if (activeIndex === -1 && rows.length !== 0) activeIndex = 0;
+  const updateFocus = (nextIndex, focus) => {
+    const active = rows[nextIndex];
+    if (active.kind !== "pagination") {
+      selectedNode = { kind: active.kind, value: active.value };
+      selectedKey = active.key;
+      treeStatus.textContent = `Selected: ${active.value.name}`;
+    }
     rows.forEach((entry, index) => {
-      const isSelected = index === selectedIndex;
-      entry.row.setAttribute("aria-selected", String(isSelected));
-      entry.row.tabIndex = isSelected ? 0 : -1;
+      entry.row.setAttribute(
+        "aria-selected",
+        String(entry.kind !== "pagination" && entry.key === selectedKey)
+      );
+      entry.row.tabIndex = index === nextIndex ? 0 : -1;
     });
-    treeStatus.textContent = `Selected: ${selected.value.name}`;
     updateTreeControls(rows);
-    if (focus) selected.row.focus();
+    if (focus) active.row.focus();
   };
   rows.forEach((entry, index) => {
-    const isSelected = entry.key === selectedKey;
-    entry.row.setAttribute("aria-selected", String(isSelected));
-    entry.row.tabIndex = isSelected ? 0 : -1;
     entry.row.addEventListener("click", event => {
       if (event.target.closest("button")) return;
-      updateSelection(index, true);
+      updateFocus(index, true);
     });
     entry.row.addEventListener("keydown", event => {
       if (event.target !== entry.row) return;
@@ -589,7 +621,10 @@ const configureRenderedRows = (rows, focusKey) => {
         nextIndex = 0;
       } else if (event.key === "End") {
         nextIndex = rows.length - 1;
-      } else if (event.key === "ArrowRight") {
+      } else if (
+        event.key === "ArrowRight" &&
+        entry.kind !== "pagination"
+      ) {
         if (entry.hasChildren && !entry.isExpanded && !isFilterActive()) {
           selectedNode = { kind: entry.kind, value: entry.value };
           expanded.add(entry.key);
@@ -600,14 +635,20 @@ const configureRenderedRows = (rows, focusKey) => {
         ) {
           nextIndex = index + 1;
         }
-      } else if (event.key === "ArrowLeft") {
+      } else if (
+        event.key === "ArrowLeft" &&
+        entry.kind !== "pagination"
+      ) {
         if (entry.hasChildren && entry.isExpanded && !isFilterActive()) {
           selectedNode = { kind: entry.kind, value: entry.value };
           expanded.delete(entry.key);
           renderRows(entry.key);
         } else {
           for (let parent = index - 1; parent >= 0; parent -= 1) {
-            if (rows[parent].depth < entry.depth) {
+            if (
+              rows[parent].kind !== "pagination" &&
+              rows[parent].depth < entry.depth
+            ) {
               nextIndex = parent;
               break;
             }
@@ -617,13 +658,11 @@ const configureRenderedRows = (rows, focusKey) => {
         return;
       }
       event.preventDefault();
-      if (nextIndex !== null) updateSelection(nextIndex, true);
+      if (nextIndex !== null) updateFocus(nextIndex, true);
     });
   });
-  updateTreeControls(rows);
-  if (focusKey !== null) {
-    rows.find(entry => entry.key === focusKey)?.row.focus();
-  }
+  if (activeIndex === -1) updateTreeControls(rows);
+  else updateFocus(activeIndex, requestedFocusKey !== null);
 };
 const updateTreeControls = rows => {
   const selectedKey = selectedNode === null ? null : entryKey(selectedNode);
