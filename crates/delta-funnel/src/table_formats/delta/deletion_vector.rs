@@ -10,19 +10,17 @@ use crate::{
 };
 use snafu::ResultExt;
 
-use super::{DeltaStorageOptions, KernelScanDeletionVectorMetadata, kernel};
+use super::{DeltaKernelEngineContext, KernelScanDeletionVectorMetadata, kernel};
 
 /// Context required to construct the official-kernel DV reader baseline.
 #[allow(dead_code)]
 pub(crate) struct KernelDeletionVectorReaderConfig<'a> {
     /// DataFusion table name for diagnostics.
     pub(crate) source_name: &'a str,
-    /// Normalized Delta table URI used to resolve table-relative DV paths.
-    pub(crate) table_uri: &'a str,
     /// Snapshot version that selected this file.
     pub(crate) snapshot_version: u64,
-    /// Source-local options forwarded to Delta Kernel object-store construction.
-    pub(crate) storage_options: &'a DeltaStorageOptions,
+    /// Source-owned Delta Kernel infrastructure.
+    pub(crate) engine_context: std::sync::Arc<DeltaKernelEngineContext>,
 }
 
 /// Reusable official-kernel DV reader baseline for one provider scan context.
@@ -31,7 +29,7 @@ pub(crate) struct KernelDeletionVectorReader {
     source_name: String,
     table_uri: String,
     snapshot_version: u64,
-    engine: std::sync::Arc<dyn kernel::Engine>,
+    engine_context: std::sync::Arc<DeltaKernelEngineContext>,
 }
 
 /// Request to load the deletion vector for one provider-selected data file.
@@ -83,41 +81,13 @@ enum ProviderDeletionVectorSelectionAccessMode {
 impl KernelDeletionVectorReader {
     /// Builds a reusable official-kernel DV reader for one provider scan context.
     #[allow(dead_code)]
-    pub(crate) fn try_new(
-        config: KernelDeletionVectorReaderConfig<'_>,
-    ) -> Result<Self, DeltaFunnelError> {
-        const TABLE_ROOT_CONTEXT: &str = "<table-root>";
-
-        let table_url =
-            kernel::try_parse_uri(config.table_uri).context(DeltaScanDeletionVectorSnafu {
-                source_name: config.source_name.to_owned(),
-                table_uri: config.table_uri.to_owned(),
-                snapshot_version: config.snapshot_version,
-                path: TABLE_ROOT_CONTEXT.to_owned(),
-                phase: DeltaScanDeletionVectorPhase::TableUriParsing,
-            })?;
-        let store = kernel::store_from_url_opts(
-            &table_url,
-            config
-                .storage_options
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        )
-        .context(DeltaScanDeletionVectorSnafu {
+    pub(crate) fn new(config: KernelDeletionVectorReaderConfig<'_>) -> Self {
+        Self {
             source_name: config.source_name.to_owned(),
-            table_uri: config.table_uri.to_owned(),
+            table_uri: config.engine_context.table_url().as_str().to_owned(),
             snapshot_version: config.snapshot_version,
-            path: TABLE_ROOT_CONTEXT.to_owned(),
-            phase: DeltaScanDeletionVectorPhase::ObjectStoreEngineConstruction,
-        })?;
-        let engine = std::sync::Arc::new(kernel::DefaultEngineBuilder::new(store).build());
-
-        Ok(Self {
-            source_name: config.source_name.to_owned(),
-            table_uri: config.table_uri.to_owned(),
-            snapshot_version: config.snapshot_version,
-            engine,
-        })
+            engine_context: config.engine_context,
+        }
     }
 
     /// Lazily loads the provider deleted row indexes for one selected data file.
@@ -129,18 +99,12 @@ impl KernelDeletionVectorReader {
         let KernelScanDeletionVectorMetadata::Present(handle) = request.deletion_vector else {
             return Ok(None);
         };
-        let table_url =
-            kernel::try_parse_uri(&self.table_uri).context(DeltaScanDeletionVectorSnafu {
-                source_name: self.source_name.clone(),
-                table_uri: self.table_uri.clone(),
-                snapshot_version: self.snapshot_version,
-                path: request.path.to_owned(),
-                phase: DeltaScanDeletionVectorPhase::TableUriParsing,
-            })?;
-
         let deleted_row_indexes = handle
             .dv_info
-            .get_row_indexes(self.engine.as_ref(), &table_url)
+            .get_row_indexes(
+                self.engine_context.as_kernel_engine(),
+                self.engine_context.table_url(),
+            )
             .context(DeltaScanDeletionVectorSnafu {
                 source_name: self.source_name.clone(),
                 table_uri: self.table_uri.clone(),
@@ -890,14 +854,13 @@ mod tests {
     fn test_reader(
         source: &PlannedDeltaSource,
     ) -> Result<KernelDeletionVectorReader, Box<dyn std::error::Error>> {
-        Ok(KernelDeletionVectorReader::try_new(
+        Ok(KernelDeletionVectorReader::new(
             KernelDeletionVectorReaderConfig {
                 source_name: source.name(),
-                table_uri: source.table_uri(),
                 snapshot_version: source.version(),
-                storage_options: source.storage_options(),
+                engine_context: std::sync::Arc::clone(source.engine_context()),
             },
-        )?)
+        ))
     }
 
     fn test_context() -> ProviderDeletionVectorSelectionContext<'static> {

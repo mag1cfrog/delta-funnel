@@ -493,6 +493,7 @@ fn reject_unsupported_reader_backend_source(
                 table_uri: source.table_uri(),
                 snapshot_version: source.version(),
                 storage_options: source.storage_options(),
+                engine_context: Arc::clone(source.engine_context()),
             })
         }
     }

@@ -297,9 +297,8 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                 let file_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
                     reader_backend: self.execution_options.reader_backend,
                     source_name: &self.scan_plan.source_name,
-                    table_uri: &self.scan_plan.table_uri,
                     snapshot_version: self.scan_plan.snapshot_version,
-                    storage_options: &self.scan_plan.storage_options,
+                    engine_context: Arc::clone(self.scan_plan.engine_context()),
                 })
                 .map_err(DataFusionError::from)?;
                 let partition_limiter = self
@@ -327,6 +326,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                         table_uri: &self.scan_plan.table_uri,
                         snapshot_version: self.scan_plan.snapshot_version,
                         storage_options: &self.scan_plan.storage_options,
+                        engine_context: Arc::clone(self.scan_plan.engine_context()),
                     })?;
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
                     file_reader,
@@ -1014,8 +1014,10 @@ fn record_deletion_vector_read_error(
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::{self, File};
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{Array, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -1038,10 +1040,17 @@ mod tests {
     use delta_kernel::actions::deletion_vector::{
         DeletionVectorDescriptor, DeletionVectorStorageType,
     };
+    use delta_kernel::object_store::{local::LocalFileSystem, path::Path as ObjectStorePath};
     use futures_util::StreamExt;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use super::super::file_reader::{DeltaFileReadRequest, DeltaFileReadResult};
+    use super::super::native_async_reader::{
+        DeltaNativeAsyncFileReader, DeltaNativeAsyncFileReaderConfig,
+    };
+    use super::super::reader_backend::{
+        DeltaProviderReaderBackendConfig, build_partition_file_reader,
+    };
     use super::{
         DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
         DeltaScanPartitionFileReader,
@@ -1064,6 +1073,7 @@ mod tests {
     use crate::table_formats::{
         KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata, RealParquetDeltaTable,
         build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
+        insert_url_handler,
     };
     use crate::{
         DeltaSourceConfig, QueryOptions, datafusion_session_context, load_delta_source,
@@ -1071,6 +1081,33 @@ mod tests {
     };
 
     const TWO_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_date\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]"#;
+
+    fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let name = name
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+
+        Ok(format!("df{name}{}{nanos}", std::process::id()))
+    }
+
+    fn register_counting_local_storage_handler(
+        scheme: &str,
+        table_path: &Path,
+        construction_count: Arc<AtomicUsize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = LocalFileSystem::new_with_prefix(table_path)?;
+        insert_url_handler(
+            scheme,
+            Arc::new(move |_url, _options| {
+                construction_count.fetch_add(1, Ordering::SeqCst);
+                Ok((Box::new(store.clone()), ObjectStorePath::from("")))
+            }),
+        )?;
+
+        Ok(())
+    }
 
     async fn collect_sql_with_reader_backend(
         table_uri: &str,
@@ -3063,6 +3100,119 @@ mod tests {
             scans[0].read_stats_snapshot().reader_backend,
             DeltaProviderReaderBackend::OfficialKernel
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_backends_share_source_context_across_partitions_and_release_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = RealParquetDeltaTable::new_with_two_files_and_deletion_vector(
+            "shared-reader-engine-context",
+            &[1],
+        )?;
+        let scheme = unique_storage_scheme("sharedreadercontext")?;
+        let construction_count = Arc::new(AtomicUsize::new(0));
+        register_counting_local_storage_handler(
+            &scheme,
+            table.path(),
+            Arc::clone(&construction_count),
+        )?;
+        let table_uri = format!("{scheme}://table/");
+        let storage_options = BTreeMap::from([
+            ("authorization".to_owned(), "reader-token".to_owned()),
+            ("region".to_owned(), "us-east-1".to_owned()),
+        ]);
+        let ctx = SessionContext::new();
+        let source = load_delta_source(
+            DeltaSourceConfig::new("orders", &table_uri)
+                .with_storage_options(storage_options.clone()),
+        )?;
+        let source_context = Arc::clone(source.engine_context());
+        let weak_context = Arc::downgrade(&source_context);
+        assert_eq!(construction_count.load(Ordering::SeqCst), 1);
+
+        let official_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
+            reader_backend: DeltaProviderReaderBackend::OfficialKernel,
+            source_name: "orders",
+            snapshot_version: source.version(),
+            engine_context: Arc::clone(&source_context),
+        })?;
+        assert_eq!(construction_count.load(Ordering::SeqCst), 1);
+
+        let native_reader =
+            DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
+                source_name: "orders",
+                table_uri: source.table_uri(),
+                snapshot_version: source.version(),
+                storage_options: &storage_options,
+                engine_context: Arc::clone(&source_context),
+            })?;
+        assert_eq!(
+            construction_count.load(Ordering::SeqCst),
+            2,
+            "NativeAsync still constructs one direct Parquet store until issue #565"
+        );
+
+        let preflight = preflight_delta_protocol(&source)?;
+        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::OfficialKernel,
+            2,
+            1,
+        )?;
+        register_delta_sources_with_scan_execution_options(
+            &ctx,
+            vec![DeltaTableProviderConfig {
+                source,
+                protocol: preflight,
+                scan_target_partitions: Some(2),
+            }],
+            execution_options,
+        )?;
+
+        let dataframe = ctx.sql("select id from orders").await?;
+        let physical_plan = dataframe.create_physical_plan().await?;
+        let mut scans = Vec::new();
+        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
+
+        assert_eq!(scans.len(), 1);
+        assert!(Arc::ptr_eq(
+            &source_context,
+            scans[0].scan_plan().engine_context()
+        ));
+        assert_eq!(scans[0].partition_plan().partitions.len(), 2);
+        assert_eq!(construction_count.load(Ordering::SeqCst), 2);
+
+        let stream_a = scans[0].execute(0, ctx.task_ctx())?;
+        let stream_b = scans[0].execute(1, ctx.task_ctx())?;
+        let (batches_a, batches_b) = tokio::try_join!(
+            datafusion::physical_plan::common::collect(stream_a),
+            datafusion::physical_plan::common::collect(stream_b)
+        )?;
+        let mut ids = collect_batch_ids(&batches_a)?;
+        ids.extend(collect_batch_ids(&batches_b)?);
+        ids.sort_unstable();
+
+        assert_eq!(ids, vec![1, 3, 4]);
+        assert_eq!(construction_count.load(Ordering::SeqCst), 2);
+        let stats = scans[0].read_stats_snapshot();
+        assert_eq!(stats.scan_partitions_started, 2);
+        assert_eq!(stats.scan_partitions_completed, 2);
+        assert_eq!(stats.files_started, 2);
+        assert_eq!(stats.files_completed, 2);
+        assert_eq!(stats.deletion_vector_payloads_loaded, 1);
+        assert_eq!(stats.deletion_vectors_applied, 1);
+        assert_eq!(stats.deletion_vector_rows_deleted, 1);
+
+        drop(official_reader);
+        drop(native_reader);
+        drop(source_context);
+        assert!(weak_context.upgrade().is_some());
+        drop(scans);
+        drop(physical_plan);
+        assert!(weak_context.upgrade().is_some());
+        drop(ctx);
+        assert!(weak_context.upgrade().is_none());
 
         Ok(())
     }

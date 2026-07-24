@@ -11,7 +11,9 @@ use crate::{
 use delta_kernel::arrow::array::BooleanArray;
 use snafu::ResultExt;
 
-use super::{DeltaKernelPredicate, DeltaStorageOptions, KernelPhysicalToLogicalTransform, kernel};
+use super::{
+    DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform, kernel,
+};
 
 /// Kernel scan schema state required to read physical Parquet data.
 #[allow(dead_code)]
@@ -125,12 +127,10 @@ impl KernelScanReadSchema {
 pub(crate) struct KernelDataFileReaderConfig<'a> {
     /// DataFusion table name for diagnostics.
     pub(crate) source_name: &'a str,
-    /// Normalized Delta table URI used to resolve the table-relative file path.
-    pub(crate) table_uri: &'a str,
     /// Snapshot version that selected this file.
     pub(crate) snapshot_version: u64,
-    /// Source-local options forwarded to Delta Kernel object-store construction.
-    pub(crate) storage_options: &'a DeltaStorageOptions,
+    /// Source-owned Delta Kernel infrastructure.
+    pub(crate) engine_context: std::sync::Arc<DeltaKernelEngineContext>,
 }
 
 /// Reusable official-kernel reader baseline for one provider scan context.
@@ -139,7 +139,7 @@ pub(crate) struct KernelDataFileReader {
     source_name: String,
     table_uri: String,
     snapshot_version: u64,
-    engine: std::sync::Arc<dyn kernel::Engine>,
+    engine_context: std::sync::Arc<DeltaKernelEngineContext>,
 }
 
 /// Request to read one Delta data file through the official kernel engine path.
@@ -195,41 +195,13 @@ pub(crate) struct KernelDataFilePredicateEvalRequest<'a> {
 impl KernelDataFileReader {
     /// Builds a reusable official-kernel reader for one provider scan context.
     #[allow(dead_code)]
-    pub(crate) fn try_new(
-        config: KernelDataFileReaderConfig<'_>,
-    ) -> Result<Self, DeltaFunnelError> {
-        const TABLE_ROOT_CONTEXT: &str = "<table-root>";
-
-        let table_url =
-            kernel::try_parse_uri(config.table_uri).context(DeltaScanFileReadSnafu {
-                source_name: config.source_name.to_owned(),
-                table_uri: config.table_uri.to_owned(),
-                snapshot_version: config.snapshot_version,
-                path: TABLE_ROOT_CONTEXT.to_owned(),
-                phase: DeltaScanFileReadPhase::TableUriParsing,
-            })?;
-        let store = kernel::store_from_url_opts(
-            &table_url,
-            config
-                .storage_options
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        )
-        .context(DeltaScanFileReadSnafu {
+    pub(crate) fn new(config: KernelDataFileReaderConfig<'_>) -> Self {
+        Self {
             source_name: config.source_name.to_owned(),
-            table_uri: config.table_uri.to_owned(),
+            table_uri: config.engine_context.table_url().as_str().to_owned(),
             snapshot_version: config.snapshot_version,
-            path: TABLE_ROOT_CONTEXT.to_owned(),
-            phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
-        })?;
-        let engine = std::sync::Arc::new(kernel::DefaultEngineBuilder::new(store).build());
-
-        Ok(Self {
-            source_name: config.source_name.to_owned(),
-            table_uri: config.table_uri.to_owned(),
-            snapshot_version: config.snapshot_version,
-            engine,
-        })
+            engine_context: config.engine_context,
+        }
     }
 
     /// Reads one provider-selected Delta data file through official Delta Kernel APIs.
@@ -238,13 +210,6 @@ impl KernelDataFileReader {
         &self,
         request: KernelDataFileReadRequest<'_>,
     ) -> Result<KernelDataFileReadResult, DeltaFunnelError> {
-        let table_url = kernel::try_parse_uri(&self.table_uri).context(DeltaScanFileReadSnafu {
-            source_name: self.source_name.clone(),
-            table_uri: self.table_uri.clone(),
-            snapshot_version: self.snapshot_version,
-            path: request.path.to_owned(),
-            phase: DeltaScanFileReadPhase::TableUriParsing,
-        })?;
         let size = request
             .size
             .ok_or_else(|| {
@@ -271,7 +236,9 @@ impl KernelDataFileReader {
                 path: request.path.to_owned(),
                 phase: DeltaScanFileReadPhase::FileMetadataConversion,
             })?;
-        let location = table_url
+        let location = self
+            .engine_context
+            .table_url()
             .join(request.path)
             .map_err(kernel::DeltaKernelError::from)
             .context(DeltaScanFileReadSnafu {
@@ -283,7 +250,8 @@ impl KernelDataFileReader {
             })?;
         let file_meta = kernel::FileMeta::new(location, modification_time_ms, size);
         let read_results = self
-            .engine
+            .engine_context
+            .as_kernel_engine()
             .parquet_handler()
             .read_parquet_files(
                 std::slice::from_ref(&file_meta),
@@ -336,7 +304,7 @@ impl KernelDataFileReader {
         let physical_data: Box<dyn delta_kernel::EngineData> =
             Box::new(kernel::ArrowEngineData::new(request.batch));
         let logical_data = match kernel::transform_to_logical(
-            self.engine.as_ref(),
+            self.engine_context.as_kernel_engine(),
             physical_data,
             request.schema.physical_schema(),
             request.schema.logical_schema(),
@@ -412,7 +380,8 @@ impl KernelDataFileReader {
                 phase: DeltaScanFileReadPhase::PredicateEvaluation,
             })?;
         let evaluator = self
-            .engine
+            .engine_context
+            .as_kernel_engine()
             .evaluation_handler()
             .new_predicate_evaluator(request.schema.physical_schema.clone(), predicate)
             .context(DeltaScanFileReadSnafu {
@@ -622,11 +591,10 @@ mod tests {
     fn test_reader(
         source: &PlannedDeltaSource,
     ) -> Result<KernelDataFileReader, Box<dyn std::error::Error>> {
-        Ok(KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+        Ok(KernelDataFileReader::new(KernelDataFileReaderConfig {
             source_name: source.name(),
-            table_uri: source.table_uri(),
             snapshot_version: source.version(),
-            storage_options: source.storage_options(),
-        })?)
+            engine_context: std::sync::Arc::clone(source.engine_context()),
+        }))
     }
 }
