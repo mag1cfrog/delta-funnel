@@ -432,10 +432,16 @@ mod tests {
         }
         let mut functions = (1..=101)
             .map(|function_id| {
+                let worker = match function_id {
+                    1 => " worker 1",
+                    10 => " worker 10",
+                    14 => " worker 14",
+                    _ => "",
+                };
                 function(
                     function_id,
                     None,
-                    format!("match function {function_id:03}"),
+                    format!("match function {function_id:03}{worker}"),
                 )
             })
             .collect::<Vec<_>>();
@@ -516,6 +522,35 @@ mod tests {
     pagination.querySelector("button").click();
     check(operationsBody.rows.length === 102, "previous sibling page was incorrect");
 
+    let functionRootRow = Array.from(
+      operationsBody.querySelectorAll(".function-row")
+    ).find(row => row.textContent.includes("match function 001"));
+    check(functionRootRow !== undefined, "nested function root was not rendered");
+    functionRootRow.focus();
+    functionRootRow.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowRight",
+      bubbles: true
+    }));
+    const nestedFunctionRow = Array.from(
+      operationsBody.querySelectorAll(".function-row")
+    ).find(row => row.textContent.includes("nested target"));
+    check(nestedFunctionRow !== undefined, "nested function was not expanded");
+    check(
+      nestedFunctionRow.getAttribute("aria-level") === "3",
+      "nested function hierarchy was incorrect"
+    );
+    functionRootRow = Array.from(
+      operationsBody.querySelectorAll(".function-row")
+    ).find(row => row.textContent.includes("match function 001"));
+    functionRootRow.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowLeft",
+      bubbles: true
+    }));
+    check(
+      !operationsBody.textContent.includes("nested target"),
+      "nested function was not collapsed"
+    );
+
     document.querySelector('[data-sort="name"]').click();
     const semanticNames = Array.from(
       operationsBody.querySelectorAll('.semantic-row[aria-level="2"] .name-line'),
@@ -567,6 +602,28 @@ mod tests {
     collapseSubtree.click();
     check(!expanded.has(groupKeys[0]), "bounded subtree collapse failed");
     selectedNode = { kind: "semantic", value: semanticsById.get(1) };
+
+    filterInput.value = "worker 1";
+    applyFilter();
+    check(filterResults.length === 1, "numeric filter count was incorrect");
+    check(operationsBody.textContent.includes("worker 1"), "numeric filter missed worker 1");
+    check(!operationsBody.textContent.includes("worker 10"), "numeric filter matched worker 10");
+    check(!operationsBody.textContent.includes("worker 14"), "numeric filter matched worker 14");
+
+    filterInput.value = "delta_funnel";
+    applyFilter();
+    check(
+      filterResults.length === 102 &&
+        filterResults.every(result => result.function_id !== undefined),
+      "module metadata was not searchable"
+    );
+    filterInput.value = "src/lib.rs:42";
+    applyFilter();
+    check(
+      filterResults.length === 102 &&
+        filterResults.every(result => result.function_id !== undefined),
+      "source metadata was not searchable"
+    );
 
     const originalSemanticLookup = semanticsById.get;
     let oversizedAncestorLookups = 0;
