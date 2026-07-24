@@ -727,17 +727,20 @@ const retainSemantic = (semantic, visible) => {
   while (current) {
     const key = semanticKey(current);
     if (visible.has(key)) break;
+    if (visible.size >= maximumRenderedRows) return false;
     visible.add(key);
     current = current.parent_semantic_id === null
       ? null
       : semanticsById.get(current.parent_semantic_id);
   }
+  return true;
 };
 const retainFunction = (fn, visible) => {
   let current = fn;
   while (current) {
     const key = functionKey(current);
     if (visible.has(key)) break;
+    if (visible.size >= maximumRenderedRows) return false;
     visible.add(key);
     current = current.parent_function_id === null
       ? null
@@ -745,14 +748,13 @@ const retainFunction = (fn, visible) => {
           `f:${current.semantic_id}:${current.parent_function_id}`
         );
   }
-  retainSemantic(semanticsById.get(fn.semantic_id), visible);
+  return retainSemantic(semanticsById.get(fn.semantic_id), visible);
 };
 const retainFilterResult = (result, visible) => {
   if (result.function_id === undefined) {
-    retainSemantic(result, visible);
-  } else {
-    retainFunction(result, visible);
+    return retainSemantic(result, visible);
   }
+  return retainFunction(result, visible);
 };
 const showFilterPage = page => {
   filterPage = Math.max(0, Math.min(page, filterPageStarts.length - 1));
@@ -765,8 +767,7 @@ const showFilterPage = page => {
     end - start < filterPageSize
   ) {
     const candidateVisible = new Set(filterVisible);
-    retainFilterResult(filterResults[end], candidateVisible);
-    if (candidateVisible.size > maximumRenderedRows) {
+    if (!retainFilterResult(filterResults[end], candidateVisible)) {
       if (end === start) {
         filterOversizedResult = filterResults[end];
         filterVisible.add(

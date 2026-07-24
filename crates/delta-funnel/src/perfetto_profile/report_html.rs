@@ -568,9 +568,20 @@ mod tests {
     check(!expanded.has(groupKeys[0]), "bounded subtree collapse failed");
     selectedNode = { kind: "semantic", value: semanticsById.get(1) };
 
+    const originalSemanticLookup = semanticsById.get;
+    let oversizedAncestorLookups = 0;
+    semanticsById.get = key => {
+      oversizedAncestorLookups += 1;
+      return originalSemanticLookup.call(semanticsById, key);
+    };
     filterInput.value = "oversized target";
     applyFilter();
+    semanticsById.get = originalSemanticLookup;
     check(filterResults.length === 1, "oversized filter count was incorrect");
+    check(
+      oversizedAncestorLookups <= maximumRenderedRows,
+      "oversized filter traversed its complete ancestor chain"
+    );
     check(operationsBody.rows.length === 1, "oversized match was not rendered flat");
     check(
       operationsBody.querySelector(".match-label").textContent === "Match",
