@@ -82,7 +82,7 @@ pub(crate) struct DeltaKernelEngineContext {
 }
 
 impl DeltaKernelEngineContext {
-    fn build(
+    pub(crate) fn build(
         table_uri: &str,
         storage_options: &DeltaStorageOptions,
     ) -> Result<Self, DeltaFunnelError> {

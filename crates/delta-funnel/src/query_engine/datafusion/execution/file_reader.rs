@@ -14,7 +14,7 @@ use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
-        DeltaStorageOptions, KernelDataFileReadRequest, KernelDataFileReader,
+        DeltaKernelEngineContext, KernelDataFileReadRequest, KernelDataFileReader,
         KernelDataFileReaderConfig, KernelDataFileTransformRequest,
         KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
         KernelDeletionVectorReaderConfig, KernelScanReadSchema, ProviderDeletionVectorSelection,
@@ -39,12 +39,10 @@ pub(crate) struct DeltaFileReader {
 pub(crate) struct DeltaFileReaderConfig<'a> {
     /// DataFusion table name for diagnostics.
     pub(crate) source_name: &'a str,
-    /// Normalized Delta table URI used to resolve table-relative file paths.
-    pub(crate) table_uri: &'a str,
     /// Snapshot version that selected the file tasks.
     pub(crate) snapshot_version: u64,
-    /// Source-local options forwarded to Delta Kernel object-store construction.
-    pub(crate) storage_options: &'a DeltaStorageOptions,
+    /// Source-owned Delta Kernel infrastructure.
+    pub(crate) engine_context: std::sync::Arc<DeltaKernelEngineContext>,
 }
 
 /// Request to read exactly one provider file task.
@@ -92,28 +90,27 @@ pub(crate) struct DeltaFileReadDeletionVectorStats {
 impl DeltaFileReader {
     /// Builds a file-level reader for one provider scan context.
     #[allow(dead_code)]
-    pub(crate) fn try_new(config: DeltaFileReaderConfig<'_>) -> Result<Self, DeltaFunnelError> {
-        let data_file_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+    pub(crate) fn new(config: DeltaFileReaderConfig<'_>) -> Self {
+        let table_uri = config.engine_context.table_url().as_str().to_owned();
+        let data_file_reader = KernelDataFileReader::new(KernelDataFileReaderConfig {
             source_name: config.source_name,
-            table_uri: config.table_uri,
             snapshot_version: config.snapshot_version,
-            storage_options: config.storage_options,
-        })?;
+            engine_context: std::sync::Arc::clone(&config.engine_context),
+        });
         let deletion_vector_reader =
-            KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            KernelDeletionVectorReader::new(KernelDeletionVectorReaderConfig {
                 source_name: config.source_name,
-                table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
-                storage_options: config.storage_options,
-            })?;
+                engine_context: config.engine_context,
+            });
 
-        Ok(Self {
+        Self {
             source_name: config.source_name.to_owned(),
-            table_uri: config.table_uri.to_owned(),
+            table_uri,
             snapshot_version: config.snapshot_version,
             data_file_reader,
             deletion_vector_reader,
-        })
+        }
     }
 
     /// Reads one provider file task into logical Arrow batches.
@@ -733,11 +730,10 @@ mod tests {
     fn test_reader(
         source: &PlannedDeltaSource,
     ) -> Result<DeltaFileReader, Box<dyn std::error::Error>> {
-        Ok(DeltaFileReader::try_new(DeltaFileReaderConfig {
+        Ok(DeltaFileReader::new(DeltaFileReaderConfig {
             source_name: source.name(),
-            table_uri: source.table_uri(),
             snapshot_version: source.version(),
-            storage_options: source.storage_options(),
-        })?)
+            engine_context: std::sync::Arc::clone(source.engine_context()),
+        }))
     }
 }

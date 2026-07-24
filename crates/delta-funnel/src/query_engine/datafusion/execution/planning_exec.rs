@@ -297,9 +297,8 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                 let file_reader = build_partition_file_reader(DeltaProviderReaderBackendConfig {
                     reader_backend: self.execution_options.reader_backend,
                     source_name: &self.scan_plan.source_name,
-                    table_uri: &self.scan_plan.table_uri,
                     snapshot_version: self.scan_plan.snapshot_version,
-                    storage_options: &self.scan_plan.storage_options,
+                    engine_context: Arc::clone(self.scan_plan.engine_context()),
                 })
                 .map_err(DataFusionError::from)?;
                 let partition_limiter = self
@@ -327,6 +326,7 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                         table_uri: &self.scan_plan.table_uri,
                         snapshot_version: self.scan_plan.snapshot_version,
                         storage_options: &self.scan_plan.storage_options,
+                        engine_context: Arc::clone(self.scan_plan.engine_context()),
                     })?;
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
                     file_reader,

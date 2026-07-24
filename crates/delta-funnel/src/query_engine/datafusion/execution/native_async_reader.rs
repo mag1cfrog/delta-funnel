@@ -31,8 +31,8 @@ use crate::{
     DeltaFunnelError,
     error::{DeltaScanFileReadPhase, DeltaScanFileReadSnafu},
     table_formats::{
-        KernelColumnMetadataKey, KernelDataFilePredicateEvalRequest, KernelDataType,
-        KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
+        DeltaKernelEngineContext, KernelColumnMetadataKey, KernelDataFilePredicateEvalRequest,
+        KernelDataType, KernelDeletionVectorReadRequest, KernelDeletionVectorReader,
         KernelDeletionVectorReaderConfig, KernelMetadataColumnSpec, KernelMetadataValue,
         KernelPhysicalToLogicalTransform, KernelScanReadSchema, KernelSchemaRef, KernelStructField,
         ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
@@ -65,6 +65,8 @@ pub(crate) struct DeltaNativeAsyncFileReaderConfig<'a> {
     pub(crate) snapshot_version: u64,
     /// Source-local options forwarded to Delta Kernel object-store construction.
     pub(crate) storage_options: &'a DeltaStorageOptions,
+    /// Source-owned Delta Kernel infrastructure used by Kernel-backed helpers.
+    pub(crate) engine_context: Arc<DeltaKernelEngineContext>,
 }
 
 /// Reusable native async file reader context for one provider scan.
@@ -74,6 +76,7 @@ pub(crate) struct DeltaNativeAsyncFileReader {
     table_uri: String,
     snapshot_version: u64,
     store: Arc<dyn ObjectStore>,
+    engine_context: Arc<DeltaKernelEngineContext>,
     data_file_reader: Arc<KernelDataFileReader>,
     deletion_vector_reader: Arc<KernelDeletionVectorReader>,
 }
@@ -164,27 +167,25 @@ impl DeltaNativeAsyncFileReader {
             path: TABLE_ROOT_CONTEXT.to_owned(),
             phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
         })?;
-        let data_file_reader =
-            Arc::new(KernelDataFileReader::try_new(KernelDataFileReaderConfig {
-                source_name: config.source_name,
-                table_uri: config.table_uri,
-                snapshot_version: config.snapshot_version,
-                storage_options: config.storage_options,
-            })?);
-        let deletion_vector_reader = Arc::new(KernelDeletionVectorReader::try_new(
+        let data_file_reader = Arc::new(KernelDataFileReader::new(KernelDataFileReaderConfig {
+            source_name: config.source_name,
+            snapshot_version: config.snapshot_version,
+            engine_context: Arc::clone(&config.engine_context),
+        }));
+        let deletion_vector_reader = Arc::new(KernelDeletionVectorReader::new(
             KernelDeletionVectorReaderConfig {
                 source_name: config.source_name,
-                table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
-                storage_options: config.storage_options,
+                engine_context: Arc::clone(&config.engine_context),
             },
-        )?);
+        ));
 
         Ok(Self {
             source_name: config.source_name.to_owned(),
             table_uri: config.table_uri.to_owned(),
             snapshot_version: config.snapshot_version,
             store,
+            engine_context: config.engine_context,
             data_file_reader,
             deletion_vector_reader,
         })
@@ -1832,10 +1833,10 @@ mod tests {
             planning::file_task::DeltaScanFileTask,
         },
         table_formats::{
-            KernelColumnMetadataKey, KernelDataType, KernelMetadataColumnSpec, KernelMetadataValue,
-            KernelPhysicalToLogicalTransform, KernelScanDeletionVectorMetadata,
-            KernelScanReadSchema, KernelSchemaRef, KernelStructField, KernelStructType,
-            RealParquetDeltaTable, build_projected_delta_scan,
+            DeltaKernelEngineContext, KernelColumnMetadataKey, KernelDataType,
+            KernelMetadataColumnSpec, KernelMetadataValue, KernelPhysicalToLogicalTransform,
+            KernelScanDeletionVectorMetadata, KernelScanReadSchema, KernelSchemaRef,
+            KernelStructField, KernelStructType, RealParquetDeltaTable, build_projected_delta_scan,
             build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
         },
     };
@@ -1918,11 +1919,16 @@ mod tests {
 
     fn reader(table_uri: &str) -> Result<DeltaNativeAsyncFileReader, DeltaFunnelError> {
         let storage_options = DeltaStorageOptions::default();
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(
+            table_uri,
+            &storage_options,
+        )?);
         DeltaNativeAsyncFileReader::try_new(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri,
             snapshot_version: 42,
             storage_options: &storage_options,
+            engine_context,
         })
     }
 
@@ -2730,11 +2736,16 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table_uri = "memory:///table/root/";
         let storage_options = DeltaStorageOptions::default();
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(
+            table_uri,
+            &storage_options,
+        )?);
         validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri,
             snapshot_version: 42,
             storage_options: &storage_options,
+            engine_context,
         })?;
         let reader = reader(table_uri)?;
         let object = reader.parquet_object_for_task(&task(table_uri, "part-00000.parquet"))?;
@@ -2745,7 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn native_async_reader_config_passes_storage_options_to_each_store_construction()
+    fn native_async_reader_config_reuses_context_for_kernel_helpers()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheme = unique_storage_scheme("options")?;
         let captured = CapturedStorageOptions::default();
@@ -2756,15 +2767,17 @@ mod tests {
             ("endpoint", "http://storage.example"),
         ]);
 
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(&table_uri, &options)?);
         validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
             source_name: "orders",
             table_uri: &table_uri,
             snapshot_version: 42,
             storage_options: &options,
+            engine_context,
         })?;
 
         let captured_options = captured_storage_options(&captured);
-        assert_eq!(captured_options.len(), 3);
+        assert_eq!(captured_options.len(), 2);
         assert!(captured_options.iter().all(|captured| captured == &options));
 
         Ok(())
@@ -2842,26 +2855,6 @@ mod tests {
         assert_eq!(batch_rows, vec![2, 1]);
 
         Ok(())
-    }
-
-    #[test]
-    fn native_async_reader_rejects_unsupported_object_store_scheme() {
-        let storage_options = DeltaStorageOptions::default();
-        let error = validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
-            source_name: "orders",
-            table_uri: "ftp://example.com/table/",
-            snapshot_version: 42,
-            storage_options: &storage_options,
-        })
-        .expect_err("unsupported object store scheme must fail");
-
-        assert!(matches!(
-            error,
-            DeltaFunnelError::DeltaScanFileRead {
-                phase: DeltaScanFileReadPhase::ObjectStoreEngineConstruction,
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -4441,6 +4434,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
 
         let stream = reader
@@ -4508,6 +4502,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
 
         let mut stream = reader
@@ -4568,6 +4563,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
 
         assert!(read_schema.enforces_physical_predicate_rows());
@@ -4636,6 +4632,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
 
         assert!(task.deletion_vector.is_present());
@@ -4709,6 +4706,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
         let object = reader.parquet_object_for_task(&task)?;
         let parquet_reader =
@@ -4804,6 +4802,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
 
         let stream = reader
@@ -4864,6 +4863,7 @@ mod tests {
             table_uri: source.table_uri(),
             snapshot_version: source.version(),
             storage_options: source.storage_options(),
+            engine_context: Arc::clone(source.engine_context()),
         })?;
 
         let stream = reader

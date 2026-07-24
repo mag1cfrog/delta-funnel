@@ -697,11 +697,12 @@ mod tests {
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
-        DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, KernelDataFileReader,
-        KernelDataFileReaderConfig, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
-        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
-        datafusion_expr_to_kernel_predicate, effective_storage_options_for_source_from_env,
-        load_delta_source, load_delta_sources, load_delta_table_snapshot,
+        DeltaKernelEngineContext, DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions,
+        KernelDataFileReader, KernelDataFileReaderConfig, KernelDeletionVectorReader,
+        KernelDeletionVectorReaderConfig, ProjectedDeltaScan, build_projected_delta_scan,
+        build_projected_predicated_delta_scan, datafusion_expr_to_kernel_predicate,
+        effective_storage_options_for_source_from_env, load_delta_source, load_delta_sources,
+        load_delta_table_snapshot,
     };
     use crate::DeltaFunnelError;
 
@@ -6808,8 +6809,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_construction_passes_storage_options_to_each_store_construction()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn reader_construction_reuses_one_engine_context() -> Result<(), Box<dyn std::error::Error>> {
         let scheme = unique_storage_scheme("readeroptions")?;
         let captured = CapturedStorageOptions::default();
         register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
@@ -6819,27 +6819,58 @@ mod tests {
             ("endpoint", "http://storage.example"),
         ]);
 
-        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(&table_uri, &options)?);
+        let _data_reader = KernelDataFileReader::new(KernelDataFileReaderConfig {
             source_name: "orders",
-            table_uri: &table_uri,
             snapshot_version: 42,
-            storage_options: &options,
-        })?;
-        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            engine_context: Arc::clone(&engine_context),
+        });
+        let _dv_reader = KernelDeletionVectorReader::new(KernelDeletionVectorReaderConfig {
             source_name: "orders",
-            table_uri: &table_uri,
             snapshot_version: 42,
-            storage_options: &options,
-        })?;
-        let captured_options = captured_storage_options(&captured);
-        assert_eq!(captured_options.len(), 2);
-        assert!(captured_options.iter().all(|captured| captured == &options));
+            engine_context,
+        });
+        assert_eq!(captured_storage_options(&captured), vec![options]);
 
         Ok(())
     }
 
     #[test]
-    fn reader_construction_passes_effective_s3_storage_options_to_each_store_construction()
+    fn kernel_readers_retain_and_release_engine_context() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let scheme = unique_storage_scheme("readerlifetime")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
+        let table_uri = format!("{scheme}://table/root/");
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(
+            &table_uri,
+            &DeltaStorageOptions::default(),
+        )?);
+        let weak_context = Arc::downgrade(&engine_context);
+        let data_reader = KernelDataFileReader::new(KernelDataFileReaderConfig {
+            source_name: "orders",
+            snapshot_version: 42,
+            engine_context: Arc::clone(&engine_context),
+        });
+        let deletion_vector_reader =
+            KernelDeletionVectorReader::new(KernelDeletionVectorReaderConfig {
+                source_name: "orders",
+                snapshot_version: 42,
+                engine_context: Arc::clone(&engine_context),
+            });
+
+        drop(engine_context);
+        assert!(weak_context.upgrade().is_some());
+        drop(data_reader);
+        assert!(weak_context.upgrade().is_some());
+        drop(deletion_vector_reader);
+        assert!(weak_context.upgrade().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn reader_construction_reuses_effective_s3_engine_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheme = unique_storage_scheme("readereffectiveoptions")?;
         let captured = CapturedStorageOptions::default();
@@ -6855,25 +6886,18 @@ mod tests {
             ]),
         );
 
-        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(&table_uri, &effective)?);
+        let _data_reader = KernelDataFileReader::new(KernelDataFileReaderConfig {
             source_name: "orders",
-            table_uri: &table_uri,
             snapshot_version: 42,
-            storage_options: &effective,
-        })?;
-        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            engine_context: Arc::clone(&engine_context),
+        });
+        let _dv_reader = KernelDeletionVectorReader::new(KernelDeletionVectorReaderConfig {
             source_name: "orders",
-            table_uri: &table_uri,
             snapshot_version: 42,
-            storage_options: &effective,
-        })?;
-        let captured_options = captured_storage_options(&captured);
-        assert_eq!(captured_options.len(), 2);
-        assert!(
-            captured_options
-                .iter()
-                .all(|captured| captured == &effective)
-        );
+            engine_context,
+        });
+        assert_eq!(captured_storage_options(&captured), vec![effective]);
 
         Ok(())
     }
