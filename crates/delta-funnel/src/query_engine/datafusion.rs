@@ -17,6 +17,7 @@ pub(crate) mod execution_profile;
 mod operator_activity;
 mod planning;
 mod planning_activity;
+mod profiled_execution;
 mod session;
 
 #[cfg(feature = "perfetto-profile")]
@@ -25,6 +26,7 @@ pub(crate) use operator_activity::instrument_query_execution_plan;
 pub(crate) use planning_activity::{
     profile_query_planning_sync_result, with_query_planning_activity,
 };
+pub(crate) use profiled_execution::profiled_datafusion_query_output_stream_with_effective_root;
 
 pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
@@ -198,53 +200,36 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
 ) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
-    datafusion_query_output_stream_with_effective_root_impl(plan, task_context, None)
+    let (effective_profile_root, execute) = prepare_datafusion_query_output(plan);
+    execute_datafusion_query_output(effective_profile_root, execute, task_context)
 }
 
-pub(crate) fn profiled_datafusion_query_output_stream_with_effective_root(
+pub(super) fn prepare_datafusion_query_output(
     plan: Arc<dyn ExecutionPlan>,
-    task_context: Arc<TaskContext>,
-    trace_identity: QueryTraceIdentity,
-) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
-    datafusion_query_output_stream_with_effective_root_impl(
-        plan,
-        task_context,
-        Some(trace_identity),
-    )
-}
-
-fn datafusion_query_output_stream_with_effective_root_impl(
-    plan: Arc<dyn ExecutionPlan>,
-    task_context: Arc<TaskContext>,
-    trace_identity: Option<QueryTraceIdentity>,
-) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
+) -> (Arc<dyn ExecutionPlan>, bool) {
     // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
-    let (effective_profile_root, execute) =
-        match plan.properties().output_partitioning().partition_count() {
-            // DataFusion returns an empty stream without executing a partition, but
-            // profiling still needs the real planned root.
-            0 => (plan, false),
-            // The only output partition has the zero-based index 0.
-            1 => (plan, true),
-            2.. => {
-                // The wrapper exposes one output partition at index 0 and consumes
-                // every output partition from the original plan.
-                (
-                    Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>,
-                    true,
-                )
-            }
-        };
-    let effective_profile_root = match trace_identity {
-        Some(trace_identity) => {
-            instrument_query_execution_plan(Arc::clone(&effective_profile_root), trace_identity)
-                .map_err(|source| DFQueryExecutionSetupError {
-                    source,
-                    effective_profile_root,
-                })?
+    match plan.properties().output_partitioning().partition_count() {
+        // DataFusion returns an empty stream without executing a partition, but
+        // profiling still needs the real planned root.
+        0 => (plan, false),
+        // The only output partition has the zero-based index 0.
+        1 => (plan, true),
+        2.. => {
+            // The wrapper exposes one output partition at index 0 and consumes
+            // every output partition from the original plan.
+            (
+                Arc::new(CoalescePartitionsExec::new(plan)) as Arc<dyn ExecutionPlan>,
+                true,
+            )
         }
-        None => effective_profile_root,
-    };
+    }
+}
+
+pub(super) fn execute_datafusion_query_output(
+    effective_profile_root: Arc<dyn ExecutionPlan>,
+    execute: bool,
+    task_context: Arc<TaskContext>,
+) -> Result<DFQueryExecution, DFQueryExecutionSetupError> {
     let stream = if execute {
         effective_profile_root
             .execute(0, task_context)
