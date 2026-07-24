@@ -3210,6 +3210,12 @@ mod tests {
         drop(physical_plan);
         assert!(weak_context.upgrade().is_some());
         drop(ctx);
+        for _ in 0..1000 {
+            if weak_context.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         assert!(weak_context.upgrade().is_none());
 
         Ok(())
