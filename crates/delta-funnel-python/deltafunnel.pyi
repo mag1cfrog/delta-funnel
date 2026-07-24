@@ -88,6 +88,7 @@ class Session:
         dry_run: bool | None = None,
         progress: bool | None = None,
         trace_path: str | PathLike[str] | None = None,
+        profiler: ProfilerConfig | None = None,
     ) -> Report: ...
 
 

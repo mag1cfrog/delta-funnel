@@ -8,6 +8,7 @@ use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 use crate::exception::{attach_operation_result, delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
+use crate::profiler::{PyProfilerConfig, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::table::{PyTable, TraceDestination};
 
@@ -145,10 +146,13 @@ impl PySession {
     /// Trace Event JSON file for the complete write-all wall clock. Cache
     /// profiles are under `report["cache"]["aliases"]`, or under
     /// `error.context["aliases"]` for cache orchestration failures.
+    /// Pass `profiler=ProfilerConfig(...)` to record the complete write-all
+    /// operation and export an interactive ranked HTML report.
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.
-    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None, trace_path=None))]
+    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None, trace_path=None, profiler=None))]
+    #[allow(clippy::too_many_arguments)]
     fn write_all(
         slf: Py<Self>,
         py: Python<'_>,
@@ -157,6 +161,7 @@ impl PySession {
         dry_run: Option<bool>,
         progress: Option<bool>,
         trace_path: Option<PathBuf>,
+        profiler: Option<PyRef<'_, PyProfilerConfig>>,
     ) -> PyResult<Py<PyAny>> {
         for output in &outputs {
             if !output.belongs_to_session(py, &slf) {
@@ -179,6 +184,13 @@ impl PySession {
             .collect::<Vec<_>>();
 
         if dry_run == Some(true) {
+            if profiler.is_some() {
+                return Err(config_py_error(
+                    py,
+                    "invalid_option_value",
+                    "profiling is only supported for execute `write_all` calls".to_owned(),
+                ));
+            }
             if trace_path.is_some() {
                 return Err(config_py_error(
                     py,
@@ -203,32 +215,51 @@ impl PySession {
         }
 
         let options = parse_write_all_options(py, options)?;
+        let options = if profiler.is_some() {
+            options.with_execution_profile_mode(delta_funnel::ExecutionProfileMode::Detailed)
+        } else {
+            options
+        };
         if trace_path.is_some()
             && options.execution_profile_mode() != delta_funnel::ExecutionProfileMode::Detailed
         {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` requires `options={'profile': True}`".to_owned(),
+                "`trace_path` requires `options={'profile': True}` or `profiler=ProfilerConfig(...)`"
+                    .to_owned(),
             ));
         }
-        if requests.is_empty() {
-            return slf.borrow(py).execute_write_all(
-                py,
-                &requests,
-                options,
-                None,
-                trace_path.as_deref(),
-            );
-        }
-        let progress = PythonProgress::new(progress);
-        slf.borrow(py).execute_write_all(
+        let operation_profile = start_operation_profile(py, profiler.as_deref())?;
+        drop(profiler);
+        let progress = if requests.is_empty() {
+            None
+        } else {
+            PythonProgress::new(progress)
+        };
+        let write = slf.borrow(py).execute_write_all(
             py,
             &requests,
             options,
             progress.as_ref(),
             trace_path.as_deref(),
-        )
+        );
+        let profile_result = operation_profile
+            .map(|operation_profile| operation_profile.finish(py))
+            .transpose();
+        match (write, profile_result) {
+            (Err(error), _) => Err(error),
+            (Ok((report, status)), Err(error)) => {
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_status", status);
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_report", report.bind(py));
+                Err(error)
+            }
+            (Ok((report, _)), Ok(_)) => Ok(report),
+        }
     }
 }
 
@@ -408,7 +439,7 @@ impl PySession {
         options: delta_funnel::WriteAllOptions,
         progress: Option<&PythonProgress>,
         trace_path: Option<&Path>,
-    ) -> PyResult<Py<PyAny>> {
+    ) -> PyResult<(Py<PyAny>, &'static str)> {
         let trace_destination = trace_path.map(TraceDestination::open).transpose()?;
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_all_with_progress(
@@ -447,7 +478,7 @@ impl PySession {
                 &report_value,
             )?;
         }
-        json_value_to_py(py, &report_value)
+        Ok((json_value_to_py(py, &report_value)?, status))
     }
 }
 
@@ -1327,6 +1358,7 @@ mod tests {
             .map_or("", |(signature, _)| signature);
         assert!(signature.contains("options: WriteAllExecutionOptions | None = None"));
         assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
+        assert!(signature.contains("profiler: ProfilerConfig | None = None"));
         assert!(!signature.contains("options: Options"));
     }
 
@@ -1366,7 +1398,44 @@ mod tests {
                 .getattr("write_all")?
                 .getattr("__text_signature__")?
                 .extract::<String>()?;
-            assert!(signature.ends_with("progress=None, trace_path=None)"));
+            assert!(signature.ends_with("progress=None, trace_path=None, profiler=None)"));
+            Ok(())
+        })
+    }
+
+    #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+    #[test]
+    fn write_all_profiler_requires_a_diagnostics_build_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let outputs = PyList::empty(py);
+            let output = env_unique_path("write-all-profiler-unavailable")?.with_extension("html");
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call1((output.to_string_lossy().as_ref(),))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("profiler", profiler)?;
+
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .expect_err("a standard wheel must reject operation profiling");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "profiler"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "not_available"
+            );
+
+            kwargs.set_item("dry_run", true)?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .expect_err("dry-run operation profiling must be rejected");
+            assert_config_error(py, &error, "invalid_option_value")?;
+            assert!(!output.exists());
             Ok(())
         })
     }
