@@ -9,7 +9,7 @@ use datafusion::physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
 };
 
-use crate::{DeltaFunnelError, QueryExecutionScope, profiling::OperationTraceContext};
+use crate::DeltaFunnelError;
 
 mod catalog;
 mod execution;
@@ -27,7 +27,9 @@ pub(crate) use operator_activity::instrument_query_execution_plan;
 pub(crate) use planning_activity::{
     profile_query_planning_sync_result, with_query_planning_activity,
 };
-pub(crate) use profiled_execution::profiled_datafusion_query_output_stream_with_effective_root;
+pub(crate) use profiled_execution::{
+    QueryTraceIdentity, profiled_datafusion_query_output_stream_with_effective_root,
+};
 
 pub use catalog::registration::{
     DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
@@ -47,57 +49,6 @@ pub use planning::partition_target::{
     derive_delta_scan_partition_target_diagnostic,
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
-
-/// Shared identity for the planning and execution events of one query.
-#[derive(Debug, Clone)]
-pub(crate) struct QueryTraceIdentity {
-    context: OperationTraceContext,
-    query_execution_id: u64,
-    query_scope: QueryExecutionScope,
-    query_owner: Option<Arc<str>>,
-}
-
-impl QueryTraceIdentity {
-    pub(crate) fn new(
-        context: OperationTraceContext,
-        query_scope: QueryExecutionScope,
-        query_owner: Option<&str>,
-    ) -> Option<Self> {
-        debug_assert_ne!(context.operation_id(), 0);
-        debug_assert!(context.timeline().is_some() || context.process_spans_enabled());
-        let query_execution_id = context.next_query_execution_id()?;
-        Some(Self {
-            context,
-            query_execution_id,
-            query_scope,
-            query_owner: query_owner.map(Arc::<str>::from),
-        })
-    }
-
-    const fn timeline(&self) -> Option<&crate::report::OperationTimelineRecorder> {
-        self.context.timeline()
-    }
-
-    const fn operation_id(&self) -> u64 {
-        self.context.operation_id()
-    }
-
-    fn process_root_span(&self) -> Option<&tracing::Span> {
-        self.context.process_root_span()
-    }
-
-    const fn query_execution_id(&self) -> u64 {
-        self.query_execution_id
-    }
-
-    const fn query_scope(&self) -> QueryExecutionScope {
-        self.query_scope
-    }
-
-    fn query_owner(&self) -> Option<&str> {
-        self.query_owner.as_deref()
-    }
-}
 
 /// Shared live read counters for one physical Delta scan.
 pub(crate) type DeltaProviderReadStatsHandle = Arc<execution::read_stats::DeltaProviderReadStats>;
