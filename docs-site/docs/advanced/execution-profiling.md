@@ -319,6 +319,39 @@ before later SQL Server work finishes. Neither surface includes plan display
 text, raw SQL, row values, paths, URLs, credentials, storage options, headers,
 or byte ranges.
 
+### Inspect write-all profiles
+
+Enable detailed profiling for every attempted output and executed cache alias:
+
+```python
+report = session.write_all(outputs, options={"profile": True})
+```
+
+Profiling works with either cache mode. Profiles stay with the output result
+that produced them:
+
+```python
+for output in report["workflow"]["outputs"]:
+    if output["kind"] == "succeeded":
+        profile = output["report"]["execution_profile"]
+    elif output["kind"] == "failed":
+        context = output["failure"]["context"]
+        profile = None if context is None else context["report"]["execution_profile"]
+    else:
+        profile = output["skipped"]["execution_profile"]  # Always None.
+```
+
+An attempted output can have `None` when it failed before a profile observer
+was installed. A skipped output was not attempted and always has
+`execution_profile=None`. The top-level report and output status wrappers do
+not duplicate the field.
+
+Omitting `profile`, or passing `None` or `False`, disables profiling. Only the
+actual Boolean `True` enables it. Dry runs reject the `options` argument. See
+the [Python API signature](../reference/api.md#session-write-all) and
+[execution profile schema](../reference/execution-profile.md#profile-schema)
+for the exact contracts.
+
 ### Export a write-all trace
 
 Use one root wall clock to understand phase order, overlap, and sequential
