@@ -60,6 +60,7 @@ jobs:
       RELEASE_VERSION: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
       RUSTC_WRAPPER: ${{ matrix.host_sccache == 'true' && 'sccache' || '' }}
 
     steps:
