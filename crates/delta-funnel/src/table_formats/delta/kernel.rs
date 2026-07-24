@@ -18,16 +18,12 @@ use delta_kernel::arrow::error::ArrowError;
 pub(crate) use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 pub(crate) use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
-pub(crate) use delta_kernel::engine::default::DefaultEngineBuilder;
-#[cfg(test)]
-pub(crate) use delta_kernel::engine::default::storage::insert_url_handler;
-pub(crate) use delta_kernel::engine::default::storage::store_from_url_opts;
 pub(crate) use delta_kernel::expressions::{
     ColumnName, DecimalData, Expression, ExpressionRef, Predicate, PredicateRef, Scalar,
 };
-pub(crate) use delta_kernel::scan::Scan;
 pub(crate) use delta_kernel::scan::ScanMetadata;
 pub(crate) use delta_kernel::scan::state::{DvInfo, ScanFile, transform_to_logical};
+pub(crate) use delta_kernel::scan::{Scan, StatsOptions};
 pub(crate) use delta_kernel::schema::{
     ColumnMetadataKey as KernelColumnMetadataKey, DataType as KernelDataType,
     MetadataColumnSpec as KernelMetadataColumnSpec, MetadataValue as KernelMetadataValue,
@@ -40,6 +36,9 @@ pub(crate) use delta_kernel::{
     Engine, Error as DeltaKernelError, FileMeta, ParquetHandler, Snapshot, SnapshotRef, Version,
     try_parse_uri,
 };
+#[cfg(test)]
+pub(crate) use delta_kernel_default_engine::storage::insert_url_handler;
+pub(crate) use delta_kernel_default_engine::{DefaultEngineBuilder, storage::store_from_url_opts};
 use snafu::Snafu;
 
 /// Approximates Add actions excluded while Kernel planned this metadata batch.
@@ -128,10 +127,8 @@ pub(crate) fn build_projected_scan(
 
 /// Builds kernel scan state for selected logical Delta columns and an optional predicate.
 ///
-/// This helper intentionally leaves parsed stats output disabled. `delta_kernel`
-/// 0.23.0 supports combining `ScanBuilder::with_predicate` with
-/// `ScanBuilder::include_all_stats_columns`, and a later scan-metadata slice
-/// should choose that path when it needs parsed file stats output.
+/// This helper intentionally leaves parsed stats output disabled. A later
+/// scan-metadata slice should request parsed file stats when it needs them.
 #[allow(dead_code)]
 pub(crate) fn build_projected_predicated_scan(
     snapshot: &SnapshotRef,
@@ -165,7 +162,7 @@ pub(crate) fn build_projected_predicated_stats_scan(
         .scan_builder()
         .with_schema(Arc::clone(&schema))
         .with_predicate(predicate.map(DeltaKernelPredicate::into_inner))
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
         .build()?;
 
     Ok((scan, schema))
@@ -555,7 +552,7 @@ fn scan_builder_with_predicate_and_stats_symbol(
 ) -> delta_kernel::scan::ScanBuilder {
     builder
         .with_predicate(predicate)
-        .include_all_stats_columns()
+        .with_stats(StatsOptions::all())
 }
 
 fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {

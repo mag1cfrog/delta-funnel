@@ -150,7 +150,7 @@ impl DeltaNativeAsyncFileReader {
                 path: TABLE_ROOT_CONTEXT.to_owned(),
                 phase: DeltaScanFileReadPhase::TableUriParsing,
             })?;
-        let store = delta_kernel::engine::default::storage::store_from_url_opts(
+        let store = crate::table_formats::store_from_url_opts(
             &table_url,
             config
                 .storage_options
@@ -1889,7 +1889,7 @@ mod tests {
         scheme: &str,
         captured: CapturedStorageOptions,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        delta_kernel::engine::default::storage::insert_url_handler(
+        crate::table_formats::insert_url_handler(
             scheme,
             Arc::new(move |_url, options| {
                 let options = options.into_iter().collect::<BTreeMap<_, _>>();
