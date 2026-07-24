@@ -30,44 +30,10 @@ jobs:
         id: filter
         uses: dorny/paths-filter@v4
         with:
-          filters: |
-            code:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'crates/**'
-              - 'xtask/**'
-              - '.github/workflows/ci.yml'
-            diagnostics:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'crates/delta-funnel/Cargo.toml'
-              - 'crates/delta-funnel/src/bin/delta_funnel_perfetto.rs'
-              - 'crates/delta-funnel/src/bin/delta_scan_partition_bench.rs'
-              - 'crates/delta-funnel/src/perfetto_profile.rs'
-              - 'crates/delta-funnel/src/perfetto_profile/**'
-              - 'crates/delta-funnel/src/profiling.rs'
-              - 'crates/delta-funnel/src/query_engine/datafusion.rs'
-              - 'crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs'
-              - 'crates/delta-funnel/src/query_engine/datafusion/operator_activity.rs'
-              - 'crates/delta-funnel/tests/perfetto_ranked_report_cli.rs'
-              - 'crates/delta-funnel-python/Cargo.toml'
-              - 'crates/delta-funnel-python/build.rs'
-              - 'crates/delta-funnel-python/pyproject.toml'
-              - 'crates/delta-funnel-python/src/logging.rs'
-              - 'tools/perfetto/**'
-              - '.github/workflows/ci.yml'
-              - '.github/workflows/testpypi-diagnostics-build.yml'
-              - '.github/workflows/testpypi-diagnostics.yml'
-            release_wheel:
-              - '.cargo/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'crates/delta-funnel/**'
-              - 'crates/delta-funnel-python/**'
-              - 'xtask/Cargo.toml'
-              - '.github/workflows/ci.yml'
-              - '.github/workflows/pypi-build.yml'
-              - '.github/workflows/pypi.yml'
+          filters: .github/path-filters.json
+
+      - name: Check diagnostics path routing
+        run: node tools/ci/check-diagnostics-routing.mjs
 
   rust:
     name: Rust Checks / ${{ matrix.task }}
