@@ -47,7 +47,7 @@ nav:
           - Perfetto diagnostics: contributing/profiling-perfetto.md
           - Samply native CPU profiling: contributing/profiling-samply.md
   - Reference:
-      - API references: reference/api.md
+      - API reference: reference/api.md
       - Diagnostics reference: reference/diagnostics.md
       - Execution profile reference: reference/execution-profile.md
   - Contributors:
