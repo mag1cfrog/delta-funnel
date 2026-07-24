@@ -48,8 +48,28 @@ th, td { border-bottom: 1px solid GrayText; padding: .65rem; text-align: left; }
 th { background: color-mix(in srgb, CanvasText 8%, Canvas); }
 tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
 .name { font-weight: 650; }
+.name-line { align-items: center; display: flex; gap: .35rem; }
 .detail { display: block; font-size: .8rem; margin-top: .2rem; }
 .number { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.disclosure, .leaf {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 1.5rem;
+  height: 1.5rem;
+  justify-content: center;
+  width: 1.5rem;
+}
+.disclosure {
+  background: Canvas;
+  border: 1px solid GrayText;
+  border-radius: .25rem;
+  color: CanvasText;
+  cursor: pointer;
+}
+.disclosure:focus-visible { outline: 3px solid Highlight; outline-offset: 2px; }
+.function-row { background: color-mix(in srgb, CanvasText 4%, Canvas); }
+.function-row .name { font-weight: 500; }
+.type-label { font-weight: 650; }
 .empty { border: 1px dashed GrayText; padding: 1rem; }
 .help { margin-top: 2rem; max-width: 80rem; }
 .help summary { cursor: pointer; font-weight: 650; }
@@ -65,15 +85,15 @@ tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
 <div id="summary" class="summary" role="status" aria-live="polite"></div>
 <section aria-labelledby="operations-heading">
 <h2 id="operations-heading">Operations</h2>
-<p>Operation roots are ranked by exact duration. CPU columns contain sampled observations.</p>
+<p>Operation roots are ranked by exact duration. Expand a row to follow exact semantic children into sampled native callsites.</p>
 <div class="table-wrap">
 <table role="treegrid" aria-label="Ranked operations">
 <thead><tr>
 <th scope="col">Operation</th>
 <th scope="col">State and time basis</th>
 <th scope="col" class="number">Exact duration</th>
-<th scope="col" class="number">Operation wall %</th>
-<th scope="col" class="number">Direct CPU samples</th>
+<th scope="col" class="number">Context %</th>
+<th scope="col" class="number">Direct/self CPU samples</th>
 <th scope="col" class="number">Inclusive CPU samples</th>
 </tr></thead>
 <tbody id="operations"></tbody>
@@ -112,53 +132,223 @@ const formatDuration = value => {
   return `${value} ns`;
 };
 const formatPercent = (value, total) =>
-  total > 0 ? `${(value * 100 / total).toFixed(1)}%` : "N/A";
-const addOperation = (body, operation) => {
+  value !== null && total > 0
+    ? `${(value * 100 / total).toFixed(1)}%`
+    : "N/A";
+const compareSemantic = (left, right) =>
+  (right.duration_ns || 0) - (left.duration_ns || 0) ||
+  left.semantic_id - right.semantic_id;
+const compareFunction = (left, right) =>
+  right.inclusive_sample_count - left.inclusive_sample_count ||
+  left.function_id - right.function_id;
+const appendIndexed = (index, key, value) => {
+  const values = index.get(key);
+  if (values) values.push(value);
+  else index.set(key, [value]);
+};
+const semanticKey = semantic => `s:${semantic.semantic_id}`;
+const functionKey = fn => `f:${fn.semantic_id}:${fn.function_id}`;
+const functionParentKey = (semanticId, functionId) =>
+  `${semanticId}:${functionId}`;
+const semanticChildren = new Map();
+const functionRoots = new Map();
+const functionChildren = new Map();
+const semanticsById = new Map();
+profile.semantics.forEach(semantic => {
+  semanticsById.set(semantic.semantic_id, semantic);
+  if (semantic.parent_semantic_id !== null) {
+    appendIndexed(semanticChildren, semantic.parent_semantic_id, semantic);
+  }
+});
+profile.functions.forEach(fn => {
+  if (fn.parent_function_id === null) {
+    appendIndexed(functionRoots, fn.semantic_id, fn);
+  } else {
+    appendIndexed(
+      functionChildren,
+      functionParentKey(fn.semantic_id, fn.parent_function_id),
+      fn
+    );
+  }
+});
+semanticChildren.forEach(children => children.sort(compareSemantic));
+functionRoots.forEach(children => children.sort(compareFunction));
+functionChildren.forEach(children => children.sort(compareFunction));
+const operations = profile.semantics
+  .filter(item => item.parent_semantic_id === null)
+  .sort(compareSemantic);
+const operationDurations = new Map(
+  operations.map(operation => [operation.operation_id, operation.duration_ns])
+);
+const expanded = new Set();
+const disclosureButtons = new Map();
+const operationsBody = document.getElementById("operations");
+const textCell = (primary, detail, className = "") => {
+  const cell = document.createElement("td");
+  cell.className = className;
+  cell.textContent = primary;
+  if (detail) {
+    const secondary = document.createElement("span");
+    secondary.className = "detail";
+    secondary.textContent = detail;
+    cell.appendChild(secondary);
+  }
+  return cell;
+};
+const nameCell = (name, detail, depth, key, hasChildren) => {
+  const cell = document.createElement("td");
+  cell.className = "name";
+  const line = document.createElement("span");
+  line.className = "name-line";
+  line.style.paddingInlineStart = `${Math.min(depth - 1, 32) * 1.25}rem`;
+  if (hasChildren) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "disclosure";
+    button.setAttribute("aria-expanded", String(expanded.has(key)));
+    button.setAttribute(
+      "aria-label",
+      expanded.has(key) ? "Collapse row" : "Expand row"
+    );
+    button.textContent = expanded.has(key) ? "-" : "+";
+    button.addEventListener("click", () => {
+      if (expanded.has(key)) expanded.delete(key);
+      else expanded.add(key);
+      renderRows();
+      disclosureButtons.get(key)?.focus();
+    });
+    disclosureButtons.set(key, button);
+    line.appendChild(button);
+  } else {
+    const leaf = document.createElement("span");
+    leaf.className = "leaf";
+    leaf.setAttribute("aria-label", "Leaf row");
+    leaf.textContent = "-";
+    line.appendChild(leaf);
+  }
+  const label = document.createElement("span");
+  label.textContent = name;
+  line.appendChild(label);
+  const secondary = document.createElement("span");
+  secondary.className = "detail";
+  secondary.textContent = detail;
+  cell.append(line, secondary);
+  return cell;
+};
+const semanticRow = (semantic, depth) => {
+  const children = semanticChildren.get(semantic.semantic_id) || [];
+  const functions = functionRoots.get(semantic.semantic_id) || [];
+  const hasChildren = children.length !== 0 || functions.length !== 0;
+  const key = semanticKey(semantic);
   const row = document.createElement("tr");
-  row.setAttribute("aria-level", "1");
-  const values = [
-    operation.name,
-    operation.is_complete ? (operation.result || "Complete") : "Incomplete",
-    formatDuration(operation.duration_ns),
-    formatPercent(operation.duration_ns || 0, operation.duration_ns || 0),
-    String(operation.direct_sample_count),
-    String(operation.inclusive_sample_count)
-  ];
-  values.forEach((value, index) => {
-    const cell = document.createElement("td");
-    cell.textContent = value;
-    if (index === 0) {
-      cell.className = "name";
-      const detail = document.createElement("span");
-      detail.className = "detail";
-      detail.textContent = operation.operation_kind || operation.semantic_kind;
-      cell.appendChild(detail);
-    } else if (index === 1) {
-      const detail = document.createElement("span");
-      detail.className = "detail";
-      detail.textContent =
-        operation.time_semantics === "wall_clock" ? "Exact wall clock" : "Lifecycle";
-      cell.appendChild(detail);
+  row.className = "semantic-row";
+  row.setAttribute("aria-level", String(depth));
+  if (hasChildren) row.setAttribute("aria-expanded", String(expanded.has(key)));
+  row.append(
+    nameCell(
+      semantic.name,
+      `Exact semantic: ${semantic.operation_kind || semantic.semantic_kind}`,
+      depth,
+      key,
+      hasChildren
+    ),
+    textCell(
+      semantic.is_complete ? (semantic.result || "Complete") : "Incomplete",
+      semantic.time_semantics === "wall_clock" ? "Exact wall clock" : "Lifecycle"
+    ),
+    textCell(formatDuration(semantic.duration_ns), "", "number"),
+    textCell(
+      formatPercent(
+        semantic.duration_ns,
+        operationDurations.get(semantic.operation_id) || 0
+      ),
+      "Owning operation duration",
+      "number"
+    ),
+    textCell(String(semantic.direct_sample_count), "Direct", "number"),
+    textCell(String(semantic.inclusive_sample_count), "Semantic subtree", "number")
+  );
+  return { row, hasChildren, key, children, functions };
+};
+const functionRow = (fn, depth) => {
+  const children =
+    functionChildren.get(functionParentKey(fn.semantic_id, fn.function_id)) || [];
+  const hasChildren = children.length !== 0;
+  const key = functionKey(fn);
+  const owner = semanticsById.get(fn.semantic_id);
+  const location = [
+    fn.module_name,
+    fn.source_file === null
+      ? null
+      : `${fn.source_file}${fn.line_number === null ? "" : `:${fn.line_number}`}`
+  ].filter(Boolean).join(" - ");
+  const row = document.createElement("tr");
+  row.className = "function-row";
+  row.setAttribute("aria-level", String(depth));
+  if (hasChildren) row.setAttribute("aria-expanded", String(expanded.has(key)));
+  row.append(
+    nameCell(
+      fn.name,
+      location ? `Sampled function - ${location}` : "Sampled function",
+      depth,
+      key,
+      hasChildren
+    ),
+    textCell("Sampled on-CPU", "Statistical, not exact wall time"),
+    textCell("N/A", "No exact function duration", "number"),
+    textCell(
+      formatPercent(fn.inclusive_sample_count, owner?.direct_sample_count || 0),
+      "Owning semantic direct samples",
+      "number"
+    ),
+    textCell(String(fn.self_sample_count), "Self", "number"),
+    textCell(String(fn.inclusive_sample_count), "Call subtree", "number")
+  );
+  return { row, hasChildren, key, children };
+};
+const renderRows = () => {
+  disclosureButtons.clear();
+  const fragment = document.createDocumentFragment();
+  const stack = operations
+    .slice()
+    .reverse()
+    .map(operation => ({ kind: "semantic", value: operation, depth: 1 }));
+  while (stack.length !== 0) {
+    const entry = stack.pop();
+    if (entry.kind === "semantic") {
+      const rendered = semanticRow(entry.value, entry.depth);
+      fragment.appendChild(rendered.row);
+      if (rendered.hasChildren && expanded.has(rendered.key)) {
+        const children = [
+          ...rendered.children.map(value => ({ kind: "semantic", value })),
+          ...rendered.functions.map(value => ({ kind: "function", value }))
+        ];
+        for (let index = children.length - 1; index >= 0; index -= 1) {
+          stack.push({ ...children[index], depth: entry.depth + 1 });
+        }
+      }
     } else {
-      cell.className = "number";
+      const rendered = functionRow(entry.value, entry.depth);
+      fragment.appendChild(rendered.row);
+      if (rendered.hasChildren && expanded.has(rendered.key)) {
+        for (let index = rendered.children.length - 1; index >= 0; index -= 1) {
+          stack.push({
+            kind: "function",
+            value: rendered.children[index],
+            depth: entry.depth + 1
+          });
+        }
+      }
     }
-    row.appendChild(cell);
-  });
-  body.appendChild(row);
+  }
+  operationsBody.replaceChildren(fragment);
 };
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
 addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);
 addSummary("Directly attributed", profile.metadata.direct_sample_count);
 addSummary("Ambiguous", profile.metadata.ambiguous_sample_count);
 addSummary("Unattributed", profile.metadata.unattributed_sample_count);
-const operations = profile.semantics
-  .filter(item => item.parent_semantic_id === null)
-  .sort((left, right) =>
-    (right.duration_ns || 0) - (left.duration_ns || 0) ||
-    left.semantic_id - right.semantic_id
-  );
-const operationsBody = document.getElementById("operations");
-operations.forEach(operation => addOperation(operationsBody, operation));
+renderRows();
 document.getElementById("operations-empty").hidden = operations.length !== 0;
 </script>
 </body>
@@ -303,6 +493,9 @@ mod tests {
         assert!(html.contains(r#"aria-label="Ranked operations""#));
         assert!(html.contains(r#"id="operations-empty""#));
         assert!(!html.contains(r#"id="functions""#));
+        assert!(html.contains(r#"button.setAttribute("aria-expanded""#));
+        assert!(html.contains("operationsBody.replaceChildren(fragment)"));
+        assert!(!html.contains("innerHTML"));
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["name"], dangerous);
