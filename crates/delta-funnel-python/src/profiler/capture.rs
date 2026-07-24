@@ -63,7 +63,13 @@ impl OperationCapture {
                     "operation profile scope identity could not be allocated",
                 )
             })?;
-        let parent = prepare_output_parent(&output)?;
+        let output = prepare_output_path(&output)?;
+        let parent = output.parent().ok_or_else(|| {
+            ProfilerFailure::new(
+                "output_unavailable",
+                "profile output path has no parent directory",
+            )
+        })?;
         preflight_trace_processor()?;
         let directory = tempfile::Builder::new()
             .prefix(".delta-funnel-profile.")
@@ -159,18 +165,26 @@ impl Drop for ProfileReservation {
     }
 }
 
-fn prepare_output_parent(output: &Path) -> Result<&Path, ProfilerFailure> {
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+fn prepare_output_path(output: &Path) -> Result<PathBuf, ProfilerFailure> {
+    let output = std::path::absolute(output).map_err(|_| {
+        ProfilerFailure::new(
+            "output_unavailable",
+            "profile output path could not be resolved",
+        )
+    })?;
+    let parent = output.parent().ok_or_else(|| {
+        ProfilerFailure::new(
+            "output_unavailable",
+            "profile output path has no parent directory",
+        )
+    })?;
     fs::create_dir_all(parent).map_err(|_| {
         ProfilerFailure::new(
             "output_unavailable",
             "profile output directory could not be created",
         )
     })?;
-    match fs::metadata(output) {
+    match fs::metadata(&output) {
         Ok(metadata) if !metadata.is_file() => {
             return Err(ProfilerFailure::new(
                 "output_unavailable",
@@ -192,7 +206,7 @@ fn prepare_output_parent(output: &Path) -> Result<&Path, ProfilerFailure> {
             "profile output directory is not writable",
         )
     })?;
-    Ok(parent)
+    Ok(output)
 }
 
 fn current_process_capture_config(sample_hz: u16) -> Result<String, ProfilerFailure> {
@@ -448,7 +462,10 @@ mod tests {
     fn tracebox_readiness_and_shutdown_use_one_managed_child() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("reports/profile.html");
-        let parent = prepare_output_parent(&output).map_err(profiler_test_error)?;
+        let output = prepare_output_path(&output).map_err(profiler_test_error)?;
+        let parent = output
+            .parent()
+            .expect("an absolute output file path must have a parent");
         assert!(parent.is_dir());
 
         let script = directory.path().join("tracebox");
@@ -466,6 +483,23 @@ mod tests {
         let child = start_tracebox_with(script.as_os_str(), &config, &trace, || Ok(()), |_| Ok(()))
             .map_err(profiler_test_error)?;
         stop_tracebox(child).map_err(profiler_test_error)
+    }
+
+    #[test]
+    fn output_path_is_frozen_before_the_profiled_operation_can_change_directory() -> io::Result<()>
+    {
+        let directory = tempfile::tempdir_in(".")?;
+        let directory_name = directory
+            .path()
+            .file_name()
+            .ok_or_else(|| io::Error::other("the temporary directory must have a name"))?;
+        let relative_output = Path::new(directory_name).join("reports/profile.html");
+
+        let output = prepare_output_path(&relative_output).map_err(profiler_test_error)?;
+
+        assert!(output.is_absolute());
+        assert!(output.ends_with(&relative_output));
+        Ok(())
     }
 
     fn profiler_test_error(error: ProfilerFailure) -> io::Error {
