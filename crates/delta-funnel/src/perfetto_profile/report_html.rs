@@ -53,6 +53,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <tbody id="operations"></tbody>
 </table>
 </div>
+<output id="render-limit-status" class="render-limit-status" role="status" aria-live="polite"></output>
 <p id="operations-empty" class="empty" hidden>No operation records are available.</p>
 </section>
 <details class="help">
@@ -60,7 +61,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <p>Exact duration is measured wall-clock or lifecycle time. Parallel semantic children may overlap and are not additive. Direct CPU samples belong to one semantic node. Inclusive CPU samples also include its semantic descendants. Sampling observes on-CPU work and does not prove why a thread was off-CPU.</p>
 <p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
 <p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
-<p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Bulk subtree actions are limited to subtrees with at most 1000 total nodes.</p>
+<p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Sibling groups are paged 100 rows at a time. Bulk subtree actions and the visible table are limited to 1000 rows.</p>
 </details>
 </main>
 <script id="profile-data" type="application/json">"#;
@@ -276,11 +277,14 @@ mod tests {
         assert!(html.contains(r#"id="next-filter-page""#));
         assert!(html.contains(r#"id="expand-subtree""#));
         assert!(html.contains(r#"id="collapse-subtree""#));
+        assert!(html.contains(r#"id="render-limit-status""#));
         assert!(html.contains(r#"data-sort="duration""#));
         assert!(!html.contains(r#"id="functions""#));
         assert!(html.contains(r#"button.setAttribute("aria-expanded""#));
         assert!(html.contains(r#"entry.row.setAttribute("aria-selected""#));
         assert!(html.contains("const maximumBulkSubtreeRows = 1000"));
+        assert!(html.contains("const maximumRenderedRows = 1000"));
+        assert!(html.contains("const siblingPageSize = 100"));
         assert!(html.contains("const containsFilter = value =>"));
         assert!(html.contains("operationsBody.replaceChildren(fragment)"));
         assert!(!html.contains("innerHTML"));
@@ -379,6 +383,18 @@ mod tests {
         let mut alpha = semantic(3, Some(1), "Alpha phase");
         alpha.end_ns = Some(1_000_000);
         alpha.duration_ns = Some(1_000_000);
+        let mut semantics = vec![operation, zeta, alpha];
+        for group in 0..10 {
+            let group_id = 4 + group * 101;
+            semantics.push(semantic(group_id, Some(1), format!("Group {group:02}")));
+            for child in 1..=100 {
+                semantics.push(semantic(
+                    group_id + child,
+                    Some(group_id),
+                    format!("Group {group:02} child {child:03}"),
+                ));
+            }
+        }
         let mut functions = (1..=101)
             .map(|function_id| {
                 function(
@@ -391,7 +407,7 @@ mod tests {
         functions.push(function(102, Some(1), "nested target"));
         let document = RankedProfileDocument {
             metadata: metadata(),
-            semantics: vec![operation, zeta, alpha],
+            semantics,
             functions,
         };
         document.validate()?;
@@ -417,11 +433,26 @@ mod tests {
       key: "ArrowRight",
       bubbles: true
     }));
-    check(operationsBody.rows.length === 104, "keyboard expansion failed");
+    check(operationsBody.rows.length === 102, "high-fanout expansion was not paged");
     check(
       operationsBody.rows[0].getAttribute("aria-expanded") === "true",
       "expanded state was not exposed"
     );
+    let pagination = operationsBody.querySelector(".pagination-row");
+    check(pagination !== null, "sibling pagination was not rendered");
+    check(
+      pagination.textContent.includes("1-100 of 113"),
+      "first sibling page status was incorrect"
+    );
+    pagination.querySelectorAll("button")[1].click();
+    check(operationsBody.rows.length === 15, "second sibling page was incorrect");
+    pagination = operationsBody.querySelector(".pagination-row");
+    check(
+      pagination.textContent.includes("101-113 of 113"),
+      "second sibling page status was incorrect"
+    );
+    pagination.querySelector("button").click();
+    check(operationsBody.rows.length === 102, "previous sibling page was incorrect");
 
     document.querySelector('[data-sort="name"]').click();
     const semanticNames = Array.from(
@@ -429,9 +460,32 @@ mod tests {
       line => line.querySelector("span:not(.leaf):not(.match-label)").textContent
     );
     check(
-      semanticNames.join(",") === "Alpha phase,Zeta phase",
+      semanticNames.filter(name => name.endsWith(" phase")).join(",") ===
+        "Alpha phase,Zeta phase",
       "name sorting flattened or misordered semantic siblings"
     );
+
+    const groupKeys = Array.from(
+      { length: 10 },
+      (_, group) => `s:${4 + group * 101}`
+    );
+    groupKeys.forEach(key => expanded.add(key));
+    renderRows();
+    check(
+      operationsBody.rows.length === maximumRenderedRows,
+      "visible row budget was not enforced"
+    );
+    check(
+      renderLimitStatus.textContent.includes("first 1000 visible rows"),
+      "visible row limit was not explained"
+    );
+    groupKeys.forEach(key => expanded.delete(key));
+    expanded.add(groupKeys[0]);
+    selectedNode = { kind: "semantic", value: semanticsById.get(4) };
+    renderRows();
+    collapseSubtree.click();
+    check(!expanded.has(groupKeys[0]), "bounded subtree collapse failed");
+    selectedNode = { kind: "semantic", value: semanticsById.get(1) };
 
     filterInput.value = "match function";
     applyFilter();
@@ -453,9 +507,14 @@ mod tests {
     );
 
     clearFilter.click();
-    check(operationsBody.rows.length === 104, "clear did not restore expansion state");
-    collapseSubtree.click();
-    check(operationsBody.rows.length === 1, "bounded subtree collapse failed");
+    check(operationsBody.rows.length === 102, "clear did not restore expansion state");
+    const expandedRoot = operationsBody.rows[0];
+    expandedRoot.focus();
+    expandedRoot.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowLeft",
+      bubbles: true
+    }));
+    check(operationsBody.rows.length === 1, "ordinary collapse failed");
     document.documentElement.dataset.viewerSmoke = "passed";
   } catch (error) {
     document.documentElement.dataset.viewerSmoke = `failed:${error.message}`;

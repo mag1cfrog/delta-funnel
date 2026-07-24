@@ -117,6 +117,11 @@ let selectedNode = operations.length === 0
 const expanded = new Set();
 const disclosureButtons = new Map();
 const maximumBulkSubtreeRows = 1000;
+const maximumRenderedRows = 1000;
+const siblingPageSize = 100;
+const siblingPages = new Map();
+const paginationRows = new Map();
+const rootPageKey = "roots";
 const bulkSubtreeLimitMessage =
   `The selected subtree exceeds ${maximumBulkSubtreeRows} nodes. Select a narrower branch.`;
 const filterPageSize = 100;
@@ -129,6 +134,7 @@ let filterOrderCache = [];
 let filterOrderCacheKey = null;
 const operationsBody = document.getElementById("operations");
 const operationsEmpty = document.getElementById("operations-empty");
+const renderLimitStatus = document.getElementById("render-limit-status");
 const filterInput = document.getElementById("profile-filter");
 const clearFilter = document.getElementById("clear-filter");
 const previousFilterPage = document.getElementById("previous-filter-page");
@@ -166,6 +172,38 @@ const sortedValues = (values, kind) =>
   values.slice().sort(kind === "semantic" ? compareSemantic : compareFunction);
 const sortedVisible = (values, kind) =>
   sortedValues(values.filter(value => isVisible(kind, value)), kind);
+const pagedEntries = (entries, key, owner, label) => {
+  if (isFilterActive() || entries.length <= siblingPageSize) {
+    return { entries, pagination: null };
+  }
+  const pageCount = Math.ceil(entries.length / siblingPageSize);
+  const page = Math.min(siblingPages.get(key) || 0, pageCount - 1);
+  siblingPages.set(key, page);
+  const start = page * siblingPageSize;
+  const end = Math.min(start + siblingPageSize, entries.length);
+  return {
+    entries: entries.slice(start, end),
+    pagination: {
+      key,
+      owner,
+      label,
+      page,
+      pageCount,
+      start,
+      end,
+      total: entries.length
+    }
+  };
+};
+const pushPagedEntries = (stack, entries, depth, key, owner, label) => {
+  const page = pagedEntries(entries, key, owner, label);
+  if (page.pagination !== null) {
+    stack.push({ kind: "pagination", value: page.pagination, depth });
+  }
+  for (let index = page.entries.length - 1; index >= 0; index -= 1) {
+    stack.push({ ...page.entries[index], depth });
+  }
+};
 const filterCandidatesInCurrentOrder = () => {
   const cacheKey = `${sortField}:${sortDirection}`;
   if (filterOrderCacheKey === cacheKey) return filterOrderCache;
@@ -277,6 +315,41 @@ const nameCell = (
   cell.append(line, secondary);
   return cell;
 };
+const paginationRow = (pagination, depth) => {
+  const row = document.createElement("tr");
+  row.className = "pagination-row";
+  row.setAttribute("aria-level", String(depth));
+  row.tabIndex = -1;
+  const cell = document.createElement("td");
+  cell.colSpan = 6;
+  const controls = document.createElement("div");
+  controls.className = "pagination-controls";
+  const status = document.createElement("span");
+  status.textContent =
+    `${pagination.label}: ${pagination.start + 1}-${pagination.end} of ${pagination.total}.`;
+  const changePage = page => {
+    siblingPages.set(pagination.key, page);
+    if (pagination.owner !== null) selectedNode = pagination.owner;
+    renderRows(null, pagination.key);
+  };
+  const previous = document.createElement("button");
+  previous.type = "button";
+  previous.className = "filter-page";
+  previous.textContent = `Previous ${siblingPageSize}`;
+  previous.disabled = pagination.page === 0;
+  previous.addEventListener("click", () => changePage(pagination.page - 1));
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "filter-page";
+  next.textContent = `Next ${siblingPageSize}`;
+  next.disabled = pagination.page + 1 >= pagination.pageCount;
+  next.addEventListener("click", () => changePage(pagination.page + 1));
+  controls.append(previous, next, status);
+  cell.appendChild(controls);
+  row.appendChild(cell);
+  paginationRows.set(pagination.key, row);
+  return row;
+};
 const semanticRow = (semantic, depth) => {
   const children = sortedVisible(
     semanticChildren.get(semantic.semantic_id) || [],
@@ -375,17 +448,29 @@ const functionRow = (fn, depth) => {
   );
   return { row, hasChildren, isExpanded, key, children };
 };
-const renderRows = (focusKey = null) => {
+const renderRows = (focusKey = null, focusPaginationKey = null) => {
   disclosureButtons.clear();
+  paginationRows.clear();
   const fragment = document.createDocumentFragment();
   const renderedRows = [];
-  const stack = sortedVisible(operations, "semantic")
-    .reverse()
-    .map(operation => ({ kind: "semantic", value: operation, depth: 1 }));
+  const stack = [];
+  pushPagedEntries(
+    stack,
+    sortedVisible(operations, "semantic").map(
+      value => ({ kind: "semantic", value })
+    ),
+    1,
+    rootPageKey,
+    null,
+    "Operation roots"
+  );
   let rowCount = 0;
-  while (stack.length !== 0) {
+  while (stack.length !== 0 && rowCount < maximumRenderedRows) {
     const entry = stack.pop();
-    if (entry.kind === "semantic") {
+    if (entry.kind === "pagination") {
+      fragment.appendChild(paginationRow(entry.value, entry.depth));
+      rowCount += 1;
+    } else if (entry.kind === "semantic") {
       const rendered = semanticRow(entry.value, entry.depth);
       fragment.appendChild(rendered.row);
       renderedRows.push({
@@ -400,9 +485,14 @@ const renderRows = (focusKey = null) => {
           ...rendered.children.map(value => ({ kind: "semantic", value })),
           ...rendered.functions.map(value => ({ kind: "function", value }))
         ];
-        for (let index = children.length - 1; index >= 0; index -= 1) {
-          stack.push({ ...children[index], depth: entry.depth + 1 });
-        }
+        pushPagedEntries(
+          stack,
+          children,
+          entry.depth + 1,
+          rendered.key,
+          { kind: "semantic", value: entry.value },
+          `${entry.value.name} children`
+        );
       }
     } else {
       const rendered = functionRow(entry.value, entry.depth);
@@ -415,13 +505,14 @@ const renderRows = (focusKey = null) => {
       });
       rowCount += 1;
       if (rendered.hasChildren && rendered.isExpanded) {
-        for (let index = rendered.children.length - 1; index >= 0; index -= 1) {
-          stack.push({
-            kind: "function",
-            value: rendered.children[index],
-            depth: entry.depth + 1
-          });
-        }
+        pushPagedEntries(
+          stack,
+          rendered.children.map(value => ({ kind: "function", value })),
+          entry.depth + 1,
+          rendered.key,
+          { kind: "function", value: entry.value },
+          `${entry.value.name} children`
+        );
       }
     }
   }
@@ -429,8 +520,14 @@ const renderRows = (focusKey = null) => {
   operationsEmpty.textContent = isFilterActive()
     ? "No profile rows match this filter."
     : "No operation records are available.";
-  operationsEmpty.hidden = rowCount !== 0;
+  operationsEmpty.hidden = renderedRows.length !== 0;
+  renderLimitStatus.textContent = stack.length === 0
+    ? ""
+    : `Showing the first ${maximumRenderedRows} visible rows. Collapse a branch or filter the profile to continue.`;
   configureRenderedRows(renderedRows, focusKey);
+  if (focusPaginationKey !== null) {
+    paginationRows.get(focusPaginationKey)?.focus();
+  }
 };
 const configureRenderedRows = (rows, focusKey) => {
   let selectedKey = selectedNode === null ? null : entryKey(selectedNode);
@@ -665,6 +762,7 @@ document.querySelectorAll("[data-sort]").forEach(button => {
       sortField = field;
       sortDirection = field === "name" ? "ascending" : "descending";
     }
+    siblingPages.clear();
     updateSortControls();
     if (isFilterActive()) applyFilter();
     else renderRows();

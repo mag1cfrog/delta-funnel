@@ -37,6 +37,7 @@ p { line-height: 1.5; margin: .5rem 0 1rem; max-width: 80rem; }
 .filter-label { display: grid; gap: .25rem; }
 .filter-label span { font-weight: 650; }
 .filter-status { min-height: 1.5rem; }
+.render-limit-status { display: block; margin-top: .75rem; min-height: 1.5rem; }
 .tree-controls { margin: 1rem 0; }
 input, button { font: inherit; }
 input[type="search"] {
@@ -95,6 +96,8 @@ tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
 .disclosure:disabled { cursor: default; opacity: .75; }
 .function-row { background: color-mix(in srgb, CanvasText 4%, Canvas); }
 .function-row .name { font-weight: 500; }
+.pagination-row td { background: color-mix(in srgb, CanvasText 4%, Canvas); }
+.pagination-controls { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; }
 .filter-context .name { font-style: italic; }
 .match-label {
   border: 1px solid GrayText;
