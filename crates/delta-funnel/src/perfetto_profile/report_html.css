@@ -55,14 +55,16 @@ input[type="search"] {
   cursor: pointer;
   padding: .35rem .55rem;
 }
+.sort { white-space: normal; }
 .clear-filter:disabled, .filter-page:disabled, .tree-action:disabled {
   cursor: default;
   opacity: .55;
 }
 .table-wrap { overflow-x: auto; }
-table { border-collapse: collapse; min-width: 58rem; width: 100%; }
+table { border-collapse: collapse; min-width: 58rem; table-layout: fixed; width: 100%; }
 th, td { border-bottom: 1px solid GrayText; padding: .65rem; text-align: left; }
 th { background: color-mix(in srgb, CanvasText 8%, Canvas); }
+th:first-child { width: 32%; }
 tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
 tbody tr[aria-selected="true"] {
   background: color-mix(in srgb, Highlight 22%, Canvas);
@@ -70,7 +72,7 @@ tbody tr[aria-selected="true"] {
   outline-offset: -2px;
 }
 tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
-.name { font-weight: 650; }
+.name { font-weight: 650; overflow-wrap: anywhere; }
 .name-line { align-items: center; display: flex; gap: .35rem; }
 .detail { display: block; font-size: .8rem; margin-top: .2rem; }
 .number { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
