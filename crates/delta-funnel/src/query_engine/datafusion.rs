@@ -18,6 +18,7 @@ mod operator_activity;
 mod planning;
 mod planning_activity;
 mod profiled_execution;
+mod profiled_object_store;
 mod session;
 
 #[cfg(feature = "perfetto-profile")]

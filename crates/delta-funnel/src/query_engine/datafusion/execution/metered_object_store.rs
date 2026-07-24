@@ -15,8 +15,7 @@ use object_store::{
 
 use super::read_stats::DeltaProviderReadStats;
 
-#[cfg(feature = "perfetto-profile")]
-use crate::query_engine::datafusion::operator_activity::current_datafusion_object_store_transport_span;
+use crate::query_engine::datafusion::profiled_object_store::await_object_store_transport;
 
 /// Measures Parquet data-file GET operations without exposing request details.
 pub(crate) struct MeteredParquetObjectStore {
@@ -78,13 +77,7 @@ impl ObjectStore for MeteredParquetObjectStore {
         }
 
         let request = self.inner.get_opts(location, options);
-        #[cfg(feature = "perfetto-profile")]
-        let result = match current_datafusion_object_store_transport_span() {
-            Some(span) => tracing::Instrument::instrument(request, span).await?,
-            None => request.await?,
-        };
-        #[cfg(not(feature = "perfetto-profile"))]
-        let result = request.await?;
+        let result = await_object_store_transport(request).await?;
         if should_meter_payload {
             Ok(meter_get_result(result, Arc::clone(&self.read_stats)))
         } else {
