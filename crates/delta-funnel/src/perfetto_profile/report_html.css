@@ -99,13 +99,14 @@ tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
 .pagination-row td { background: color-mix(in srgb, CanvasText 4%, Canvas); }
 .pagination-controls { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; }
 .filter-context .name { font-style: italic; }
-.match-label {
+.match-label, .depth-label {
   border: 1px solid GrayText;
   border-radius: 1rem;
   font-size: .7rem;
   font-weight: 500;
   padding: .05rem .35rem;
 }
+.depth-label { white-space: nowrap; }
 .type-label { font-weight: 650; }
 .empty { border: 1px dashed GrayText; padding: 1rem; }
 .help { margin-top: 2rem; max-width: 80rem; }

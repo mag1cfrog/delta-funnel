@@ -284,6 +284,7 @@ mod tests {
         assert!(html.contains(r#"entry.row.setAttribute("aria-selected""#));
         assert!(html.contains("const maximumBulkSubtreeRows = 1000"));
         assert!(html.contains("const maximumRenderedRows = 1000"));
+        assert!(html.contains("const maximumIndentDepth = 32"));
         assert!(html.contains("const siblingPageSize = 100"));
         assert!(html.contains("const containsFilter = value =>"));
         assert!(html.contains("operationsBody.replaceChildren(fragment)"));
@@ -395,6 +396,15 @@ mod tests {
                 ));
             }
         }
+        let mut deep_parent_id = 3;
+        for semantic_id in 2_000..2_040 {
+            semantics.push(semantic(
+                semantic_id,
+                Some(deep_parent_id),
+                format!("Deep semantic {semantic_id}"),
+            ));
+            deep_parent_id = semantic_id;
+        }
         let mut functions = (1..=101)
             .map(|function_id| {
                 function(
@@ -464,6 +474,25 @@ mod tests {
         "Alpha phase,Zeta phase",
       "name sorting flattened or misordered semantic siblings"
     );
+
+    const deepKeys = [
+      "s:3",
+      ...Array.from({ length: 39 }, (_, offset) => `s:${2000 + offset}`)
+    ];
+    deepKeys.forEach(key => expanded.add(key));
+    renderRows();
+    check(
+      operationsBody.querySelector('[aria-level="34"] .depth-label').textContent ===
+        "Depth 34",
+      "first capped indentation depth was not labeled"
+    );
+    check(
+      operationsBody.querySelector('[aria-level="42"] .depth-label').textContent ===
+        "Depth 42",
+      "deep hierarchy was visually flattened"
+    );
+    deepKeys.forEach(key => expanded.delete(key));
+    renderRows();
 
     const groupKeys = Array.from(
       { length: 10 },

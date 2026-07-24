@@ -118,6 +118,7 @@ const expanded = new Set();
 const disclosureButtons = new Map();
 const maximumBulkSubtreeRows = 1000;
 const maximumRenderedRows = 1000;
+const maximumIndentDepth = 32;
 const siblingPageSize = 100;
 const siblingPages = new Map();
 const paginationRows = new Map();
@@ -269,7 +270,8 @@ const nameCell = (
   cell.className = "name";
   const line = document.createElement("span");
   line.className = "name-line";
-  line.style.paddingInlineStart = `${Math.min(depth - 1, 32) * 1.25}rem`;
+  line.style.paddingInlineStart =
+    `${Math.min(depth - 1, maximumIndentDepth) * 1.25}rem`;
   if (hasChildren) {
     const button = document.createElement("button");
     button.type = "button";
@@ -299,6 +301,13 @@ const nameCell = (
     leaf.setAttribute("aria-label", "Leaf row");
     leaf.textContent = "-";
     line.appendChild(leaf);
+  }
+  if (depth - 1 > maximumIndentDepth) {
+    const depthLabel = document.createElement("span");
+    depthLabel.className = "depth-label";
+    depthLabel.setAttribute("aria-hidden", "true");
+    depthLabel.textContent = `Depth ${depth}`;
+    line.appendChild(depthLabel);
   }
   const label = document.createElement("span");
   label.textContent = name;
