@@ -1314,6 +1314,7 @@ dependencies = [
  "clap",
  "datafusion",
  "delta_kernel",
+ "delta_kernel_default_engine",
  "flate2",
  "futures-util",
  "hyper-util",
@@ -1348,16 +1349,15 @@ dependencies = [
 
 [[package]]
 name = "delta_kernel"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57e42b5d12df61aee21d19ccb5f40449d3a203014676cae7291d1dd0102fd665"
+checksum = "211cca5ebd681951d798ac8567101adb05f3ff36fb18f02d0350b0b22ea77096"
 dependencies = [
  "arrow",
  "bytes",
  "chrono",
  "crc",
  "delta_kernel_derive",
- "futures",
  "indexmap",
  "itertools",
  "object_store",
@@ -1371,7 +1371,6 @@ dependencies = [
  "serde_json",
  "strum",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -1380,10 +1379,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "delta_kernel_derive"
-version = "0.23.0"
+name = "delta_kernel_default_engine"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8388122a5a04c3224e7944592f70c611f7ba3db209c4526a86515c597504c37e"
+checksum = "f24c6e18b90d85f7827163da12d7e324133a5a9bd0e4290b5860e421b3b5c647"
+dependencies = [
+ "bytes",
+ "delta_kernel",
+ "futures",
+ "itertools",
+ "reqwest 0.13.4",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "delta_kernel_derive"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "262100725819438b64c0dc8c4dd5621e3ec68c9a51953df2149b8e5dd858acce"
 dependencies = [
  "proc-macro2",
  "quote",

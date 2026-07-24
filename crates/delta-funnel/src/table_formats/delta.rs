@@ -24,6 +24,8 @@ pub(crate) use deletion_vector::{
 };
 #[cfg(test)]
 pub(crate) use kernel::KernelStructType;
+#[cfg(test)]
+pub(crate) use kernel::insert_url_handler;
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     ColumnName as KernelColumnName, DecimalData as KernelDecimalData,
@@ -31,7 +33,7 @@ pub(crate) use kernel::{
     KernelDataType, KernelMetadataColumnSpec, KernelMetadataValue, KernelPrimitiveType,
     KernelSchemaRef, KernelStructField, Scalar as KernelScalar,
     arrow_partition_type_to_kernel_primitive, datafusion_expr_to_kernel_predicate,
-    kernel_partition_scalar_to_datafusion_scalar,
+    kernel_partition_scalar_to_datafusion_scalar, store_from_url_opts,
 };
 pub use protocol::{
     ProtocolPreflight, preflight_delta_protocol, preflight_delta_protocol_with_tracing,
@@ -1733,53 +1735,6 @@ mod tests {
         Ok((table, source))
     }
 
-    fn assert_boolean_stats_min_max_error(
-        result: Result<Vec<String>, Box<dyn std::error::Error>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let error = match result {
-            Ok(paths) => {
-                return Err(format!(
-                    "boolean min/max stats predicate should fail kernel scan: {paths:?}"
-                )
-                .into());
-            }
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        let debug_message = format!("{error:?}");
-        assert!(
-            message.contains("minValues") || debug_message.contains("minValues"),
-            "{message}\n{debug_message}"
-        );
-
-        Ok(())
-    }
-
-    fn assert_binary_stats_min_max_error(
-        result: Result<Vec<String>, Box<dyn std::error::Error>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let error = match result {
-            Ok(paths) => {
-                return Err(format!(
-                    "binary min/max stats predicate should fail kernel scan: {paths:?}"
-                )
-                .into());
-            }
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        let debug_message = format!("{error:?}");
-        assert!(
-            message.contains("minValues")
-                || message.contains("maxValues")
-                || debug_message.contains("minValues")
-                || debug_message.contains("maxValues"),
-            "{message}\n{debug_message}"
-        );
-
-        Ok(())
-    }
-
     fn assert_unsupported_literal_error(
         result: Result<Vec<String>, Box<dyn std::error::Error>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3101,13 +3056,17 @@ mod tests {
     }
 
     #[test]
-    fn kernel_partition_characterization_uses_official_delta_kernel_0_23_0() {
+    fn kernel_partition_characterization_uses_official_delta_kernel_0_25_0() {
         let manifest = include_str!("../../Cargo.toml");
         let lockfile = include_str!("../../../../Cargo.lock");
 
-        assert!(manifest.contains(r#"delta_kernel = { version = "0.23.0""#));
+        assert!(manifest.contains(r#"delta_kernel = { version = "=0.25.0""#));
+        assert!(manifest.contains(r#"delta_kernel_default_engine = { version = "=0.25.0""#));
         assert!(lockfile.contains(
-            "name = \"delta_kernel\"\nversion = \"0.23.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+            "name = \"delta_kernel\"\nversion = \"0.25.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+        ));
+        assert!(lockfile.contains(
+            "name = \"delta_kernel_default_engine\"\nversion = \"0.25.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
         ));
         assert!(!manifest.contains("deltalake"));
         assert!(!manifest.contains("buoyant_kernel"));
@@ -3205,26 +3164,37 @@ mod tests {
     }
 
     #[test]
-    fn kernel_boolean_data_column_stats_pruning_documents_min_max_boundary()
+    fn kernel_boolean_data_column_stats_pruning_keeps_min_max_predicates_conservative()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_boolean_data_stats_characterization_source()?;
+        let expected_paths = vec![
+            "boolean-false-only.parquet",
+            "boolean-false-with-null.parquet",
+            "boolean-missing-stats.parquet",
+            "boolean-mixed.parquet",
+            "boolean-true-only.parquet",
+            "boolean-true-with-null.parquet",
+        ];
 
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").eq(bool_lit(true)),
-        ))?;
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").eq(bool_lit(false)),
-        ))?;
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").not_eq(bool_lit(true)),
-        ))?;
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").not_eq(bool_lit(false)),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").eq(bool_lit(true)))?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").eq(bool_lit(false)))?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").not_eq(bool_lit(true)),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("is_current").not_eq(bool_lit(false)),
+            )?,
+            expected_paths
+        );
 
         Ok(())
     }
@@ -3586,18 +3556,30 @@ mod tests {
     }
 
     #[test]
-    fn kernel_binary_data_column_stats_pruning_documents_equality_and_empty_boundary()
+    fn kernel_binary_data_column_stats_pruning_keeps_equality_conservative_and_rejects_empty()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+        let expected_paths = vec![
+            "binary-HELLO.parquet",
+            "binary-empty.parquet",
+            "binary-hello.parquet",
+            "binary-missing-stats.parquet",
+            "binary-range.parquet",
+            "binary-special.parquet",
+            "binary-with-null.parquet",
+        ];
 
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").eq(binary_lit(b"hello")),
-        ))?;
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").not_eq(binary_lit(b"hello")),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").eq(binary_lit(b"hello")),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("payload").not_eq(binary_lit(b"hello")),
+            )?,
+            expected_paths
+        );
         assert_unsupported_literal_error(kernel_predicated_stats_file_paths(
             &source,
             &col("payload").eq(binary_lit(b"")),
@@ -3611,22 +3593,31 @@ mod tests {
     }
 
     #[test]
-    fn kernel_binary_data_column_stats_pruning_documents_ordering()
+    fn kernel_binary_data_column_stats_pruning_keeps_ordering_conservative()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+        let expected_paths = vec![
+            "binary-HELLO.parquet",
+            "binary-empty.parquet",
+            "binary-hello.parquet",
+            "binary-missing-stats.parquet",
+            "binary-range.parquet",
+            "binary-special.parquet",
+            "binary-with-null.parquet",
+        ];
 
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").gt(binary_lit(b"hello")),
-        ))?;
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").lt(binary_lit(b"hello")),
-        ))?;
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &binary_lit(b"hello").gt(col("payload")),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").gt(binary_lit(b"hello")),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").lt(binary_lit(b"hello")),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &binary_lit(b"hello").gt(col("payload")),)?,
+            expected_paths
+        );
 
         Ok(())
     }
@@ -3661,14 +3652,20 @@ mod tests {
     }
 
     #[test]
-    fn kernel_binary_data_column_stats_pruning_documents_partial_stats_boundary()
+    fn kernel_binary_data_column_stats_pruning_keeps_partial_min_max_stats_conservative()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_partial_binary_data_stats_characterization_source()?;
 
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").gt(binary_lit(b"hello")),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").gt(binary_lit(b"hello")),)?,
+            vec![
+                "binary-counts-only.parquet",
+                "binary-max-only-low.parquet",
+                "binary-min-only-high.parquet",
+                "binary-missing-null-count.parquet",
+                "binary-missing-stats.parquet",
+            ]
+        );
         assert_eq!(
             kernel_predicated_stats_file_paths(&source, &col("payload").is_null())?,
             vec![

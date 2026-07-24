@@ -10,6 +10,8 @@ pub(crate) use delta::KernelStructType;
 #[cfg(test)]
 pub(crate) use delta::build_projected_delta_scan;
 #[cfg(test)]
+pub(crate) use delta::insert_url_handler;
+#[cfg(test)]
 pub(crate) use delta::snapshot_metadata_load_attempt_count;
 #[cfg(test)]
 pub(crate) use delta::test_support::RealParquetDeltaTable;
@@ -25,7 +27,7 @@ pub(crate) use delta::{
     ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
     arrow_partition_type_to_kernel_primitive, build_projected_predicated_delta_scan,
     build_projected_predicated_stats_delta_scan, datafusion_expr_to_kernel_predicate,
-    delta_source_arrow_schema, kernel_partition_scalar_to_datafusion_scalar,
+    delta_source_arrow_schema, kernel_partition_scalar_to_datafusion_scalar, store_from_url_opts,
 };
 pub use delta::{
     DeltaSourceConfig, DeltaStorageOptions, PlannedDeltaSource, ProtocolPreflight,
