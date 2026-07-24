@@ -107,7 +107,6 @@ tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
   padding: .05rem .35rem;
 }
 .depth-label { white-space: nowrap; }
-.type-label { font-weight: 650; }
 .empty { border: 1px dashed GrayText; padding: 1rem; }
 .help { margin-top: 2rem; max-width: 80rem; }
 .help summary { cursor: pointer; font-weight: 650; }
