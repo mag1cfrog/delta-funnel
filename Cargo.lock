@@ -1341,8 +1341,10 @@ version = "0.3.3"
 dependencies = [
  "arrow-schema",
  "delta-funnel",
+ "libc",
  "pyo3",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

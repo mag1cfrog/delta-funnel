@@ -1,17 +1,36 @@
-//! Python profiler configuration.
+//! Python operation profiler configuration and lifecycle entry points.
 
 use std::path::{Path, PathBuf};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool};
 
-use crate::session::config_py_error;
+use crate::{exception::delta_funnel_py_error, session::config_py_error};
+
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+mod capture;
+
+const PROFILER_PHASE: &str = "profiler";
 
 /// Immutable configuration for one operation-scoped profiling report.
+///
+/// Use 1000 Hz for short operations and 100 Hz for longer, bounded-volume captures.
 #[pyclass(frozen, name = "ProfilerConfig", module = "deltafunnel")]
 pub(crate) struct PyProfilerConfig {
     output: PathBuf,
     sample_hz: u16,
+}
+
+impl PyProfilerConfig {
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    fn output_path(&self) -> &Path {
+        &self.output
+    }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    const fn sampling_frequency(&self) -> u16 {
+        self.sample_hz
+    }
 }
 
 #[pymethods]
@@ -53,6 +72,72 @@ impl PyProfilerConfig {
 
 pub(crate) fn add_profiler(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyProfilerConfig>()
+}
+
+pub(crate) struct OperationProfile {
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    capture: capture::OperationCapture,
+}
+
+pub(crate) fn start_operation_profile(
+    py: Python<'_>,
+    config: Option<&PyProfilerConfig>,
+) -> PyResult<Option<OperationProfile>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+    {
+        let _ = config;
+        Err(profiler_py_error(
+            py,
+            "not_available",
+            "operation profiling requires a diagnostics-enabled Linux build".to_owned(),
+        ))
+    }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    {
+        crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
+        let output = config.output_path().to_owned();
+        let sample_hz = config.sampling_frequency();
+        py.detach(move || capture::OperationCapture::start(output, sample_hz))
+            .map(|capture| Some(OperationProfile { capture }))
+            .map_err(|error| profiler_failure_py_error(py, error))
+    }
+}
+
+impl OperationProfile {
+    pub(crate) fn finish(self, py: Python<'_>) -> PyResult<()> {
+        #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+        {
+            py.detach(move || self.capture.finish())
+                .map_err(|error| profiler_failure_py_error(py, error))
+        }
+
+        #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+        {
+            let _ = self;
+            Err(profiler_py_error(
+                py,
+                "not_available",
+                "operation profiling requires a diagnostics-enabled Linux build".to_owned(),
+            ))
+        }
+    }
+}
+
+fn profiler_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
+    match delta_funnel_py_error(py, PROFILER_PHASE, kind, message, None) {
+        Ok(error) => error,
+        Err(error) => error,
+    }
+}
+
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+fn profiler_failure_py_error(py: Python<'_>, error: capture::ProfilerFailure) -> PyErr {
+    profiler_py_error(py, error.kind, error.message)
 }
 
 fn parse_sample_hz(value: &Bound<'_, PyAny>) -> PyResult<u16> {

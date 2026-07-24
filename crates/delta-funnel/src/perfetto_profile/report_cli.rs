@@ -231,19 +231,29 @@ impl CliArgumentError {
     }
 }
 
+/// Stage that rejected a ranked profile report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RankedReportFailurePhase {
+pub enum RankedReportFailurePhase {
+    /// Command arguments were invalid.
     Argument,
+    /// The input trace could not be read.
     Input,
+    /// Capture completeness checks failed.
     Health,
+    /// Trace Processor could not run.
     TraceProcessor,
+    /// The report query failed.
     Query,
+    /// Aggregated profile data was invalid.
     AggregateValidation,
+    /// The report could not be serialized.
     Serialization,
+    /// The report could not be written.
     Output,
 }
 
 impl RankedReportFailurePhase {
+    /// Returns the stable machine-readable phase name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Argument => "argument",
@@ -258,8 +268,9 @@ impl RankedReportFailurePhase {
     }
 }
 
+/// Structured failure from ranked profile report generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RankedReportFailure {
+pub struct RankedReportFailure {
     phase: RankedReportFailurePhase,
     kind: &'static str,
     message: String,
@@ -278,15 +289,17 @@ impl RankedReportFailure {
         }
     }
 
+    /// Returns the report stage that failed.
     pub fn phase(&self) -> RankedReportFailurePhase {
         self.phase
     }
 
-    #[cfg(test)]
+    /// Returns the stable machine-readable failure kind.
     pub fn kind(&self) -> &'static str {
         self.kind
     }
 
+    /// Serializes the sanitized failure for command-line consumers.
     pub fn machine_line(&self) -> String {
         serde_json::json!({
             "phase": self.phase.as_str(),

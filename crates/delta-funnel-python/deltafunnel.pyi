@@ -117,6 +117,7 @@ class Table:
         *,
         progress: bool | None = None,
         profile: bool | None = False,
+        profiler: ProfilerConfig | None = None,
     ) -> Preview: ...
 
     def show(self, limit: int = 20, *, progress: bool | None = None) -> None: ...

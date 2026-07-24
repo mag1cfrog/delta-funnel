@@ -10,8 +10,10 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool};
 
+use crate::exception::attach_operation_result;
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
+use crate::profiler::{PyProfilerConfig, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::session::{PySession, borrow_session_mut, config_py_error};
 
@@ -241,16 +243,18 @@ impl PyTable {
     /// Pass `progress=True` to force it or `progress=False` to disable it. The
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass `profile=True` to also attach the
-    /// detailed execution profile.
-    #[pyo3(signature = (limit=20, *, progress=None, profile=false))]
+    /// detailed execution profile. Pass `profiler=ProfilerConfig(...)` to
+    /// record this preview and write an interactive ranked HTML report.
+    #[pyo3(signature = (limit=20, *, progress=None, profile=false, profiler=None))]
     fn preview(
         &self,
         py: Python<'_>,
         limit: usize,
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
+        profiler: Option<PyRef<'_, PyProfilerConfig>>,
     ) -> PyResult<PyPreview> {
-        let profile_mode = if profile {
+        let profile_mode = if profile || profiler.is_some() {
             delta_funnel::ExecutionProfileMode::Detailed
         } else {
             delta_funnel::ExecutionProfileMode::Disabled
@@ -258,11 +262,23 @@ impl PyTable {
         let options =
             delta_funnel::PreviewOptions::new(limit).with_execution_profile_mode(profile_mode);
         let progress = PythonProgress::for_preview(progress);
+        let operation_profile = start_operation_profile(py, profiler.as_deref())?;
+        drop(profiler);
         let preview =
             self.session
                 .borrow(py)
-                .preview_table(py, &self.inner, options, progress.as_ref())?;
-        PyPreview::new(py, preview)
+                .preview_table(py, &self.inner, options, progress.as_ref());
+        let profile_result = operation_profile
+            .map(|operation_profile| operation_profile.finish(py))
+            .transpose();
+        match (preview, profile_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => {
+                attach_operation_result(py, &error, "completed", None, None);
+                Err(error)
+            }
+            (Ok(preview), Ok(_)) => PyPreview::new(py, preview),
+        }
     }
 
     /// Prints a bounded preview of this lazy table to Python stdout.
@@ -457,6 +473,7 @@ mod tests {
 
         assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
         assert!(stub.contains("trace_path: str | PathLike[str] | None = None"));
+        assert!(stub.contains("profiler: ProfilerConfig | None = None"));
     }
 
     #[test]
@@ -529,7 +546,7 @@ mod tests {
             assert_eq!(preview.repr()?.extract::<String>()?, text);
             assert_eq!(
                 preview_signature,
-                "(limit=20, *, progress=None, profile=False)"
+                "(limit=20, *, progress=None, profile=False, profiler=None)"
             );
             assert_eq!(
                 preview.call_method0("_repr_html_")?.extract::<String>()?,
@@ -577,6 +594,43 @@ mod tests {
                         .is_err_and(|error| { error.is_instance_of::<PyAttributeError>(py) })
                 );
             }
+            Ok(())
+        })
+    }
+
+    #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+    #[test]
+    fn preview_profiler_requires_a_diagnostics_build_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1(
+                "table_from_sql",
+                ("select cast(1 as bigint) / cast(0 as bigint) as value",),
+            )?;
+            let output = temp_trace_path("profiler-unavailable")?.with_extension("html");
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call1((output.to_string_lossy().as_ref(),))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profiler", profiler)?;
+
+            let error = table
+                .call_method("preview", (), Some(&kwargs))
+                .expect_err("a standard wheel must reject operation profiling");
+
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "profiler"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "not_available"
+            );
+            assert!(!output.exists());
             Ok(())
         })
     }

@@ -31,15 +31,22 @@ mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
 use report_aggregate::load_ranked_profile;
-#[cfg(test)]
-use report_cli::RankedReportFailurePhase;
-use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
-pub use report_cli::{run_perfetto_diagnostics_cli, run_perfetto_diagnostics_cli_with_args};
+use report_cli::preflight_ranked_report_paths;
+pub use report_cli::{
+    RankedReportFailure, RankedReportFailurePhase, run_perfetto_diagnostics_cli,
+    run_perfetto_diagnostics_cli_with_args,
+};
 use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;
 
-fn generate_ranked_profile_report(
+/// Generates one self-contained ranked HTML report from a completed Perfetto trace.
+///
+/// # Errors
+///
+/// Returns a structured failure when the trace, Trace Processor query, aggregate,
+/// serialization, or output write fails.
+pub fn generate_ranked_profile_report(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {

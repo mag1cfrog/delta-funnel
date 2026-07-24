@@ -1,5 +1,7 @@
 //! Python Perfetto diagnostics bridge.
 
+#[cfg(feature = "perfetto-profile")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     env,
     time::{Duration, Instant},
@@ -31,6 +33,8 @@ use crate::{
 
 const DEFAULT_PERFETTO_WAIT_TIMEOUT_SECONDS: f64 = 10.0;
 const PERFETTO_DIAGNOSTICS_PHASE: &str = "perfetto_diagnostics";
+#[cfg(feature = "perfetto-profile")]
+static PERFETTO_SUBSCRIBER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn add_perfetto_diagnostics(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(init_perfetto_diagnostics, module)?)?;
@@ -142,7 +146,39 @@ fn init_perfetto_diagnostics_inner(
 
 #[cfg(feature = "perfetto-profile")]
 pub(super) fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
-    tracing::subscriber::set_global_default(perfetto_diagnostics_subscriber(filter, logger)).is_ok()
+    let installed =
+        tracing::subscriber::set_global_default(perfetto_diagnostics_subscriber(filter, logger))
+            .is_ok();
+    if installed {
+        PERFETTO_SUBSCRIBER_INSTALLED.store(true, Ordering::Release);
+    }
+    installed
+}
+
+#[cfg(feature = "perfetto-profile")]
+pub(super) fn ensure_perfetto_subscriber(py: Python<'_>) -> PyResult<()> {
+    if PERFETTO_SUBSCRIBER_INSTALLED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if tracing::dispatcher::has_been_set() {
+        return Err(perfetto_diagnostics_py_error(
+            py,
+            "subscriber_unavailable",
+            "operation profiling cannot attach to the installed tracing subscriber".to_owned(),
+        ));
+    }
+    let filter = parse_logging_filter(py, None, env::var(LOG_FILTER_ENV).ok())?;
+    if install_perfetto_subscriber(filter, DEFAULT_LOGGER.to_owned())
+        || PERFETTO_SUBSCRIBER_INSTALLED.load(Ordering::Acquire)
+    {
+        Ok(())
+    } else {
+        Err(perfetto_diagnostics_py_error(
+            py,
+            "subscriber_unavailable",
+            "operation profiling could not install its tracing subscriber".to_owned(),
+        ))
+    }
 }
 
 #[cfg(feature = "perfetto-profile")]
