@@ -12,6 +12,11 @@ on:
         description: "Expected package version, such as 0.1.0 or v0.1.0"
         required: false
         type: string
+      upload_artifacts:
+        description: "Upload built wheels"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -60,6 +65,7 @@ jobs:
       RELEASE_VERSION: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
       RUSTC_WRAPPER: ${{ matrix.host_sccache == 'true' && 'sccache' || '' }}
 
     steps:
@@ -213,6 +219,7 @@ jobs:
           PY
 
       - name: Upload wheel artifact
+        if: inputs.upload_artifacts
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}

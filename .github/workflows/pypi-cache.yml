@@ -1,0 +1,27 @@
+name: Warm PyPI wheel caches
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/pypi-build.yml"
+      - ".github/workflows/pypi-cache.yml"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - "xtask/Cargo.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/pypi-build.yml
+    with:
+      upload_artifacts: false
