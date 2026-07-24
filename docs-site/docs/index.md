@@ -37,10 +37,10 @@ Follow these steps in order:
 
 ## Troubleshoot a run
 
-- [Python logging](advanced/python-logging.md): route diagnostic events through
-  standard-library logging.
 - [Troubleshoot a failed run](advanced/tracing-and-diagnostics.md): inspect
   failure reports and collect safe troubleshooting information.
+- [Python logging](advanced/python-logging.md): route diagnostic events through
+  standard-library logging.
 
 ## Profile performance
 

@@ -1,3 +1,8 @@
+---
+search:
+  exclude: true
+---
+
 # Failure Diagnostics
 
 This guide moved to
