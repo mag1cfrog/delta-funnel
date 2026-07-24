@@ -199,6 +199,11 @@ const formatPercent = (value, total) =>
   value !== null && total > 0
     ? `${(value * 100 / total).toFixed(1)}%`
     : "N/A";
+const formatCoverage = value =>
+  `${value} (${formatPercent(
+    value,
+    profile.metadata.eligible_sample_count
+  )} of eligible)`;
 const compareValue = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 let sortField = "duration";
 let sortDirection = "descending";
@@ -356,6 +361,7 @@ const nameCell = (
     button.disabled = isFilterActive();
     button.addEventListener("click", () => {
       selectedNode = node;
+      treeStatus.textContent = `Selected: ${node.value.name}`;
       if (expanded.has(key)) expanded.delete(key);
       else expanded.add(key);
       renderRows();
@@ -473,7 +479,14 @@ const functionRow = (fn, depth) => {
       "Owning semantic direct samples",
       "number"
     ),
-    textCell(String(fn.self_sample_count), "Self", "number"),
+    textCell(
+      String(fn.self_sample_count),
+      `${formatPercent(
+        fn.self_sample_count,
+        owner?.direct_sample_count || 0
+      )} of owning semantic direct samples`,
+      "number"
+    ),
     textCell(String(fn.inclusive_sample_count), "Call subtree", "number")
   );
   return { row, hasChildren, isExpanded, key, children };
@@ -808,9 +821,9 @@ collapseSubtree.addEventListener("click", () => {
 });
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
 addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);
-addSummary("Directly attributed", profile.metadata.direct_sample_count);
-addSummary("Ambiguous", profile.metadata.ambiguous_sample_count);
-addSummary("Unattributed", profile.metadata.unattributed_sample_count);
+addSummary("Directly attributed", formatCoverage(profile.metadata.direct_sample_count));
+addSummary("Ambiguous", formatCoverage(profile.metadata.ambiguous_sample_count));
+addSummary("Unattributed", formatCoverage(profile.metadata.unattributed_sample_count));
 updateSortControls();
 renderRows();
 </script>
@@ -886,67 +899,111 @@ mod tests {
     use super::super::ranked_report::{RankedFunction, RankedProfileMetadata, RankedSemantic};
     use super::*;
 
+    fn metadata() -> RankedProfileMetadata {
+        RankedProfileMetadata {
+            schema_version: 1,
+            sample_frequency_hz: 1000,
+            exact_time_unit: "nanoseconds".to_owned(),
+            sample_unit: "samples".to_owned(),
+            eligible_sample_count: 0,
+            direct_sample_count: 0,
+            ambiguous_sample_count: 0,
+            unattributed_sample_count: 0,
+        }
+    }
+
+    fn semantic(
+        semantic_id: i64,
+        parent_semantic_id: Option<i64>,
+        name: impl Into<String>,
+    ) -> RankedSemantic {
+        RankedSemantic {
+            semantic_id,
+            parent_semantic_id,
+            operation_id: 1,
+            name: name.into(),
+            semantic_kind: if parent_semantic_id.is_none() {
+                "operation"
+            } else {
+                "stage"
+            }
+            .to_owned(),
+            operation_kind: parent_semantic_id.is_none().then(|| "write".to_owned()),
+            stage_category: None,
+            stage_name: None,
+            activity: None,
+            start_ns: 0,
+            end_ns: Some(1_000_000),
+            duration_ns: Some(1_000_000),
+            time_semantics: "wall_clock".to_owned(),
+            result: Some("completed".to_owned()),
+            is_complete: true,
+            query_execution_id: None,
+            query_scope: None,
+            query_owner: None,
+            worker_lane_id: None,
+            worker_kind: None,
+            node_id: None,
+            parent_node_id: None,
+            operator_partition: None,
+            execution_stream_id: None,
+            stage_owner_id: None,
+            direct_sample_count: 0,
+            inclusive_sample_count: 0,
+        }
+    }
+
+    fn function(
+        function_id: i64,
+        parent_function_id: Option<i64>,
+        name: impl Into<String>,
+    ) -> RankedFunction {
+        RankedFunction {
+            semantic_id: 1,
+            function_id,
+            parent_function_id,
+            name: name.into(),
+            module_name: Some("delta_funnel".to_owned()),
+            source_file: Some("src/lib.rs".to_owned()),
+            line_number: Some(42),
+            self_sample_count: 0,
+            inclusive_sample_count: 0,
+        }
+    }
+
+    fn embedded_json(html: &str) -> Result<&str, &'static str> {
+        html.strip_prefix(HTML_PREFIX)
+            .and_then(|remainder| remainder.strip_suffix(HTML_SUFFIX))
+            .ok_or("embedded profile data is missing")
+    }
+
     #[test]
     fn renders_a_safe_self_contained_report() -> Result<(), Box<dyn std::error::Error>> {
         let dangerous = "</script><img src=x onerror=alert(1)> & \"quoted\" \u{2028} \u{2029} 函数";
+        let mut semantic = semantic(1, None, dangerous);
+        semantic.operation_kind = Some("preview".to_owned());
+        semantic.end_ns = Some(1);
+        semantic.duration_ns = Some(1);
+        semantic.result = Some("ok".to_owned());
+        semantic.direct_sample_count = 1;
+        semantic.inclusive_sample_count = 1;
+        let mut function = function(1, None, dangerous);
+        function.module_name = None;
+        function.source_file = None;
+        function.line_number = None;
+        function.self_sample_count = 1;
+        function.inclusive_sample_count = 1;
+        let mut profile_metadata = metadata();
+        profile_metadata.eligible_sample_count = 1;
+        profile_metadata.direct_sample_count = 1;
         let document = RankedProfileDocument {
-            metadata: RankedProfileMetadata {
-                schema_version: 1,
-                sample_frequency_hz: 1000,
-                exact_time_unit: "nanoseconds".to_owned(),
-                sample_unit: "samples".to_owned(),
-                eligible_sample_count: 1,
-                direct_sample_count: 1,
-                ambiguous_sample_count: 0,
-                unattributed_sample_count: 0,
-            },
-            semantics: vec![RankedSemantic {
-                semantic_id: 1,
-                parent_semantic_id: None,
-                operation_id: 1,
-                name: dangerous.to_owned(),
-                semantic_kind: "operation".to_owned(),
-                operation_kind: Some("preview".to_owned()),
-                stage_category: None,
-                stage_name: None,
-                activity: None,
-                start_ns: 0,
-                end_ns: Some(1),
-                duration_ns: Some(1),
-                time_semantics: "wall_clock".to_owned(),
-                result: Some("ok".to_owned()),
-                is_complete: true,
-                query_execution_id: None,
-                query_scope: None,
-                query_owner: None,
-                worker_lane_id: None,
-                worker_kind: None,
-                node_id: None,
-                parent_node_id: None,
-                operator_partition: None,
-                execution_stream_id: None,
-                stage_owner_id: None,
-                direct_sample_count: 1,
-                inclusive_sample_count: 1,
-            }],
-            functions: vec![RankedFunction {
-                semantic_id: 1,
-                function_id: 1,
-                parent_function_id: None,
-                name: dangerous.to_owned(),
-                module_name: None,
-                source_file: None,
-                line_number: None,
-                self_sample_count: 1,
-                inclusive_sample_count: 1,
-            }],
+            metadata: profile_metadata,
+            semantics: vec![semantic],
+            functions: vec![function],
         };
 
         let html = render_ranked_profile_html(&document)?;
-        let embedded = html
-            .strip_prefix(HTML_PREFIX)
-            .and_then(|remainder| remainder.strip_suffix(HTML_SUFFIX))
-            .ok_or("embedded profile data is missing")?;
+        let embedded = embedded_json(&html)?;
         assert!(!embedded.contains(['<', '>', '&', '\u{2028}', '\u{2029}']));
         assert!(!embedded.to_ascii_lowercase().contains("</script"));
         assert!(!html.contains(dangerous));
@@ -972,6 +1029,80 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["name"], dangerous);
+        Ok(())
+    }
+
+    #[test]
+    fn renders_a_deterministic_large_tree_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        let mut semantics = vec![semantic(1, None, "large operation")];
+        for semantic_id in 2..=257 {
+            semantics.push(semantic(
+                semantic_id,
+                Some(1),
+                format!("overlapping sibling {semantic_id}"),
+            ));
+        }
+        let mut parent_semantic_id = 1;
+        for semantic_id in 258..=385 {
+            semantics.push(semantic(
+                semantic_id,
+                Some(parent_semantic_id),
+                format!("deep semantic {semantic_id}"),
+            ));
+            parent_semantic_id = semantic_id;
+        }
+        let mut incomplete = semantic(386, Some(1), "incomplete semantic");
+        incomplete.end_ns = None;
+        incomplete.duration_ns = None;
+        incomplete.result = None;
+        incomplete.is_complete = false;
+        semantics.push(incomplete);
+
+        let mut functions = vec![function(1, None, "[native stack unavailable]")];
+        for function_id in 2..=5_001 {
+            functions.push(function(
+                function_id,
+                None,
+                if function_id == 2 {
+                    "x".repeat(512)
+                } else {
+                    format!("wide function {function_id}")
+                },
+            ));
+        }
+        let mut parent_function_id = 1;
+        for function_id in 5_002..=5_129 {
+            functions.push(function(
+                function_id,
+                Some(parent_function_id),
+                format!("deep function {function_id}"),
+            ));
+            parent_function_id = function_id;
+        }
+        let mut profile_metadata = metadata();
+        profile_metadata.eligible_sample_count = 2;
+        profile_metadata.ambiguous_sample_count = 1;
+        profile_metadata.unattributed_sample_count = 1;
+        let document = RankedProfileDocument {
+            metadata: profile_metadata,
+            semantics,
+            functions,
+        };
+
+        document.validate()?;
+        let html = render_ranked_profile_html(&document)?;
+        let decoded: serde_json::Value = serde_json::from_str(embedded_json(&html)?)?;
+        assert_eq!(decoded["semantics"].as_array().map(Vec::len), Some(386));
+        assert_eq!(decoded["functions"].as_array().map(Vec::len), Some(5_129));
+        assert_eq!(
+            decoded["functions"][0]["name"],
+            "[native stack unavailable]"
+        );
+        assert_eq!(
+            decoded["functions"][1]["name"].as_str().map(str::len),
+            Some(512)
+        );
+        assert!(html.contains("operationsBody.replaceChildren(fragment)"));
         Ok(())
     }
 
