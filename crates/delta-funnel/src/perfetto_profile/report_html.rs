@@ -52,6 +52,7 @@ p { line-height: 1.5; margin: .5rem 0 1rem; max-width: 80rem; }
 .filter-label { display: grid; gap: .25rem; }
 .filter-label span { font-weight: 650; }
 .filter-status { min-height: 1.5rem; }
+.tree-controls { margin: 1rem 0; }
 input, button { font: inherit; }
 input[type="search"] {
   background: Canvas;
@@ -61,7 +62,7 @@ input[type="search"] {
   min-width: min(24rem, 80vw);
   padding: .45rem .6rem;
 }
-.clear-filter, .filter-page, .sort {
+.clear-filter, .filter-page, .sort, .tree-action {
   background: Canvas;
   border: 1px solid GrayText;
   border-radius: .25rem;
@@ -69,12 +70,21 @@ input[type="search"] {
   cursor: pointer;
   padding: .35rem .55rem;
 }
-.clear-filter:disabled, .filter-page:disabled { cursor: default; opacity: .55; }
+.clear-filter:disabled, .filter-page:disabled, .tree-action:disabled {
+  cursor: default;
+  opacity: .55;
+}
 .table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; min-width: 58rem; width: 100%; }
 th, td { border-bottom: 1px solid GrayText; padding: .65rem; text-align: left; }
 th { background: color-mix(in srgb, CanvasText 8%, Canvas); }
 tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
+tbody tr[aria-selected="true"] {
+  background: color-mix(in srgb, Highlight 22%, Canvas);
+  outline: 2px solid Highlight;
+  outline-offset: -2px;
+}
+tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
 .name { font-weight: 650; }
 .name-line { align-items: center; display: flex; gap: .35rem; }
 .detail { display: block; font-size: .8rem; margin-top: .2rem; }
@@ -132,6 +142,11 @@ tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
 <button id="next-filter-page" class="filter-page" type="button" hidden>Next 100</button>
 <output id="filter-status" class="filter-status" for="profile-filter" role="status" aria-live="polite"></output>
 </div>
+<div class="controls tree-controls">
+<button id="expand-subtree" class="tree-action" type="button">Expand selected subtree</button>
+<button id="collapse-subtree" class="tree-action" type="button">Collapse selected subtree</button>
+<output id="tree-status" class="filter-status" role="status" aria-live="polite"></output>
+</div>
 <div class="table-wrap">
 <table role="treegrid" aria-label="Ranked operations">
 <thead><tr>
@@ -150,6 +165,9 @@ tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
 <details class="help">
 <summary>How to read these metrics</summary>
 <p>Exact duration is measured wall-clock or lifecycle time. Parallel semantic children may overlap and are not additive. Direct CPU samples belong to one semantic node. Inclusive CPU samples also include its semantic descendants. Sampling observes on-CPU work and does not prove why a thread was off-CPU.</p>
+<p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
+<p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
+<p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Bulk expansion is limited to subtrees with at most 1000 total nodes.</p>
 </details>
 </main>
 <script id="profile-data" type="application/json">"#;
@@ -242,8 +260,15 @@ const operations = profile.semantics
 const operationDurations = new Map(
   operations.map(operation => [operation.operation_id, operation.duration_ns])
 );
+let selectedNode = operations.length === 0
+  ? null
+  : {
+      kind: "semantic",
+      value: operations.slice().sort(compareSemantic)[0]
+    };
 const expanded = new Set();
 const disclosureButtons = new Map();
+const maximumBulkExpansionRows = 1000;
 const filterPageSize = 100;
 let filterQuery = "";
 let filterMatches = new Set();
@@ -257,7 +282,14 @@ const clearFilter = document.getElementById("clear-filter");
 const previousFilterPage = document.getElementById("previous-filter-page");
 const nextFilterPage = document.getElementById("next-filter-page");
 const filterStatus = document.getElementById("filter-status");
+const expandSubtree = document.getElementById("expand-subtree");
+const collapseSubtree = document.getElementById("collapse-subtree");
+const treeStatus = document.getElementById("tree-status");
 const isFilterActive = () => filterQuery.length !== 0;
+const entryKey = entry =>
+  entry.kind === "semantic"
+    ? semanticKey(entry.value)
+    : functionKey(entry.value);
 const isVisible = (kind, value) =>
   !isFilterActive() ||
   filterVisible.has(kind === "semantic" ? semanticKey(value) : functionKey(value));
@@ -294,7 +326,16 @@ const textCell = (primary, detail, className = "") => {
   }
   return cell;
 };
-const nameCell = (name, detail, depth, key, hasChildren, isExpanded, match) => {
+const nameCell = (
+  name,
+  detail,
+  depth,
+  key,
+  hasChildren,
+  isExpanded,
+  match,
+  node
+) => {
   const cell = document.createElement("td");
   cell.className = "name";
   const line = document.createElement("span");
@@ -314,6 +355,7 @@ const nameCell = (name, detail, depth, key, hasChildren, isExpanded, match) => {
     button.textContent = isExpanded ? "-" : "+";
     button.disabled = isFilterActive();
     button.addEventListener("click", () => {
+      selectedNode = node;
       if (expanded.has(key)) expanded.delete(key);
       else expanded.add(key);
       renderRows();
@@ -370,7 +412,8 @@ const semanticRow = (semantic, depth) => {
       key,
       hasChildren,
       isExpanded,
-      match
+      match,
+      { kind: "semantic", value: semantic }
     ),
     textCell(
       semantic.is_complete ? (semantic.result || "Complete") : "Incomplete",
@@ -388,7 +431,7 @@ const semanticRow = (semantic, depth) => {
     textCell(String(semantic.direct_sample_count), "Direct", "number"),
     textCell(String(semantic.inclusive_sample_count), "Semantic subtree", "number")
   );
-  return { row, hasChildren, isExpanded, children, functions };
+  return { row, hasChildren, isExpanded, key, children, functions };
 };
 const functionRow = (fn, depth) => {
   const children = sortedVisible(
@@ -420,7 +463,8 @@ const functionRow = (fn, depth) => {
       key,
       hasChildren,
       isExpanded,
-      match
+      match,
+      { kind: "function", value: fn }
     ),
     textCell("Sampled on-CPU", "Statistical, not exact wall time"),
     textCell("N/A", "No exact function duration", "number"),
@@ -432,11 +476,12 @@ const functionRow = (fn, depth) => {
     textCell(String(fn.self_sample_count), "Self", "number"),
     textCell(String(fn.inclusive_sample_count), "Call subtree", "number")
   );
-  return { row, hasChildren, isExpanded, children };
+  return { row, hasChildren, isExpanded, key, children };
 };
-const renderRows = () => {
+const renderRows = (focusKey = null) => {
   disclosureButtons.clear();
   const fragment = document.createDocumentFragment();
+  const renderedRows = [];
   const stack = sortedVisible(operations, "semantic")
     .reverse()
     .map(operation => ({ kind: "semantic", value: operation, depth: 1 }));
@@ -446,6 +491,12 @@ const renderRows = () => {
     if (entry.kind === "semantic") {
       const rendered = semanticRow(entry.value, entry.depth);
       fragment.appendChild(rendered.row);
+      renderedRows.push({
+        kind: "semantic",
+        value: entry.value,
+        depth: entry.depth,
+        ...rendered
+      });
       rowCount += 1;
       if (rendered.hasChildren && rendered.isExpanded) {
         const children = [
@@ -459,6 +510,12 @@ const renderRows = () => {
     } else {
       const rendered = functionRow(entry.value, entry.depth);
       fragment.appendChild(rendered.row);
+      renderedRows.push({
+        kind: "function",
+        value: entry.value,
+        depth: entry.depth,
+        ...rendered
+      });
       rowCount += 1;
       if (rendered.hasChildren && rendered.isExpanded) {
         for (let index = rendered.children.length - 1; index >= 0; index -= 1) {
@@ -476,6 +533,142 @@ const renderRows = () => {
     ? "No profile rows match this filter."
     : "No operation records are available.";
   operationsEmpty.hidden = rowCount !== 0;
+  configureRenderedRows(renderedRows, focusKey);
+};
+const configureRenderedRows = (rows, focusKey) => {
+  let selectedKey = selectedNode === null ? null : entryKey(selectedNode);
+  if (!rows.some(entry => entry.key === selectedKey) && rows.length !== 0) {
+    selectedNode = { kind: rows[0].kind, value: rows[0].value };
+    selectedKey = rows[0].key;
+  }
+  const updateSelection = (selectedIndex, focus) => {
+    const selected = rows[selectedIndex];
+    selectedNode = { kind: selected.kind, value: selected.value };
+    rows.forEach((entry, index) => {
+      const isSelected = index === selectedIndex;
+      entry.row.setAttribute("aria-selected", String(isSelected));
+      entry.row.tabIndex = isSelected ? 0 : -1;
+    });
+    treeStatus.textContent = `Selected: ${selected.value.name}`;
+    updateTreeControls(rows);
+    if (focus) selected.row.focus();
+  };
+  rows.forEach((entry, index) => {
+    const isSelected = entry.key === selectedKey;
+    entry.row.setAttribute("aria-selected", String(isSelected));
+    entry.row.tabIndex = isSelected ? 0 : -1;
+    entry.row.addEventListener("click", event => {
+      if (event.target.closest("button")) return;
+      updateSelection(index, true);
+    });
+    entry.row.addEventListener("keydown", event => {
+      if (event.target !== entry.row) return;
+      let nextIndex = null;
+      if (event.key === "ArrowDown" && index + 1 < rows.length) {
+        nextIndex = index + 1;
+      } else if (event.key === "ArrowUp" && index > 0) {
+        nextIndex = index - 1;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = rows.length - 1;
+      } else if (event.key === "ArrowRight") {
+        if (entry.hasChildren && !entry.isExpanded && !isFilterActive()) {
+          selectedNode = { kind: entry.kind, value: entry.value };
+          expanded.add(entry.key);
+          renderRows(entry.key);
+        } else if (
+          index + 1 < rows.length &&
+          rows[index + 1].depth > entry.depth
+        ) {
+          nextIndex = index + 1;
+        }
+      } else if (event.key === "ArrowLeft") {
+        if (entry.hasChildren && entry.isExpanded && !isFilterActive()) {
+          selectedNode = { kind: entry.kind, value: entry.value };
+          expanded.delete(entry.key);
+          renderRows(entry.key);
+        } else {
+          for (let parent = index - 1; parent >= 0; parent -= 1) {
+            if (rows[parent].depth < entry.depth) {
+              nextIndex = parent;
+              break;
+            }
+          }
+        }
+      } else {
+        return;
+      }
+      event.preventDefault();
+      if (nextIndex !== null) updateSelection(nextIndex, true);
+    });
+  });
+  updateTreeControls(rows);
+  if (focusKey !== null) {
+    rows.find(entry => entry.key === focusKey)?.row.focus();
+  }
+};
+const updateTreeControls = rows => {
+  const selectedKey = selectedNode === null ? null : entryKey(selectedNode);
+  const selectedIsVisible = rows.some(entry => entry.key === selectedKey);
+  const disabled = !selectedIsVisible || isFilterActive();
+  expandSubtree.disabled = disabled;
+  collapseSubtree.disabled = disabled;
+  if (isFilterActive()) {
+    treeStatus.textContent = "Clear the filter to change subtree expansion.";
+  } else if (
+    treeStatus.textContent === "Clear the filter to change subtree expansion."
+  ) {
+    treeStatus.textContent = selectedNode === null
+      ? ""
+      : `Selected: ${selectedNode.value.name}`;
+  }
+};
+const childEntries = entry => {
+  if (entry.kind === "semantic") {
+    return [
+      ...(semanticChildren.get(entry.value.semantic_id) || []).map(
+        value => ({ kind: "semantic", value })
+      ),
+      ...(functionRoots.get(entry.value.semantic_id) || []).map(
+        value => ({ kind: "function", value })
+      )
+    ];
+  }
+  return (
+    functionChildren.get(
+      functionParentKey(entry.value.semantic_id, entry.value.function_id)
+    ) || []
+  ).map(value => ({ kind: "function", value }));
+};
+const collectExpansionKeys = root => {
+  const keys = [];
+  const stack = [root];
+  let nodeCount = 0;
+  while (stack.length !== 0) {
+    const entry = stack.pop();
+    nodeCount += 1;
+    if (nodeCount > maximumBulkExpansionRows) return null;
+    const children = childEntries(entry);
+    if (children.length !== 0) keys.push(entryKey(entry));
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      stack.push(children[index]);
+    }
+  }
+  return keys;
+};
+const collapseSelectedSubtree = root => {
+  const stack = [root];
+  let collapsedCount = 0;
+  while (stack.length !== 0) {
+    const entry = stack.pop();
+    if (expanded.delete(entryKey(entry))) collapsedCount += 1;
+    const children = childEntries(entry);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      stack.push(children[index]);
+    }
+  }
+  return collapsedCount;
 };
 const retainSemantic = semantic => {
   let current = semantic;
@@ -592,6 +785,26 @@ previousFilterPage.addEventListener("click", () => {
 });
 nextFilterPage.addEventListener("click", () => {
   showFilterPage(filterPage + 1);
+});
+expandSubtree.addEventListener("click", () => {
+  if (selectedNode === null) return;
+  const keys = collectExpansionKeys(selectedNode);
+  if (keys === null) {
+    treeStatus.textContent =
+      `The selected subtree exceeds ${maximumBulkExpansionRows} nodes. Select a narrower branch.`;
+    return;
+  }
+  keys.forEach(key => expanded.add(key));
+  treeStatus.textContent =
+    `Expanded ${keys.length} rows with children in the selected subtree.`;
+  renderRows(entryKey(selectedNode));
+});
+collapseSubtree.addEventListener("click", () => {
+  if (selectedNode === null) return;
+  const collapsedCount = collapseSelectedSubtree(selectedNode);
+  treeStatus.textContent =
+    `Collapsed ${collapsedCount} expanded rows in the selected subtree.`;
+  renderRows(entryKey(selectedNode));
 });
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
 addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);
@@ -746,9 +959,13 @@ mod tests {
         assert!(html.contains(r#"maxlength="200""#));
         assert!(html.contains(r#"id="previous-filter-page""#));
         assert!(html.contains(r#"id="next-filter-page""#));
+        assert!(html.contains(r#"id="expand-subtree""#));
+        assert!(html.contains(r#"id="collapse-subtree""#));
         assert!(html.contains(r#"data-sort="duration""#));
         assert!(!html.contains(r#"id="functions""#));
         assert!(html.contains(r#"button.setAttribute("aria-expanded""#));
+        assert!(html.contains(r#"entry.row.setAttribute("aria-selected""#));
+        assert!(html.contains("const maximumBulkExpansionRows = 1000"));
         assert!(html.contains("const containsFilter = value =>"));
         assert!(html.contains("operationsBody.replaceChildren(fragment)"));
         assert!(!html.contains("innerHTML"));
