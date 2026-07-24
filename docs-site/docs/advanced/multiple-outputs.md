@@ -131,8 +131,8 @@ A report can contain failed or skipped outputs when top-level orchestration
 completes. A top-level planning, cache, orchestration, or cache-restoration
 error raises an exception instead. A cache failure retains every attempted
 alias report. If output execution completed before cache restoration failed,
-the failure also retains that completed workflow report. See
-[returned write-all cache diagnostics](tracing-and-diagnostics.md#inspect-returned-write-all-cache-diagnostics)
+the failure also retains that completed workflow report. See the
+[write-all cache diagnostics reference](../reference/diagnostics.md#inspect-returned-write-all-cache-diagnostics)
 for phase boundaries and Python and Rust failure access.
 
 For consolidated progress across planning, shared cache work, and every output,

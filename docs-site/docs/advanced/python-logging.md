@@ -62,9 +62,9 @@ Rust tracing filter. They do not lower the selected Python logger or handler
 level. A Python INFO threshold still discards forwarded DEBUG records.
 
 For event fields and terminal outcome rules, see
-[Inspect terminal Parquet I/O](tracing-and-diagnostics.md#inspect-terminal-parquet-io)
+[Inspect terminal Parquet I/O](../reference/diagnostics.md#inspect-terminal-parquet-io)
 and
-[Inspect terminal execution profiles](tracing-and-diagnostics.md#inspect-terminal-execution-profiles).
+[Inspect terminal execution profiles](../reference/diagnostics.md#inspect-terminal-execution-profiles).
 
 ## Keep Python in control
 
@@ -74,4 +74,4 @@ logging, pytest capture, notebook, and framework integrations continue to own
 Python logging output.
 
 For report fields and a safe bug-report checklist, see
-[Tracing and diagnostics](tracing-and-diagnostics.md).
+[Troubleshoot a failed run](tracing-and-diagnostics.md).

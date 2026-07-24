@@ -39,14 +39,16 @@ nav:
       - Private S3 sources: advanced/private-s3.md
   - Advanced:
       - Troubleshooting:
+          - Troubleshoot a failed run: advanced/tracing-and-diagnostics.md
           - Python logging: advanced/python-logging.md
-          - Tracing and failure diagnostics: advanced/tracing-and-diagnostics.md
       - Profiling:
           - Choose a profiling method: contributing/profiling.md
+          - Export execution profiles: advanced/execution-profiling.md
           - Perfetto diagnostics: contributing/profiling-perfetto.md
           - Samply native CPU profiling: contributing/profiling-samply.md
   - Reference:
       - API references: reference/api.md
+      - Diagnostics reference: reference/diagnostics.md
   - Contributors:
       - Development:
           - Local development: contributing/development.md
