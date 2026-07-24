@@ -50,11 +50,19 @@ pub(super) struct OperationCapture {
     _directory: tempfile::TempDir,
     child: Option<Child>,
     reservation: Option<ProfileReservation>,
+    scope: delta_funnel::perfetto_profile::OperationCaptureScope,
 }
 
 impl OperationCapture {
     pub(super) fn start(output: PathBuf, sample_hz: u16) -> Result<Self, ProfilerFailure> {
         let reservation = ProfileReservation::acquire()?;
+        let scope =
+            delta_funnel::perfetto_profile::OperationCaptureScope::allocate().ok_or_else(|| {
+                ProfilerFailure::new(
+                    "capture_scope_unavailable",
+                    "operation profile scope identity could not be allocated",
+                )
+            })?;
         let parent = prepare_output_parent(&output)?;
         preflight_trace_processor()?;
         let directory = tempfile::Builder::new()
@@ -90,7 +98,12 @@ impl OperationCapture {
             _directory: directory,
             child: Some(child),
             reservation: Some(reservation),
+            scope,
         })
+    }
+
+    pub(super) fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        self.scope.in_scope(operation)
     }
 
     pub(super) fn finish(mut self) -> Result<(), ProfilerFailure> {

@@ -13,7 +13,7 @@ use pyo3::types::{PyAnyMethods, PyBool};
 use crate::exception::attach_operation_result;
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
-use crate::profiler::{PyProfilerConfig, start_operation_profile};
+use crate::profiler::{PyProfilerConfig, in_operation_profile_scope, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::session::{PySession, borrow_session_mut, config_py_error};
 
@@ -233,13 +233,15 @@ impl PyTable {
         };
         let operation_profile = start_operation_profile(py, profiler.as_deref())?;
         drop(profiler);
-        let write = self.session.borrow(py).write_to_mssql(
-            py,
-            &spec.write_plan(delta_funnel::RunMode::Execute),
-            profile_mode,
-            progress.as_ref(),
-            trace_path.as_deref(),
-        );
+        let write = in_operation_profile_scope(operation_profile.as_ref(), || {
+            self.session.borrow(py).write_to_mssql(
+                py,
+                &spec.write_plan(delta_funnel::RunMode::Execute),
+                profile_mode,
+                progress.as_ref(),
+                trace_path.as_deref(),
+            )
+        });
         let profile_result = operation_profile
             .map(|operation_profile| operation_profile.finish(py))
             .transpose();
@@ -285,10 +287,11 @@ impl PyTable {
         let progress = PythonProgress::for_preview(progress);
         let operation_profile = start_operation_profile(py, profiler.as_deref())?;
         drop(profiler);
-        let preview =
+        let preview = in_operation_profile_scope(operation_profile.as_ref(), || {
             self.session
                 .borrow(py)
-                .preview_table(py, &self.inner, options, progress.as_ref());
+                .preview_table(py, &self.inner, options, progress.as_ref())
+        });
         let profile_result = operation_profile
             .map(|operation_profile| operation_profile.finish(py))
             .transpose();

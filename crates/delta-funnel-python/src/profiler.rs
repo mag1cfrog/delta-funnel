@@ -79,6 +79,16 @@ pub(crate) struct OperationProfile {
     capture: capture::OperationCapture,
 }
 
+pub(crate) fn in_operation_profile_scope<T>(
+    profile: Option<&OperationProfile>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    match profile {
+        Some(profile) => profile.in_scope(operation),
+        None => operation(),
+    }
+}
+
 pub(crate) fn start_operation_profile(
     py: Python<'_>,
     config: Option<&PyProfilerConfig>,
@@ -109,6 +119,16 @@ pub(crate) fn start_operation_profile(
 }
 
 impl OperationProfile {
+    fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+        {
+            self.capture.in_scope(operation)
+        }
+
+        #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+        operation()
+    }
+
     pub(crate) fn finish(self, py: Python<'_>) -> PyResult<()> {
         #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
         {

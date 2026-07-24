@@ -1,6 +1,7 @@
 //! Shared activation and identity state for one profiled operation.
 
 use std::{
+    cell::Cell,
     future::Future,
     sync::{
         Arc,
@@ -28,6 +29,33 @@ pub(crate) const OBJECT_STORE_TRANSPORT_DISPLAY_NAME: &str = "Object store trans
 const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static OPERATION_CAPTURE_SCOPE_ID: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+pub(crate) fn in_operation_capture_scope<T>(
+    capture_scope_id: u64,
+    operation: impl FnOnce() -> T,
+) -> T {
+    debug_assert_ne!(capture_scope_id, 0);
+    let previous =
+        OPERATION_CAPTURE_SCOPE_ID.with(|current| current.replace(Some(capture_scope_id)));
+    let _reset = OperationCaptureScopeReset(previous);
+    operation()
+}
+
+fn current_operation_capture_scope_id() -> Option<u64> {
+    OPERATION_CAPTURE_SCOPE_ID.get()
+}
+
+struct OperationCaptureScopeReset(Option<u64>);
+
+impl Drop for OperationCaptureScopeReset {
+    fn drop(&mut self) {
+        OPERATION_CAPTURE_SCOPE_ID.set(self.0);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperationTraceKind {
@@ -96,8 +124,13 @@ impl OperationTraceContext {
             kind,
             next_query_execution_id: Arc::new(AtomicU64::new(1)),
             timeline,
-            process_trace: process_spans_enabled
-                .then(|| Arc::new(ProcessOperationTrace::new(kind, operation_id))),
+            process_trace: process_spans_enabled.then(|| {
+                Arc::new(ProcessOperationTrace::new(
+                    kind,
+                    operation_id,
+                    current_operation_capture_scope_id(),
+                ))
+            }),
             operator_activity_budget: Arc::new(OperatorActivityBudget::new(
                 MAX_OPERATOR_ACTIVITY_SPANS,
             )),
@@ -488,13 +521,15 @@ struct ProcessOperationTrace {
 }
 
 impl ProcessOperationTrace {
-    fn new(kind: OperationTraceKind, operation_id: u64) -> Self {
+    fn new(kind: OperationTraceKind, operation_id: u64, capture_scope_id: Option<u64>) -> Self {
+        let capture_scope_id = capture_scope_id.unwrap_or_default();
         let span = match kind {
             OperationTraceKind::Preview => tracing::trace_span!(
                 target: PROFILE_TARGET,
                 parent: None,
                 "Delta Funnel preview",
                 operation_id,
+                capture_scope_id,
                 result = tracing::field::Empty,
                 time_semantics = "wall_clock",
             ),
@@ -503,6 +538,7 @@ impl ProcessOperationTrace {
                 parent: None,
                 "Delta Funnel SQL Server write",
                 operation_id,
+                capture_scope_id,
                 result = tracing::field::Empty,
                 time_semantics = "wall_clock",
             ),
@@ -511,6 +547,7 @@ impl ProcessOperationTrace {
                 parent: None,
                 "Delta Funnel SQL Server write_all",
                 operation_id,
+                capture_scope_id,
                 result = tracing::field::Empty,
                 time_semantics = "wall_clock",
             ),
@@ -640,6 +677,21 @@ mod tests {
     }
 
     #[test]
+    fn operation_capture_scope_restores_nested_and_panicking_calls() {
+        assert_eq!(current_operation_capture_scope_id(), None);
+        in_operation_capture_scope(1, || {
+            assert_eq!(current_operation_capture_scope_id(), Some(1));
+            let _ = std::panic::catch_unwind(|| {
+                in_operation_capture_scope(2, || {
+                    std::panic::resume_unwind(Box::new("scope test"));
+                });
+            });
+            assert_eq!(current_operation_capture_scope_id(), Some(1));
+        });
+        assert_eq!(current_operation_capture_scope_id(), None);
+    }
+
+    #[test]
     fn process_activation_uses_the_profile_callsite() {
         use tracing::subscriber::{NoSubscriber, with_default};
         use tracing_subscriber::Registry;
@@ -663,8 +715,10 @@ mod tests {
         let capture = TracingCapture::start_with_profile_spans_enabled();
         let application_span = tracing::info_span!("application operation");
         let application_guard = application_span.enter();
-        let completed = OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
-            .expect("process tracing should create a context");
+        let completed = in_operation_capture_scope(42, || {
+            OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
+                .expect("process tracing should create a context")
+        });
         let completed_id = completed.operation_id();
         completed.record_process_result("ok");
         drop(completed);
@@ -685,9 +739,11 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].name, "Delta Funnel SQL Server write");
         assert_eq!(spans[0].fields["operation_id"], completed_id.to_string());
+        assert_eq!(spans[0].fields["capture_scope_id"], "42");
         assert_eq!(spans[0].fields["result"], "ok");
         assert_eq!(spans[1].name, "Delta Funnel preview");
         assert_eq!(spans[1].fields["operation_id"], cancelled_id.to_string());
+        assert_eq!(spans[1].fields["capture_scope_id"], "0");
         assert_eq!(spans[1].fields["result"], "cancelled");
         assert!(spans.iter().all(|span| {
             span.target == PROFILE_TARGET

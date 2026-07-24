@@ -8,7 +8,7 @@ use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 use crate::exception::{attach_operation_result, delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
-use crate::profiler::{PyProfilerConfig, start_operation_profile};
+use crate::profiler::{PyProfilerConfig, in_operation_profile_scope, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::table::{PyTable, TraceDestination};
 
@@ -237,13 +237,15 @@ impl PySession {
         } else {
             PythonProgress::new(progress)
         };
-        let write = slf.borrow(py).execute_write_all(
-            py,
-            &requests,
-            options,
-            progress.as_ref(),
-            trace_path.as_deref(),
-        );
+        let write = in_operation_profile_scope(operation_profile.as_ref(), || {
+            slf.borrow(py).execute_write_all(
+                py,
+                &requests,
+                options,
+                progress.as_ref(),
+                trace_path.as_deref(),
+            )
+        });
         let profile_result = operation_profile
             .map(|operation_profile| operation_profile.finish(py))
             .transpose();

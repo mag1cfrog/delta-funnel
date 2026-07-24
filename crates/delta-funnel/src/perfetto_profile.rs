@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
 use perfetto_sdk::producer::{Backends, Producer, ProducerInitArgsBuilder};
@@ -17,6 +17,7 @@ use perfetto_sdk::track_event::{
 };
 use perfetto_sdk::{track_event_categories, track_event_category_enabled};
 
+use crate::profiling::{allocate_id, in_operation_capture_scope};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
@@ -65,6 +66,31 @@ const DELTA_SCAN_OUTPUT_SIBLING_ORDER_BASE: u64 = 1_000_000;
 // bursts. This is the largest bounded hint accepted by Perfetto v57.2.
 const PRODUCER_SHMEM_SIZE_HINT_KB: u32 = 32 * 1024;
 static PERFETTO_INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
+static NEXT_OPERATION_CAPTURE_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Unique correlation scope for one host-managed operation capture.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct OperationCaptureScope {
+    id: u64,
+}
+
+impl OperationCaptureScope {
+    /// Allocates one process-unique operation capture scope.
+    pub fn allocate() -> Option<Self> {
+        allocate_id(&NEXT_OPERATION_CAPTURE_SCOPE_ID).map(|id| Self { id })
+    }
+
+    /// Returns the stable scope identity recorded on the operation root.
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Runs the operation entry point inside this capture scope.
+    pub fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        in_operation_capture_scope(self.id, operation)
+    }
+}
 
 track_event_categories! {
     pub(crate) mod delta_funnel_perfetto {
