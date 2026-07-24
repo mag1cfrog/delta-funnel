@@ -37,6 +37,6 @@ target or create a missing one, including an empty target for empty output.
 
 `replace` writes to a staging table, validates that staging table, then swaps
 it into an existing final target or promotes it to a missing final target. The
-replacement table is recreated from the DeltaFunnel-planned SQL Server schema,
+replacement table is recreated from the SQL Server schema planned by Delta Funnel,
 so existing table metadata such as indexes, constraints, triggers, permissions,
 and extended properties is not preserved.

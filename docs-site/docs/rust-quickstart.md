@@ -88,4 +88,4 @@ query result, and finishes with `wrote output daily_orders`.
 - [SQL Server writes](sql-server.md) explains connection and load-mode choices.
 - [Dry runs and reports](dry-runs-reports.md) explains how to validate a plan
   before writing.
-- [API references](reference/api.md) links to the complete Rust API.
+- [API reference](reference/api.md) links to the complete Rust API.

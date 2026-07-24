@@ -1,4 +1,4 @@
-# Multiple Outputs And Shared Caching
+# Multiple Outputs and Shared Caching
 
 Use `Session.write_all(...)` when one workflow writes several related lazy
 tables to SQL Server. Shared lazy SQL dependencies can be cached so common
@@ -57,73 +57,10 @@ report = session.write_all(
 
 ## Profile every attempted output
 
-Enable detailed DataFusion profiling for each output query:
-
-```python
-report = session.write_all(outputs, options={"profile": True})
-```
-
-Export the complete workflow on one wall clock when phase and output ordering
-matters:
-
-```python
-report = session.write_all(
-    outputs,
-    options={"profile": True},
-    trace_path="write-all-trace.json",
-)
-```
-
-Open the file with `vizviewer write-all-trace.json`, Perfetto, or another
-Chrome Trace Event viewer. The root event is the total `write_all` duration.
-Top-level planning, workflow execution, source reporting, sequential output
-attempts, SQL Server work, and output-query operator lifecycles are positioned
-relative to that same origin. The returned dictionary also exposes the model
-under `report["operation_timeline"]`. Detailed output queries also record
-wall-clock operator activity grouped into query and executor-worker tracks and
-nested Delta planning activity. Planning and execution tracks share an
-operation-local query ID, scope, and output owner.
-
-With automatic caching, the trace also positions each alias's resolution,
-planning, execution, `MemTable` construction, installation, restoration, and
-DataFusion operator lifecycles on labeled cache lanes.
-Cache materialization queries also use query and executor-worker activity
-tracks, so selecting one exact worker produces a top-down flame view. Their
-planning and worker events carry the cache alias as `query_owner`.
-
-Profiling works with both cache modes. For example, disable shared caching and
-enable profiling in the same call:
-
-```python
-report = session.write_all(
-    outputs,
-    options={"cache_mode": "disabled", "profile": True},
-)
-```
-
-Profiles stay with the output result that produced them:
-
-```python
-for output in report["workflow"]["outputs"]:
-    if output["kind"] == "succeeded":
-        profile = output["report"]["execution_profile"]
-    elif output["kind"] == "failed":
-        context = output["failure"]["context"]
-        profile = None if context is None else context["report"]["execution_profile"]
-    else:
-        profile = output["skipped"]["execution_profile"]  # Always None.
-```
-
-An attempted output can still have `None` when it failed before a profile
-observer could be installed. An output skipped after an earlier failure was
-not attempted and always has `execution_profile=None`. The top-level report and
-output status wrappers do not duplicate these fields.
-
-Omitting `profile`, or passing `None` or `False`, disables profiling. Only the
-actual Boolean `True` enables it. The `options` argument remains unavailable
-for dry runs, and `trace_path` is execute-only. For exact Python and Rust
-contracts, profile outcomes, and the profile schema, see
-[API references](../reference/api.md#multi-output-sql-server-profiling).
+Profiling is optional and belongs to the Advanced path. See
+[Inspect write-all profiles](execution-profiling.md#inspect-write-all-profiles)
+to enable profiling, find each output's profile, and export the complete
+workflow timeline.
 
 ## Interpret failures
 
@@ -131,8 +68,8 @@ A report can contain failed or skipped outputs when top-level orchestration
 completes. A top-level planning, cache, orchestration, or cache-restoration
 error raises an exception instead. A cache failure retains every attempted
 alias report. If output execution completed before cache restoration failed,
-the failure also retains that completed workflow report. See
-[returned write-all cache diagnostics](tracing-and-diagnostics.md#inspect-returned-write-all-cache-diagnostics)
+the failure also retains that completed workflow report. See the
+[write-all cache diagnostics reference](../reference/diagnostics.md#inspect-returned-write-all-cache-diagnostics)
 for phase boundaries and Python and Rust failure access.
 
 For consolidated progress across planning, shared cache work, and every output,

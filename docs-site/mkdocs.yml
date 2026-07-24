@@ -31,26 +31,28 @@ nav:
       - Python quickstart: python-api-walkthrough.md
       - Rust quickstart: rust-quickstart.md
       - Core concepts: concepts.md
-  - Core workflows:
+  - Common tasks:
       - SQL Server writes: sql-server.md
       - Dry runs and reports: dry-runs-reports.md
-  - Advanced workflows:
       - Multiple outputs and shared caching: advanced/multiple-outputs.md
       - Progress displays: progress.md
       - Private S3 sources: advanced/private-s3.md
-      - Python logging: advanced/python-logging.md
-      - Tracing and diagnostics: advanced/tracing-and-diagnostics.md
+  - Advanced:
+      - Troubleshooting:
+          - Troubleshoot a failed run: advanced/tracing-and-diagnostics.md
+          - Python logging: advanced/python-logging.md
+      - Profiling:
+          - Choose a profiling method: contributing/profiling.md
+          - Export execution profiles: advanced/execution-profiling.md
+          - Perfetto diagnostics: contributing/profiling-perfetto.md
+          - Samply native CPU profiling: contributing/profiling-samply.md
   - Reference:
-      - API references: reference/api.md
+      - API reference: reference/api.md
+      - Diagnostics reference: reference/diagnostics.md
+      - Execution profile reference: reference/execution-profile.md
   - Contributors:
       - Development:
           - Local development: contributing/development.md
-          - Profiling:
-              - Choose a profiling method: contributing/profiling.md
-              - Perfetto diagnostics: contributing/profiling-perfetto.md
-              - Samply native CPU profiling: contributing/profiling-samply.md
-              - Validation report: contributing/profiling-validation-report.md
-              - Reproduce validation: contributing/profiling-validation-reproduction.md
           - SQL Server integration tests: contributing/sql-server-tests.md
       - Delta internals:
           - DataFusion and Delta overview: internals/datafusion-delta.md
@@ -58,3 +60,5 @@ nav:
           - Provider read scheduling: internals/provider-read-scheduling.md
       - Performance:
           - Delta scan benchmarks: contributing/scan-benchmarks.md
+          - Profiling validation report: contributing/profiling-validation-report.md
+          - Reproduce profiling validation: contributing/profiling-validation-reproduction.md

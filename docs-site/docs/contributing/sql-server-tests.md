@@ -1,6 +1,6 @@
 # SQL Server integration tests
 
-DeltaFunnel's SQL Server integration tests are opt-in through the xtask runner.
+Delta Funnel's SQL Server integration tests are opt-in through the xtask runner.
 A normal `cargo test --workspace` run does not require SQL Server. The Rust
 integration target skips database work when its environment variables are
 absent, and the Python database tests are ignored unless explicitly selected.

@@ -1,12 +1,31 @@
-# API References
+# API Reference
+
+Use this page to look up public entry points and exact Python signatures. For
+task-oriented examples, start with the
+[Python quickstart](../python-api-walkthrough.md) or
+[Rust quickstart](../rust-quickstart.md).
+
+## Find an Entry Point
+
+| Goal | Python entry point |
+| --- | --- |
+| Configure a workflow | [`Session`](#session) |
+| Register a Delta source | [`Session.delta_lake`](#session-delta-lake) |
+| Build a lazy SQL query | [`Session.table_from_sql`](#session-table-from-sql) |
+| Preview rows | [`Table.preview`](#table-preview) or [`Table.show`](#table-show) |
+| Write one SQL Server output | [`Table.write_to_mssql`](#table-write-to-mssql) |
+| Define one of several outputs | [`Table.to_mssql`](#table-to-mssql) |
+| Write several outputs | [`Session.write_all`](#session-write-all) |
+| Enable Python logging | [`init_logging`](#init-logging) |
+| Enable Perfetto diagnostics | [`init_perfetto_diagnostics`](#init-perfetto-diagnostics) |
+| Handle a Delta Funnel failure | [`DeltaFunnelError`](#delta-funnel-error) |
 
 ## Rust
 
-The Rust crate owns the workflow implementation and public report types. The
-published Rust API reference lives on
+The published Rust API reference is
 [docs.rs/delta-funnel](https://docs.rs/delta-funnel).
 
-For local API docs, run:
+Build the reference for the checked-out version with:
 
 ```bash
 cargo doc -p delta-funnel --open
@@ -14,444 +33,421 @@ cargo doc -p delta-funnel --open
 
 ## Python
 
-The Python package name and import name are `deltafunnel`.
+The package and import name are `deltafunnel`. The typed public surface is
+recorded in
+[`deltafunnel.pyi`](https://github.com/mag1cfrog/delta-funnel/blob/main/crates/delta-funnel-python/deltafunnel.pyi).
 
-The current typed public surface is recorded in the package stub:
-
-- [`deltafunnel.pyi`](https://github.com/mag1cfrog/delta-funnel/blob/main/crates/delta-funnel-python/deltafunnel.pyi)
-
-Core Python entry points:
-
-- `init_logging`
-- `Session`
-- `PendingDeltaSource`
-- `Table`
-- `Preview`
-- `MssqlOutputSpec`
-- `DeltaFunnelError`
-
-For `init_logging` setup and filter behavior, see
-[Python logging](../advanced/python-logging.md).
-
-For progress modes and display behavior shared by the supported actions, see
-[Progress displays](../progress.md).
-
-`Session.delta_lake(source_uri, *, version=None, storage_options=None,
-name=None, progress=None)` registers a named Delta source immediately when
-`name` is present. Without `name`, it returns a lazy `PendingDeltaSource` and
-does not load or register the source.
-
-For Delta sources, `Session.delta_lake(..., storage_options=...)` accepts a
-mapping of string keys and values and forwards them to the underlying
-object-store builder used by Delta Funnel. For private S3 tables, see the
-[Private S3 sources](../advanced/private-s3.md) guide for the exact
-documented AWS keys, examples, and troubleshooting guidance.
-
-`PendingDeltaSource.alias(name, *, progress=None)` performs the deferred
-registration. Progress is selected by the call that performs registration. A
-value passed while creating an unnamed pending source is not reused by
-`alias(...)`.
-
-`Table.preview(limit=20, *, progress=None, profile=False)` returns a `Preview`
-object. Phase timings are always available through the read-only
-`Preview.phase_timings` list. Pass `profile=True` to also populate the read-only
-`Preview.execution_profile` dictionary. Omission, `None`, and `False` disable
-detailed profiling; other values except the actual Boolean `True` are rejected.
-
-`Table.show(limit=20, *, progress=None)` executes the same bounded query and
-prints the text form to Python stdout. It keeps detailed profiling disabled
-because it discards the `Preview` object. Both methods apply the limit before
-collection, read rows, and do not contact or write to SQL Server. `Preview.text`
-is the plain text table and `Preview.html` backs notebook `_repr_html_()`
-display.
-
-`Preview.export_trace(path)` writes the full preview wall-clock timeline as
-Chrome Trace Event JSON. The root event covers the complete preview, and child
-events position planning, stream setup, execution, formatting, and available
-DataFusion operator lifecycles on that same clock. Detailed previews also
-include wall-clock `execute` and `poll_next` activity grouped by query execution
-and executor worker. Each worker lane remains sequential or properly nested
-while Tokio task IDs remain event metadata. VizViewer's `Filter by Thread`
-selector can choose one exact displayed worker lane. Bracketed query and worker
-IDs, such as `DataFusion query [1] / worker [2]`, also make substring name
-filtering unambiguous.
-`path` accepts a string or `os.PathLike[str]`. The method creates or replaces
-the file, but does not create missing parent directories. It raises
-`DeltaFunnelError` with
-`kind="execution_profile_unavailable"` when the preview was not created with
-`profile=True`; file-system failures raise `OSError`.
-
-The trace document is accepted by VizTracer's `vizviewer`, Perfetto, and other
-Chrome Trace Event viewers. Rust callers can produce the same complete preview
-document with `TablePreview::to_trace_event_json_value()` and inspect the
-underlying relative spans with `TablePreview::operation_timeline()`. The
-lower-level `QueryExecutionProfile::to_trace_event_json_value()` remains
-available for execution-only operator traces. See
-[Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#export-a-preview-trace)
-for export steps and event interpretation.
-
-Rust callers opt in with `PreviewOptions` and the option-bearing session or
-runtime method:
-
-```rust
-use delta_funnel::{ExecutionProfileMode, PreviewOptions};
-
-let options = PreviewOptions::new(20)
-    .with_execution_profile_mode(ExecutionProfileMode::Detailed);
-let preview = runtime.preview_table_with_options(&session, &table, options)?;
-
-for timing in preview.phase_timings() {
-    println!("{}: {:?}", timing.phase_name(), timing.status());
-}
-if let Some(profile) = preview.execution_profile() {
-    println!("profiled {} operators", profile.operators().len());
-}
-```
-
-The legacy Rust `preview_table` methods remain available. They return phase
-timings with detailed profiling disabled.
-
-When preview execution fails, Rust returns
-`DeltaFunnelError::PreviewFailed { context, source }`. The redacted context
-identifies the failed phase and retains the ordered phase timings plus any
-terminal execution profile and partial operation timeline that were available.
-Python exposes the same data on `DeltaFunnelError` with `phase="preview"`,
-`kind="preview_failed"`, and the JSON-compatible `context` dictionary. The
-timeline is available at `error.context["operation_timeline"]`; Rust reads it
-with `PreviewFailureContext::operation_timeline()`.
-
-See [Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-preview-diagnostics)
-for phase boundaries and interpretation. See the execution profile model below
-for the profile schema.
-
-## One-Output SQL Server Profiling
-
-Python callers can attach a detailed query profile to an execute report:
+### Values and Type Aliases
 
 ```python
-report = table.write_to_mssql(
-    schema="dbo",
-    table="daily_orders",
-    load_mode="create_and_load",
-    profile=True,
-    trace_path="daily-orders-write.json",
-)
-profile = report["execution_profile"]
-timeline = report["operation_timeline"]
-```
+__version__: str
 
-Omitting `profile`, or passing `None` or `False`, leaves detailed profiling
-disabled and sets the execute report's `execution_profile` and
-`operation_timeline` fields to `None`.
-Only the actual Boolean `True` enables it. `profile=True` is rejected with
-`dry_run=True`; dry-run report JSON keeps its existing schema and has no
-`execution_profile` field.
-
-`trace_path` accepts a string or `os.PathLike[str]` and requires
-`profile=True` on an execute call. DeltaFunnel opens the destination before SQL
-Server work starts, without creating missing parent directories. An open
-failure raises `OSError` before the database operation. After a successful
-write, the destination receives Chrome Trace Event JSON. The root event covers
-the complete one-output wall clock, while positioned child events cover
-planning, SQL Server lifecycle work, query stream polls, per-batch validation
-and writes, finalization, target validation, swap, cleanup, and available
-DataFusion operator lifecycles. Detailed output queries also record wall-clock
-operator activity grouped by query and executor worker and nested Delta provider
-planning activity. Shared query IDs, scopes, and owners connect planning and
-execution tracks. A failed write leaves an existing
-destination unchanged and removes a newly reserved file.
-
-Final serialization and file writes still happen after SQL Server reports
-success. A resulting Python error carries
-`deltafunnel_operation_status="completed"` and the sanitized successful report
-in `deltafunnel_operation_report`. It does not roll back the database write and
-must not be treated as evidence that an append is safe to retry.
-
-Rust callers select the same mode on the option-bearing session or runtime
-method:
-
-```rust
-use delta_funnel::ExecutionProfileMode;
-
-let report = runtime.write_to_mssql_with_profile_mode(
-    &session,
-    &request,
-    ExecutionProfileMode::Detailed,
-)?;
-
-if let Some(profile) = report.execution_profile() {
-    println!("profiled {} operators", profile.operators().len());
-}
-if let Some(trace) = report.to_trace_event_json_value() {
-    std::fs::write("daily-orders-write.json", serde_json::to_vec(&trace)?)?;
-}
-```
-
-The existing `write_to_mssql` methods remain default-disabled. For query phase
-boundaries, outcome interpretation, and failure-context access, see
-[returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics).
-
-## Multi-Output SQL Server Profiling
-
-`Session.write_all(...)` accepts this typed options dictionary on execute
-calls:
-
-```python
+LoadMode: TypeAlias = Literal["append_existing", "create_and_load", "replace"]
 WriteAllCacheMode: TypeAlias = Literal["auto", "disabled"]
+Report: TypeAlias = dict[str, object]
+Options: TypeAlias = Mapping[str, object]
 
 class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
     profile: bool | None
 ```
 
-Enable one independent detailed profile for every attempted output and every
-executed auto-cache alias:
+Reports are JSON-compatible Python dictionaries. See
+[Dry runs and reports](../dry-runs-reports.md) for report interpretation.
+
+### Functions
+
+<a id="init-logging"></a>
+#### `init_logging`
 
 ```python
-report = session.write_all(
-    outputs,
-    options={"profile": True},
-    trace_path="write-all-trace.json",
-)
+def init_logging(
+    filter: str | None = None,
+    logger: str = "deltafunnel",
+) -> bool
 ```
 
-Omission, `None`, and `False` leave detailed profiling disabled. Only the
-actual Boolean `True` enables it; integers, strings, and other truthy values
-are rejected. Any `options` dictionary, including an empty one, is rejected
-when `dry_run=True`.
+Installs the Python logging bridge for Rust tracing events. It returns `True`
+when it installs the process-wide subscriber and `False` when a subscriber is
+already set. See [Python logging](../advanced/python-logging.md) for filters,
+record fields, and setup.
 
-`trace_path` accepts a string or `os.PathLike[str]`, requires
-`options={"profile": True}`, and is rejected for dry runs. DeltaFunnel opens
-the destination before SQL Server work starts. A returned `write_all` report
-writes one Chrome Trace Event JSON document even when the report contains
-failed or skipped outputs. The root event is the full `write_all` duration, and
-its positioned spans include top-level phases, attempted outputs, SQL Server
-work, output-query operator lifecycles, and wall-clock operator activity for
-output and cache-materialization queries. Nested Delta planning activity uses
-the same query identity as worker activity. The same relative model is available
-at `report["operation_timeline"]`.
+<a id="init-perfetto-diagnostics"></a>
+#### `init_perfetto_diagnostics`
 
-A top-level planning, cache, or orchestration exception leaves an existing
-destination unchanged and removes a newly reserved file. A final export error
-after the workflow report carries `deltafunnel_operation_status` as `completed`
-or `completed_with_failures` and attaches the sanitized report as
-`deltafunnel_operation_report`. It must not trigger a blind retry. Rust callers
-use `WriteAllReport::operation_timeline()` and
-`WriteAllReport::to_trace_event_json_value()`.
-
-Auto-cache traces position alias resolution, planning, stream setup,
-execution and collection, `MemTable` construction, installation, and
-restoration on labeled cache lanes. A detailed cache orchestration exception
-retains the partial failed timeline at
-`error.context["operation_timeline"]`; Rust reads it with
-`WriteAllCacheFailure::operation_timeline()`.
-
-Returned profiles are nested under the output report that owns them:
-
-| Output status | Python profile location | Rust profile location |
-| --- | --- | --- |
-| `succeeded` | `output["report"]["execution_profile"]` | `MssqlOutputWriteStatus::Succeeded(report)` and `report.execution_profile()` |
-| `failed` | `output["failure"]["context"]["report"]["execution_profile"]`, when context exists | `MssqlOutputWriteStatus::Failed(failure)`, then `failure.context()` and `context.report().execution_profile()` |
-| `skipped` | `output["skipped"]["execution_profile"]`, always `None` | No profile because the output was not attempted |
-
-Cache materialization profiles are nested under the attempted alias that owns
-them:
-
-| Result | Python profile location | Rust profile location |
-| --- | --- | --- |
-| Normal `write_all` report | `report["cache"]["aliases"][i]["execution_profile"]` | Match `WriteAllCacheReport::CacheAliases`, then call `alias.execution_profile()` |
-| Cache orchestration failure | `error.context["aliases"][i]["execution_profile"]` | Match `DeltaFunnelError::WriteAllCache`, then call `failure.aliases()[i].execution_profile()` |
-
-An executed alias has `None` when profiling is disabled or failure happens
-before its physical plan exists. Dry-run and other `selected` cache metadata
-omit `execution_profile` because no alias was executed. Multi-alias results keep
-one profile per attempt in cache-selection order.
-
-An attempted output that fails before its physical plan or profile observer
-exists has no profile. Each attempt uses a fresh physical plan, so repeated
-writes of the same lazy table still produce separate profiles. The
-`WriteAllReport`, its `workflow` object, and each output status wrapper do not
-duplicate `execution_profile`.
-
-The profile outcome describes the output query stream, not the final SQL
-Server result. Normal end-of-stream is `success`, an upstream DataFusion error
-is `error`, and dropping the stream before end-of-stream is `cancelled`. A
-later SQL Server failure can therefore retain a `success` profile. See
-[returned SQL Server output diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-sql-server-output-diagnostics)
-for the shared stream-outcome semantics.
-
-A cache profile has `scope="write_all_cache_alias"` and describes only the
-physical-plan execution that materialized that alias. It does not include later
-reads from the cached `MemTable` or any output query. A successful cache
-execution therefore remains `success` when `MemTable` construction, cache
-installation, a later alias, output execution, or restoration fails. A
-post-plan setup or collection failure keeps its exact `error` or `cancelled`
-outcome. Output profiles remain separate with `scope="mssql_output"`.
-
-Rust callers select the same mode with `WriteAllOptions`:
-
-```rust
-use delta_funnel::{ExecutionProfileMode, WriteAllOptions};
-
-let options = WriteAllOptions::new()
-    .with_execution_profile_mode(ExecutionProfileMode::Detailed);
-let report = runtime.write_all_with_options(&session, &outputs, options)?;
+```python
+def init_perfetto_diagnostics(
+    filter: str | None = None,
+    logger: str = "deltafunnel",
+    wait_timeout_seconds: float = 10.0,
+) -> bool
 ```
 
-The default `write_all` methods and `WriteAllOptions::default()` keep profiling
-disabled. Profiling composes with either `WriteAllCacheMode`; cache selection
-does not change per-output profile ownership. Each available profile also
-supplies one bounded `query_execution_profile_terminal` event. See
-[terminal execution profiles](../advanced/tracing-and-diagnostics.md#inspect-terminal-execution-profiles)
-for its tracing contract and
-[returned write-all cache diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-write-all-cache-diagnostics)
-for cache lifecycle and failure interpretation. The shared profile model,
-terminal consumer, and cache lifecycle are owned by
-[#450](https://github.com/mag1cfrog/delta-funnel/issues/450),
-[#457](https://github.com/mag1cfrog/delta-funnel/issues/457), and
-[#458](https://github.com/mag1cfrog/delta-funnel/issues/458), respectively.
-The shared partition terminal transition comes from
-[#449](https://github.com/mag1cfrog/delta-funnel/issues/449).
+Installs the Python logging bridge and Perfetto profiling layer, then waits for
+a capture to attach. The function is available only in builds compiled with
+Perfetto diagnostics. See
+[Perfetto diagnostics](../contributing/profiling-perfetto.md) for build and
+capture steps.
 
-## Execution Profile Model
+### Exceptions
 
-The Rust crate exports one immutable execution-profile model for bounded
-previews, one-output SQL Server writes, and selected `write_all` cache aliases.
-This foundation also supplies the reusable terminal consumer and bounded
-tracing summary. It does not by itself expose a profile option or attach the
-immutable result to an operation report. Individual operation APIs own that
-integration; the model itself does not change query execution.
+<a id="delta-funnel-error"></a>
+#### `DeltaFunnelError`
 
-`ExecutionProfileMode` defaults to `Disabled`. Its other value is `Detailed`.
-The stable JSON spellings used by the remaining enums are:
+```python
+class DeltaFunnelError(Exception):
+    phase: str
+    kind: str
+    message: str
+    context: object | None
+```
 
-| Enum | JSON values |
+Delta Funnel raises this exception for configuration, planning, and workflow
+failures. `phase` identifies the failed operation area, `kind` is a stable
+machine-readable category, `message` is safe for display, and `context`
+contains structured details when available.
+
+Errors raised after an operation finishes can also expose
+`deltafunnel_operation_status`, `deltafunnel_operation_error`, or
+`deltafunnel_operation_report`. Inspect these fields before retrying a write.
+See [Troubleshoot a failed run](../advanced/tracing-and-diagnostics.md).
+
+### Classes
+
+<a id="session"></a>
+#### `Session`
+
+```python
+class Session:
+    def __init__(
+        self,
+        *,
+        default_mssql_connection_string: str | None = None,
+        target_partitions: int | None = None,
+        output_batch_size: int | None = None,
+        provider_scan_options: Options | None = None,
+        validation_options: Options | None = None,
+        schema_options: Options | None = None,
+    ) -> None
+```
+
+A session owns registered sources, lazy SQL tables, runtime configuration, and
+SQL Server defaults.
+
+| Parameter | Meaning |
 | --- | --- |
-| `QueryExecutionScope` | `preview`, `mssql_output`, `write_all_cache_alias` |
-| `QueryExecutionOutcome` | `success`, `error`, `cancelled` |
-| `QueryExecutionMetricCategory` | `summary`, `dev` |
+| `default_mssql_connection_string` | Default ADO-style connection string for outputs that do not provide one. |
+| `target_partitions` | Positive DataFusion execution partition target. `None` preserves the DataFusion default. |
+| `output_batch_size` | Positive target row count for output batches. `None` preserves the DataFusion default. |
+| `provider_scan_options` | Delta scan concurrency, buffering, and prefetch overrides. |
+| `validation_options` | Target validation and dry-run scan-summary behavior. |
+| `schema_options` | Arrow-to-SQL Server type mapping policies. |
 
-The public Rust model uses typed values and read-only accessors. JSON is an
-explicit projection of that model, not its in-memory source of truth.
+##### Session option mappings
 
-### Profile Schema
+All option mappings reject unknown keys.
 
-```json
-{
-  "scope": "preview",
-  "outcome": "success",
-  "partial": false,
-  "delta_funnel_row_limit": 20,
-  "operators": [
-    {
-      "node_id": 0,
-      "parent_node_id": null,
-      "operator_name": "GlobalLimitExec",
-      "output_partition_count": 1,
-      "metrics_available": true,
-      "aggregated_metrics": [],
-      "metrics": [],
-      "delta_provider_read_stats": null
-    }
-  ]
-}
+`provider_scan_options` accepts:
+
+| Key | Accepted value | Default |
+| --- | --- | --- |
+| `max_concurrent_file_reads_per_scan` | Positive integer | Automatic: resolved scan partition target multiplied by the per-partition limit |
+| `max_concurrent_file_reads_per_partition` | Positive integer | `3` |
+| `output_buffer_capacity_per_partition` | Positive integer | `1` |
+| `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
+
+See [Provider read scheduling](../internals/provider-read-scheduling.md#execution-options)
+for the execution boundaries controlled by these values.
+
+`validation_options` accepts:
+
+| Key | Accepted value | Default |
+| --- | --- | --- |
+| `target_validation_mode` | `"disabled"`, `"validate_if_possible"`, or `"require"` | `"validate_if_possible"` |
+| `dry_run_scan_summary_mode` | `"metadata_only"` or `"exhaust_scan_metadata"` | `"metadata_only"` |
+| `require_successful_planning` | Boolean | `True` |
+
+See [Dry runs and reports](../dry-runs-reports.md) for the behavior and cost of
+the validation and scan-summary modes.
+
+`schema_options` accepts:
+
+| Key | Accepted value | Default |
+| --- | --- | --- |
+| `string_policy` | `"nvarchar_max"`, `"observed_nvarchar"`, or `{"nvarchar": N}` with positive `N` | `"nvarchar_max"` |
+| `binary_policy` | `"varbinary_max"`, `"observed_varbinary"`, or `{"varbinary": N}` with positive `N` | `"varbinary_max"` |
+| `timezone_policy` | `"reject"`, `"datetimeoffset"`, or `"normalize_utc_datetime2"` | `"reject"` |
+| `timestamp_policy` | `"datetime"`, `"datetime2"`, or `{"datetime2": P}` with `P` from `0` through `7` | `"datetime2"` with precision `7` |
+| `nanosecond_policy` | `"reject_non_100ns"`, `"round_to_100ns"`, or `"truncate_to_100ns"` | `"reject_non_100ns"` |
+| `uint64_policy` | `"reject"`, `"decimal20_0"`, or `"checked_bigint"` | `"reject"` |
+| `decimal_policy` | `"reject_negative_scale"` or `"normalize_negative_scale"` | `"reject_negative_scale"` |
+| `decimal256_policy` | `"checked_downcast"` or `"reject"` | `"checked_downcast"` |
+| `float_policy` | `"reject_non_finite"` | `"reject_non_finite"` |
+| `date64_policy` | `"reject_non_midnight"` or `"timestamp_datetime2"` | `"reject_non_midnight"` |
+
+The bounded string and binary forms choose an explicit SQL Server length;
+the `observed_*` forms infer a bounded length from observed values.
+`normalize_utc_datetime2` converts timezone-aware values to UTC before using
+the timezone-free timestamp target. The `checked_*` policies accept values
+only when the target representation can hold them. Normalization, rounding,
+and truncation policies perform the conversion named by the value.
+
+<a id="session-delta-lake"></a>
+##### `Session.delta_lake`
+
+```python
+@overload
+def delta_lake(
+    self,
+    source_uri: str,
+    *,
+    version: int | None = None,
+    storage_options: Mapping[str, str] | None = None,
+    name: str,
+    progress: bool | None = None,
+) -> Table
+
+@overload
+def delta_lake(
+    self,
+    source_uri: str,
+    *,
+    version: int | None = None,
+    storage_options: Mapping[str, str] | None = None,
+    name: None = None,
+    progress: bool | None = None,
+) -> PendingDeltaSource
 ```
 
-`partial` is derived from `outcome`: it is `false` only for `success`.
-`delta_funnel_row_limit` is the exact Delta Funnel preview limit, converted to
-an unsigned 64-bit value with saturation. It is `null` for both write scopes.
-A successful limited preview means the limited execution completed normally;
-it does not describe an unbounded write.
+With `name`, loads and registers the Delta source immediately. Without `name`,
+returns an unregistered `PendingDeltaSource`; call its `alias` method to load
+and register it. `version` selects a Delta snapshot. `storage_options` must map
+string keys to string values. See [Private S3 sources](../advanced/private-s3.md)
+for documented AWS keys.
 
-Operators are the unique physical-plan nodes in deterministic first-seen
-pre-order. IDs start at zero and are local to one profile. The root parent is
-`null`. Repeated references to the exact same `Arc<dyn ExecutionPlan>` keep the
-first node and first parent, while distinct nodes remain separate even when
-their names and metadata match. `operator_name` is only DataFusion's short
-`ExecutionPlan::name()` value. Plan display text is never collected.
+<a id="session-table-from-sql"></a>
+##### `Session.table_from_sql`
 
-`metrics_available=false` means DataFusion returned no metric set. An available
-but empty set uses `metrics_available=true` with two empty metric arrays. Every
-operator, including a zero-output-partition root, remains in the profile.
-
-### Raw And Aggregated Metrics
-
-Each operator has two views of the same terminal DataFusion metric set:
-
-- `metrics` preserves original per-partition entries.
-- `aggregated_metrics` uses DataFusion's `aggregate_by_name()` result and
-  therefore sets `partition` and `output_partition` to `null`.
-
-Both arrays are sorted by category, name, partition, output partition, value
-kind, and typed value. Original metric position is used only to order otherwise
-identical redacted entries. Collection reads each node's metric set once and
-does not execute or poll the plan.
-
-DataFusion operator metrics are cumulative counters and gauges. Partitions and
-operators can execute concurrently, and parent and child work can overlap. Do
-not sum operator compute durations and call the result query wall time. The
-profile does not derive wall-time percentages.
-
-Each metric has this envelope:
-
-```json
-{
-  "name": "output_rows",
-  "category": "summary",
-  "partition": 0,
-  "output_partition": null,
-  "value_kind": "count",
-  "value": 42,
-  "components": null
-}
+```python
+def table_from_sql(self, sql: str) -> Table
 ```
 
-DataFusion 53.1 values map as follows:
+Builds a lazy table from one read-only DataFusion SQL statement. It plans the
+query but does not read rows.
 
-| DataFusion value | Profile value |
-| --- | --- |
-| Output rows, output batches, spill count, spilled rows, generic count | `count` with an unsigned scalar |
-| Output bytes, spilled bytes, current memory usage | `bytes` with an unsigned scalar |
-| Elapsed compute, generic time | `nanoseconds` with an unsigned scalar |
-| Generic gauge | `gauge` with an unsigned scalar |
-| Start or end timestamp | `timestamp_nanoseconds` with a signed Unix epoch scalar or `null` |
-| Pruning metrics | `pruning` with `pruned`, `matched`, and `fully_matched` components |
-| Ratio | `ratio` with unsigned `part` and `total` components |
-| Custom | `custom` with its unsigned `as_usize()` value |
+<a id="multi-output-sql-server-profiling"></a>
+<a id="session-write-all"></a>
+##### `Session.write_all`
 
-All non-timestamp `usize` conversions saturate to `u64`. A numeric zero is an
-available measured value. Unavailable metrics use the relevant absence signal,
-such as `metrics_available=false`, a `null` optional provider field, or a
-`null` unset or out-of-range timestamp. Current memory is a terminal gauge, not
-a promised peak. Ratios preserve their two integer components and are not
-converted to floating-point percentages. Custom display text is not exposed.
+```python
+def write_all(
+    self,
+    outputs: Sequence[MssqlOutputSpec],
+    *,
+    options: WriteAllExecutionOptions | None = None,
+    dry_run: bool | None = None,
+    progress: bool | None = None,
+    trace_path: str | PathLike[str] | None = None,
+) -> Report
+```
 
-### Labels And Redaction
+Plans or executes several SQL Server output specs in order and returns one
+report. Every spec must come from the same session.
 
-The collector recognizes only an exact `outputPartition` label whose value is
-a base-10 non-negative integer that fits in `u64`. It normalizes that value to
-`output_partition`. Malformed values and every other label are dropped,
-including `filename`, `expr`, and unknown future labels.
+- `dry_run=True` plans without writing and rejects `options` and `trace_path`.
+- `options={"cache_mode": "auto"}` enables eligible shared-work caching.
+- `options={"cache_mode": "disabled"}` disables shared-work caching.
+- `options={"profile": True}` attaches profiles to attempted outputs and
+  executed cache aliases.
+- `trace_path` requires profiling and exports one Chrome Trace Event JSON
+  document for the complete operation.
 
-Profiles never include plan display text, expressions, SQL, schemas, literals,
-URLs, paths, storage options, headers, credentials, or custom metric display
-text. These redaction rules apply to both JSON and Rust `Debug` output.
+See [Multiple outputs and shared caching](../advanced/multiple-outputs.md) for
+workflow examples and
+[Export a write-all trace](../advanced/execution-profiling.md#export-a-write-all-trace)
+for profile ownership and trace behavior.
 
-### Delta Provider Snapshots
+<a id="pending-delta-source"></a>
+#### `PendingDeltaSource`
 
-A `DeltaScanPlanningExec` operator can contain the existing
-`DeltaProviderReadStatsSnapshot` under `delta_provider_read_stats`. The profile
-reuses the established provider JSON mapping wholesale, so provider fields keep
-their existing names and availability semantics.
+Returned by `Session.delta_lake(...)` when `name` is omitted. The source is not
+available to SQL until it is registered.
 
-Terminal consumers associate snapshots by exact read-stats `Arc` identity, not
-source name or snapshot contents. They reuse the immutable snapshot captured at
-the shared terminal transition and do not take a later live snapshot. A scan
-missing from a supplied terminal set gets `null` provider stats and an internal
-redacted diagnostic. A supplied snapshot with no matching scan is ignored.
-The standalone internal collector can instead snapshot each unique handle once
-when no terminal set is supplied.
+<a id="pending-delta-source-alias"></a>
+##### `PendingDeltaSource.alias`
 
-This model is application-level query profiling. It does not collect syscall,
-CPU stack, scheduler, Tokio, network-packet, `perf`, eBPF, or kernel profiles,
-and it does not run `EXPLAIN ANALYZE` or execute the query a second time.
+```python
+def alias(
+    self,
+    name: str,
+    *,
+    progress: bool | None = None,
+) -> Table
+```
+
+Loads and registers the pending source under `name`, then returns a `Table`.
+The `progress` value applies to this registration call.
+
+<a id="table"></a>
+#### `Table`
+
+A lazy Delta source or SQL-derived query associated with its owning session.
+
+<a id="table-alias"></a>
+##### `Table.alias`
+
+```python
+def alias(self, name: str) -> Table
+```
+
+Registers the lazy SQL-derived table under `name` so later SQL can reference
+it, then returns the registered table.
+
+<a id="table-preview"></a>
+##### `Table.preview`
+
+```python
+def preview(
+    self,
+    limit: int = 20,
+    *,
+    progress: bool | None = None,
+    profile: bool | None = False,
+) -> Preview
+```
+
+Executes a bounded query and returns a rendered `Preview`. Phase timings are
+always included. Only the Boolean `True` enables the detailed execution
+profile. The method reads rows but does not contact SQL Server.
+
+<a id="table-show"></a>
+##### `Table.show`
+
+```python
+def show(
+    self,
+    limit: int = 20,
+    *,
+    progress: bool | None = None,
+) -> None
+```
+
+Executes the same bounded query as `preview` and prints its text form to Python
+stdout. It does not retain the `Preview` or enable detailed profiling.
+
+<a id="table-to-mssql"></a>
+##### `Table.to_mssql`
+
+```python
+def to_mssql(
+    self,
+    *,
+    schema: str,
+    table: str,
+    load_mode: LoadMode,
+    name: str | None = None,
+    connection_string: str | None = None,
+) -> MssqlOutputSpec
+```
+
+Builds an output specification without planning or writing rows. `name`
+defaults to the target table name and identifies the output in `write_all`
+reports. `connection_string` overrides the session default for this output.
+
+<a id="one-output-sql-server-profiling"></a>
+<a id="table-write-to-mssql"></a>
+##### `Table.write_to_mssql`
+
+```python
+def write_to_mssql(
+    self,
+    *,
+    schema: str,
+    table: str,
+    load_mode: LoadMode,
+    dry_run: bool | None = None,
+    name: str | None = None,
+    connection_string: str | None = None,
+    progress: bool | None = None,
+    profile: bool | None = False,
+    trace_path: str | PathLike[str] | None = None,
+) -> Report
+```
+
+Plans or executes one SQL Server output and returns a report.
+
+- `dry_run=True` plans without writing and rejects `profile=True` and
+  `trace_path`.
+- `profile=True` attaches `execution_profile` and `operation_timeline` to an
+  execute report.
+- `trace_path` requires `profile=True` and exports Chrome Trace Event JSON
+  after a successful write.
+- `connection_string` overrides the session default for this call.
+
+If trace export fails after SQL Server succeeds, the raised exception reports
+`deltafunnel_operation_status="completed"` and contains the sanitized report
+in `deltafunnel_operation_report`. Do not treat the export error as evidence
+that a write is safe to retry.
+
+See [SQL Server writes](../sql-server.md) for load modes and
+[Inspect returned SQL Server output diagnostics](../advanced/execution-profiling.md#inspect-returned-sql-server-output-diagnostics)
+for profile and trace details.
+
+<a id="preview"></a>
+#### `Preview`
+
+```python
+class Preview:
+    text: str
+    html: str
+    phase_timings: list[dict[str, object]]
+    execution_profile: dict[str, object] | None
+
+    def export_trace(self, path: str | PathLike[str]) -> None
+    def __str__(self) -> str
+    def _repr_html_(self) -> str
+```
+
+`text` is the plain-text table. `html` backs notebook display.
+`phase_timings` is always populated. `execution_profile` is populated only
+when `Table.preview(profile=True)` was used.
+
+`export_trace` creates or replaces a Chrome Trace Event JSON file. It requires
+a profiled preview, accepts a string or `os.PathLike`, and does not create
+missing parent directories. See
+[Export a preview trace](../advanced/execution-profiling.md#export-a-preview-trace).
+
+<a id="mssql-output-spec"></a>
+#### `MssqlOutputSpec`
+
+An opaque output specification created by `Table.to_mssql(...)` and consumed
+by `Session.write_all(...)`. It retains its owning session, lazy table, output
+name, target, load mode, and optional connection override.
+
+## Related Reference
+
+- [Execution profile reference](execution-profile.md) defines the returned
+  profile schema, metric mapping, labels, and redaction rules.
+- [Diagnostics reference](diagnostics.md) defines tracing events, operation
+  timelines, stream outcomes, and cache lifecycle fields.
+- [Progress displays](../progress.md) defines automatic, forced, and disabled
+  progress behavior.
+
+## Moved Reference Sections
+
+These anchors preserve links to sections that moved out of this page.
+
+<a id="execution-profile-model"></a>
+[Execution profile model](execution-profile.md#execution-profile-model)
+
+<a id="profile-schema"></a>
+[Profile schema](execution-profile.md#profile-schema)
+
+<a id="raw-and-aggregated-metrics"></a>
+[Raw and aggregated metrics](execution-profile.md#raw-and-aggregated-metrics)
+
+<a id="labels-and-redaction"></a>
+[Labels and redaction](execution-profile.md#labels-and-redaction)
+
+<a id="delta-provider-snapshots"></a>
+[Delta provider snapshots](execution-profile.md#delta-provider-snapshots)

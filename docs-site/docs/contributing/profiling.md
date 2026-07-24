@@ -48,7 +48,7 @@ preview.export_trace("preview-trace.json")
 For a single SQL Server write, pass `profile=True` and `trace_path` to the
 execute call. For `write_all`, pass `options={"profile": True}` and
 `trace_path`. See the exact preview, write, and write-all examples in
-[Tracing and diagnostics](../advanced/tracing-and-diagnostics.md#inspect-returned-preview-diagnostics).
+[Export and inspect execution profiles](../advanced/execution-profiling.md#inspect-returned-preview-diagnostics).
 
 Open the JSON with VizTracer's viewer or any compatible Chrome Trace Event
 viewer:

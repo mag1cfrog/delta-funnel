@@ -100,5 +100,5 @@ and validation status depend on the data and available target validation.
 - [Progress displays](progress.md) explains terminal and notebook progress.
 - [Private S3 sources](advanced/private-s3.md) explains credentials and source
   access.
-- [API references](reference/api.md) covers deferred source registration and
+- [API reference](reference/api.md) covers deferred source registration and
   the complete typed surface.

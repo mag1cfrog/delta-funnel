@@ -18,9 +18,11 @@ Before adding or expanding a page, choose one primary reader and one user goal.
 Place the content in the matching navigation section:
 
 - `Start here`: the shortest path for a new user to reach a first result.
-- `Core workflows`: common tasks most users are expected to perform.
-- `Advanced workflows`: optional features, complex workflows, and
-  troubleshooting.
+- `Common tasks`: problem-oriented guides for supported user workflows.
+- `Advanced > Troubleshooting`: failure investigation and safe diagnostic
+  collection.
+- `Advanced > Profiling`: method selection and tool-specific performance
+  workflows.
 - `Reference`: precise API facts meant for lookup rather than guided reading.
 - `Contributors`: repository development, testing, and implementation details.
 
