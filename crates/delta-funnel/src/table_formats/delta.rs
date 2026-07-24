@@ -3,6 +3,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::{DeltaFunnelError, error::DeltaSourceSchemaSnafu, observability};
 use delta_kernel::object_store::aws::AmazonS3ConfigKey;
@@ -24,6 +25,8 @@ pub(crate) use deletion_vector::{
 };
 #[cfg(test)]
 pub(crate) use kernel::KernelStructType;
+#[cfg(test)]
+pub(crate) use kernel::insert_url_handler;
 use kernel::{ArrowSchemaRef, Version, snapshot_arrow_schema};
 pub(crate) use kernel::{
     ColumnName as KernelColumnName, DecimalData as KernelDecimalData,
@@ -41,6 +44,7 @@ pub(crate) use read::{
     KernelDataFilePredicateEvalRequest, KernelDataFileReadRequest, KernelDataFileReader,
     KernelDataFileReaderConfig, KernelDataFileTransformRequest, KernelScanReadSchema,
 };
+pub(crate) use snapshot::DeltaKernelEngineContext;
 use snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot, s3_auth_mode_hint_for_source};
 
 #[cfg(test)]
@@ -244,6 +248,7 @@ pub struct PlannedDeltaSource {
 pub(crate) struct ProjectedDeltaScan {
     scan: kernel::Scan,
     kernel_schema: kernel::KernelSchemaRef,
+    engine_context: Arc<DeltaKernelEngineContext>,
 }
 
 impl ProjectedDeltaScan {
@@ -259,6 +264,12 @@ impl ProjectedDeltaScan {
     #[must_use]
     pub(crate) fn kernel_scan(&self) -> &kernel::Scan {
         &self.scan
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
+        &self.engine_context
     }
 
     /// Returns the kernel scan schema state needed by data-file reads.
@@ -289,26 +300,19 @@ impl ProjectedDeltaScan {
     #[allow(dead_code)]
     pub(crate) fn expand_kernel_scan_metadata(
         &self,
-        table_uri: &str,
-        storage_options: &DeltaStorageOptions,
     ) -> Result<KernelScanMetadataExpansion, delta_kernel::Error> {
         fn collect_scan_file(files: &mut Vec<KernelScanFileMetadata>, file: kernel::ScanFile) {
             files.push(KernelScanFileMetadata::from_kernel_scan_file(file));
         }
 
-        let table_url = kernel::try_parse_uri(table_uri)?;
-        let store = kernel::store_from_url_opts(
-            &table_url,
-            storage_options
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        )?;
-        let engine = kernel::DefaultEngineBuilder::new(store).build();
         let mut files = Vec::new();
         let mut files_filtered_during_planning = Some(0_u64);
         let mut saw_metadata_batch = false;
 
-        for scan_metadata in self.scan.scan_metadata(&engine)? {
+        for scan_metadata in self
+            .scan
+            .scan_metadata(self.engine_context.as_kernel_engine())?
+        {
             let scan_metadata = scan_metadata?;
             saw_metadata_batch = true;
             files_filtered_during_planning = files_filtered_during_planning.and_then(|total| {
@@ -331,13 +335,9 @@ impl ProjectedDeltaScan {
 
     #[cfg(test)]
     /// Returns scan file paths after kernel scan planning.
-    pub(crate) fn scan_file_paths(
-        &self,
-        table_uri: &str,
-        storage_options: &DeltaStorageOptions,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub(crate) fn scan_file_paths(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut paths = self
-            .expand_kernel_scan_metadata(table_uri, storage_options)?
+            .expand_kernel_scan_metadata()?
             .files
             .into_iter()
             .map(|file| file.path)
@@ -455,6 +455,10 @@ impl PlannedDeltaSource {
     pub(crate) fn loaded_snapshot(&self) -> &LoadedDeltaTableSnapshot {
         &self.snapshot
     }
+
+    pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
+        self.loaded_snapshot().engine_context()
+    }
 }
 
 pub(crate) fn delta_source_arrow_schema(
@@ -500,6 +504,7 @@ pub(crate) fn build_projected_predicated_delta_scan(
     Ok(ProjectedDeltaScan {
         scan,
         kernel_schema,
+        engine_context: Arc::clone(source.engine_context()),
     })
 }
 
@@ -519,6 +524,7 @@ pub(crate) fn build_projected_predicated_stats_delta_scan(
     Ok(ProjectedDeltaScan {
         scan,
         kernel_schema,
+        engine_context: Arc::clone(source.engine_context()),
     })
 }
 
@@ -691,11 +697,12 @@ mod tests {
 
     use super::kernel::{ColumnName, Expression, Predicate, Scalar};
     use super::{
-        DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions, KernelDataFileReader,
-        KernelDataFileReaderConfig, KernelDeletionVectorReader, KernelDeletionVectorReaderConfig,
-        ProjectedDeltaScan, build_projected_delta_scan, build_projected_predicated_delta_scan,
-        datafusion_expr_to_kernel_predicate, effective_storage_options_for_source_from_env,
-        load_delta_source, load_delta_sources, load_delta_table_snapshot,
+        DeltaKernelEngineContext, DeltaKernelPredicate, DeltaSourceConfig, DeltaStorageOptions,
+        KernelDataFileReader, KernelDataFileReaderConfig, KernelDeletionVectorReader,
+        KernelDeletionVectorReaderConfig, ProjectedDeltaScan, build_projected_delta_scan,
+        build_projected_predicated_delta_scan, datafusion_expr_to_kernel_predicate,
+        effective_storage_options_for_source_from_env, load_delta_source, load_delta_sources,
+        load_delta_table_snapshot,
     };
     use crate::DeltaFunnelError;
 
@@ -1193,11 +1200,9 @@ mod tests {
 
     fn kernel_scan_file_paths(
         scan: &ProjectedDeltaScan,
-        table_uri: &str,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let storage_options = DeltaStorageOptions::default();
         let mut paths = scan
-            .expand_kernel_scan_metadata(table_uri, &storage_options)?
+            .expand_kernel_scan_metadata()?
             .files
             .into_iter()
             .map(|file| file.path)
@@ -1222,7 +1227,7 @@ mod tests {
 
         let preflight = super::preflight_delta_protocol(&source)?;
         let scan = build_projected_delta_scan(&source, None)?;
-        let file_paths = kernel_scan_file_paths(&scan, source.table_uri())?;
+        let file_paths = kernel_scan_file_paths(&scan)?;
 
         assert_eq!(source.version(), 6);
         assert_eq!(preflight.protocol().reader_features, vec!["v2Checkpoint"]);
@@ -1239,11 +1244,9 @@ mod tests {
 
     fn kernel_scan_file_boundaries(
         scan: &ProjectedDeltaScan,
-        table_uri: &str,
     ) -> Result<Vec<KernelScanFileBoundary>, Box<dyn std::error::Error>> {
-        let storage_options = DeltaStorageOptions::default();
         let mut boundaries = scan
-            .expand_kernel_scan_metadata(table_uri, &storage_options)?
+            .expand_kernel_scan_metadata()?
             .files
             .into_iter()
             .map(|file| KernelScanFileBoundary {
@@ -1280,8 +1283,7 @@ mod tests {
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        let expansion =
-            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
+        let expansion = scan.expand_kernel_scan_metadata()?;
 
         assert!(expansion.scan_metadata_exhausted);
         assert_eq!(expansion.files.len(), 1);
@@ -1315,8 +1317,7 @@ mod tests {
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None)?;
 
-        let expansion =
-            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
+        let expansion = scan.expand_kernel_scan_metadata()?;
 
         assert!(expansion.scan_metadata_exhausted);
         assert!(expansion.files.is_empty());
@@ -1731,53 +1732,6 @@ mod tests {
         })?;
 
         Ok((table, source))
-    }
-
-    fn assert_boolean_stats_min_max_error(
-        result: Result<Vec<String>, Box<dyn std::error::Error>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let error = match result {
-            Ok(paths) => {
-                return Err(format!(
-                    "boolean min/max stats predicate should fail kernel scan: {paths:?}"
-                )
-                .into());
-            }
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        let debug_message = format!("{error:?}");
-        assert!(
-            message.contains("minValues") || debug_message.contains("minValues"),
-            "{message}\n{debug_message}"
-        );
-
-        Ok(())
-    }
-
-    fn assert_binary_stats_min_max_error(
-        result: Result<Vec<String>, Box<dyn std::error::Error>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let error = match result {
-            Ok(paths) => {
-                return Err(format!(
-                    "binary min/max stats predicate should fail kernel scan: {paths:?}"
-                )
-                .into());
-            }
-            Err(error) => error,
-        };
-        let message = error.to_string();
-        let debug_message = format!("{error:?}");
-        assert!(
-            message.contains("minValues")
-                || message.contains("maxValues")
-                || debug_message.contains("minValues")
-                || debug_message.contains("maxValues"),
-            "{message}\n{debug_message}"
-        );
-
-        Ok(())
     }
 
     fn assert_unsupported_literal_error(
@@ -2686,7 +2640,7 @@ mod tests {
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let scan = build_projected_predicated_delta_scan(source, None, Some(predicate))?;
 
-        kernel_scan_file_paths(&scan, source.table_uri())
+        kernel_scan_file_paths(&scan)
     }
 
     fn build_projected_predicated_stats_delta_scan(
@@ -2702,6 +2656,7 @@ mod tests {
         Ok(ProjectedDeltaScan {
             scan,
             kernel_schema,
+            engine_context: Arc::clone(source.engine_context()),
         })
     }
 
@@ -2712,7 +2667,7 @@ mod tests {
         let predicate = datafusion_expr_to_kernel_predicate(filter)?;
         let scan = build_projected_predicated_stats_delta_scan(source, Some(predicate))?;
 
-        kernel_scan_file_paths(&scan, source.table_uri())
+        kernel_scan_file_paths(&scan)
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -2727,20 +2682,13 @@ mod tests {
 
     fn kernel_stats_metadata_boundary(
         scan: &ProjectedDeltaScan,
-        table_uri: &str,
     ) -> Result<KernelStatsMetadataBoundary, Box<dyn std::error::Error>> {
-        let storage_options = DeltaStorageOptions::default();
-        let table_url = super::kernel::try_parse_uri(table_uri)?;
-        let store = super::kernel::store_from_url_opts(
-            &table_url,
-            storage_options
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        )?;
-        let engine = super::kernel::DefaultEngineBuilder::new(store).build();
         let mut boundary = KernelStatsMetadataBoundary::default();
 
-        for scan_metadata in scan.kernel_scan().scan_metadata(&engine)? {
+        for scan_metadata in scan
+            .kernel_scan()
+            .scan_metadata(scan.engine_context().as_kernel_engine())?
+        {
             let (underlying_data, selection_vector) = scan_metadata?.scan_files.into_parts();
             let batch: RecordBatch =
                 super::kernel::ArrowEngineData::try_from_engine_data(underlying_data)?.into();
@@ -3101,13 +3049,17 @@ mod tests {
     }
 
     #[test]
-    fn kernel_partition_characterization_uses_official_delta_kernel_0_23_0() {
+    fn kernel_partition_characterization_uses_official_delta_kernel_0_25_0() {
         let manifest = include_str!("../../Cargo.toml");
         let lockfile = include_str!("../../../../Cargo.lock");
 
-        assert!(manifest.contains(r#"delta_kernel = { version = "0.23.0""#));
+        assert!(manifest.contains(r#"delta_kernel = { version = "=0.25.0""#));
+        assert!(manifest.contains(r#"delta_kernel_default_engine = { version = "=0.25.0""#));
         assert!(lockfile.contains(
-            "name = \"delta_kernel\"\nversion = \"0.23.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+            "name = \"delta_kernel\"\nversion = \"0.25.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+        ));
+        assert!(lockfile.contains(
+            "name = \"delta_kernel_default_engine\"\nversion = \"0.25.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
         ));
         assert!(!manifest.contains("deltalake"));
         assert!(!manifest.contains("buoyant_kernel"));
@@ -3135,11 +3087,11 @@ mod tests {
             build_projected_predicated_delta_scan(&source, None, Some(predicate))?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec!["region-us-east.parquet", "region-us-west.parquet"]
         );
         assert_eq!(
-            kernel_scan_file_paths(&predicated_scan, source.table_uri())?,
+            kernel_scan_file_paths(&predicated_scan)?,
             vec!["region-us-west.parquet"]
         );
 
@@ -3156,7 +3108,7 @@ mod tests {
         assert!(!table.path.join("id-possible.parquet").exists());
         assert!(!table.path.join("id-missing-stats.parquet").exists());
         assert_eq!(
-            kernel_scan_file_paths(&stats_scan, source.table_uri())?,
+            kernel_scan_file_paths(&stats_scan)?,
             vec![
                 "id-impossible.parquet",
                 "id-missing-stats.parquet",
@@ -3164,7 +3116,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            kernel_stats_metadata_boundary(&stats_scan, source.table_uri())?,
+            kernel_stats_metadata_boundary(&stats_scan)?,
             KernelStatsMetadataBoundary {
                 selected_rows: 3,
                 selected_stats_rows: 2,
@@ -3205,26 +3157,37 @@ mod tests {
     }
 
     #[test]
-    fn kernel_boolean_data_column_stats_pruning_documents_min_max_boundary()
+    fn kernel_boolean_data_column_stats_pruning_keeps_min_max_predicates_conservative()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_boolean_data_stats_characterization_source()?;
+        let expected_paths = vec![
+            "boolean-false-only.parquet",
+            "boolean-false-with-null.parquet",
+            "boolean-missing-stats.parquet",
+            "boolean-mixed.parquet",
+            "boolean-true-only.parquet",
+            "boolean-true-with-null.parquet",
+        ];
 
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").eq(bool_lit(true)),
-        ))?;
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").eq(bool_lit(false)),
-        ))?;
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").not_eq(bool_lit(true)),
-        ))?;
-        assert_boolean_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("is_current").not_eq(bool_lit(false)),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").eq(bool_lit(true)))?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").eq(bool_lit(false)))?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("is_current").not_eq(bool_lit(true)),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("is_current").not_eq(bool_lit(false)),
+            )?,
+            expected_paths
+        );
 
         Ok(())
     }
@@ -3586,18 +3549,30 @@ mod tests {
     }
 
     #[test]
-    fn kernel_binary_data_column_stats_pruning_documents_equality_and_empty_boundary()
+    fn kernel_binary_data_column_stats_pruning_keeps_equality_conservative_and_rejects_empty()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+        let expected_paths = vec![
+            "binary-HELLO.parquet",
+            "binary-empty.parquet",
+            "binary-hello.parquet",
+            "binary-missing-stats.parquet",
+            "binary-range.parquet",
+            "binary-special.parquet",
+            "binary-with-null.parquet",
+        ];
 
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").eq(binary_lit(b"hello")),
-        ))?;
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").not_eq(binary_lit(b"hello")),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").eq(binary_lit(b"hello")),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(
+                &source,
+                &col("payload").not_eq(binary_lit(b"hello")),
+            )?,
+            expected_paths
+        );
         assert_unsupported_literal_error(kernel_predicated_stats_file_paths(
             &source,
             &col("payload").eq(binary_lit(b"")),
@@ -3611,22 +3586,31 @@ mod tests {
     }
 
     #[test]
-    fn kernel_binary_data_column_stats_pruning_documents_ordering()
+    fn kernel_binary_data_column_stats_pruning_keeps_ordering_conservative()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_binary_data_stats_characterization_source()?;
+        let expected_paths = vec![
+            "binary-HELLO.parquet",
+            "binary-empty.parquet",
+            "binary-hello.parquet",
+            "binary-missing-stats.parquet",
+            "binary-range.parquet",
+            "binary-special.parquet",
+            "binary-with-null.parquet",
+        ];
 
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").gt(binary_lit(b"hello")),
-        ))?;
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").lt(binary_lit(b"hello")),
-        ))?;
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &binary_lit(b"hello").gt(col("payload")),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").gt(binary_lit(b"hello")),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").lt(binary_lit(b"hello")),)?,
+            expected_paths
+        );
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &binary_lit(b"hello").gt(col("payload")),)?,
+            expected_paths
+        );
 
         Ok(())
     }
@@ -3661,14 +3645,20 @@ mod tests {
     }
 
     #[test]
-    fn kernel_binary_data_column_stats_pruning_documents_partial_stats_boundary()
+    fn kernel_binary_data_column_stats_pruning_keeps_partial_min_max_stats_conservative()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_table, source) = kernel_partial_binary_data_stats_characterization_source()?;
 
-        assert_binary_stats_min_max_error(kernel_predicated_stats_file_paths(
-            &source,
-            &col("payload").gt(binary_lit(b"hello")),
-        ))?;
+        assert_eq!(
+            kernel_predicated_stats_file_paths(&source, &col("payload").gt(binary_lit(b"hello")),)?,
+            vec![
+                "binary-counts-only.parquet",
+                "binary-max-only-low.parquet",
+                "binary-min-only-high.parquet",
+                "binary-missing-null-count.parquet",
+                "binary-missing-stats.parquet",
+            ]
+        );
         assert_eq!(
             kernel_predicated_stats_file_paths(&source, &col("payload").is_null())?,
             vec![
@@ -4485,11 +4475,11 @@ mod tests {
         let stats_scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
 
         assert_eq!(
-            kernel_scan_file_paths(&stats_scan, source.table_uri())?,
+            kernel_scan_file_paths(&stats_scan)?,
             vec!["id-missing-stats.parquet", "id-possible.parquet"]
         );
         assert_eq!(
-            kernel_stats_metadata_boundary(&stats_scan, source.table_uri())?,
+            kernel_stats_metadata_boundary(&stats_scan)?,
             KernelStatsMetadataBoundary {
                 selected_rows: 2,
                 selected_stats_rows: 1,
@@ -4528,7 +4518,7 @@ mod tests {
         let stats_scan = build_projected_predicated_stats_delta_scan(&source, Some(predicate))?;
 
         assert_eq!(
-            kernel_scan_file_boundaries(&stats_scan, source.table_uri())?,
+            kernel_scan_file_boundaries(&stats_scan)?,
             vec![
                 KernelScanFileBoundary {
                     path: "id-dv-missing-stats.parquet".to_owned(),
@@ -4604,7 +4594,7 @@ mod tests {
             build_projected_predicated_delta_scan(&source, None, Some(predicate))?;
 
         assert_eq!(
-            kernel_scan_file_boundaries(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_boundaries(&unfiltered_scan)?,
             vec![
                 KernelScanFileBoundary {
                     path: "region-us-east-dv.parquet".to_owned(),
@@ -4625,7 +4615,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            kernel_scan_file_boundaries(&predicated_scan, source.table_uri())?,
+            kernel_scan_file_boundaries(&predicated_scan)?,
             vec![
                 KernelScanFileBoundary {
                     path: "region-us-west-dv.parquet".to_owned(),
@@ -4648,7 +4638,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "region-empty-string.parquet",
                 "region-missing.parquet",
@@ -4710,7 +4700,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "boolean-empty.parquet",
                 "boolean-false.parquet",
@@ -4807,7 +4797,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "date-empty.parquet",
                 "date-epoch.parquet",
@@ -4957,7 +4947,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "decimal-empty.parquet",
                 "decimal-large.parquet",
@@ -5132,10 +5122,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
 
-        assert_invalid_decimal_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            invalid_text_source.table_uri(),
-        ))?;
+        assert_invalid_decimal_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_decimal_partition_error(kernel_predicated_file_paths(
             &invalid_text_source,
             &col("amount").eq(decimal_lit(12_345)),
@@ -5171,7 +5158,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "floating-empty.parquet",
                 "floating-missing.parquet",
@@ -5339,7 +5326,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "binary-HELLO.parquet",
                 "binary-empty.parquet",
@@ -5495,7 +5482,7 @@ mod tests {
         let high = 1_767_225_600_123_457_i64;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "timestamp-empty.parquet",
                 "timestamp-high.parquet",
@@ -5719,7 +5706,7 @@ mod tests {
         let high = 1_767_225_600_123_457_i64;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "timestamp-ntz-empty.parquet",
                 "timestamp-ntz-high.parquet",
@@ -5996,10 +5983,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
-        assert_invalid_timestamp_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            source.table_uri(),
-        ))?;
+        assert_invalid_timestamp_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_timestamp_partition_error(kernel_predicate_file_paths(
             &source,
             timestamp_partition_eq(1_767_225_600_123_456),
@@ -6034,10 +6018,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
 
-        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            invalid_text_source.table_uri(),
-        ))?;
+        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_timestamp_ntz_partition_error(kernel_predicate_file_paths(
             &invalid_text_source,
             timestamp_ntz_partition_eq(1_767_225_600_123_456),
@@ -6066,10 +6047,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&t_separator_source, None)?;
 
-        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            t_separator_source.table_uri(),
-        ))?;
+        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_timestamp_ntz_partition_error(kernel_predicate_file_paths(
             &t_separator_source,
             timestamp_ntz_partition_eq(1_767_225_600_123_456),
@@ -6098,10 +6076,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&zone_source, None)?;
 
-        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            zone_source.table_uri(),
-        ))?;
+        assert_invalid_timestamp_ntz_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_timestamp_ntz_partition_error(kernel_predicate_file_paths(
             &zone_source,
             timestamp_ntz_partition_eq(1_767_225_600_123_456),
@@ -6135,10 +6110,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&invalid_text_source, None)?;
 
-        assert_invalid_floating_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            invalid_text_source.table_uri(),
-        ))?;
+        assert_invalid_floating_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_floating_partition_error(kernel_predicated_file_paths(
             &invalid_text_source,
             &col("float_part").eq(float32_lit(1.5)),
@@ -6181,7 +6153,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "floating-inf.parquet",
                 "floating-nan.parquet",
@@ -6234,10 +6206,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
-        assert_invalid_date_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            source.table_uri(),
-        ))?;
+        assert_invalid_date_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_date_partition_error(kernel_predicated_file_paths(
             &source,
             &col("event_date").eq(date_lit(20_454)),
@@ -6268,10 +6237,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
-        assert_invalid_boolean_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            source.table_uri(),
-        ))?;
+        assert_invalid_boolean_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_boolean_partition_error(kernel_predicated_file_paths(
             &source,
             &col("is_current").eq(bool_lit(true)),
@@ -6287,7 +6253,7 @@ mod tests {
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
         assert_eq!(
-            kernel_scan_file_paths(&unfiltered_scan, source.table_uri())?,
+            kernel_scan_file_paths(&unfiltered_scan)?,
             vec![
                 "integer--1.parquet",
                 "integer-10.parquet",
@@ -6482,10 +6448,7 @@ mod tests {
         })?;
         let unfiltered_scan = build_projected_delta_scan(&source, None)?;
 
-        assert_invalid_integer_partition_error(kernel_scan_file_paths(
-            &unfiltered_scan,
-            source.table_uri(),
-        ))?;
+        assert_invalid_integer_partition_error(kernel_scan_file_paths(&unfiltered_scan))?;
         assert_invalid_integer_partition_error(kernel_predicated_file_paths(
             &source,
             &col("long_part").eq(int64_lit(7)),
@@ -6846,38 +6809,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_construction_passes_storage_options_to_each_store_construction()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scheme = unique_storage_scheme("readeroptions")?;
-        let captured = CapturedStorageOptions::default();
-        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
-        let table_uri = format!("{scheme}://table/root/");
-        let options = storage_options(&[
-            ("authorization", "reader-token"),
-            ("endpoint", "http://storage.example"),
-        ]);
-
-        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
-            source_name: "orders",
-            table_uri: &table_uri,
-            snapshot_version: 42,
-            storage_options: &options,
-        })?;
-        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
-            source_name: "orders",
-            table_uri: &table_uri,
-            snapshot_version: 42,
-            storage_options: &options,
-        })?;
-        let captured_options = captured_storage_options(&captured);
-        assert_eq!(captured_options.len(), 2);
-        assert!(captured_options.iter().all(|captured| captured == &options));
-
-        Ok(())
-    }
-
-    #[test]
-    fn reader_construction_passes_effective_s3_storage_options_to_each_store_construction()
+    fn reader_construction_reuses_effective_s3_engine_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let scheme = unique_storage_scheme("readereffectiveoptions")?;
         let captured = CapturedStorageOptions::default();
@@ -6893,25 +6825,18 @@ mod tests {
             ]),
         );
 
-        let _data_reader = KernelDataFileReader::try_new(KernelDataFileReaderConfig {
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(&table_uri, &effective)?);
+        let _data_reader = KernelDataFileReader::new(KernelDataFileReaderConfig {
             source_name: "orders",
-            table_uri: &table_uri,
             snapshot_version: 42,
-            storage_options: &effective,
-        })?;
-        let _dv_reader = KernelDeletionVectorReader::try_new(KernelDeletionVectorReaderConfig {
+            engine_context: Arc::clone(&engine_context),
+        });
+        let _dv_reader = KernelDeletionVectorReader::new(KernelDeletionVectorReaderConfig {
             source_name: "orders",
-            table_uri: &table_uri,
             snapshot_version: 42,
-            storage_options: &effective,
-        })?;
-        let captured_options = captured_storage_options(&captured);
-        assert_eq!(captured_options.len(), 2);
-        assert!(
-            captured_options
-                .iter()
-                .all(|captured| captured == &effective)
-        );
+            engine_context,
+        });
+        assert_eq!(captured_storage_options(&captured), vec![effective]);
 
         Ok(())
     }
@@ -7013,6 +6938,22 @@ mod tests {
         })?;
 
         assert_eq!(source.version(), 0);
+        assert_eq!(
+            super::preflight_delta_protocol(&source)?
+                .protocol()
+                .min_reader_version,
+            1
+        );
+        assert_eq!(
+            super::delta_source_arrow_schema(&source)?.field(0).name(),
+            "id"
+        );
+        assert!(
+            build_projected_delta_scan(&source, None)?
+                .expand_kernel_scan_metadata()?
+                .files
+                .is_empty()
+        );
 
         Ok(())
     }

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::{DeltaFunnelError, DeltaStorageOptions};
+use crate::{DeltaFunnelError, table_formats::DeltaKernelEngineContext};
 
 use super::file_reader::{
     DeltaFileReadRequest, DeltaFileReadResult, DeltaFileReader, DeltaFileReaderConfig,
@@ -21,12 +21,10 @@ pub(crate) struct DeltaProviderReaderBackendConfig<'a> {
     pub(crate) reader_backend: DeltaProviderReaderBackend,
     /// DataFusion table name for diagnostics.
     pub(crate) source_name: &'a str,
-    /// Normalized Delta table URI used to resolve table-relative file paths.
-    pub(crate) table_uri: &'a str,
     /// Snapshot version that selected the file tasks.
     pub(crate) snapshot_version: u64,
-    /// Source-local options forwarded to Delta Kernel object-store construction.
-    pub(crate) storage_options: &'a DeltaStorageOptions,
+    /// Source-owned Delta Kernel infrastructure.
+    pub(crate) engine_context: Arc<DeltaKernelEngineContext>,
 }
 
 /// File reader used by one DataFusion execution partition.
@@ -44,12 +42,11 @@ pub(crate) fn build_partition_file_reader(
 ) -> Result<Arc<dyn DeltaScanPartitionFileReader>, DeltaFunnelError> {
     match config.reader_backend {
         DeltaProviderReaderBackend::OfficialKernel => {
-            let reader = DeltaFileReader::try_new(DeltaFileReaderConfig {
+            let reader = DeltaFileReader::new(DeltaFileReaderConfig {
                 source_name: config.source_name,
-                table_uri: config.table_uri,
                 snapshot_version: config.snapshot_version,
-                storage_options: config.storage_options,
-            })?;
+                engine_context: config.engine_context,
+            });
             Ok(Arc::new(reader))
         }
         DeltaProviderReaderBackend::NativeAsync => Err(DeltaFunnelError::Config {

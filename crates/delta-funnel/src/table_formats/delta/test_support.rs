@@ -181,6 +181,25 @@ impl RealParquetDeltaTable {
         )
     }
 
+    /// Creates a local Delta table with two real Parquet files and a persisted
+    /// deletion vector on the first file.
+    pub(crate) fn new_with_two_files_and_deletion_vector(
+        name: &str,
+        deleted_rows: &[u64],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut first = file_batch(1, vec![(1, Some("file-a-1")), (2, Some("file-a-2"))])?;
+        first.deletion_vector = Some(deletion_vector_fixture(deleted_rows)?);
+
+        Self::new_with_protocol_file_batches(
+            name,
+            DELETION_VECTOR_PROTOCOL_JSON,
+            vec![
+                first,
+                file_batch(2, vec![(3, Some("file-b-3")), (4, Some("file-b-4"))])?,
+            ],
+        )
+    }
+
     /// Creates a local Delta table with two large real Parquet files.
     pub(crate) fn new_with_two_large_files(
         name: &str,
