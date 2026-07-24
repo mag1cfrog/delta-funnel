@@ -31,8 +31,8 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <label class="filter-label" for="profile-filter"><span>Filter profile</span>
 <input id="profile-filter" type="search" maxlength="200" autocomplete="off" placeholder="Name, symbol, module, or source file"></label>
 <button id="clear-filter" class="clear-filter" type="button" disabled>Clear filter</button>
-<button id="previous-filter-page" class="filter-page" type="button" hidden>Previous 100</button>
-<button id="next-filter-page" class="filter-page" type="button" hidden>Next 100</button>
+<button id="previous-filter-page" class="filter-page" type="button" hidden>Previous matches</button>
+<button id="next-filter-page" class="filter-page" type="button" hidden>Next matches</button>
 <output id="filter-status" class="filter-status" for="profile-filter" role="status" aria-live="polite"></output>
 </div>
 <div class="controls tree-controls">
@@ -405,6 +405,31 @@ mod tests {
             ));
             deep_parent_id = semantic_id;
         }
+        semantics.push(semantic(3_000, Some(1), "Distributed cases"));
+        let mut distributed_id = 3_001;
+        for case in 0..100 {
+            let mut parent_id = 3_000;
+            for depth in 0..10 {
+                let name = if depth == 9 {
+                    format!("distributed target {case:03}")
+                } else {
+                    format!("Distributed {case:03} context {depth:02}")
+                };
+                semantics.push(semantic(distributed_id, Some(parent_id), name));
+                parent_id = distributed_id;
+                distributed_id += 1;
+            }
+        }
+        let mut oversized_parent_id = 3_000;
+        for semantic_id in 5_000..6_000 {
+            let name = if semantic_id == 5_999 {
+                "oversized target".to_owned()
+            } else {
+                format!("Oversized context {semantic_id}")
+            };
+            semantics.push(semantic(semantic_id, Some(oversized_parent_id), name));
+            oversized_parent_id = semantic_id;
+        }
         let mut functions = (1..=101)
             .map(|function_id| {
                 function(
@@ -451,14 +476,14 @@ mod tests {
     let pagination = operationsBody.querySelector(".pagination-row");
     check(pagination !== null, "sibling pagination was not rendered");
     check(
-      pagination.textContent.includes("1-100 of 113"),
+      pagination.textContent.includes("1-100 of 114"),
       "first sibling page status was incorrect"
     );
     pagination.querySelectorAll("button")[1].click();
-    check(operationsBody.rows.length === 15, "second sibling page was incorrect");
+    check(operationsBody.rows.length === 16, "second sibling page was incorrect");
     pagination = operationsBody.querySelector(".pagination-row");
     check(
-      pagination.textContent.includes("101-113 of 113"),
+      pagination.textContent.includes("101-114 of 114"),
       "second sibling page status was incorrect"
     );
     pagination.querySelector("button").click();
@@ -515,6 +540,44 @@ mod tests {
     collapseSubtree.click();
     check(!expanded.has(groupKeys[0]), "bounded subtree collapse failed");
     selectedNode = { kind: "semantic", value: semanticsById.get(1) };
+
+    filterInput.value = "oversized target";
+    applyFilter();
+    check(filterResults.length === 1, "oversized filter count was incorrect");
+    check(operationsBody.rows.length === 1, "oversized match was not rendered flat");
+    check(
+      operationsBody.querySelector(".match-label").textContent === "Match",
+      "oversized match was not labeled"
+    );
+    check(
+      renderLimitStatus.textContent.includes("Ancestor context was omitted"),
+      "omitted oversized context was not explained"
+    );
+
+    filterInput.value = "distributed target";
+    applyFilter();
+    check(filterResults.length === 100, "distributed filter count was incorrect");
+    check(
+      filterStatus.textContent === "Showing 1-99 of 100 matches.",
+      "filter page did not account for ancestor context"
+    );
+    check(operationsBody.rows.length === 992, "first context-limited page was incorrect");
+    check(
+      Array.from(operationsBody.querySelectorAll(".match-label"))
+        .filter(label => label.textContent === "Match").length === 99,
+      "first context-limited page omitted a declared match"
+    );
+    nextFilterPage.click();
+    check(
+      filterStatus.textContent === "Showing 100-100 of 100 matches.",
+      "second context-limited page status was incorrect"
+    );
+    check(operationsBody.rows.length === 12, "second context-limited page was incorrect");
+    check(
+      Array.from(operationsBody.querySelectorAll(".match-label"))
+        .filter(label => label.textContent === "Match").length === 1,
+      "second context-limited page omitted its match"
+    );
 
     filterInput.value = "match function";
     applyFilter();

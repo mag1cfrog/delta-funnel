@@ -131,6 +131,8 @@ let filterMatches = new Set();
 let filterVisible = new Set();
 let filterResults = [];
 let filterPage = 0;
+let filterPageStarts = [0];
+let filterOversizedResult = null;
 let filterOrderCache = [];
 let filterOrderCacheKey = null;
 const operationsBody = document.getElementById("operations");
@@ -463,16 +465,26 @@ const renderRows = (focusKey = null, focusPaginationKey = null) => {
   const fragment = document.createDocumentFragment();
   const renderedRows = [];
   const stack = [];
-  pushPagedEntries(
-    stack,
-    sortedVisible(operations, "semantic").map(
-      value => ({ kind: "semantic", value })
-    ),
-    1,
-    rootPageKey,
-    null,
-    "Operation roots"
-  );
+  if (filterOversizedResult === null) {
+    pushPagedEntries(
+      stack,
+      sortedVisible(operations, "semantic").map(
+        value => ({ kind: "semantic", value })
+      ),
+      1,
+      rootPageKey,
+      null,
+      "Operation roots"
+    );
+  } else {
+    stack.push({
+      kind: filterOversizedResult.function_id === undefined
+        ? "semantic"
+        : "function",
+      value: filterOversizedResult,
+      depth: 1
+    });
+  }
   let rowCount = 0;
   while (stack.length !== 0 && rowCount < maximumRenderedRows) {
     const entry = stack.pop();
@@ -530,9 +542,11 @@ const renderRows = (focusKey = null, focusPaginationKey = null) => {
     ? "No profile rows match this filter."
     : "No operation records are available.";
   operationsEmpty.hidden = renderedRows.length !== 0;
-  renderLimitStatus.textContent = stack.length === 0
-    ? ""
-    : `Showing the first ${maximumRenderedRows} visible rows. Collapse a branch or filter the profile to continue.`;
+  renderLimitStatus.textContent = filterOversizedResult !== null
+    ? `Ancestor context was omitted because the complete context for this match exceeds the ${maximumRenderedRows}-row visible limit.`
+    : stack.length === 0
+      ? ""
+      : `Showing the first ${maximumRenderedRows} visible rows. Collapse a branch or filter the profile to continue.`;
   configureRenderedRows(renderedRows, focusKey);
   if (focusPaginationKey !== null) {
     paginationRows.get(focusPaginationKey)?.focus();
@@ -669,60 +683,85 @@ const collapseSelectedSubtree = root => {
   });
   return collapsedCount;
 };
-const retainSemantic = semantic => {
+const retainSemantic = (semantic, visible) => {
   let current = semantic;
   while (current) {
     const key = semanticKey(current);
-    if (filterVisible.has(key)) break;
-    filterVisible.add(key);
+    if (visible.has(key)) break;
+    visible.add(key);
     current = current.parent_semantic_id === null
       ? null
       : semanticsById.get(current.parent_semantic_id);
   }
 };
-const retainFunction = fn => {
+const retainFunction = (fn, visible) => {
   let current = fn;
   while (current) {
     const key = functionKey(current);
-    if (filterVisible.has(key)) break;
-    filterVisible.add(key);
+    if (visible.has(key)) break;
+    visible.add(key);
     current = current.parent_function_id === null
       ? null
       : functionsByKey.get(
           `f:${current.semantic_id}:${current.parent_function_id}`
         );
   }
-  retainSemantic(semanticsById.get(fn.semantic_id));
+  retainSemantic(semanticsById.get(fn.semantic_id), visible);
+};
+const retainFilterResult = (result, visible) => {
+  if (result.function_id === undefined) {
+    retainSemantic(result, visible);
+  } else {
+    retainFunction(result, visible);
+  }
 };
 const showFilterPage = page => {
-  const pageCount = Math.ceil(filterResults.length / filterPageSize);
-  filterPage = Math.max(0, Math.min(page, Math.max(0, pageCount - 1)));
+  filterPage = Math.max(0, Math.min(page, filterPageStarts.length - 1));
+  const start = filterPageStarts[filterPage];
+  let end = start;
   filterVisible = new Set();
-  const start = filterPage * filterPageSize;
-  const end = Math.min(start + filterPageSize, filterResults.length);
-  for (let index = start; index < end; index += 1) {
-    const result = filterResults[index];
-    if (result.function_id === undefined) {
-      retainSemantic(result);
-    } else {
-      retainFunction(result);
+  filterOversizedResult = null;
+  while (
+    end < filterResults.length &&
+    end - start < filterPageSize
+  ) {
+    const candidateVisible = new Set(filterVisible);
+    retainFilterResult(filterResults[end], candidateVisible);
+    if (candidateVisible.size > maximumRenderedRows) {
+      if (end === start) {
+        filterOversizedResult = filterResults[end];
+        filterVisible.add(
+          filterOversizedResult.function_id === undefined
+            ? semanticKey(filterOversizedResult)
+            : functionKey(filterOversizedResult)
+        );
+        end += 1;
+      }
+      break;
     }
+    filterVisible = candidateVisible;
+    end += 1;
   }
+  filterPageStarts.length = filterPage + 1;
+  if (end < filterResults.length) filterPageStarts.push(end);
   filterStatus.textContent = !isFilterActive()
     ? ""
     : filterResults.length === 0
       ? "0 matches."
       : `Showing ${start + 1}-${end} of ${filterResults.length} matches.`;
-  previousFilterPage.hidden = pageCount <= 1;
-  previousFilterPage.disabled = filterPage === 0;
-  nextFilterPage.hidden = pageCount <= 1;
-  nextFilterPage.disabled = filterPage + 1 >= pageCount;
+  const hasMultiplePages = start !== 0 || end < filterResults.length;
+  previousFilterPage.hidden = !hasMultiplePages;
+  previousFilterPage.disabled = start === 0;
+  nextFilterPage.hidden = !hasMultiplePages;
+  nextFilterPage.disabled = end >= filterResults.length;
   renderRows();
 };
 const applyFilter = () => {
   filterQuery = filterInput.value.trim().toLowerCase();
   filterResults = [];
   filterMatches = new Set();
+  filterPageStarts = [0];
+  filterOversizedResult = null;
   if (isFilterActive()) {
     filterCandidatesInCurrentOrder().forEach(record => {
       if (record.function_id === undefined) {
