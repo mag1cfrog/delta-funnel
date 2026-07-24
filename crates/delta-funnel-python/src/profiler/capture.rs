@@ -367,7 +367,23 @@ fn wait_for_tracebox_readiness(child: &mut Child) -> Result<(), ProfilerFailure>
     }
 }
 
-fn stop_tracebox(mut child: Child) -> Result<(), ProfilerFailure> {
+fn stop_tracebox(child: Child) -> Result<(), ProfilerFailure> {
+    stop_tracebox_with_timeout(child, TRACEBOX_STOP_TIMEOUT)
+}
+
+fn stop_tracebox_with_timeout(
+    mut child: Child,
+    stop_timeout: Duration,
+) -> Result<(), ProfilerFailure> {
+    let result = try_stop_tracebox(&mut child, stop_timeout);
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn try_stop_tracebox(child: &mut Child, stop_timeout: Duration) -> Result<(), ProfilerFailure> {
     let initial_status = child.try_wait().map_err(|_| {
         ProfilerFailure::new(
             "capture_stop_failed",
@@ -377,8 +393,8 @@ fn stop_tracebox(mut child: Child) -> Result<(), ProfilerFailure> {
     let status = match initial_status {
         Some(status) => status,
         None => {
-            terminate_child(&mut child)?;
-            wait_for_tracebox_exit(&mut child)?
+            terminate_child(child)?;
+            wait_for_tracebox_exit(child, stop_timeout)?
         }
     };
     if status.success() {
@@ -391,8 +407,11 @@ fn stop_tracebox(mut child: Child) -> Result<(), ProfilerFailure> {
     }
 }
 
-fn wait_for_tracebox_exit(child: &mut Child) -> Result<std::process::ExitStatus, ProfilerFailure> {
-    let deadline = Instant::now() + TRACEBOX_STOP_TIMEOUT;
+fn wait_for_tracebox_exit(
+    child: &mut Child,
+    stop_timeout: Duration,
+) -> Result<std::process::ExitStatus, ProfilerFailure> {
+    let deadline = Instant::now() + stop_timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -400,8 +419,6 @@ fn wait_for_tracebox_exit(child: &mut Child) -> Result<std::process::ExitStatus,
                 thread::sleep(TRACEBOX_STOP_POLL_INTERVAL);
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(ProfilerFailure::new(
                     "capture_stop_timeout",
                     "Perfetto capture did not stop within 5 seconds",
@@ -483,6 +500,31 @@ mod tests {
         let child = start_tracebox_with(script.as_os_str(), &config, &trace, || Ok(()), |_| Ok(()))
             .map_err(profiler_test_error)?;
         stop_tracebox(child).map_err(profiler_test_error)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracebox_is_reaped_when_graceful_shutdown_fails() -> io::Result<()> {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; printf '\\000'; while :; do :; done"])
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("the test child must expose stdout"))?;
+        let mut ready = [0_u8];
+        stdout.read_exact(&mut ready)?;
+        let pid = child.id();
+
+        let error = stop_tracebox_with_timeout(child, Duration::ZERO)
+            .expect_err("an unresponsive tracebox must time out");
+
+        assert_eq!(error.kind, "capture_stop_timeout");
+        // SAFETY: signal 0 only checks whether the captured numeric PID still exists.
+        assert_eq!(unsafe { libc::kill(pid.cast_signed(), 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        Ok(())
     }
 
     #[test]
