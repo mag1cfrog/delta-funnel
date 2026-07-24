@@ -13,7 +13,7 @@ use pyo3::types::{PyAnyMethods, PyBool};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::progress::PythonProgress;
-use crate::session::{PySession, config_py_error};
+use crate::session::{PySession, borrow_session_mut, config_py_error};
 
 /// Rendered preview of a Delta Funnel table.
 #[pyclass(name = "Preview", module = "deltafunnel")]
@@ -115,10 +115,8 @@ impl PyTable {
 impl PyTable {
     /// Registers this pending SQL-derived table under `name` and returns a `Table`.
     fn alias(&self, py: Python<'_>, name: String) -> PyResult<Self> {
-        let table = self
-            .session
-            .borrow_mut(py)
-            .register_table_alias(py, name, &self.inner)?;
+        let table =
+            borrow_session_mut(&self.session, py)?.register_table_alias(py, name, &self.inner)?;
         Ok(Self::from_inner(self.session.clone_ref(py), table))
     }
 

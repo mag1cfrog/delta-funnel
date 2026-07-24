@@ -22,6 +22,24 @@ pub(crate) struct PySession {
     runtime: delta_funnel::DeltaFunnelRuntime,
 }
 
+pub(crate) fn borrow_session_mut<'py>(
+    session: &'py Py<PySession>,
+    py: Python<'py>,
+) -> PyResult<PyRefMut<'py, PySession>> {
+    session.try_borrow_mut(py).map_err(|_| {
+        match delta_funnel_py_error(
+            py,
+            "session_catalog_mutation",
+            "concurrent_session_mutation",
+            "concurrent Session catalog mutation is not supported".to_owned(),
+            None,
+        ) {
+            Ok(error) => error,
+            Err(error) => error,
+        }
+    })
+}
+
 #[pymethods]
 impl PySession {
     #[new]
@@ -109,7 +127,7 @@ impl PySession {
     /// Builds a lazy SQL-derived table without executing rows.
     fn table_from_sql(slf: Py<Self>, py: Python<'_>, sql: String) -> PyResult<PyTable> {
         let table = {
-            let mut session = slf.borrow_mut(py);
+            let mut session = borrow_session_mut(&slf, py)?;
             let PySession { inner, runtime } = &mut *session;
             runtime
                 .table_from_sql(inner, sql.as_str())
@@ -490,7 +508,7 @@ impl PendingDeltaSource {
         name: String,
         progress: Option<&PythonProgress>,
     ) -> PyResult<PyTable> {
-        let table = self.session.borrow_mut(py).register_delta_source(
+        let table = borrow_session_mut(&self.session, py)?.register_delta_source(
             py,
             name,
             self.source_uri.clone(),
@@ -1193,6 +1211,7 @@ mod tests {
     use super::{PySession, parse_storage_options, parse_write_all_options};
     use crate::{
         deltafunnel,
+        exception::DeltaFunnelError,
         progress::{
             adapter_creation_count,
             tests::{ModuleGuard, StderrGuard, record_strings},
@@ -1375,6 +1394,60 @@ mod tests {
             });
             assert_eq!(result, 42);
             worker.join().expect("join Python worker")?;
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn catalog_mutations_return_stable_error_when_session_is_already_borrowed() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let table = session
+                .bind(py)
+                .call_method1("table_from_sql", ("select 'table-secret' as value",))?;
+            let pending = session
+                .bind(py)
+                .call_method1("delta_lake", ("file:///pending-secret",))?;
+            let named_source_kwargs = PyDict::new(py);
+            named_source_kwargs.set_item("name", "source_secret")?;
+            let _borrow = session.bind(py).borrow_mut();
+
+            let errors = [
+                session
+                    .bind(py)
+                    .call_method1("table_from_sql", ("select 'sql-secret' as value",))
+                    .unwrap_err(),
+                session
+                    .bind(py)
+                    .call_method(
+                        "delta_lake",
+                        ("file:///source-secret",),
+                        Some(&named_source_kwargs),
+                    )
+                    .unwrap_err(),
+                pending
+                    .call_method1("alias", ("pending_secret",))
+                    .unwrap_err(),
+                table.call_method1("alias", ("alias_secret",)).unwrap_err(),
+            ];
+
+            for error in errors {
+                assert!(error.is_instance_of::<DeltaFunnelError>(py));
+                assert_eq!(
+                    error.value(py).getattr("phase")?.extract::<String>()?,
+                    "session_catalog_mutation"
+                );
+                assert_eq!(
+                    error.value(py).getattr("kind")?.extract::<String>()?,
+                    "concurrent_session_mutation"
+                );
+                assert_eq!(
+                    error.value(py).getattr("message")?.extract::<String>()?,
+                    "concurrent Session catalog mutation is not supported"
+                );
+                assert!(error.value(py).getattr("context")?.is_none());
+            }
 
             Ok(())
         })
