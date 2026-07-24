@@ -144,6 +144,7 @@ class Table:
         progress: bool | None = None,
         profile: bool | None = False,
         trace_path: str | PathLike[str] | None = None,
+        profiler: ProfilerConfig | None = None,
     ) -> Report: ...
 
 
