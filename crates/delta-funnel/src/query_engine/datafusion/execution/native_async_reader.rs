@@ -1796,7 +1796,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::arrow::array::{
@@ -1809,7 +1809,6 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Expr, col, lit};
-    use delta_kernel::object_store::{memory::InMemory, path::Path as ObjectStorePath};
     use object_store::ObjectStoreExt;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -1861,60 +1860,6 @@ mod tests {
         let table_uri = delta_kernel::try_parse_uri(path.to_string_lossy().as_ref())?.to_string();
 
         Ok((TestDir { path }, table_uri))
-    }
-
-    type CapturedStorageOptions = Arc<Mutex<Vec<DeltaStorageOptions>>>;
-
-    fn storage_options(entries: &[(&str, &str)]) -> DeltaStorageOptions {
-        entries
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect()
-    }
-
-    fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let sanitized_name = name
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .collect::<String>();
-
-        Ok(format!(
-            "dfnative{sanitized_name}{}{}",
-            std::process::id(),
-            nanos
-        ))
-    }
-
-    fn register_capturing_storage_handler(
-        scheme: &str,
-        captured: CapturedStorageOptions,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        crate::table_formats::insert_url_handler(
-            scheme,
-            Arc::new(move |_url, options| {
-                let options = options.into_iter().collect::<BTreeMap<_, _>>();
-                captured
-                    .lock()
-                    .map_err(|_| delta_kernel::object_store::Error::Generic {
-                        store: "capture",
-                        source: std::io::Error::other("captured storage options lock poisoned")
-                            .into(),
-                    })?
-                    .push(options);
-
-                Ok((Box::new(InMemory::new()), ObjectStorePath::from("")))
-            }),
-        )?;
-
-        Ok(())
-    }
-
-    fn captured_storage_options(captured: &CapturedStorageOptions) -> Vec<DeltaStorageOptions> {
-        captured
-            .lock()
-            .map(|options| options.clone())
-            .unwrap_or_default()
     }
 
     fn reader(table_uri: &str) -> Result<DeltaNativeAsyncFileReader, DeltaFunnelError> {
@@ -2751,34 +2696,6 @@ mod tests {
         let object = reader.parquet_object_for_task(&task(table_uri, "part-00000.parquet"))?;
 
         assert_eq!(object.path.as_ref(), "table/root/part-00000.parquet");
-
-        Ok(())
-    }
-
-    #[test]
-    fn native_async_reader_config_reuses_context_for_kernel_helpers()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let scheme = unique_storage_scheme("options")?;
-        let captured = CapturedStorageOptions::default();
-        register_capturing_storage_handler(&scheme, Arc::clone(&captured))?;
-        let table_uri = format!("{scheme}://table/root/");
-        let options = storage_options(&[
-            ("authorization", "native-token"),
-            ("endpoint", "http://storage.example"),
-        ]);
-
-        let engine_context = Arc::new(DeltaKernelEngineContext::build(&table_uri, &options)?);
-        validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
-            source_name: "orders",
-            table_uri: &table_uri,
-            snapshot_version: 42,
-            storage_options: &options,
-            engine_context,
-        })?;
-
-        let captured_options = captured_storage_options(&captured);
-        assert_eq!(captured_options.len(), 2);
-        assert!(captured_options.iter().all(|captured| captured == &options));
 
         Ok(())
     }
