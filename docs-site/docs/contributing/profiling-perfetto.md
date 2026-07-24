@@ -1,9 +1,8 @@
-# Record and Inspect a Unified Perfetto Trace
+# Set Up Perfetto Diagnostics for Python
 
-This is the default path for profiling a real Python workload. It installs the
-diagnostics wheel with uv, records a short trace, checks the result, and leaves
-one `.pftrace` file. Inspect that file as a bounded terminal hierarchy, generate
-a self-contained ranked HTML report, or open the raw timeline in Perfetto UI.
+This guide installs the diagnostics wheel and the two external Perfetto tools
+needed to generate an operation-scoped ranked HTML report directly from
+`Table.preview`, `Table.write_to_mssql`, or `Session.write_all`.
 
 Perfetto diagnostics are intended for occasional local investigation, not
 continuous collection. The TestPyPI wheel supports CPython 3.10 or newer on
@@ -11,27 +10,38 @@ Linux x86_64 with glibc 2.28 or newer.
 
 ## 1. Prepare the Linux host
 
-Install matching `tracebox` and `trace_processor_shell` binaries from the same
-Perfetto release, plus Linux `perf`. The workflow is verified with Perfetto
-v57.2. Put all three commands on `PATH` and check them once:
+Download the official Perfetto launchers. Saving the Trace Processor launcher
+as `trace_processor_shell` matches the command Delta Funnel uses:
 
 ```sh
-command -v tracebox trace_processor_shell perf timeout
-tracebox --version
-trace_processor_shell --version
-perf stat --all-cpus --event cpu-clock -- sleep 0.1 >/dev/null
+mkdir -p ~/.local/bin
+
+curl -fL https://get.perfetto.dev/tracebox \
+  -o ~/.local/bin/tracebox
+curl -fL https://get.perfetto.dev/trace_processor \
+  -o ~/.local/bin/trace_processor_shell
+
+chmod +x ~/.local/bin/tracebox ~/.local/bin/trace_processor_shell
+export PATH="$HOME/.local/bin:$PATH"
+
+tracebox --help >/dev/null
+trace_processor_shell --help >/dev/null
 ```
 
-If the final command reports a permission error, this temporary development
-machine setting lasts until reboot:
+The launchers download, verify, and cache the matching native binaries on first
+use. Delta Funnel has been verified with Perfetto v57.2. `tracebox` manages the
+`traced`, `traced_probes`, and `traced_perf` processes for each capture; do not
+start separate daemons.
+
+Allow native call-stack sampling on a development machine:
 
 ```sh
-echo '-1' | sudo tee /proc/sys/kernel/perf_event_paranoid
+sudo sysctl kernel.perf_event_paranoid=-1
 ```
 
 This loosens system-wide performance-event access. Do not use it on a shared or
-production host without approval. The capture command repeats the permission
-and Perfetto readiness checks before starting the workload.
+production host without approval. The temporary setting lasts until reboot.
+Do not run the Python workload or `tracebox` with `sudo`.
 
 ## 2. Install the diagnostics wheel with uv
 
@@ -56,16 +66,34 @@ deltafunnel = { index = "delta-funnel-testpypi" }
 Only `deltafunnel` comes from TestPyPI. Its dependencies and the rest of the
 project continue to resolve from the default PyPI index.
 
-Sync the environment and verify the installed diagnostics CLI:
+Sync the environment and verify the installed package:
 
 ```sh
 uv sync --upgrade-package deltafunnel
 
-uv run delta-funnel-perfetto --help
-uv run delta-funnel-perfetto inspect --help
+uv run python -c \
+  'from deltafunnel import ProfilerConfig; print(ProfilerConfig("profile.html"))'
 ```
 
-Locate the packaged capture command:
+The generated `uv.lock` records the exact diagnostics version and TestPyPI
+source. Keep it with the report when reproducibility matters.
+
+## 3. Generate one operation-scoped report
+
+Follow
+[Generate an operation-scoped ranked HTML report](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report).
+The Python operation starts and stops its own capture, enables the required
+subscriber, and writes the final interactive HTML report. No separate capture
+command or `init_perfetto_diagnostics()` call is needed.
+
+## Advanced: capture a whole Python process
+
+Use the manual path only when one operation scope is insufficient, when an
+agent needs the terminal inspector, or when you need the raw Perfetto timeline
+or scheduler context. A whole-process capture includes every enabled Delta
+Funnel operation between activation and process exit.
+
+Locate the packaged capture command and verify the diagnostics CLI:
 
 ```sh
 environment_python="$(uv run python -c 'import sys; print(sys.executable)')"
@@ -74,14 +102,11 @@ perfetto_assets="$(uv run python -c \
 capture_workload="$perfetto_assets/capture-workload"
 test -x "$capture_workload"
 
-uv run python -c \
-  'import deltafunnel; print("Delta Funnel diagnostics", deltafunnel.__version__)'
+uv run delta-funnel-perfetto --help
+uv run delta-funnel-perfetto inspect --help
 ```
 
-The generated `uv.lock` records the exact diagnostics version and TestPyPI
-source. Keep it with the capture when reproducibility matters.
-
-## 3. Activate diagnostics in the workload
+### Activate diagnostics in the workload
 
 Add this before `init_logging()` and before any preview or write operation:
 
@@ -95,7 +120,7 @@ if not deltafunnel.init_perfetto_diagnostics():
 Activation is process-wide. Every later Delta Funnel operation in that Python
 process can appear in the trace.
 
-## 4. Record the workload
+### Record the workload
 
 Run one command from the workload project root. Use a new output name for each
 capture because existing trace files are never overwritten:
@@ -125,7 +150,7 @@ accepts only `100` or `1000` and works with every mode. At 1000 Hz the capture
 tool also drains the kernel sampling buffers more often to avoid losing short
 bursts.
 
-## 5. Inspect ranked results in the terminal
+### Inspect ranked results in the terminal
 
 Start with a bounded one-shot view of the operation roots:
 
@@ -193,7 +218,7 @@ This prevents a short identity from accidentally selecting another node.
 Every interactive response ends with `-- end --`, so an agent can consume the
 session without terminal-screen parsing.
 
-## 6. Generate a ranked HTML report
+### Generate a ranked HTML report
 
 Generate a self-contained interactive report beside the trace:
 
@@ -216,7 +241,7 @@ Open the HTML file in a browser. It uses the same ranked semantic and function
 data model as the terminal inspector. The raw trace is not embedded in the
 report and is not modified.
 
-## 7. Inspect the raw timeline in Perfetto UI
+### Inspect the raw timeline in Perfetto UI
 
 Open the `.pftrace` file in [Perfetto UI](https://ui.perfetto.dev/). Expand the
 `Delta Funnel diagnostics` process to read the exact hierarchy from top to
@@ -265,7 +290,7 @@ size.
 The repository example takes about 6 seconds and produced about 12 MB during
 validation. Hardware, workload, and symbols change both values.
 
-## Advanced Perfetto options
+## Whole-process capture options
 
 ### Record a longer workload
 
