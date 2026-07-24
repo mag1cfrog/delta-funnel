@@ -29,26 +29,41 @@ const formatCoverage = value =>
     profile.metadata.eligible_sample_count
   )} of eligible)`;
 const compareValue = (left, right) => left < right ? -1 : left > right ? 1 : 0;
+const compareText = (left, right) => {
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const leftCodePoint = left.codePointAt(leftIndex);
+    const rightCodePoint = right.codePointAt(rightIndex);
+    const comparison = compareValue(leftCodePoint, rightCodePoint);
+    if (comparison !== 0) return comparison;
+    leftIndex += leftCodePoint > 0xffff ? 2 : 1;
+    rightIndex += rightCodePoint > 0xffff ? 2 : 1;
+  }
+  return compareValue(left.length - leftIndex, right.length - rightIndex);
+};
 let sortField = "duration";
 let sortDirection = "descending";
 const semanticSortValue = semantic => {
-  if (sortField === "name") return semantic.name;
   if (sortField === "direct") return semantic.direct_sample_count;
   if (sortField === "inclusive") return semantic.inclusive_sample_count;
   return semantic.duration_ns || 0;
 };
 const functionSortValue = fn => {
-  if (sortField === "name") return fn.name;
   if (sortField === "direct") return fn.self_sample_count;
   return fn.inclusive_sample_count;
 };
 const compareSemantic = (left, right) => {
-  const primary = compareValue(semanticSortValue(left), semanticSortValue(right));
+  const primary = sortField === "name"
+    ? compareText(left.name, right.name)
+    : compareValue(semanticSortValue(left), semanticSortValue(right));
   return (sortDirection === "ascending" ? primary : -primary) ||
     compareValue(left.semantic_id, right.semantic_id);
 };
 const compareFunction = (left, right) => {
-  const primary = compareValue(functionSortValue(left), functionSortValue(right));
+  const primary = sortField === "name"
+    ? compareText(left.name, right.name)
+    : compareValue(functionSortValue(left), functionSortValue(right));
   return (sortDirection === "ascending" ? primary : -primary) ||
     compareValue(left.function_id, right.function_id);
 };
