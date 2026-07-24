@@ -17,8 +17,8 @@ use crate::{
     DeltaFunnelError, DeltaProtocolReport,
     error::DeltaScanMetadataExpansionSnafu,
     table_formats::{
-        DeltaKernelEngineContext, DeltaKernelPredicate, DeltaStorageOptions,
-        KernelScanFileMetadata, KernelScanMetadataExpansion, ProjectedDeltaScan,
+        DeltaKernelEngineContext, DeltaKernelPredicate, KernelScanFileMetadata,
+        KernelScanMetadataExpansion, ProjectedDeltaScan,
     },
 };
 
@@ -46,8 +46,6 @@ pub(crate) struct ProviderScanPlan {
     pub(crate) source_name: String,
     /// Normalized Delta table URI for this source.
     pub(crate) table_uri: String,
-    /// Source-local options forwarded to Delta Kernel object-store construction.
-    pub(crate) storage_options: DeltaStorageOptions,
     /// Resolved Delta snapshot version.
     pub(crate) snapshot_version: u64,
     /// Arrow schema expected from this provider scan.
@@ -92,7 +90,6 @@ pub(crate) struct ProviderScanMetadataExpansion {
 pub(crate) struct ProviderScanPlanParts {
     pub(crate) source_name: String,
     pub(crate) table_uri: String,
-    pub(crate) storage_options: DeltaStorageOptions,
     pub(crate) snapshot_version: u64,
     pub(crate) projected_schema: SchemaRef,
     pub(crate) protocol: DeltaProtocolReport,
@@ -109,7 +106,6 @@ impl ProviderScanPlan {
         Self {
             source_name: parts.source_name,
             table_uri: parts.table_uri,
-            storage_options: parts.storage_options,
             snapshot_version: parts.snapshot_version,
             projected_schema: parts.projected_schema,
             protocol: parts.protocol,
@@ -732,8 +728,6 @@ mod tests {
             pushed_filters: Vec::new(),
         })?;
         plan.table_uri = "\nnot a valid table uri".to_owned();
-        plan.storage_options
-            .insert("invalid-option".to_owned(), "\nsecret".to_owned());
 
         let expansion = plan.expand_scan_metadata()?;
         assert_eq!(expansion.source_name, "orders");

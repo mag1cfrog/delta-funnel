@@ -34,7 +34,7 @@ pub(crate) use kernel::{
     KernelDataType, KernelMetadataColumnSpec, KernelMetadataValue, KernelPrimitiveType,
     KernelSchemaRef, KernelStructField, Scalar as KernelScalar,
     arrow_partition_type_to_kernel_primitive, datafusion_expr_to_kernel_predicate,
-    kernel_partition_scalar_to_datafusion_scalar, store_from_url_opts,
+    kernel_partition_scalar_to_datafusion_scalar,
 };
 pub use protocol::{
     ProtocolPreflight, preflight_delta_protocol, preflight_delta_protocol_with_tracing,
