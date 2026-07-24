@@ -812,7 +812,7 @@ mod tests {
         let source = load_source("orders", &table)?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
         let file = scan
-            .expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?
+            .expand_kernel_scan_metadata()?
             .files
             .into_iter()
             .next()

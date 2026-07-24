@@ -251,8 +251,7 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let scan = build_projected_predicated_stats_delta_scan(&source, None, None)?;
-        let expansion =
-            scan.expand_kernel_scan_metadata(source.table_uri(), source.storage_options())?;
+        let expansion = scan.expand_kernel_scan_metadata()?;
         let Some(file) = expansion.files.into_iter().next() else {
             return Err("expected one deletion-vector scan file".into());
         };

@@ -17,8 +17,8 @@ use crate::{
     DeltaFunnelError, DeltaProtocolReport,
     error::DeltaScanMetadataExpansionSnafu,
     table_formats::{
-        DeltaKernelPredicate, DeltaStorageOptions, KernelScanFileMetadata,
-        KernelScanMetadataExpansion, ProjectedDeltaScan,
+        DeltaKernelEngineContext, DeltaKernelPredicate, DeltaStorageOptions,
+        KernelScanFileMetadata, KernelScanMetadataExpansion, ProjectedDeltaScan,
     },
 };
 
@@ -135,6 +135,12 @@ impl ProviderScanPlan {
         &self.kernel_scan
     }
 
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn engine_context(&self) -> &std::sync::Arc<DeltaKernelEngineContext> {
+        self.kernel_scan.engine_context()
+    }
+
     /// Expands this provider scan plan into metadata-only file records.
     ///
     /// This is the provider-facing boundary for scan metadata expansion. It
@@ -152,13 +158,13 @@ impl ProviderScanPlan {
             "Delta scan metadata expansion",
             "delta_scan_metadata_expansion",
             || {
-                self.kernel_scan
-                    .expand_kernel_scan_metadata(&self.table_uri, &self.storage_options)
-                    .context(DeltaScanMetadataExpansionSnafu {
+                self.kernel_scan.expand_kernel_scan_metadata().context(
+                    DeltaScanMetadataExpansionSnafu {
                         source_name: self.source_name.clone(),
                         table_uri: self.table_uri.clone(),
                         snapshot_version: self.snapshot_version,
-                    })
+                    },
+                )
             },
         )?;
 
@@ -260,16 +266,57 @@ fn file_tasks_from_metadata(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+    use delta_kernel::object_store::{local::LocalFileSystem, path::Path as ObjectStorePath};
 
-    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+    use crate::{
+        DeltaFunnelError, DeltaSourceConfig, DeltaStorageOptions, load_delta_source,
+        preflight_delta_protocol,
+    };
 
     use super::super::super::catalog::provider::DeltaTableProvider;
     use super::*;
     use crate::query_engine::datafusion::test_support::DeltaLogTable;
+    use crate::table_formats::insert_url_handler;
+
+    type CapturedStorageOptions = Arc<Mutex<Vec<DeltaStorageOptions>>>;
+
+    fn unique_storage_scheme(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        Ok(format!("df{name}{}{nanos}", std::process::id()))
+    }
+
+    fn register_capturing_local_storage_handler(
+        scheme: &str,
+        table_path: &Path,
+        captured: CapturedStorageOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = LocalFileSystem::new_with_prefix(table_path)?;
+        insert_url_handler(
+            scheme,
+            Arc::new(move |_url, options| {
+                let options = options.into_iter().collect::<BTreeMap<_, _>>();
+                captured
+                    .lock()
+                    .map_err(|_| delta_kernel::object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::other("captured storage options lock poisoned")
+                            .into(),
+                    })?
+                    .push(options);
+
+                Ok((Box::new(store.clone()), ObjectStorePath::from("")))
+            }),
+        )?;
+
+        Ok(())
+    }
 
     #[test]
     fn full_projection_scan_plan_preserves_source_context() -> Result<(), Box<dyn std::error::Error>>
@@ -300,6 +347,64 @@ mod tests {
         assert_eq!(plan.kernel_scan().kernel_schema().num_fields(), 2);
         assert!(plan.kernel_partition_predicate.is_none());
         let _ = plan.kernel_scan().kernel_scan();
+
+        Ok(())
+    }
+
+    #[test]
+    fn source_planning_and_metadata_expansion_share_one_owned_kernel_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("owned-kernel-context")?;
+        let scheme = unique_storage_scheme("ownedcontext")?;
+        let captured = CapturedStorageOptions::default();
+        register_capturing_local_storage_handler(&scheme, table.path(), Arc::clone(&captured))?;
+        let options = BTreeMap::from([
+            ("authorization".to_owned(), "context-secret".to_owned()),
+            ("region".to_owned(), "us-east-1".to_owned()),
+        ]);
+        let source = load_delta_source(
+            DeltaSourceConfig::new("orders", format!("{scheme}://table/"))
+                .with_storage_options(options.clone()),
+        )?;
+        let source_context = Arc::clone(source.engine_context());
+        let weak_context = Arc::downgrade(&source_context);
+        let preflight = preflight_delta_protocol(&source)?;
+
+        assert_eq!(source.version(), 1);
+        assert_eq!(preflight.protocol().min_reader_version, 1);
+
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: None,
+            pushed_filters: Vec::new(),
+        })?;
+        assert!(Arc::ptr_eq(&source_context, plan.engine_context()));
+        assert_eq!(plan.projected_schema.field(0).name(), "id");
+
+        let expansion = plan.expand_scan_metadata()?;
+        assert!(expansion.scan_metadata_exhausted);
+        assert_eq!(
+            expansion
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["part-00000.parquet"]
+        );
+        assert_eq!(
+            captured
+                .lock()
+                .map(|options| options.clone())
+                .unwrap_or_default(),
+            vec![options]
+        );
+
+        drop(expansion);
+        drop(source_context);
+        drop(provider);
+        assert!(weak_context.upgrade().is_some());
+        drop(plan);
+        assert!(weak_context.upgrade().is_none());
 
         Ok(())
     }
@@ -610,9 +715,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_scan_plan_metadata_expansion_maps_kernel_errors()
+    fn provider_scan_plan_metadata_expansion_reuses_loaded_context()
     -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("provider-scan-metadata-expansion-error")?;
+        let table = DeltaLogTable::new("provider-scan-metadata-loaded-context")?;
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
             table_uri: table.path().to_string_lossy().to_string(),
@@ -627,9 +732,45 @@ mod tests {
             pushed_filters: Vec::new(),
         })?;
         plan.table_uri = "\nnot a valid table uri".to_owned();
+        plan.storage_options
+            .insert("invalid-option".to_owned(), "\nsecret".to_owned());
+
+        let expansion = plan.expand_scan_metadata()?;
+        assert_eq!(expansion.source_name, "orders");
+        assert_eq!(expansion.table_uri, "\nnot a valid table uri");
+        assert_eq!(expansion.snapshot_version, 1);
+        assert_eq!(expansion.files.len(), 1);
+        assert!(expansion.scan_metadata_exhausted);
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_scan_plan_metadata_expansion_maps_kernel_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
+        let table = DeltaLogTable::new_with_schema(
+            "provider-scan-metadata-expansion-error",
+            INTEGER_PARTITION_SCHEMA_FIELDS_JSON,
+            r#"["long_part"]"#,
+            r#""partitionValues":{"long_part":"not-an-integer"}"#,
+        )?;
+        let source = load_delta_source(DeltaSourceConfig {
+            name: "orders".to_owned(),
+            table_uri: table.path().to_string_lossy().to_string(),
+            version: None,
+            storage_options: Default::default(),
+        })?;
+        let preflight = preflight_delta_protocol(&source)?;
+        let provider = DeltaTableProvider::try_new(source, preflight)?;
+        let plan = provider.plan_scan(ProviderScanPlanRequest {
+            requested_projection: None,
+            pushed_filters: Vec::new(),
+        })?;
+        let expected_table_uri = plan.table_uri.clone();
 
         let error = match plan.expand_scan_metadata() {
-            Ok(_) => return Err("scan metadata expansion should fail".into()),
+            Ok(_) => return Err("invalid partition metadata should fail expansion".into()),
             Err(error) => error,
         };
 
@@ -638,11 +779,12 @@ mod tests {
                 source_name,
                 table_uri,
                 snapshot_version,
-                source: _,
+                source,
             } => {
                 assert_eq!(source_name, "orders");
-                assert_eq!(table_uri, "\nnot a valid table uri");
+                assert_eq!(table_uri, expected_table_uri);
                 assert_eq!(snapshot_version, 1);
+                assert!(source.to_string().contains("not-an-integer"));
             }
             other => return Err(format!("unexpected error: {other}").into()),
         }
@@ -691,8 +833,7 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, &plan.storage_options)?,
+            plan.kernel_scan().scan_file_paths()?,
             vec!["part-00000.parquet"]
         );
         assert_eq!(plan.projected_schema.field(0).name(), "id");
@@ -746,8 +887,7 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, &plan.storage_options)?,
+            plan.kernel_scan().scan_file_paths()?,
             vec!["part-00000.parquet"]
         );
 
@@ -790,11 +930,7 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.exact_count, 2);
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
-        assert!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, &plan.storage_options)?
-                .is_empty()
-        );
+        assert!(plan.kernel_scan().scan_file_paths()?.is_empty());
 
         Ok(())
     }
@@ -877,8 +1013,7 @@ mod tests {
         assert_eq!(plan.pushed_filter_plan.residual_filter_count, 0);
         assert!(plan.kernel_partition_predicate.is_some());
         assert_eq!(
-            plan.kernel_scan()
-                .scan_file_paths(&plan.table_uri, &plan.storage_options)?,
+            plan.kernel_scan().scan_file_paths()?,
             vec!["part-00000.parquet", "part-00001.parquet"]
         );
 
