@@ -137,22 +137,60 @@ SQL Server defaults.
 | Parameter | Meaning |
 | --- | --- |
 | `default_mssql_connection_string` | Default ADO-style connection string for outputs that do not provide one. |
-| `target_partitions` | Optional DataFusion execution partition target. |
-| `output_batch_size` | Optional target row count for output batches. |
+| `target_partitions` | Positive DataFusion execution partition target. `None` preserves the DataFusion default. |
+| `output_batch_size` | Positive target row count for output batches. `None` preserves the DataFusion default. |
 | `provider_scan_options` | Delta scan concurrency, buffering, and prefetch overrides. |
 | `validation_options` | Target validation and dry-run scan-summary behavior. |
 | `schema_options` | Arrow-to-SQL Server type mapping policies. |
 
-All option mappings reject unknown keys. `provider_scan_options` accepts
-`max_concurrent_file_reads_per_scan`,
-`max_concurrent_file_reads_per_partition`,
-`output_buffer_capacity_per_partition`, and
-`native_async_prefetch_file_count_per_partition`. `validation_options` accepts
-`target_validation_mode`, `dry_run_scan_summary_mode`, and
-`require_successful_planning`. `schema_options` accepts `string_policy`,
-`binary_policy`, `timezone_policy`, `timestamp_policy`, `nanosecond_policy`,
-`uint64_policy`, `decimal_policy`, `decimal256_policy`, `float_policy`, and
-`date64_policy`.
+##### Session option mappings
+
+All option mappings reject unknown keys.
+
+`provider_scan_options` accepts:
+
+| Key | Accepted value | Default |
+| --- | --- | --- |
+| `max_concurrent_file_reads_per_scan` | Positive integer | Automatic: resolved scan partition target multiplied by the per-partition limit |
+| `max_concurrent_file_reads_per_partition` | Positive integer | `3` |
+| `output_buffer_capacity_per_partition` | Positive integer | `1` |
+| `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
+
+See [Provider read scheduling](../internals/provider-read-scheduling.md#execution-options)
+for the execution boundaries controlled by these values.
+
+`validation_options` accepts:
+
+| Key | Accepted value | Default |
+| --- | --- | --- |
+| `target_validation_mode` | `"disabled"`, `"validate_if_possible"`, or `"require"` | `"validate_if_possible"` |
+| `dry_run_scan_summary_mode` | `"metadata_only"` or `"exhaust_scan_metadata"` | `"metadata_only"` |
+| `require_successful_planning` | Boolean | `True` |
+
+See [Dry runs and reports](../dry-runs-reports.md) for the behavior and cost of
+the validation and scan-summary modes.
+
+`schema_options` accepts:
+
+| Key | Accepted value | Default |
+| --- | --- | --- |
+| `string_policy` | `"nvarchar_max"`, `"observed_nvarchar"`, or `{"nvarchar": N}` with positive `N` | `"nvarchar_max"` |
+| `binary_policy` | `"varbinary_max"`, `"observed_varbinary"`, or `{"varbinary": N}` with positive `N` | `"varbinary_max"` |
+| `timezone_policy` | `"reject"`, `"datetimeoffset"`, or `"normalize_utc_datetime2"` | `"reject"` |
+| `timestamp_policy` | `"datetime"`, `"datetime2"`, or `{"datetime2": P}` with `P` from `0` through `7` | `"datetime2"` with precision `7` |
+| `nanosecond_policy` | `"reject_non_100ns"`, `"round_to_100ns"`, or `"truncate_to_100ns"` | `"reject_non_100ns"` |
+| `uint64_policy` | `"reject"`, `"decimal20_0"`, or `"checked_bigint"` | `"reject"` |
+| `decimal_policy` | `"reject_negative_scale"` or `"normalize_negative_scale"` | `"reject_negative_scale"` |
+| `decimal256_policy` | `"checked_downcast"` or `"reject"` | `"checked_downcast"` |
+| `float_policy` | `"reject_non_finite"` | `"reject_non_finite"` |
+| `date64_policy` | `"reject_non_midnight"` or `"timestamp_datetime2"` | `"reject_non_midnight"` |
+
+The bounded string and binary forms choose an explicit SQL Server length;
+the `observed_*` forms infer a bounded length from observed values.
+`normalize_utc_datetime2` converts timezone-aware values to UTC before using
+the timezone-free timestamp target. The `checked_*` policies accept values
+only when the target representation can hold them. Normalization, rounding,
+and truncation policies perform the conversion named by the value.
 
 <a id="session-delta-lake"></a>
 ##### `Session.delta_lake`
