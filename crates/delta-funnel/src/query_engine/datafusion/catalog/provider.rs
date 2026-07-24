@@ -26,8 +26,7 @@ use crate::{
 };
 
 use super::super::execution::{
-    DeltaNativeAsyncFileReaderConfig, DeltaProviderReaderBackend,
-    DeltaProviderScanExecutionOptions, DeltaScanPlanningExec, validate_native_async_reader_config,
+    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaScanPlanningExec,
 };
 use super::super::planning::filters::{DeltaFilterPushdownOutcome, DeltaFilterPushdownPlan};
 use super::super::planning::partition_target::{
@@ -85,7 +84,6 @@ impl DeltaTableProvider {
     ) -> Result<Self, DeltaFunnelError> {
         reject_mismatched_preflight(&source, preflight.protocol())?;
         execution_options.validate()?;
-        reject_unsupported_reader_backend_source(&execution_options, &source)?;
         let schema = delta_source_arrow_schema(&source)?;
 
         Ok(Self {
@@ -209,7 +207,6 @@ impl DeltaTableProvider {
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
             source_name: self.source_name().to_owned(),
             table_uri: self.source.table_uri().to_owned(),
-            storage_options: self.source.storage_options().clone(),
             snapshot_version: self.snapshot_version(),
             projected_schema,
             protocol: self.protocol.clone(),
@@ -478,24 +475,6 @@ fn unqualify_filter_columns(filter: Expr, schema: &SchemaRef) -> Expr {
     {
         Ok(filter) => filter,
         Err(_error) => original_filter,
-    }
-}
-
-fn reject_unsupported_reader_backend_source(
-    execution_options: &DeltaProviderScanExecutionOptions,
-    source: &PlannedDeltaSource,
-) -> Result<(), DeltaFunnelError> {
-    match execution_options.reader_backend {
-        DeltaProviderReaderBackend::OfficialKernel => Ok(()),
-        DeltaProviderReaderBackend::NativeAsync => {
-            validate_native_async_reader_config(DeltaNativeAsyncFileReaderConfig {
-                source_name: source.name(),
-                table_uri: source.table_uri(),
-                snapshot_version: source.version(),
-                storage_options: source.storage_options(),
-                engine_context: Arc::clone(source.engine_context()),
-            })
-        }
     }
 }
 

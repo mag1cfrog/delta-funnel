@@ -122,7 +122,6 @@ impl DeltaKernelEngineContext {
         &self.table_url
     }
 
-    #[allow(dead_code)]
     pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
         Arc::clone(&self.object_store)
     }

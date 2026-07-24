@@ -11,9 +11,6 @@ pub(crate) mod read_stats;
 pub(crate) mod reader_backend;
 pub(crate) mod scheduling;
 
-pub(crate) use native_async_reader::{
-    DeltaNativeAsyncFileReaderConfig, validate_native_async_reader_config,
-};
 pub(crate) use planning_exec::DeltaScanPlanningExec;
 pub use read_stats::DeltaProviderReadStatsSnapshot;
 pub use scheduling::{DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions};
