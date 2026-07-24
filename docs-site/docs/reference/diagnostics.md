@@ -94,7 +94,7 @@ The event is derived only from the stored immutable profile. It emits no
 operator list, raw metrics, plan text, SQL, expressions, schemas, row values,
 source or object names, paths, URLs, aliases, credentials, storage options,
 headers, or byte ranges. See the
-[execution profile model](api.md#execution-profile-model) for the
+[execution profile model](execution-profile.md#execution-profile-model) for the
 full profile content instead of treating this event as a replacement schema.
 
 One profile event represents one query execution, including a plan with no
@@ -228,9 +228,9 @@ event from the same immutable terminal result. The event is a live bounded
 summary, not another report-owned profile. Operator work can overlap across the
 cache phase boundaries above, so operator durations and lifecycle durations are
 not additive. See
-[multi-output SQL Server profiling](api.md#multi-output-sql-server-profiling)
+[multi-output API](api.md#session-write-all)
 for normal and failure navigation and the
-[execution profile model](api.md#execution-profile-model) for the
+[execution profile model](execution-profile.md#execution-profile-model) for the
 operator-level contract.
 
 ## Related guides

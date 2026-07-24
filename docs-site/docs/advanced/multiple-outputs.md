@@ -121,9 +121,11 @@ output status wrappers do not duplicate these fields.
 
 Omitting `profile`, or passing `None` or `False`, disables profiling. Only the
 actual Boolean `True` enables it. The `options` argument remains unavailable
-for dry runs, and `trace_path` is execute-only. For exact Python and Rust
-contracts, profile outcomes, and the profile schema, see
-[API references](../reference/api.md#multi-output-sql-server-profiling).
+for dry runs, and `trace_path` is execute-only. See the
+[Python API signature](../reference/api.md#session-write-all), the
+[write-all profiling guide](execution-profiling.md#export-a-write-all-trace),
+and the [execution profile schema](../reference/execution-profile.md#profile-schema)
+for exact contracts.
 
 ## Interpret failures
 

@@ -55,6 +55,8 @@ Follow these steps in order:
   points.
 - [Diagnostics reference](reference/diagnostics.md): look up tracing events,
   operation phases, stream outcomes, and cache lifecycle fields.
+- [Execution profile reference](reference/execution-profile.md): look up the
+  returned profile schema, metrics, labels, and redaction rules.
 
 ## About Delta Funnel
 

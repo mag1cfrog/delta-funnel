@@ -134,8 +134,15 @@ this disabled mode because it does not return the preview diagnostics.
 Rust callers use `PreviewOptions` with `ExecutionProfileMode::Detailed`, then
 call `TablePreview::to_trace_event_json_value()` or inspect
 `TablePreview::operation_timeline()`, `phase_timings()`, and
-`execution_profile()`. See [API references](../reference/api.md) for the
-option-bearing call.
+`execution_profile()`:
+
+```rust
+use delta_funnel::{ExecutionProfileMode, PreviewOptions};
+
+let options = PreviewOptions::new(20)
+    .with_execution_profile_mode(ExecutionProfileMode::Detailed);
+let preview = runtime.preview_table_with_options(&session, &table, options)?;
+```
 
 The phases are:
 
@@ -179,7 +186,7 @@ The returned diagnostics and terminal tracing event serve different uses:
 | Surface | Availability | Content |
 | --- | --- | --- |
 | Preview phase timings | Every real preview result or returned preview failure. | Full ordered logical phase timings. |
-| Preview execution profile | Returned result or failure context when `profile=True` or Rust detailed mode is enabled. | Full operator profile described by the [execution profile model](../reference/api.md#execution-profile-model). |
+| Preview execution profile | Returned result or failure context when `profile=True` or Rust detailed mode is enabled. | Full operator profile described by the [execution profile model](../reference/execution-profile.md#execution-profile-model). |
 | `query_execution_profile_terminal` | One `DEBUG` tracing event when detailed mode reaches the terminal execution transition. | Bounded summary fields for live tracing and logging systems. |
 
 The terminal event is not a serialized copy of the returned profile. It omits
@@ -193,8 +200,20 @@ After output planning succeeds, one-output SQL Server execute reports include
 three query preparation timings in addition to the existing output planning,
 stream polling, SQL Server lifecycle, validation, and cleanup timings. Detailed
 operator profiling is separately opt-in. See
-[API references](../reference/api.md#one-output-sql-server-profiling) for
-Python and Rust enablement.
+[API reference](../reference/api.md#table-write-to-mssql) for
+the Python signature.
+
+Rust callers select detailed mode on the option-bearing runtime method:
+
+```rust
+use delta_funnel::ExecutionProfileMode;
+
+let report = runtime.write_to_mssql_with_profile_mode(
+    &session,
+    &request,
+    ExecutionProfileMode::Detailed,
+)?;
+```
 
 The query phases are:
 
@@ -291,7 +310,7 @@ writing still fails after SQL Server succeeds, the Python error carries
 create-and-load operation.
 
 The returned value uses the shared
-[execution profile model](../reference/api.md#execution-profile-model),
+[execution profile model](../reference/execution-profile.md#execution-profile-model),
 including its Delta provider snapshots and redaction rules. The same immutable
 terminal profile supplies the bounded
 [`query_execution_profile_terminal`](../reference/diagnostics.md#inspect-terminal-execution-profiles)
@@ -311,6 +330,16 @@ report = session.write_all(
     options={"profile": True},
     trace_path="write-all-trace.json",
 )
+```
+
+Rust callers select the same mode with `WriteAllOptions`:
+
+```rust
+use delta_funnel::{ExecutionProfileMode, WriteAllOptions};
+
+let options = WriteAllOptions::new()
+    .with_execution_profile_mode(ExecutionProfileMode::Detailed);
+let report = runtime.write_all_with_options(&session, &outputs, options)?;
 ```
 
 Open the file with `vizviewer write-all-trace.json`, Perfetto, or another
@@ -353,5 +382,7 @@ retry.
 
 - [Diagnostics reference](../reference/diagnostics.md) defines terminal events,
   phase boundaries, stream outcomes, and cache lifecycle fields.
-- [API references](../reference/api.md) defines the Python and Rust option
-  surfaces and execution profile schema.
+- [API reference](../reference/api.md) defines the Python call signatures and
+  links to the published Rust reference.
+- [Execution profile reference](../reference/execution-profile.md) defines the
+  returned profile schema, metrics, labels, and redaction rules.
