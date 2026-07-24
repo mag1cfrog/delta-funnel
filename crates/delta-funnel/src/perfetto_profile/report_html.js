@@ -116,7 +116,9 @@ let selectedNode = operations.length === 0
     };
 const expanded = new Set();
 const disclosureButtons = new Map();
-const maximumBulkExpansionRows = 1000;
+const maximumBulkSubtreeRows = 1000;
+const bulkSubtreeLimitMessage =
+  `The selected subtree exceeds ${maximumBulkSubtreeRows} nodes. Select a narrower branch.`;
 const filterPageSize = 100;
 let filterQuery = "";
 let filterMatches = new Set();
@@ -536,14 +538,14 @@ const childEntries = entry => {
     ) || []
   ).map(value => ({ kind: "function", value }));
 };
-const collectExpansionKeys = root => {
+const collectSubtreeBranchKeys = root => {
   const keys = [];
   const stack = [root];
   let nodeCount = 0;
   while (stack.length !== 0) {
     const entry = stack.pop();
     nodeCount += 1;
-    if (nodeCount > maximumBulkExpansionRows) return null;
+    if (nodeCount > maximumBulkSubtreeRows) return null;
     const children = childEntries(entry);
     if (children.length !== 0) keys.push(entryKey(entry));
     for (let index = children.length - 1; index >= 0; index -= 1) {
@@ -553,16 +555,12 @@ const collectExpansionKeys = root => {
   return keys;
 };
 const collapseSelectedSubtree = root => {
-  const stack = [root];
+  const keys = collectSubtreeBranchKeys(root);
+  if (keys === null) return null;
   let collapsedCount = 0;
-  while (stack.length !== 0) {
-    const entry = stack.pop();
-    if (expanded.delete(entryKey(entry))) collapsedCount += 1;
-    const children = childEntries(entry);
-    for (let index = children.length - 1; index >= 0; index -= 1) {
-      stack.push(children[index]);
-    }
-  }
+  keys.forEach(key => {
+    if (expanded.delete(key)) collapsedCount += 1;
+  });
   return collapsedCount;
 };
 const retainSemantic = semantic => {
@@ -691,10 +689,9 @@ nextFilterPage.addEventListener("click", () => {
 });
 expandSubtree.addEventListener("click", () => {
   if (selectedNode === null) return;
-  const keys = collectExpansionKeys(selectedNode);
+  const keys = collectSubtreeBranchKeys(selectedNode);
   if (keys === null) {
-    treeStatus.textContent =
-      `The selected subtree exceeds ${maximumBulkExpansionRows} nodes. Select a narrower branch.`;
+    treeStatus.textContent = bulkSubtreeLimitMessage;
     return;
   }
   keys.forEach(key => expanded.add(key));
@@ -705,6 +702,10 @@ expandSubtree.addEventListener("click", () => {
 collapseSubtree.addEventListener("click", () => {
   if (selectedNode === null) return;
   const collapsedCount = collapseSelectedSubtree(selectedNode);
+  if (collapsedCount === null) {
+    treeStatus.textContent = bulkSubtreeLimitMessage;
+    return;
+  }
   treeStatus.textContent =
     `Collapsed ${collapsedCount} expanded rows in the selected subtree.`;
   renderRows(entryKey(selectedNode));

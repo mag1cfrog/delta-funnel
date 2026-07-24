@@ -60,7 +60,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <p>Exact duration is measured wall-clock or lifecycle time. Parallel semantic children may overlap and are not additive. Direct CPU samples belong to one semantic node. Inclusive CPU samples also include its semantic descendants. Sampling observes on-CPU work and does not prove why a thread was off-CPU.</p>
 <p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
 <p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
-<p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Bulk expansion is limited to subtrees with at most 1000 total nodes.</p>
+<p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Bulk subtree actions are limited to subtrees with at most 1000 total nodes.</p>
 </details>
 </main>
 <script id="profile-data" type="application/json">"#;
@@ -280,7 +280,7 @@ mod tests {
         assert!(!html.contains(r#"id="functions""#));
         assert!(html.contains(r#"button.setAttribute("aria-expanded""#));
         assert!(html.contains(r#"entry.row.setAttribute("aria-selected""#));
-        assert!(html.contains("const maximumBulkExpansionRows = 1000"));
+        assert!(html.contains("const maximumBulkSubtreeRows = 1000"));
         assert!(html.contains("const containsFilter = value =>"));
         assert!(html.contains("operationsBody.replaceChildren(fragment)"));
         assert!(!html.contains("innerHTML"));
