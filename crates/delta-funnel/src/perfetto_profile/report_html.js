@@ -128,8 +128,8 @@ const entryKey = entry =>
 const isVisible = (kind, value) =>
   !isFilterActive() ||
   filterVisible.has(kind === "semantic" ? semanticKey(value) : functionKey(value));
-const filterState = key =>
-  !isFilterActive() ? null : filterMatches.has(key) ? "Match" : "Context";
+const filterState = record =>
+  !isFilterActive() ? null : filterMatches.has(record) ? "Match" : "Context";
 const isAsciiDigit = character =>
   character !== undefined && character >= "0" && character <= "9";
 const containsFilter = value => {
@@ -272,7 +272,7 @@ const semanticRow = (semantic, depth) => {
   const hasChildren = children.length !== 0 || functions.length !== 0;
   const key = semanticKey(semantic);
   const isExpanded = isFilterActive() || expanded.has(key);
-  const match = filterState(key);
+  const match = filterState(semantic);
   const row = document.createElement("tr");
   row.className = match === "Context"
     ? "semantic-row filter-context"
@@ -316,7 +316,7 @@ const functionRow = (fn, depth) => {
   const hasChildren = children.length !== 0;
   const key = functionKey(fn);
   const isExpanded = isFilterActive() || expanded.has(key);
-  const match = filterState(key);
+  const match = filterState(fn);
   const owner = semanticsById.get(fn.semantic_id);
   const location = [
     fn.module_name,
@@ -578,17 +578,14 @@ const retainFunction = fn => {
 const showFilterPage = page => {
   const pageCount = Math.ceil(filterResults.length / filterPageSize);
   filterPage = Math.max(0, Math.min(page, Math.max(0, pageCount - 1)));
-  filterMatches = new Set();
   filterVisible = new Set();
   const start = filterPage * filterPageSize;
   const end = Math.min(start + filterPageSize, filterResults.length);
   for (let index = start; index < end; index += 1) {
     const result = filterResults[index];
     if (result.function_id === undefined) {
-      filterMatches.add(semanticKey(result));
       retainSemantic(result);
     } else {
-      filterMatches.add(functionKey(result));
       retainFunction(result);
     }
   }
@@ -606,11 +603,13 @@ const showFilterPage = page => {
 const applyFilter = () => {
   filterQuery = filterInput.value.trim().toLowerCase();
   filterResults = [];
+  filterMatches = new Set();
   if (isFilterActive()) {
     filterCandidatesInCurrentOrder().forEach(record => {
       if (record.function_id === undefined) {
         if (containsFilter(record.name.toLowerCase())) {
           filterResults.push(record);
+          filterMatches.add(record);
         }
       } else {
         const matches = [
@@ -620,7 +619,10 @@ const applyFilter = () => {
         ].some(
           value => value !== null && containsFilter(value.toLowerCase())
         );
-        if (matches) filterResults.push(record);
+        if (matches) {
+          filterResults.push(record);
+          filterMatches.add(record);
+        }
       }
     });
   }
