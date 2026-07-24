@@ -42,6 +42,34 @@ p { line-height: 1.5; margin: .5rem 0 1rem; max-width: 80rem; }
 }
 .summary-label { display: block; font-size: .8rem; }
 .summary-value { display: block; font-size: 1.3rem; font-variant-numeric: tabular-nums; }
+.controls {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .75rem;
+  margin: 1rem 0;
+}
+.filter-label { display: grid; gap: .25rem; }
+.filter-label span { font-weight: 650; }
+.filter-status { min-height: 1.5rem; }
+input, button { font: inherit; }
+input[type="search"] {
+  background: Canvas;
+  border: 1px solid GrayText;
+  border-radius: .25rem;
+  color: CanvasText;
+  min-width: min(24rem, 80vw);
+  padding: .45rem .6rem;
+}
+.clear-filter, .filter-page, .sort {
+  background: Canvas;
+  border: 1px solid GrayText;
+  border-radius: .25rem;
+  color: CanvasText;
+  cursor: pointer;
+  padding: .35rem .55rem;
+}
+.clear-filter:disabled, .filter-page:disabled { cursor: default; opacity: .55; }
 .table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; min-width: 58rem; width: 100%; }
 th, td { border-bottom: 1px solid GrayText; padding: .65rem; text-align: left; }
@@ -67,12 +95,22 @@ tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
   cursor: pointer;
 }
 .disclosure:focus-visible { outline: 3px solid Highlight; outline-offset: 2px; }
+.disclosure:disabled { cursor: default; opacity: .75; }
 .function-row { background: color-mix(in srgb, CanvasText 4%, Canvas); }
 .function-row .name { font-weight: 500; }
+.filter-context .name { font-style: italic; }
+.match-label {
+  border: 1px solid GrayText;
+  border-radius: 1rem;
+  font-size: .7rem;
+  font-weight: 500;
+  padding: .05rem .35rem;
+}
 .type-label { font-weight: 650; }
 .empty { border: 1px dashed GrayText; padding: 1rem; }
 .help { margin-top: 2rem; max-width: 80rem; }
 .help summary { cursor: pointer; font-weight: 650; }
+:is(input, button):focus-visible { outline: 3px solid Highlight; outline-offset: 2px; }
 @media (max-width: 40rem) {
   main { padding: 1rem; }
 }
@@ -86,15 +124,23 @@ tbody tr:hover { background: color-mix(in srgb, Highlight 12%, Canvas); }
 <section aria-labelledby="operations-heading">
 <h2 id="operations-heading">Operations</h2>
 <p>Operation roots are ranked by exact duration. Expand a row to follow exact semantic children into sampled native callsites.</p>
+<div class="controls">
+<label class="filter-label" for="profile-filter"><span>Filter profile</span>
+<input id="profile-filter" type="search" maxlength="200" autocomplete="off" placeholder="Name, symbol, module, or source file"></label>
+<button id="clear-filter" class="clear-filter" type="button" disabled>Clear filter</button>
+<button id="previous-filter-page" class="filter-page" type="button" hidden>Previous 100</button>
+<button id="next-filter-page" class="filter-page" type="button" hidden>Next 100</button>
+<output id="filter-status" class="filter-status" for="profile-filter" role="status" aria-live="polite"></output>
+</div>
 <div class="table-wrap">
 <table role="treegrid" aria-label="Ranked operations">
 <thead><tr>
-<th scope="col">Operation</th>
+<th scope="col" data-sort-column="name"><button class="sort" type="button" data-sort="name" data-label="Operation">Operation</button></th>
 <th scope="col">State and time basis</th>
-<th scope="col" class="number">Exact duration</th>
+<th scope="col" class="number" data-sort-column="duration"><button class="sort" type="button" data-sort="duration" data-label="Exact duration">Exact duration</button></th>
 <th scope="col" class="number">Context %</th>
-<th scope="col" class="number">Direct/self CPU samples</th>
-<th scope="col" class="number">Inclusive CPU samples</th>
+<th scope="col" class="number" data-sort-column="direct"><button class="sort" type="button" data-sort="direct" data-label="Direct/self CPU samples">Direct/self CPU samples</button></th>
+<th scope="col" class="number" data-sort-column="inclusive"><button class="sort" type="button" data-sort="inclusive" data-label="Inclusive CPU samples">Inclusive CPU samples</button></th>
 </tr></thead>
 <tbody id="operations"></tbody>
 </table>
@@ -135,12 +181,30 @@ const formatPercent = (value, total) =>
   value !== null && total > 0
     ? `${(value * 100 / total).toFixed(1)}%`
     : "N/A";
-const compareSemantic = (left, right) =>
-  (right.duration_ns || 0) - (left.duration_ns || 0) ||
-  left.semantic_id - right.semantic_id;
-const compareFunction = (left, right) =>
-  right.inclusive_sample_count - left.inclusive_sample_count ||
-  left.function_id - right.function_id;
+const compareValue = (left, right) => left < right ? -1 : left > right ? 1 : 0;
+let sortField = "duration";
+let sortDirection = "descending";
+const semanticSortValue = semantic => {
+  if (sortField === "name") return semantic.name;
+  if (sortField === "direct") return semantic.direct_sample_count;
+  if (sortField === "inclusive") return semantic.inclusive_sample_count;
+  return semantic.duration_ns || 0;
+};
+const functionSortValue = fn => {
+  if (sortField === "name") return fn.name;
+  if (sortField === "direct") return fn.self_sample_count;
+  return fn.inclusive_sample_count;
+};
+const compareSemantic = (left, right) => {
+  const primary = compareValue(semanticSortValue(left), semanticSortValue(right));
+  return (sortDirection === "ascending" ? primary : -primary) ||
+    compareValue(left.semantic_id, right.semantic_id);
+};
+const compareFunction = (left, right) => {
+  const primary = compareValue(functionSortValue(left), functionSortValue(right));
+  return (sortDirection === "ascending" ? primary : -primary) ||
+    compareValue(left.function_id, right.function_id);
+};
 const appendIndexed = (index, key, value) => {
   const values = index.get(key);
   if (values) values.push(value);
@@ -154,6 +218,7 @@ const semanticChildren = new Map();
 const functionRoots = new Map();
 const functionChildren = new Map();
 const semanticsById = new Map();
+const functionsByKey = new Map();
 profile.semantics.forEach(semantic => {
   semanticsById.set(semantic.semantic_id, semantic);
   if (semantic.parent_semantic_id !== null) {
@@ -161,6 +226,7 @@ profile.semantics.forEach(semantic => {
   }
 });
 profile.functions.forEach(fn => {
+  functionsByKey.set(functionKey(fn), fn);
   if (fn.parent_function_id === null) {
     appendIndexed(functionRoots, fn.semantic_id, fn);
   } else {
@@ -171,18 +237,51 @@ profile.functions.forEach(fn => {
     );
   }
 });
-semanticChildren.forEach(children => children.sort(compareSemantic));
-functionRoots.forEach(children => children.sort(compareFunction));
-functionChildren.forEach(children => children.sort(compareFunction));
 const operations = profile.semantics
-  .filter(item => item.parent_semantic_id === null)
-  .sort(compareSemantic);
+  .filter(item => item.parent_semantic_id === null);
 const operationDurations = new Map(
   operations.map(operation => [operation.operation_id, operation.duration_ns])
 );
 const expanded = new Set();
 const disclosureButtons = new Map();
+const filterPageSize = 100;
+let filterQuery = "";
+let filterMatches = new Set();
+let filterVisible = new Set();
+let filterResults = [];
+let filterPage = 0;
 const operationsBody = document.getElementById("operations");
+const operationsEmpty = document.getElementById("operations-empty");
+const filterInput = document.getElementById("profile-filter");
+const clearFilter = document.getElementById("clear-filter");
+const previousFilterPage = document.getElementById("previous-filter-page");
+const nextFilterPage = document.getElementById("next-filter-page");
+const filterStatus = document.getElementById("filter-status");
+const isFilterActive = () => filterQuery.length !== 0;
+const isVisible = (kind, value) =>
+  !isFilterActive() ||
+  filterVisible.has(kind === "semantic" ? semanticKey(value) : functionKey(value));
+const filterState = key =>
+  !isFilterActive() ? null : filterMatches.has(key) ? "Match" : "Context";
+const isAsciiDigit = character =>
+  character !== undefined && character >= "0" && character <= "9";
+const containsFilter = value => {
+  let position = value.indexOf(filterQuery);
+  while (position !== -1) {
+    const end = position + filterQuery.length;
+    const startsCleanly =
+      !isAsciiDigit(filterQuery[0]) || !isAsciiDigit(value[position - 1]);
+    const endsCleanly =
+      !isAsciiDigit(filterQuery.at(-1)) || !isAsciiDigit(value[end]);
+    if (startsCleanly && endsCleanly) return true;
+    position = value.indexOf(filterQuery, position + 1);
+  }
+  return false;
+};
+const sortedVisible = (values, kind) =>
+  values.filter(value => isVisible(kind, value)).sort(
+    kind === "semantic" ? compareSemantic : compareFunction
+  );
 const textCell = (primary, detail, className = "") => {
   const cell = document.createElement("td");
   cell.className = className;
@@ -195,7 +294,7 @@ const textCell = (primary, detail, className = "") => {
   }
   return cell;
 };
-const nameCell = (name, detail, depth, key, hasChildren) => {
+const nameCell = (name, detail, depth, key, hasChildren, isExpanded, match) => {
   const cell = document.createElement("td");
   cell.className = "name";
   const line = document.createElement("span");
@@ -205,12 +304,15 @@ const nameCell = (name, detail, depth, key, hasChildren) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "disclosure";
-    button.setAttribute("aria-expanded", String(expanded.has(key)));
+    button.setAttribute("aria-expanded", String(isExpanded));
     button.setAttribute(
       "aria-label",
-      expanded.has(key) ? "Collapse row" : "Expand row"
+      isFilterActive()
+        ? "Expanded to show filter matches"
+        : isExpanded ? "Collapse row" : "Expand row"
     );
-    button.textContent = expanded.has(key) ? "-" : "+";
+    button.textContent = isExpanded ? "-" : "+";
+    button.disabled = isFilterActive();
     button.addEventListener("click", () => {
       if (expanded.has(key)) expanded.delete(key);
       else expanded.add(key);
@@ -229,6 +331,12 @@ const nameCell = (name, detail, depth, key, hasChildren) => {
   const label = document.createElement("span");
   label.textContent = name;
   line.appendChild(label);
+  if (match) {
+    const matchLabel = document.createElement("span");
+    matchLabel.className = "match-label";
+    matchLabel.textContent = match;
+    line.appendChild(matchLabel);
+  }
   const secondary = document.createElement("span");
   secondary.className = "detail";
   secondary.textContent = detail;
@@ -236,21 +344,33 @@ const nameCell = (name, detail, depth, key, hasChildren) => {
   return cell;
 };
 const semanticRow = (semantic, depth) => {
-  const children = semanticChildren.get(semantic.semantic_id) || [];
-  const functions = functionRoots.get(semantic.semantic_id) || [];
+  const children = sortedVisible(
+    semanticChildren.get(semantic.semantic_id) || [],
+    "semantic"
+  );
+  const functions = sortedVisible(
+    functionRoots.get(semantic.semantic_id) || [],
+    "function"
+  );
   const hasChildren = children.length !== 0 || functions.length !== 0;
   const key = semanticKey(semantic);
+  const isExpanded = isFilterActive() || expanded.has(key);
+  const match = filterState(key);
   const row = document.createElement("tr");
-  row.className = "semantic-row";
+  row.className = match === "Context"
+    ? "semantic-row filter-context"
+    : "semantic-row";
   row.setAttribute("aria-level", String(depth));
-  if (hasChildren) row.setAttribute("aria-expanded", String(expanded.has(key)));
+  if (hasChildren) row.setAttribute("aria-expanded", String(isExpanded));
   row.append(
     nameCell(
       semantic.name,
       `Exact semantic: ${semantic.operation_kind || semantic.semantic_kind}`,
       depth,
       key,
-      hasChildren
+      hasChildren,
+      isExpanded,
+      match
     ),
     textCell(
       semantic.is_complete ? (semantic.result || "Complete") : "Incomplete",
@@ -268,13 +388,17 @@ const semanticRow = (semantic, depth) => {
     textCell(String(semantic.direct_sample_count), "Direct", "number"),
     textCell(String(semantic.inclusive_sample_count), "Semantic subtree", "number")
   );
-  return { row, hasChildren, key, children, functions };
+  return { row, hasChildren, isExpanded, children, functions };
 };
 const functionRow = (fn, depth) => {
-  const children =
-    functionChildren.get(functionParentKey(fn.semantic_id, fn.function_id)) || [];
+  const children = sortedVisible(
+    functionChildren.get(functionParentKey(fn.semantic_id, fn.function_id)) || [],
+    "function"
+  );
   const hasChildren = children.length !== 0;
   const key = functionKey(fn);
+  const isExpanded = isFilterActive() || expanded.has(key);
+  const match = filterState(key);
   const owner = semanticsById.get(fn.semantic_id);
   const location = [
     fn.module_name,
@@ -283,16 +407,20 @@ const functionRow = (fn, depth) => {
       : `${fn.source_file}${fn.line_number === null ? "" : `:${fn.line_number}`}`
   ].filter(Boolean).join(" - ");
   const row = document.createElement("tr");
-  row.className = "function-row";
+  row.className = match === "Context"
+    ? "function-row filter-context"
+    : "function-row";
   row.setAttribute("aria-level", String(depth));
-  if (hasChildren) row.setAttribute("aria-expanded", String(expanded.has(key)));
+  if (hasChildren) row.setAttribute("aria-expanded", String(isExpanded));
   row.append(
     nameCell(
       fn.name,
       location ? `Sampled function - ${location}` : "Sampled function",
       depth,
       key,
-      hasChildren
+      hasChildren,
+      isExpanded,
+      match
     ),
     textCell("Sampled on-CPU", "Statistical, not exact wall time"),
     textCell("N/A", "No exact function duration", "number"),
@@ -304,21 +432,22 @@ const functionRow = (fn, depth) => {
     textCell(String(fn.self_sample_count), "Self", "number"),
     textCell(String(fn.inclusive_sample_count), "Call subtree", "number")
   );
-  return { row, hasChildren, key, children };
+  return { row, hasChildren, isExpanded, children };
 };
 const renderRows = () => {
   disclosureButtons.clear();
   const fragment = document.createDocumentFragment();
-  const stack = operations
-    .slice()
+  const stack = sortedVisible(operations, "semantic")
     .reverse()
     .map(operation => ({ kind: "semantic", value: operation, depth: 1 }));
+  let rowCount = 0;
   while (stack.length !== 0) {
     const entry = stack.pop();
     if (entry.kind === "semantic") {
       const rendered = semanticRow(entry.value, entry.depth);
       fragment.appendChild(rendered.row);
-      if (rendered.hasChildren && expanded.has(rendered.key)) {
+      rowCount += 1;
+      if (rendered.hasChildren && rendered.isExpanded) {
         const children = [
           ...rendered.children.map(value => ({ kind: "semantic", value })),
           ...rendered.functions.map(value => ({ kind: "function", value }))
@@ -330,7 +459,8 @@ const renderRows = () => {
     } else {
       const rendered = functionRow(entry.value, entry.depth);
       fragment.appendChild(rendered.row);
-      if (rendered.hasChildren && expanded.has(rendered.key)) {
+      rowCount += 1;
+      if (rendered.hasChildren && rendered.isExpanded) {
         for (let index = rendered.children.length - 1; index >= 0; index -= 1) {
           stack.push({
             kind: "function",
@@ -342,14 +472,134 @@ const renderRows = () => {
     }
   }
   operationsBody.replaceChildren(fragment);
+  operationsEmpty.textContent = isFilterActive()
+    ? "No profile rows match this filter."
+    : "No operation records are available.";
+  operationsEmpty.hidden = rowCount !== 0;
 };
+const retainSemantic = semantic => {
+  let current = semantic;
+  while (current) {
+    const key = semanticKey(current);
+    if (filterVisible.has(key)) break;
+    filterVisible.add(key);
+    current = current.parent_semantic_id === null
+      ? null
+      : semanticsById.get(current.parent_semantic_id);
+  }
+};
+const retainFunction = fn => {
+  let current = fn;
+  while (current) {
+    const key = functionKey(current);
+    if (filterVisible.has(key)) break;
+    filterVisible.add(key);
+    current = current.parent_function_id === null
+      ? null
+      : functionsByKey.get(
+          `f:${current.semantic_id}:${current.parent_function_id}`
+        );
+  }
+  retainSemantic(semanticsById.get(fn.semantic_id));
+};
+const showFilterPage = page => {
+  const pageCount = Math.ceil(filterResults.length / filterPageSize);
+  filterPage = Math.max(0, Math.min(page, Math.max(0, pageCount - 1)));
+  filterMatches = new Set();
+  filterVisible = new Set();
+  const start = filterPage * filterPageSize;
+  const end = Math.min(start + filterPageSize, filterResults.length);
+  for (let index = start; index < end; index += 1) {
+    const result = filterResults[index];
+    if (result.function_id === undefined) {
+      filterMatches.add(semanticKey(result));
+      retainSemantic(result);
+    } else {
+      filterMatches.add(functionKey(result));
+      retainFunction(result);
+    }
+  }
+  filterStatus.textContent = !isFilterActive()
+    ? ""
+    : filterResults.length === 0
+      ? "0 matches."
+      : `Showing ${start + 1}-${end} of ${filterResults.length} matches.`;
+  previousFilterPage.hidden = pageCount <= 1;
+  previousFilterPage.disabled = filterPage === 0;
+  nextFilterPage.hidden = pageCount <= 1;
+  nextFilterPage.disabled = filterPage + 1 >= pageCount;
+  renderRows();
+};
+const applyFilter = () => {
+  filterQuery = filterInput.value.trim().toLowerCase();
+  filterResults = [];
+  if (isFilterActive()) {
+    profile.semantics.forEach(semantic => {
+      if (containsFilter(semantic.name.toLowerCase())) {
+        filterResults.push(semantic);
+      }
+    });
+    profile.functions.forEach(fn => {
+      const matches = [fn.name, fn.module_name, fn.source_file].some(
+        value => value !== null && containsFilter(value.toLowerCase())
+      );
+      if (matches) filterResults.push(fn);
+    });
+  }
+  clearFilter.disabled = !isFilterActive();
+  showFilterPage(0);
+};
+const updateSortControls = () => {
+  document.querySelectorAll("[data-sort-column]").forEach(header => {
+    if (header.dataset.sortColumn === sortField) {
+      header.setAttribute("aria-sort", sortDirection);
+    } else {
+      header.removeAttribute("aria-sort");
+    }
+  });
+  document.querySelectorAll("[data-sort]").forEach(button => {
+    const active = button.dataset.sort === sortField;
+    const state = active ? ` [${sortDirection}]` : "";
+    button.textContent = `${button.dataset.label}${state}`;
+  });
+};
+document.querySelectorAll("[data-sort]").forEach(button => {
+  button.addEventListener("click", () => {
+    const field = button.dataset.sort;
+    if (sortField === field) {
+      sortDirection = sortDirection === "ascending" ? "descending" : "ascending";
+    } else {
+      sortField = field;
+      sortDirection = field === "name" ? "ascending" : "descending";
+    }
+    updateSortControls();
+    renderRows();
+  });
+});
+let filterTimer;
+filterInput.addEventListener("input", () => {
+  window.clearTimeout(filterTimer);
+  filterTimer = window.setTimeout(applyFilter, 150);
+});
+clearFilter.addEventListener("click", () => {
+  window.clearTimeout(filterTimer);
+  filterInput.value = "";
+  applyFilter();
+  filterInput.focus();
+});
+previousFilterPage.addEventListener("click", () => {
+  showFilterPage(filterPage - 1);
+});
+nextFilterPage.addEventListener("click", () => {
+  showFilterPage(filterPage + 1);
+});
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
 addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);
 addSummary("Directly attributed", profile.metadata.direct_sample_count);
 addSummary("Ambiguous", profile.metadata.ambiguous_sample_count);
 addSummary("Unattributed", profile.metadata.unattributed_sample_count);
+updateSortControls();
 renderRows();
-document.getElementById("operations-empty").hidden = operations.length !== 0;
 </script>
 </body>
 </html>
@@ -492,8 +742,14 @@ mod tests {
         assert!(html.contains(r#"role="treegrid""#));
         assert!(html.contains(r#"aria-label="Ranked operations""#));
         assert!(html.contains(r#"id="operations-empty""#));
+        assert!(html.contains(r#"id="profile-filter""#));
+        assert!(html.contains(r#"maxlength="200""#));
+        assert!(html.contains(r#"id="previous-filter-page""#));
+        assert!(html.contains(r#"id="next-filter-page""#));
+        assert!(html.contains(r#"data-sort="duration""#));
         assert!(!html.contains(r#"id="functions""#));
         assert!(html.contains(r#"button.setAttribute("aria-expanded""#));
+        assert!(html.contains("const containsFilter = value =>"));
         assert!(html.contains("operationsBody.replaceChildren(fragment)"));
         assert!(!html.contains("innerHTML"));
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
