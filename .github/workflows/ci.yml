@@ -98,11 +98,17 @@ jobs:
 
       - name: Test workspace with all features
         if: matrix.task == 'All Features'
+        env:
+          CHROME_BIN: google-chrome
         run: cargo test --workspace --all-targets --all-features
 
       - name: Lint workspace
         if: matrix.task == 'Lints and Docs'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check ranked report JavaScript syntax
+        if: matrix.task == 'Lints and Docs'
+        run: node --check crates/delta-funnel/src/perfetto_profile/report_html.js
 
       - name: Check Rust API documentation
         if: matrix.task == 'Lints and Docs'

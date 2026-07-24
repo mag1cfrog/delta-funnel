@@ -365,6 +365,139 @@ mod tests {
     }
 
     #[test]
+    fn exercises_the_viewer_in_a_configured_browser() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(browser) = std::env::var_os("CHROME_BIN").filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+
+        let mut operation = semantic(1, None, "Root operation");
+        operation.end_ns = Some(10_000_000);
+        operation.duration_ns = Some(10_000_000);
+        let mut zeta = semantic(2, Some(1), "Zeta phase");
+        zeta.end_ns = Some(2_000_000);
+        zeta.duration_ns = Some(2_000_000);
+        let mut alpha = semantic(3, Some(1), "Alpha phase");
+        alpha.end_ns = Some(1_000_000);
+        alpha.duration_ns = Some(1_000_000);
+        let mut functions = (1..=101)
+            .map(|function_id| {
+                function(
+                    function_id,
+                    None,
+                    format!("match function {function_id:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        functions.push(function(102, Some(1), "nested target"));
+        let document = RankedProfileDocument {
+            metadata: metadata(),
+            semantics: vec![operation, zeta, alpha],
+            functions,
+        };
+        document.validate()?;
+
+        let rendered = render_ranked_profile_html(&document)?;
+        let mut html = rendered
+            .strip_suffix(HTML_SUFFIX)
+            .ok_or("report suffix is missing")?
+            .to_owned();
+        html.push_str(
+            r#"</script>
+<script>
+(() => {
+  const check = (condition, message) => {
+    if (!condition) throw new Error(message);
+  };
+  try {
+    check(operationsBody.rows.length === 1, "initial render was not lazy");
+    const rootRow = operationsBody.rows[0];
+    check(rootRow.getAttribute("aria-selected") === "true", "root was not selected");
+    rootRow.focus();
+    rootRow.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "ArrowRight",
+      bubbles: true
+    }));
+    check(operationsBody.rows.length === 104, "keyboard expansion failed");
+    check(
+      operationsBody.rows[0].getAttribute("aria-expanded") === "true",
+      "expanded state was not exposed"
+    );
+
+    document.querySelector('[data-sort="name"]').click();
+    const semanticNames = Array.from(
+      operationsBody.querySelectorAll('.semantic-row[aria-level="2"] .name-line'),
+      line => line.querySelector("span:not(.leaf):not(.match-label)").textContent
+    );
+    check(
+      semanticNames.join(",") === "Alpha phase,Zeta phase",
+      "name sorting flattened or misordered semantic siblings"
+    );
+
+    filterInput.value = "match function";
+    applyFilter();
+    check(filterResults.length === 101, "filter match count was incorrect");
+    check(operationsBody.rows.length === 101, "first filter page was not bounded");
+    const matchCount = Array.from(
+      operationsBody.querySelectorAll(".match-label")
+    ).filter(label => label.textContent === "Match").length;
+    check(matchCount === 100, `first filter page labeled ${matchCount} matches`);
+    check(
+      operationsBody.querySelectorAll(".filter-context").length === 1,
+      "first filter page did not retain its context"
+    );
+    nextFilterPage.click();
+    check(operationsBody.rows.length === 2, "second filter page was incorrect");
+    check(
+      filterStatus.textContent === "Showing 101-101 of 101 matches.",
+      "second filter page status was incorrect"
+    );
+
+    clearFilter.click();
+    check(operationsBody.rows.length === 104, "clear did not restore expansion state");
+    collapseSubtree.click();
+    check(operationsBody.rows.length === 1, "bounded subtree collapse failed");
+    document.documentElement.dataset.viewerSmoke = "passed";
+  } catch (error) {
+    document.documentElement.dataset.viewerSmoke = `failed:${error.message}`;
+  }
+})();
+</script>
+</body>
+</html>
+"#,
+        );
+
+        let mut report = tempfile::Builder::new().suffix(".html").tempfile()?;
+        report.write_all(html.as_bytes())?;
+        report.flush()?;
+        let output = std::process::Command::new("timeout")
+            .arg("30s")
+            .arg(browser)
+            .args([
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-background-networking",
+                "--dump-dom",
+            ])
+            .arg(format!("file://{}", report.path().display()))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "headless browser failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let dom = String::from_utf8(output.stdout)?;
+        let result = dom
+            .split_once("data-viewer-smoke=\"")
+            .and_then(|(_, result)| result.split_once('"'))
+            .map(|(result, _)| result)
+            .unwrap_or("missing");
+        assert_eq!(result, "passed", "browser smoke result");
+        Ok(())
+    }
+
+    #[test]
     fn atomically_replaces_output_and_preserves_it_on_failure() -> std::io::Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("nested/report.profile.html");
