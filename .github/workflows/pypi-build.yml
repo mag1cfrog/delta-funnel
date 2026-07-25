@@ -110,10 +110,11 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: pypi-${{ matrix.artifact }}
+          cache-targets: false
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Set up sccache
@@ -134,14 +135,6 @@ jobs:
             --manifest-path crates/delta-funnel-python/Cargo.toml
             --compatibility pypi
             -i ${{ matrix.interpreter }}
-
-      - name: Reset Linux cache ownership
-        if: matrix.maturin_sccache == 'true'
-        run: |
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          if [ -d target ]; then
-            sudo chown -R "$USER:$(id -gn)" target
-          fi
 
       - name: Set up smoke-test Python
         uses: actions/setup-python@v6

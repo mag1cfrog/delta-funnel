@@ -94,10 +94,11 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: testpypi-diagnostics-linux-x86-64
+          cache-targets: false
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build diagnostics wheel
@@ -117,13 +118,6 @@ jobs:
             --compatibility pypi
             --target-dir target
             -i python3.10
-
-      - name: Reset cache ownership
-        run: |
-          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-          if [ -d target ]; then
-            sudo chown -R "$USER:$(id -gn)" target
-          fi
 
       - name: Verify diagnostics wheel
         env:
