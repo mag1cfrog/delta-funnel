@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sccache-write
+  queue: max
+
 env:
   RELEASE_PLZ_RUST_VERSION: "1.91"
 

@@ -19,8 +19,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: cache-warm-${{ github.ref }}
-  cancel-in-progress: true
+  group: sccache-write
+  queue: max
 
 jobs:
   changes:
@@ -95,8 +95,11 @@ jobs:
 
   wheels:
     name: Warm wheel caches
-    needs: changes
+    needs:
+      - changes
+      - core
     if: needs.changes.outputs.wheels == 'true'
     uses: ./.github/workflows/pypi-build.yml
     with:
+      max_parallel: 1
       upload_artifacts: false

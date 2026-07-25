@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: none
+      max_parallel:
+        description: "Maximum concurrent wheel builds"
+        required: false
+        type: number
+        default: 4
       version:
         description: "Expected package version, such as 0.1.0 or v0.1.0"
         required: false
@@ -30,6 +35,7 @@ jobs:
         shell: bash
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         include:
           - name: Linux x86_64
