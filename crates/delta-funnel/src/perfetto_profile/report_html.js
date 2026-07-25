@@ -28,6 +28,11 @@ const formatCoverage = value =>
     value,
     profile.metadata.eligible_sample_count
   )} of eligible)`;
+const formatFunctionCoverage = value =>
+  `${value} (${formatPercent(
+    value,
+    profile.metadata.direct_sample_count
+  )} of direct)`;
 const compareValue = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 const compareText = (left, right) => {
   let leftIndex = 0;
@@ -411,7 +416,12 @@ const semanticRow = (semantic, depth) => {
       "Owning operation duration",
       "number"
     ),
-    textCell(String(semantic.direct_sample_count), "Direct", "number"),
+    textCell(
+      String(semantic.direct_sample_count),
+      `${semantic.available_function_sample_count} native stacks available; ` +
+        `${semantic.unavailable_function_sample_count} unavailable`,
+      "number"
+    ),
     textCell(String(semantic.inclusive_sample_count), "Semantic subtree", "number")
   );
   return { row, hasChildren, isExpanded, key, children, functions };
@@ -922,9 +932,22 @@ collapseSubtree.addEventListener("click", () => {
   renderRows(entryKey(selectedNode));
 });
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
+addSummary("Sampled CPUs", profile.metadata.sampled_cpu_count);
 addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);
 addSummary("Directly attributed", formatCoverage(profile.metadata.direct_sample_count));
 addSummary("Ambiguous", formatCoverage(profile.metadata.ambiguous_sample_count));
 addSummary("Unattributed", formatCoverage(profile.metadata.unattributed_sample_count));
+addSummary(
+  "Native stacks available",
+  formatFunctionCoverage(profile.metadata.available_function_sample_count)
+);
+addSummary(
+  "Native stacks unavailable",
+  formatFunctionCoverage(profile.metadata.unavailable_function_sample_count)
+);
+addSummary(
+  "Profiler samples dropped",
+  profile.metadata.trace_profiler_dropped_sample_count
+);
 updateSortControls();
 renderRows();

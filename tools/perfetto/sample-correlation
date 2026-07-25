@@ -49,6 +49,9 @@ fi
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 sql_dir=$script_dir/../../crates/delta-funnel/src/perfetto_profile/sql
 output=$({
+  printf '%s\n' \
+    "CREATE PERFETTO TABLE delta_funnel_report_selection AS" \
+    "SELECT NULL AS capture_scope_id;"
   sed -n '1,$p' "$sql_dir/sample_correlation.sql"
   if $ranked_audit; then
     sed -n '1,$p' "$sql_dir/ranked_profile_base.sql"

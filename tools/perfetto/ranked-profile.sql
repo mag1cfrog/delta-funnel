@@ -11,8 +11,7 @@ SELECT
   ), -1) + row_number() OVER (
     ORDER BY semantic_id, function_id
   ) AS root_node_id
-FROM delta_funnel_ranked_function_self_counts
-WHERE function_id != -1;
+FROM delta_funnel_ranked_function_self_counts;
 
 CREATE PERFETTO TABLE delta_funnel_ranked_function_graph AS
 SELECT
@@ -51,13 +50,7 @@ FROM delta_funnel_ranked_function_ancestry AS ancestry
 JOIN delta_funnel_ranked_function_roots AS root USING (root_node_id)
 JOIN delta_funnel_ranked_official_function_frames AS frame
   ON frame.id = ancestry.node_id
-GROUP BY root.semantic_id, ancestry.node_id
-
-UNION ALL
-
-SELECT semantic_id, function_id, self_sample_count
-FROM delta_funnel_ranked_function_self_counts
-WHERE function_id = -1;
+GROUP BY root.semantic_id, ancestry.node_id;
 
 CREATE PERFETTO INDEX delta_funnel_ranked_function_inclusive_lookup
 ON delta_funnel_ranked_function_inclusive_counts(semantic_id, function_id);
@@ -78,22 +71,7 @@ SELECT
 FROM delta_funnel_ranked_function_inclusive_counts AS inclusive
 JOIN delta_funnel_ranked_function_metadata AS metadata USING (function_id)
 LEFT JOIN delta_funnel_ranked_function_self_counts AS self
-  USING (semantic_id, function_id)
-
-UNION ALL
-
-SELECT
-  self.semantic_id,
-  self.function_id,
-  NULL AS parent_function_id,
-  '[native stack unavailable]' AS name,
-  NULL AS module_name,
-  NULL AS source_file,
-  NULL AS line_number,
-  self.self_sample_count,
-  self.self_sample_count AS inclusive_sample_count
-FROM delta_funnel_ranked_function_self_counts AS self
-WHERE self.function_id = -1;
+  USING (semantic_id, function_id);
 
 CREATE PERFETTO INDEX delta_funnel_ranked_function_aggregate_identity
 ON delta_funnel_ranked_function_aggregates(semantic_id, function_id);
@@ -133,7 +111,6 @@ WITH actual AS (
     sum(self_sample_count) AS self_sample_count,
     sum(inclusive_sample_count) AS cumulative_sample_count
   FROM delta_funnel_ranked_function_aggregates
-  WHERE function_id != -1
   GROUP BY function_id
 )
 SELECT
@@ -156,18 +133,18 @@ SELECT
   (
     SELECT count(*)
     FROM delta_funnel_ranked_function_aggregates
-    WHERE name IN ('[unresolved]', '[native stack unavailable]')
-  ) AS unresolved_function_node_count,
+    WHERE name = '[native stack unavailable]'
+  ) AS unavailable_function_node_count,
   (SELECT count(*) FROM delta_funnel_ranked_function_sample_ownership)
     AS function_sample_count,
   coalesce((
     SELECT sum(resolution = 'resolved')
     FROM delta_funnel_ranked_function_sample_ownership
-  ), 0) AS resolved_function_sample_count,
+  ), 0) AS available_function_sample_count,
   coalesce((
     SELECT sum(resolution = 'unresolved')
     FROM delta_funnel_ranked_function_sample_ownership
-  ), 0) AS unresolved_function_sample_count,
+  ), 0) AS unavailable_function_sample_count,
   (
     SELECT count(*)
     FROM (
@@ -219,6 +196,7 @@ SELECT
   (
     SELECT count(*)
     FROM delta_funnel_ranked_function_sample_ownership
+    WHERE resolution = 'resolved'
   ) - coalesce((
     SELECT sum(self_sample_count)
     FROM delta_funnel_ranked_function_self_counts
@@ -273,10 +251,14 @@ SELECT
   semantic.execution_stream_id,
   semantic.stage_owner_id,
   sample_count.direct_sample_count,
-  sample_count.inclusive_sample_count
+  sample_count.inclusive_sample_count,
+  function_sample_count.available_function_sample_count,
+  function_sample_count.unavailable_function_sample_count
 FROM delta_funnel_ranked_semantics AS semantic
 JOIN delta_funnel_ranked_semantic_parents AS parent USING (semantic_id)
-JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count USING (semantic_id);
+JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count USING (semantic_id)
+JOIN delta_funnel_ranked_semantic_function_sample_counts AS function_sample_count
+  USING (semantic_id);
 
 -- Ambiguous and unattributed samples have no unique semantic owner, so their
 -- conservation totals remain profile-scoped rather than attached arbitrarily.
@@ -286,7 +268,16 @@ SELECT
   count(*) AS eligible_sample_count,
   coalesce(sum(attribution = 'direct'), 0) AS direct_sample_count,
   coalesce(sum(attribution = 'ambiguous'), 0) AS ambiguous_sample_count,
-  coalesce(sum(attribution = 'unattributed'), 0) AS unattributed_sample_count
+  coalesce(sum(attribution = 'unattributed'), 0) AS unattributed_sample_count,
+  (SELECT count(DISTINCT cpu) FROM perf_sample) AS sampled_cpu_count,
+  (
+    SELECT coalesce(sum(resolution = 'resolved'), 0)
+    FROM delta_funnel_ranked_function_sample_ownership
+  ) AS available_function_sample_count,
+  (
+    SELECT coalesce(sum(resolution = 'unresolved'), 0)
+    FROM delta_funnel_ranked_function_sample_ownership
+  ) AS unavailable_function_sample_count
 FROM delta_funnel_ranked_sample_ownership;
 
 -- Measure the exact UTF-8 JSON Lines representation without emitting it or
@@ -322,7 +313,9 @@ SELECT
       'execution_stream_id', execution_stream_id,
       'stage_owner_id', stage_owner_id,
       'direct_sample_count', direct_sample_count,
-      'inclusive_sample_count', inclusive_sample_count
+      'inclusive_sample_count', inclusive_sample_count,
+      'available_function_sample_count', available_function_sample_count,
+      'unavailable_function_sample_count', unavailable_function_sample_count
     ) AS BLOB))) + count(*), 0)
     FROM delta_funnel_ranked_semantic_aggregates
   ) AS semantic_aggregate_json_bytes,
@@ -348,7 +341,10 @@ SELECT
       'eligible_sample_count', eligible_sample_count,
       'direct_sample_count', direct_sample_count,
       'ambiguous_sample_count', ambiguous_sample_count,
-      'unattributed_sample_count', unattributed_sample_count
+      'unattributed_sample_count', unattributed_sample_count,
+      'sampled_cpu_count', sampled_cpu_count,
+      'available_function_sample_count', available_function_sample_count,
+      'unavailable_function_sample_count', unavailable_function_sample_count
     ) AS BLOB))) + count(*), 0)
     FROM delta_funnel_ranked_coverage_aggregate
   ) AS coverage_aggregate_json_bytes;
@@ -357,7 +353,7 @@ CREATE PERFETTO TABLE delta_funnel_ranked_aggregate_audit AS
 SELECT
   semantic.semantic_count,
   function.aggregate_function_node_count,
-  function.unresolved_function_node_count,
+  function.unavailable_function_node_count,
   (
     SELECT profile_process_sample_count
     FROM delta_funnel_sample_correlation_audit
@@ -370,8 +366,12 @@ SELECT
   ) AS inclusive_semantic_sample_count,
   attribution.ambiguous_sample_count,
   attribution.unattributed_sample_count,
-  function.resolved_function_sample_count,
-  function.unresolved_function_sample_count,
+  (
+    SELECT sampled_cpu_count
+    FROM delta_funnel_ranked_coverage_aggregate
+  ) AS sampled_cpu_count,
+  function.available_function_sample_count,
+  function.unavailable_function_sample_count,
   function.official_summary_mismatch_count,
   size.semantic_aggregate_json_bytes,
   size.function_aggregate_json_bytes,

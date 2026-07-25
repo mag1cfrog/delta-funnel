@@ -11,6 +11,9 @@ if ! command -v "$trace_processor" >/dev/null 2>&1; then
 fi
 
 output=$({
+  printf '%s\n' \
+    "CREATE PERFETTO TABLE delta_funnel_report_selection AS" \
+    "SELECT NULL AS capture_scope_id;"
   sed -n '1,$p' "$sql_dir/sample_correlation.sql"
   sed -n '1,$p' "$sql_dir/ranked_profile_base.sql"
   sed -n '1,$p' "$script_dir/ranked-profile.sql"

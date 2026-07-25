@@ -129,10 +129,37 @@ pub(crate) fn start_operation_profile(
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
         let output = config.output_path().to_owned();
         let sample_hz = config.sampling_frequency();
-        py.detach(move || capture::OperationCapture::start(output, sample_hz))
+        let tracebox = tracebox_launcher(py)?;
+        py.detach(move || capture::OperationCapture::start(output, sample_hz, tracebox))
             .map(|capture| Some(OperationProfile { capture }))
             .map_err(|error| profiler_failure_py_error(py, error))
     }
+}
+
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+fn tracebox_launcher(py: Python<'_>) -> PyResult<PathBuf> {
+    if let Some(tracebox) = std::env::var_os("TRACEBOX") {
+        return Ok(tracebox.into());
+    }
+    let extension = py
+        .import("deltafunnel.deltafunnel")
+        .and_then(|module| module.getattr("__file__"))
+        .and_then(|path| path.extract::<PathBuf>())
+        .map_err(|_| {
+            profiler_py_error(
+                py,
+                "tracebox_unavailable",
+                "packaged Perfetto tracebox launcher could not be located".to_owned(),
+            )
+        })?;
+    let package = extension.parent().ok_or_else(|| {
+        profiler_py_error(
+            py,
+            "tracebox_unavailable",
+            "packaged Perfetto tracebox launcher could not be located".to_owned(),
+        )
+    })?;
+    Ok(package.join("perfetto/delta-funnel-tracebox"))
 }
 
 impl OperationProfile {

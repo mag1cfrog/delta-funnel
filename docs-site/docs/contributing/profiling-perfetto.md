@@ -10,28 +10,29 @@ Linux x86_64 with glibc 2.28 or newer.
 
 ## 1. Prepare the Linux host
 
-Download the official Perfetto launchers. Saving the Trace Processor launcher
-as `trace_processor_shell` matches the command Delta Funnel uses:
+Download the official Trace Processor and traceconv launchers. Saving the Trace
+Processor launcher as `trace_processor_shell` matches the command Delta Funnel
+uses:
 
 ```sh
 mkdir -p ~/.local/bin
 
-curl -fL https://get.perfetto.dev/tracebox \
-  -o ~/.local/bin/tracebox
 curl -fL https://get.perfetto.dev/trace_processor \
   -o ~/.local/bin/trace_processor_shell
+curl -fL https://get.perfetto.dev/traceconv \
+  -o ~/.local/bin/traceconv
 
-chmod +x ~/.local/bin/tracebox ~/.local/bin/trace_processor_shell
+chmod +x \
+  ~/.local/bin/trace_processor_shell \
+  ~/.local/bin/traceconv
 export PATH="$HOME/.local/bin:$PATH"
 
-tracebox --help >/dev/null
 trace_processor_shell --help >/dev/null
+traceconv --help 2>&1 | grep -q symbolize
 ```
 
-The launchers download, verify, and cache the matching native binaries on first
-use. Delta Funnel has been verified with Perfetto v57.2. `tracebox` manages the
-`traced`, `traced_probes`, and `traced_perf` processes for each capture; do not
-start separate daemons.
+The launchers download and cache the matching native binaries on first use.
+Delta Funnel has been verified with Perfetto v57.2.
 
 Allow native call-stack sampling on a development machine:
 
@@ -73,10 +74,20 @@ uv sync --upgrade-package deltafunnel
 
 uv run python -c \
   'from deltafunnel import ProfilerConfig; print(ProfilerConfig("profile.html"))'
+
+perfetto_assets="$(uv run python -c \
+  'from importlib.resources import files; print(files("deltafunnel") / "perfetto")')"
+"$perfetto_assets/delta-funnel-tracebox" --version
 ```
 
 The generated `uv.lock` records the exact diagnostics version and TestPyPI
 source. Keep it with the report when reproducibility matters.
+
+The wheel includes a small launcher for Delta Funnel's pinned Perfetto v57.2
+tracebox build. The launcher downloads and verifies the 1 MB release archive
+on first use, then caches the native binary. That tracebox manages `traced`,
+`traced_probes`, and `traced_perf` for each capture; do not start separate
+daemons.
 
 ## 3. Generate one operation-scoped report
 
@@ -149,6 +160,10 @@ volume matters more than resolving short native work. The explicit override
 accepts only `100` or `1000` and works with every mode. At 1000 Hz the capture
 tool also drains the kernel sampling buffers more often to avoid losing short
 bursts.
+
+Delta Funnel's pinned tracebox expands Perfetto's callchain queue so 1000 Hz
+reports can sample every CPU allowed by the Python process affinity. The report
+summary records how many CPUs actually contributed samples.
 
 ### Inspect ranked results in the terminal
 
@@ -337,7 +352,8 @@ tables. Build from a source checkout when source lines are required:
 ```sh
 python3 -m venv target/python-perfetto-venv
 source target/python-perfetto-venv/bin/activate
-maturin develop --locked --profile profiling \
+RUSTFLAGS='-C force-frame-pointers=yes' \
+  maturin develop --locked --profile profiling \
   --features perfetto-profile \
   --manifest-path crates/delta-funnel-python/Cargo.toml
 

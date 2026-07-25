@@ -308,12 +308,16 @@ fn render_semantic_view(
     );
     let filter = filter_label(filter);
     let mut output = format!(
-        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\n",
+        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_available: {}\nnative_stack_samples_unavailable: {}\ntrace_profiler_samples_dropped: {}\n",
         sort.as_str(),
         shown,
         shown < total,
         terminal_text(&index.document.metadata.exact_time_unit),
         terminal_text(&index.document.metadata.sample_unit),
+        index.document.metadata.sampled_cpu_count,
+        index.document.metadata.available_function_sample_count,
+        index.document.metadata.unavailable_function_sample_count,
+        index.document.metadata.trace_profiler_dropped_sample_count,
     );
     for (depth, semantic) in semantic_rows {
         write_semantic_row(
@@ -503,11 +507,15 @@ fn render_function_view(
     );
     let filter = filter_label(filter);
     let mut output = format!(
-        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_available: {}\nnative_stack_samples_unavailable: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
         sort.as_str(),
         rows.len(),
         rows.len() < total,
         terminal_text(&index.document.metadata.sample_unit),
+        index.document.metadata.sampled_cpu_count,
+        index.document.metadata.available_function_sample_count,
+        index.document.metadata.unavailable_function_sample_count,
+        index.document.metadata.trace_profiler_dropped_sample_count,
     );
     for (depth, function) in rows {
         write_function_row(
@@ -725,7 +733,7 @@ fn write_semantic_row(
         .as_deref()
         .map_or_else(|| "null".to_owned(), quoted_terminal_text);
     output.push_str(&format!(
-        "semantic depth={depth} id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={}",
+        "semantic depth={depth} id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={} native_stack_samples_available={} native_stack_samples_unavailable={}",
         semantic.semantic_id,
         quoted_terminal_text(&semantic.name),
         quoted_terminal_text(&semantic.semantic_kind),
@@ -733,6 +741,8 @@ fn write_semantic_row(
         semantic.is_complete,
         semantic.direct_sample_count,
         semantic.inclusive_sample_count,
+        semantic.available_function_sample_count,
+        semantic.unavailable_function_sample_count,
     ));
     output.push('\n');
 }
@@ -809,20 +819,26 @@ mod tests {
             stage_owner_id: None,
             direct_sample_count: semantic_id,
             inclusive_sample_count: semantic_id + 1,
+            available_function_sample_count: 0,
+            unavailable_function_sample_count: semantic_id,
         }
     }
 
     fn document(semantics: Vec<RankedSemantic>) -> RankedProfileDocument {
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
-                schema_version: 1,
+                schema_version: 2,
                 sample_frequency_hz: 100,
+                sampled_cpu_count: 1,
                 exact_time_unit: "nanoseconds".to_owned(),
                 sample_unit: "samples".to_owned(),
                 eligible_sample_count: 0,
                 direct_sample_count: 0,
                 ambiguous_sample_count: 0,
                 unattributed_sample_count: 0,
+                available_function_sample_count: 0,
+                unavailable_function_sample_count: 0,
+                trace_profiler_dropped_sample_count: 0,
             },
             semantics,
             functions: Vec::new(),
