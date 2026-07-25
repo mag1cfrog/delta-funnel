@@ -148,8 +148,39 @@ jobs:
             --compatibility pypi
             -i ${{ matrix.interpreter }}
 
-      - name: Verify sccache writes
+      - name: Check sccache writes
+        id: sccache-writes
         if: inputs.write_cache && matrix.host_sccache == 'true'
+        continue-on-error: true
+        run: >-
+          sccache --show-stats --stats-format json |
+          python -c 'import json, sys; errors = json.load(sys.stdin)["stats"]["cache_write_errors"]; sys.exit(f"sccache reported {errors} cache write errors") if errors else None'
+
+      - name: Prepare cache write retry
+        if: steps.sccache-writes.outcome == 'failure'
+        run: |
+          sccache --zero-stats
+          cargo clean
+          rm -rf dist
+
+      - name: Retry build wheels
+        if: steps.sccache-writes.outcome == 'failure'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          rust-toolchain: ${{ steps.rust-version.outputs.version }}
+          manylinux: ${{ matrix.manylinux }}
+          sccache: ${{ matrix.maturin_sccache }}
+          before-script-linux: dnf install -y openssl-devel
+          args: >-
+            --release
+            --out dist
+            --manifest-path crates/delta-funnel-python/Cargo.toml
+            --compatibility pypi
+            -i ${{ matrix.interpreter }}
+
+      - name: Verify retried sccache writes
+        if: steps.sccache-writes.outcome == 'failure'
         run: >-
           sccache --show-stats --stats-format json |
           python -c 'import json, sys; errors = json.load(sys.stdin)["stats"]["cache_write_errors"]; sys.exit(f"sccache reported {errors} cache write errors") if errors else None'
