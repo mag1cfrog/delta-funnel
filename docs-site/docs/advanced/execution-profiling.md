@@ -76,8 +76,10 @@ are statistical on-CPU samples, not wall-clock time.
 
 To keep that call tree useful, the ranked report omits known runtime wrapper
 frames with no self CPU samples and connects their children to the nearest
-meaningful parent. Runtime frames that consume sampled CPU remain visible. The
-raw `.pftrace` file retains the complete native call stack.
+meaningful parent. Runtime frames that consume sampled CPU remain visible.
+`ProfilerConfig` keeps only the requested HTML report after deleting its
+temporary capture. When you generate a report from your own `.pftrace` file,
+that input remains unchanged and retains the complete native call stack.
 
 Only one operation profile can be active in a Python process. The output parent
 directory is created when needed, and a completed report replaces an existing
