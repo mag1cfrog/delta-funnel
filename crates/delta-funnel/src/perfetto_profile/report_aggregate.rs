@@ -183,6 +183,7 @@ fn build_document(
 
     let frames = validate_frames(frames)?;
     document.functions = expand_functions(&frames, function_self)?;
+    collapse_zero_self_runtime_wrappers(&mut document.functions)?;
     document
         .functions
         .sort_by_key(|function| (function.semantic_id, function.function_id));
@@ -347,6 +348,61 @@ fn expand_functions(
         }
     }
     Ok(functions.into_values().collect())
+}
+
+fn collapse_zero_self_runtime_wrappers(
+    functions: &mut Vec<RankedFunction>,
+) -> Result<(), RankedReportFailure> {
+    let parents = functions
+        .iter()
+        .map(|function| {
+            (
+                (function.semantic_id, function.function_id),
+                function.parent_function_id,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let wrappers = functions
+        .iter()
+        .filter(|function| function.self_sample_count == 0 && is_runtime_wrapper(&function.name))
+        .map(|function| (function.semantic_id, function.function_id))
+        .collect::<HashSet<_>>();
+
+    for function in functions.iter_mut() {
+        let mut parent = function.parent_function_id;
+        while let Some(parent_id) = parent
+            && wrappers.contains(&(function.semantic_id, parent_id))
+        {
+            parent = *parents
+                .get(&(function.semantic_id, parent_id))
+                .ok_or_else(|| {
+                    aggregate_failure(
+                        "invalid_function_graph",
+                        "runtime wrapper parent is missing",
+                    )
+                })?;
+        }
+        function.parent_function_id = parent;
+    }
+    functions.retain(|function| !wrappers.contains(&(function.semantic_id, function.function_id)));
+    Ok(())
+}
+
+fn is_runtime_wrapper(name: &str) -> bool {
+    let name = name.strip_prefix('<').unwrap_or(name);
+    [
+        "tokio::runtime::",
+        "tokio::task::",
+        "tracing::instrument::Instrumented",
+        "std::sys::backtrace::__rust_begin_short_backtrace",
+        "std::sys::pal::unix::thread::Thread::new::thread_start",
+        "std::sys::pal::windows::thread::Thread::new::thread_start",
+        "core::ops::function::FnOnce::call_once",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+        || (name.starts_with("core::pin::Pin<") || name.starts_with("alloc::sync::Arc<"))
+            && name.ends_with("::poll")
 }
 
 fn fold_functions(functions: &mut [RankedFunction]) -> Result<(), RankedReportFailure> {
@@ -516,6 +572,42 @@ mod tests {
     }
 
     #[test]
+    fn collapses_zero_self_runtime_wrappers_but_keeps_runtime_costs() {
+        let mut functions = vec![
+            function(
+                1,
+                None,
+                "std::sys::pal::unix::thread::Thread::new::thread_start",
+                0,
+            ),
+            function(
+                2,
+                Some(1),
+                "tokio::runtime::scheduler::multi_thread::worker::run",
+                0,
+            ),
+            function(3, Some(2), "deltafunnel::write_batches", 7),
+            function(4, Some(2), "tokio::runtime::scheduler::park", 2),
+        ];
+
+        collapse_zero_self_runtime_wrappers(&mut functions)
+            .expect("valid wrapper chains should collapse");
+        functions.sort_by_key(|function| function.function_id);
+
+        assert_eq!(
+            functions
+                .iter()
+                .map(|function| (
+                    function.function_id,
+                    function.parent_function_id,
+                    function.self_sample_count
+                ))
+                .collect::<Vec<_>>(),
+            vec![(3, None, 7), (4, None, 2)]
+        );
+    }
+
+    #[test]
     #[ignore = "requires trace_processor_shell and a real raw trace"]
     fn loads_and_renders_a_real_raw_trace_when_requested() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -643,5 +735,24 @@ mod tests {
                 "official_inclusive_sample_count": inclusive_count,
             }
         })
+    }
+
+    fn function(
+        function_id: i64,
+        parent_function_id: Option<i64>,
+        name: &str,
+        self_sample_count: i64,
+    ) -> RankedFunction {
+        RankedFunction {
+            semantic_id: 1,
+            function_id,
+            parent_function_id,
+            name: name.to_owned(),
+            module_name: None,
+            source_file: None,
+            line_number: None,
+            self_sample_count,
+            inclusive_sample_count: 0,
+        }
     }
 }
