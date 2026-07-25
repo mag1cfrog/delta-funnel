@@ -106,6 +106,6 @@ jobs:
     if: needs.changes.outputs.wheels == 'true'
     uses: ./.github/workflows/pypi-build.yml
     with:
-      max_parallel: 1
+      max_parallel: 2
       upload_artifacts: false
       write_cache: true
