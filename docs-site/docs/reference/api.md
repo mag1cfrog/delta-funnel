@@ -454,8 +454,8 @@ class Preview:
 ```
 
 `text` is the plain-text table. `html` backs notebook display.
-`phase_timings` is always populated. `execution_profile` is populated only
-when `Table.preview(profile=True)` was used.
+`phase_timings` is always populated. `execution_profile` is populated when
+`Table.preview` receives either `profile=True` or a `ProfilerConfig`.
 
 `export_trace` creates or replaces a Chrome Trace Event JSON file. It requires
 a profiled preview, accepts a string or `os.PathLike`, and does not create
