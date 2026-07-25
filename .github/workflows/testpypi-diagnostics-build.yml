@@ -14,8 +14,6 @@ jobs:
   build:
     name: Build diagnostics wheel
     runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
     defaults:
       run:
         shell: bash
@@ -94,11 +92,13 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Cache Cargo registry
+      # The generated package version changes on every run, so compiler-cache
+      # keys for local crates cannot be reused. This workflow owns its target
+      # cache instead; pull requests restore it but only trusted runs update it.
+      - name: Cache Cargo and diagnostics target
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: testpypi-diagnostics-linux-x86-64
-          cache-targets: false
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build diagnostics wheel
@@ -108,7 +108,6 @@ jobs:
           maturin-version: v1.13.3
           rust-toolchain: ${{ steps.rust-version.outputs.version }}
           manylinux: "2_28"
-          sccache: "true"
           before-script-linux: dnf install -y openssl-devel
           args: >-
             --release
@@ -118,6 +117,12 @@ jobs:
             --compatibility pypi
             --target-dir target
             -i python3.10
+
+      - name: Reset target cache ownership
+        run: |
+          if [ -d target ]; then
+            sudo chown -R "$USER:$(id -gn)" target
+          fi
 
       - name: Verify diagnostics wheel
         env:
