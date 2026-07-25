@@ -48,10 +48,11 @@ jobs:
           rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
           rustup default "${{ steps.rust-version.outputs.version }}"
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: sqlserver-integration
+          cache-targets: false
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Set up sccache

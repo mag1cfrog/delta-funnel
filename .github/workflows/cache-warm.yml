@@ -1,0 +1,102 @@
+name: Warm CI caches
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/cache-warm.yml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/pypi-build.yml"
+      - ".cargo/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "tools/perfetto/**"
+      - "xtask/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-warm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect wheel cache changes
+    runs-on: ubuntu-latest
+    outputs:
+      wheels: ${{ steps.filter.outputs.wheels }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect wheel cache changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            wheels:
+              - '.github/workflows/cache-warm.yml'
+              - '.github/workflows/pypi-build.yml'
+              - '.cargo/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**/Cargo.toml'
+              - 'xtask/Cargo.toml'
+
+  core:
+    name: Warm core test caches
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+      RUSTC_WRAPPER: sccache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Read Rust version
+        id: rust-version
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal
+          rustup default "${{ steps.rust-version.outputs.version }}"
+
+      - name: Cache Cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: core-ci
+          cache-targets: false
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Warm default test cache
+        run: cargo test --workspace --no-run
+
+      - name: Warm all-features test cache
+        run: cargo test --workspace --all-targets --all-features --no-run
+
+  wheels:
+    name: Warm wheel caches
+    needs: changes
+    if: needs.changes.outputs.wheels == 'true'
+    uses: ./.github/workflows/pypi-build.yml
+    with:
+      upload_artifacts: false

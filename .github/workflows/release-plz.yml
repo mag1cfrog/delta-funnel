@@ -56,12 +56,11 @@ jobs:
       - name: Configure Cargo target
         run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/release-plz-target" >> "$GITHUB_ENV"
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-plz
-          cache-directories: |
-            ${{ runner.temp }}/release-plz-target
+          cache-targets: false
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -121,12 +120,11 @@ jobs:
       - name: Configure Cargo target
         run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/release-plz-target" >> "$GITHUB_ENV"
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-plz
-          cache-directories: |
-            ${{ runner.temp }}/release-plz-target
+          cache-targets: false
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
