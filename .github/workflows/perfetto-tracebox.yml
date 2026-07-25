@@ -1,0 +1,87 @@
+name: Publish patched Perfetto tracebox
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perfetto-tracebox-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish Linux x86_64 tracebox
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      PERFETTO_COMMIT: da1d152cff27890903d158fe96751de3aab883cc
+      RELEASE_TAG: perfetto-tracebox-v57.2-df1
+
+    steps:
+      - name: Checkout Delta Funnel
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Fetch and patch Perfetto
+        run: |
+          git init perfetto
+          git -C perfetto remote add origin https://github.com/google/perfetto.git
+          git -C perfetto fetch --depth 1 origin "$PERFETTO_COMMIT"
+          git -C perfetto checkout --detach FETCH_HEAD
+          test "$(git -C perfetto rev-parse HEAD)" = "$PERFETTO_COMMIT"
+          git -C perfetto apply \
+            "$GITHUB_WORKSPACE/tools/perfetto/perfetto-v57.2-unwind-queue-8192.patch"
+
+      - name: Build tracebox
+        run: |
+          perfetto/tools/install-build-deps --no-dev-tools
+          perfetto/tools/gn gen perfetto/out/tracebox --args='is_debug=false'
+          perfetto/tools/ninja -C perfetto/out/tracebox tracebox
+
+      - name: Package tracebox
+        run: |
+          mkdir -p dist/stage
+          perfetto/buildtools/linux64/clang/bin/llvm-strip \
+            -o dist/stage/tracebox \
+            perfetto/out/tracebox/tracebox
+          chmod 755 dist/stage/tracebox
+          cp perfetto/LICENSE dist/stage/LICENSE.perfetto
+          test "$(dist/stage/tracebox --version)" = \
+            "Perfetto v57.2-da1d152cf (da1d152cff27890903d158fe96751de3aab883cc)"
+          tar \
+            --create \
+            --xz \
+            --file dist/tracebox-linux-x86_64.tar.xz \
+            --directory dist/stage \
+            --sort name \
+            --mtime 'UTC 1970-01-01' \
+            --owner 0 \
+            --group 0 \
+            --numeric-owner \
+            LICENSE.perfetto \
+            tracebox
+          (
+            cd dist
+            sha256sum tracebox-linux-x86_64.tar.xz \
+              >tracebox-linux-x86_64.tar.xz.sha256
+          )
+
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            dist/tracebox-linux-x86_64.tar.xz \
+            dist/tracebox-linux-x86_64.tar.xz.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "Perfetto tracebox v57.2 for Delta Funnel diagnostics" \
+            --notes "Perfetto v57.2 with only the traced_perf unwind queue capacity increased from 1024 to 8192. The archive includes the upstream Apache-2.0 license."
