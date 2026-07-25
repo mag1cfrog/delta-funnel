@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::iter;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -231,19 +231,29 @@ impl CliArgumentError {
     }
 }
 
+/// Stage that rejected a ranked profile report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RankedReportFailurePhase {
+pub enum RankedReportFailurePhase {
+    /// Command arguments were invalid.
     Argument,
+    /// The input trace could not be read.
     Input,
+    /// Capture completeness checks failed.
     Health,
+    /// Trace Processor could not run.
     TraceProcessor,
+    /// The report query failed.
     Query,
+    /// Aggregated profile data was invalid.
     AggregateValidation,
+    /// The report could not be serialized.
     Serialization,
+    /// The report could not be written.
     Output,
 }
 
 impl RankedReportFailurePhase {
+    /// Returns the stable machine-readable phase name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Argument => "argument",
@@ -258,8 +268,9 @@ impl RankedReportFailurePhase {
     }
 }
 
+/// Structured failure from ranked profile report generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct RankedReportFailure {
+pub struct RankedReportFailure {
     phase: RankedReportFailurePhase,
     kind: &'static str,
     message: String,
@@ -278,15 +289,17 @@ impl RankedReportFailure {
         }
     }
 
+    /// Returns the report stage that failed.
     pub fn phase(&self) -> RankedReportFailurePhase {
         self.phase
     }
 
-    #[cfg(test)]
+    /// Returns the stable machine-readable failure kind.
     pub fn kind(&self) -> &'static str {
         self.kind
     }
 
+    /// Serializes the sanitized failure for command-line consumers.
     pub fn machine_line(&self) -> String {
         serde_json::json!({
             "phase": self.phase.as_str(),
@@ -461,7 +474,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
-    match super::load_ranked_profile(&input) {
+    match super::load_ranked_profile(&input, None) {
         Ok(document) if args.interactive => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -957,9 +970,7 @@ pub(super) fn preflight_ranked_report_paths(
         return Err(RankedReportPathError::OutputHasNoFileName);
     }
     inspect_output_path(&output)?;
-    let output_identity =
-        resolve_output_identity(&output).map_err(RankedReportPathError::OutputInspection)?;
-    match same_file::is_same_file(&input, &output_identity) {
+    match super::output_paths_alias(&input, &output) {
         Ok(true) => return Err(RankedReportPathError::InputOutputAlias),
         Ok(false) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -983,29 +994,6 @@ pub(super) fn preflight_ranked_profile_input(
         .canonicalize()
         .map_err(RankedReportPathError::InputUnreadable)?;
     Ok(input)
-}
-
-fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-            Component::RootDir => resolved.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::Normal(segment) => {
-                resolved.push(segment);
-                match resolved.canonicalize() {
-                    Ok(canonical) => resolved = canonical,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    Ok(resolved)
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {

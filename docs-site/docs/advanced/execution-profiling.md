@@ -1,13 +1,93 @@
 # Export and Inspect Execution Profiles
 
-Use this guide to export the stable semantic timeline returned by normal Delta
-Funnel preview and SQL Server APIs. It covers preview, one-output, and
-multi-output operations.
+Use this guide to generate an operation-scoped ranked HTML report from a
+diagnostics build, or export the stable semantic timeline returned by normal
+Delta Funnel preview and SQL Server APIs. Both paths cover preview, one-output,
+and multi-output operations.
 
-If you need native CPU stacks or scheduler context, start with
-[Choose a Delta Funnel profiling method](../contributing/profiling.md). For
-field definitions and lifecycle contracts, use the
-[Diagnostics reference](../reference/diagnostics.md).
+Install the diagnostics build and its two Perfetto tools before generating
+ranked HTML. See
+[Set up Perfetto diagnostics for Python](../contributing/profiling-perfetto.md).
+For field definitions and lifecycle contracts, use the
+[Diagnostics reference](../reference/diagnostics.md). If you need scheduler
+context or a whole-process capture, start with
+[Choose a Delta Funnel profiling method](../contributing/profiling.md).
+
+## Generate an operation-scoped ranked HTML report
+
+Create one immutable profiler configuration for the operation. Use 1000 Hz for
+a short query and 100 Hz when lower capture volume matters more than resolving
+brief native work:
+
+```python
+from deltafunnel import ProfilerConfig
+
+profiler = ProfilerConfig(
+    "target/profiles/preview.profile.html",
+    sample_hz=1000,
+)
+
+preview = table.preview(
+    limit=100_000,
+    profiler=profiler,
+)
+```
+
+The capture starts immediately before `preview` executes and stops when that
+call reaches its terminal result. Other Python work before or after the call is
+not included. Passing `profiler` automatically enables the existing detailed
+semantic and operator profile; `profile=True` is not also required.
+Concurrent Delta Funnel operations are excluded from the semantic and native
+function rankings. Process samples without a matching target-operation context
+remain visible only in the report's unattributed coverage count.
+
+Use the same configuration type for one SQL Server write:
+
+```python
+report = table.write_to_mssql(
+    schema="dbo",
+    table="orders",
+    load_mode="append_existing",
+    profiler=ProfilerConfig(
+        "target/profiles/orders-write.profile.html",
+        sample_hz=100,
+    ),
+)
+```
+
+Or for a complete multi-output workflow:
+
+```python
+report = session.write_all(
+    outputs,
+    options={"cache_mode": "auto"},
+    profiler=ProfilerConfig(
+        "target/profiles/write-all.profile.html",
+        sample_hz=100,
+    ),
+)
+```
+
+Open the resulting HTML file directly in a browser. The self-contained report
+ranks exact semantic operation durations and lets you expand each operation
+into its semantic children and sampled native callsites. Exact durations and
+sample counts use different units: a function's self and inclusive CPU values
+are statistical on-CPU samples, not wall-clock time.
+
+Only one operation profile can be active in a Python process. The output parent
+directory is created when needed, and a completed report replaces an existing
+file at the same path. Operation profiling is unavailable for dry runs.
+
+If the operation itself fails, Delta Funnel keeps that operation error as the
+primary exception and still attempts to generate the scoped report. If report
+generation fails after a SQL Server operation returned a report, the profiler
+exception exposes `deltafunnel_operation_status` and the successful or
+completed-with-failures report in `deltafunnel_operation_report`. Do not retry
+a write solely because profile finalization failed.
+
+The older `profile=True` and `trace_path` APIs below remain useful when only the
+stable semantic JSON is needed. They do not collect native CPU stacks and do
+not require a diagnostics build.
 
 ## Inspect returned preview diagnostics
 

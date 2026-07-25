@@ -3,8 +3,8 @@
 //! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
 use perfetto_sdk::producer::{Backends, Producer, ProducerInitArgsBuilder};
@@ -15,8 +15,11 @@ use perfetto_sdk::protos::trace::track_event::track_descriptor::{
 use perfetto_sdk::track_event::{
     EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTrack,
 };
-use perfetto_sdk::{track_event_categories, track_event_category_enabled};
+use perfetto_sdk::{
+    track_event_begin, track_event_categories, track_event_category_enabled, track_event_end,
+};
 
+use crate::profiling::{allocate_id, in_operation_capture_scope};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
@@ -31,20 +34,88 @@ mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
 use report_aggregate::load_ranked_profile;
-#[cfg(test)]
-use report_cli::RankedReportFailurePhase;
-use report_cli::{RankedReportFailure, preflight_ranked_report_paths};
-pub use report_cli::{run_perfetto_diagnostics_cli, run_perfetto_diagnostics_cli_with_args};
+use report_cli::preflight_ranked_report_paths;
+pub use report_cli::{
+    RankedReportFailure, RankedReportFailurePhase, run_perfetto_diagnostics_cli,
+    run_perfetto_diagnostics_cli_with_args,
+};
 use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;
 
-fn generate_ranked_profile_report(
+/// Reports whether two profile destinations resolve to the same file.
+#[doc(hidden)]
+pub fn output_paths_alias(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = resolve_output_identity(left)?;
+    let right = resolve_output_identity(right)?;
+    if left == right {
+        return Ok(true);
+    }
+    match same_file::is_same_file(left, right) {
+        Ok(alias) => Ok(alias),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(segment) => {
+                resolved.push(segment);
+                match resolved.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Generates one self-contained ranked HTML report from a completed Perfetto trace.
+///
+/// # Errors
+///
+/// Returns a structured failure when the trace, Trace Processor query, aggregate,
+/// serialization, or output write fails.
+pub fn generate_ranked_profile_report(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_report_for_scope(input, output, None)
+}
+
+/// Generates one ranked HTML report for a host-selected operation capture.
+///
+/// # Errors
+///
+/// Returns a structured failure when the selected operation is unavailable or
+/// normal ranked report generation fails.
+#[doc(hidden)]
+pub fn generate_operation_ranked_profile_report(
+    input: &Path,
+    output: &Path,
+    capture_scope: &OperationCaptureScope,
+) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_report_for_scope(input, output, Some(capture_scope.id))
+}
+
+fn generate_ranked_profile_report_for_scope(
+    input: &Path,
+    output: &Path,
+    capture_scope_id: Option<u64>,
+) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = load_ranked_profile(&paths.input)?;
+    let document = load_ranked_profile(&paths.input, capture_scope_id)?;
     let html = render_ranked_profile_html(&document)?;
     write_ranked_profile_html(&paths.output, &html)?;
     Ok(paths.output)
@@ -58,6 +129,47 @@ const DELTA_SCAN_OUTPUT_SIBLING_ORDER_BASE: u64 = 1_000_000;
 // bursts. This is the largest bounded hint accepted by Perfetto v57.2.
 const PRODUCER_SHMEM_SIZE_HINT_KB: u32 = 32 * 1024;
 static PERFETTO_INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
+static NEXT_OPERATION_CAPTURE_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Unique correlation scope for one host-managed operation capture.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct OperationCaptureScope {
+    id: u64,
+}
+
+impl OperationCaptureScope {
+    /// Allocates one process-unique operation capture scope.
+    pub fn allocate() -> Option<Self> {
+        allocate_id(&NEXT_OPERATION_CAPTURE_SCOPE_ID)
+            .filter(|id| i64::try_from(*id).is_ok())
+            .map(|id| Self { id })
+    }
+
+    /// Runs the operation entry point inside this capture scope.
+    pub fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
+        track_event_begin!(
+            "delta_funnel.profile.context",
+            "Delta Funnel operation capture scope",
+            |context: &mut EventContext| {
+                context.add_debug_arg(
+                    "capture_scope_id",
+                    perfetto_sdk::track_event::TrackEventDebugArg::Uint64(self.id),
+                );
+            }
+        );
+        let _context = OperationCaptureContext;
+        in_operation_capture_scope(self.id, operation)
+    }
+}
+
+struct OperationCaptureContext;
+
+impl Drop for OperationCaptureContext {
+    fn drop(&mut self) {
+        track_event_end!("delta_funnel.profile.context");
+    }
+}
 
 track_event_categories! {
     pub(crate) mod delta_funnel_perfetto {
@@ -282,6 +394,11 @@ pub fn initialize_perfetto() -> io::Result<()> {
     }
 }
 
+/// Returns whether an external capture currently accepts Delta Funnel profile events.
+pub fn is_profile_capture_active() -> bool {
+    track_event_category_enabled!("delta_funnel.profile")
+}
+
 /// Waits up to `timeout` for an external system capture to enable the profile category.
 ///
 /// # Errors
@@ -295,7 +412,7 @@ pub fn wait_for_capture(timeout: Duration) -> io::Result<()> {
             format!("Perfetto capture wait timeout {timeout:?} is too large"),
         )
     })?;
-    while !track_event_category_enabled!("delta_funnel.profile") {
+    while !is_profile_capture_active() {
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(

@@ -6,6 +6,7 @@ SELECT
   s.ts,
   CASE WHEN s.dur >= 0 THEN s.ts + s.dur ELSE trace_end() END AS end_ts,
   extract_arg(s.arg_set_id, 'debug.operation_id') AS operation_id,
+  extract_arg(s.arg_set_id, 'debug.capture_scope_id') AS capture_scope_id,
   pt.upid
 FROM slice AS s
 JOIN process_track AS pt ON pt.id = s.track_id
@@ -15,7 +16,17 @@ WHERE s.category = 'delta_funnel.profile'
     'Delta Funnel SQL Server write',
     'Delta Funnel SQL Server write_all'
   )
-  AND extract_arg(s.arg_set_id, 'debug.operation_id') IS NOT NULL;
+  AND extract_arg(s.arg_set_id, 'debug.operation_id') IS NOT NULL
+  AND (
+    (
+      SELECT capture_scope_id
+      FROM delta_funnel_report_selection
+    ) IS NULL
+    OR extract_arg(s.arg_set_id, 'debug.capture_scope_id') = (
+      SELECT capture_scope_id
+      FROM delta_funnel_report_selection
+    )
+  );
 
 -- Task contexts emit their complete identity once. Later entries carry only
 -- this stable ID, so resolve it process-wide rather than assuming one thread.
@@ -58,7 +69,8 @@ SELECT
   extract_arg(context.arg_set_id, 'debug.profile_context_id') AS profile_context_id,
   coalesce(
     identity.operation_id,
-    extract_arg(context.arg_set_id, 'debug.operation_id')
+    extract_arg(context.arg_set_id, 'debug.operation_id'),
+    scoped_operation.operation_id
   ) AS operation_id,
   coalesce(
     identity.query_execution_id,
@@ -95,6 +107,11 @@ LEFT JOIN delta_funnel_profile_context_identities AS identity
       context.arg_set_id,
       'debug.profile_context_id'
     )
+LEFT JOIN delta_funnel_profile_operations AS scoped_operation
+  ON scoped_operation.capture_scope_id = extract_arg(
+    context.arg_set_id,
+    'debug.capture_scope_id'
+  )
 WHERE context.category = 'delta_funnel.profile.context';
 
 CREATE PERFETTO TABLE delta_funnel_profile_process_samples AS

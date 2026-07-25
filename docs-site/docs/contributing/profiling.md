@@ -13,20 +13,20 @@ Perfetto producer.
 | Goal | Mode |
 | --- | --- |
 | Inspect exact operation, phase, query, worker, and operator timing | Stable semantic JSON export |
+| Drill from one Python operation into ranked semantic work and native functions | [Operation-scoped ranked HTML](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report) |
 | Find native Rust CPU hotspots and source lines with the smallest capture | [Samply](profiling-samply.md) |
-| Correlate a real Python workload without building from source | [TestPyPI Perfetto diagnostics wheel](profiling-perfetto.md) |
-| Correlate a brief workload with sampled native Rust stacks | [Standard short Perfetto](profiling-perfetto.md) |
+| Capture several operations or a whole Python process | [Manual Perfetto capture](profiling-perfetto.md#advanced-capture-a-whole-python-process) |
 | Correlate a workload expected to run for up to ten minutes | [Standard streaming Perfetto](profiling-perfetto.md#record-a-longer-workload) |
 | Add scheduler and wakeup context to a short standard capture | [Deep-system Perfetto](profiling-perfetto.md#add-scheduler-context) |
 
-Use the short standard mode for a brief workload and the streaming standard
-mode when the expected duration exceeds two minutes. Both modes record exact
-begin and end timestamps as semantic Track Events. Short mode samples native
-call stacks at 1000 Hz by default; streaming and deep-system modes default to
-100 Hz. These are statistical samples, so nearby runs can have different
-sample counts. On Linux, native sampling is on-CPU only. Time blocked on I/O,
-locks, or sleep is absent from the sampled stacks; use the deep-system mode
-only when scheduler context is needed.
+Start with operation-scoped ranked HTML for one preview or write. Use manual
+short capture when the scope must include several operations, and streaming
+mode when the expected duration exceeds two minutes. Operation-scoped and
+manual short captures sample native call stacks at 1000 Hz by default;
+streaming and deep-system modes default to 100 Hz. These are statistical
+samples, so nearby runs can have different sample counts. On Linux, native
+sampling is on-CPU only. Time blocked on I/O, locks, or sleep is absent from
+the sampled stacks; use deep-system mode only when scheduler context is needed.
 
 See the [profiling validation report](profiling-validation-report.md) for the
 canonical 13.4M-row performance comparison, 10-minute streaming result, and

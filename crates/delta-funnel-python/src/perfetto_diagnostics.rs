@@ -1,5 +1,7 @@
 //! Python Perfetto diagnostics bridge.
 
+#[cfg(feature = "perfetto-profile")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     env,
     time::{Duration, Instant},
@@ -9,7 +11,7 @@ use std::{io, path::PathBuf};
 
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
-    PerfettoProfileLayer, initialize_perfetto, is_profile_target,
+    PerfettoProfileLayer, initialize_perfetto, is_profile_capture_active, is_profile_target,
     run_perfetto_diagnostics_cli_with_args, wait_for_capture,
 };
 use pyo3::prelude::*;
@@ -20,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 #[cfg(feature = "perfetto-profile")]
 use tracing_subscriber::filter::filter_fn;
 #[cfg(feature = "perfetto-profile")]
-use tracing_subscriber::{Layer, Registry, prelude::*};
+use tracing_subscriber::{Layer, Registry, layer::Filter, prelude::*};
 
 #[cfg(feature = "perfetto-profile")]
 use crate::logging::python_logging_layer;
@@ -31,6 +33,8 @@ use crate::{
 
 const DEFAULT_PERFETTO_WAIT_TIMEOUT_SECONDS: f64 = 10.0;
 const PERFETTO_DIAGNOSTICS_PHASE: &str = "perfetto_diagnostics";
+#[cfg(feature = "perfetto-profile")]
+static PERFETTO_SUBSCRIBER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn add_perfetto_diagnostics(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(init_perfetto_diagnostics, module)?)?;
@@ -141,8 +145,40 @@ fn init_perfetto_diagnostics_inner(
 }
 
 #[cfg(feature = "perfetto-profile")]
-fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
-    tracing::subscriber::set_global_default(perfetto_diagnostics_subscriber(filter, logger)).is_ok()
+pub(super) fn install_perfetto_subscriber(filter: EnvFilter, logger: String) -> bool {
+    let installed =
+        tracing::subscriber::set_global_default(perfetto_diagnostics_subscriber(filter, logger))
+            .is_ok();
+    if installed {
+        PERFETTO_SUBSCRIBER_INSTALLED.store(true, Ordering::Release);
+    }
+    installed
+}
+
+#[cfg(feature = "perfetto-profile")]
+pub(super) fn ensure_perfetto_subscriber(py: Python<'_>) -> PyResult<()> {
+    if PERFETTO_SUBSCRIBER_INSTALLED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if tracing::dispatcher::has_been_set() {
+        return Err(perfetto_diagnostics_py_error(
+            py,
+            "subscriber_unavailable",
+            "operation profiling cannot attach to the installed tracing subscriber".to_owned(),
+        ));
+    }
+    let filter = parse_logging_filter(py, None, env::var(LOG_FILTER_ENV).ok())?;
+    if install_perfetto_subscriber(filter, DEFAULT_LOGGER.to_owned())
+        || PERFETTO_SUBSCRIBER_INSTALLED.load(Ordering::Acquire)
+    {
+        Ok(())
+    } else {
+        Err(perfetto_diagnostics_py_error(
+            py,
+            "subscriber_unavailable",
+            "operation profiling could not install its tracing subscriber".to_owned(),
+        ))
+    }
 }
 
 #[cfg(feature = "perfetto-profile")]
@@ -151,9 +187,24 @@ fn perfetto_diagnostics_subscriber(
     logger: String,
 ) -> impl Subscriber + Send + Sync + 'static {
     let logging_layer = python_logging_layer(logger).with_filter(filter);
-    let perfetto_layer = PerfettoProfileLayer
-        .with_filter(filter_fn(|metadata| is_profile_target(metadata.target())));
+    let perfetto_layer =
+        PerfettoProfileLayer.with_filter(perfetto_capture_filter(is_profile_capture_active));
     Registry::default().with(logging_layer).with(perfetto_layer)
+}
+
+#[cfg(feature = "perfetto-profile")]
+fn perfetto_capture_filter<S>(
+    capture_active: impl Fn() -> bool + Send + Sync + 'static,
+) -> impl Filter<S>
+where
+    S: Subscriber,
+{
+    filter_fn(move |metadata| is_profile_target(metadata.target()) && capture_active())
+}
+
+#[cfg(feature = "perfetto-profile")]
+pub(super) fn refresh_perfetto_capture_filter() {
+    tracing::callsite::rebuild_interest_cache();
 }
 
 #[cfg(feature = "perfetto-profile")]
@@ -211,6 +262,10 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -460,6 +515,53 @@ mod tests {
 
     #[cfg(feature = "perfetto-profile")]
     #[test]
+    fn perfetto_filter_rechecks_capture_state_for_the_same_callsite() {
+        let active = Arc::new(AtomicBool::new(false));
+        let event_count = Arc::new(AtomicUsize::new(0));
+        let capture_active = Arc::clone(&active);
+        let subscriber =
+            Registry::default().with(EventCounter(Arc::clone(&event_count)).with_filter(
+                perfetto_capture_filter(move || capture_active.load(Ordering::Acquire)),
+            ));
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_profile_callsite();
+            assert_eq!(event_count.load(Ordering::Acquire), 0);
+            active.store(true, Ordering::Release);
+            refresh_perfetto_capture_filter();
+            emit_profile_callsite();
+            assert_eq!(event_count.load(Ordering::Acquire), 1);
+            active.store(false, Ordering::Release);
+            refresh_perfetto_capture_filter();
+            emit_profile_callsite();
+            assert_eq!(event_count.load(Ordering::Acquire), 1);
+        });
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    fn emit_profile_callsite() {
+        tracing::trace!(target: "delta_funnel::profile", "profile state transition");
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    struct EventCounter(Arc<AtomicUsize>);
+
+    #[cfg(feature = "perfetto-profile")]
+    impl<S> Layer<S> for EventCounter
+    where
+        S: Subscriber,
+    {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
     fn combined_subscriber_keeps_logging_and_perfetto_filters_independent() -> PyResult<()> {
         Python::attach(|py| {
             let logger_name = "deltafunnel.test.combined";
@@ -470,11 +572,11 @@ mod tests {
             );
 
             tracing::subscriber::with_default(subscriber, || {
-                assert!(tracing::enabled!(
+                assert!(!tracing::enabled!(
                     target: "delta_funnel::profile",
                     Level::TRACE
                 ));
-                assert!(tracing::enabled!(
+                assert!(!tracing::enabled!(
                     target: "tiberius_raw_bulk::protocol",
                     Level::INFO
                 ));

@@ -192,6 +192,7 @@ mod tests {
 
         assert!(signature.contains("profile: bool | None = False"));
         assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
+        assert!(signature.contains("profiler: ProfilerConfig | None = None"));
     }
 
     #[test]
@@ -446,7 +447,7 @@ mod tests {
                 .to_string();
             assert_eq!(
                 signature,
-                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=False, trace_path=None)"
+                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=False, trace_path=None, profiler=None)"
             );
             Ok(())
         })

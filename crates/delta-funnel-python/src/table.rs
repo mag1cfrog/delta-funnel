@@ -10,8 +10,10 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool};
 
+use crate::exception::attach_operation_result;
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
+use crate::profiler::{PyProfilerConfig, in_operation_profile_scope, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::session::{PySession, borrow_session_mut, config_py_error};
 
@@ -152,7 +154,9 @@ impl PyTable {
     /// `dict` report. Pass `profile=True` on execute calls to attach a detailed
     /// query execution profile and full operation timeline. Pass `trace_path`
     /// with `profile=True` to export Chrome Trace Event JSON after success.
-    /// Profiling and trace export are not available for dry runs.
+    /// Pass `profiler=ProfilerConfig(...)` to record this write and export an
+    /// interactive ranked HTML report. Profiling and trace export are not
+    /// available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -166,7 +170,7 @@ impl PyTable {
     /// cleanup before raising the interruption. When possible, the exception
     /// includes `deltafunnel_operation_status` and, for a failed action,
     /// `deltafunnel_operation_error`.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false, trace_path=None))]
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=false, trace_path=None, profiler=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -180,12 +184,13 @@ impl PyTable {
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
         trace_path: Option<PathBuf>,
+        profiler: Option<PyRef<'_, PyProfilerConfig>>,
     ) -> PyResult<Py<PyAny>> {
-        if dry_run == Some(true) && profile {
+        if dry_run == Some(true) && (profile || profiler.is_some()) {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`profile=True` is only supported for execute `write_to_mssql` calls".to_owned(),
+                "profiling is only supported for execute `write_to_mssql` calls".to_owned(),
             ));
         }
         if dry_run == Some(true) && trace_path.is_some() {
@@ -195,11 +200,11 @@ impl PyTable {
                 "`trace_path` is only supported for execute `write_to_mssql` calls".to_owned(),
             ));
         }
-        if trace_path.is_some() && !profile {
+        if trace_path.is_some() && !profile && profiler.is_none() {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` requires `profile=True`".to_owned(),
+                "`trace_path` requires `profile=True` or `profiler=ProfilerConfig(...)`".to_owned(),
             ));
         }
         let spec = PyMssqlOutputSpec::new(
@@ -221,18 +226,39 @@ impl PyTable {
             );
         }
 
-        let profile_mode = if profile {
+        let profile_mode = if profile || profiler.is_some() {
             delta_funnel::ExecutionProfileMode::Detailed
         } else {
             delta_funnel::ExecutionProfileMode::Disabled
         };
-        self.session.borrow(py).write_to_mssql(
-            py,
-            &spec.write_plan(delta_funnel::RunMode::Execute),
-            profile_mode,
-            progress.as_ref(),
-            trace_path.as_deref(),
-        )
+        let operation_profile =
+            start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
+        drop(profiler);
+        let write = in_operation_profile_scope(operation_profile.as_ref(), || {
+            self.session.borrow(py).write_to_mssql(
+                py,
+                &spec.write_plan(delta_funnel::RunMode::Execute),
+                profile_mode,
+                progress.as_ref(),
+                trace_path.as_deref(),
+            )
+        });
+        let profile_result = operation_profile
+            .map(|operation_profile| operation_profile.finish(py))
+            .transpose();
+        match (write, profile_result) {
+            (Err(error), _) => Err(error),
+            (Ok(report), Err(error)) => {
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_status", "completed");
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_report", report.bind(py));
+                Err(error)
+            }
+            (Ok(report), Ok(_)) => Ok(report),
+        }
     }
 
     /// Returns a bounded rendered preview of this lazy table.
@@ -241,16 +267,18 @@ impl PyTable {
     /// Pass `progress=True` to force it or `progress=False` to disable it. The
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass `profile=True` to also attach the
-    /// detailed execution profile.
-    #[pyo3(signature = (limit=20, *, progress=None, profile=false))]
+    /// detailed execution profile. Pass `profiler=ProfilerConfig(...)` to
+    /// record this preview and write an interactive ranked HTML report.
+    #[pyo3(signature = (limit=20, *, progress=None, profile=false, profiler=None))]
     fn preview(
         &self,
         py: Python<'_>,
         limit: usize,
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
+        profiler: Option<PyRef<'_, PyProfilerConfig>>,
     ) -> PyResult<PyPreview> {
-        let profile_mode = if profile {
+        let profile_mode = if profile || profiler.is_some() {
             delta_funnel::ExecutionProfileMode::Detailed
         } else {
             delta_funnel::ExecutionProfileMode::Disabled
@@ -258,11 +286,24 @@ impl PyTable {
         let options =
             delta_funnel::PreviewOptions::new(limit).with_execution_profile_mode(profile_mode);
         let progress = PythonProgress::for_preview(progress);
-        let preview =
+        let operation_profile = start_operation_profile(py, profiler.as_deref(), None)?;
+        drop(profiler);
+        let preview = in_operation_profile_scope(operation_profile.as_ref(), || {
             self.session
                 .borrow(py)
-                .preview_table(py, &self.inner, options, progress.as_ref())?;
-        PyPreview::new(py, preview)
+                .preview_table(py, &self.inner, options, progress.as_ref())
+        });
+        let profile_result = operation_profile
+            .map(|operation_profile| operation_profile.finish(py))
+            .transpose();
+        match (preview, profile_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => {
+                attach_operation_result(py, &error, "completed", None, None);
+                Err(error)
+            }
+            (Ok(preview), Ok(_)) => PyPreview::new(py, preview),
+        }
     }
 
     /// Prints a bounded preview of this lazy table to Python stdout.
@@ -457,6 +498,7 @@ mod tests {
 
         assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
         assert!(stub.contains("trace_path: str | PathLike[str] | None = None"));
+        assert!(stub.contains("profiler: ProfilerConfig | None = None"));
     }
 
     #[test]
@@ -470,7 +512,7 @@ mod tests {
                 .import("inspect")?
                 .call_method1("signature", (table.getattr("write_to_mssql")?,))?
                 .to_string();
-            assert!(signature.ends_with("profile=False, trace_path=None)"));
+            assert!(signature.ends_with("profile=False, trace_path=None, profiler=None)"));
 
             let trace_path = temp_trace_path("write-without-profile")?;
             let kwargs = PyDict::new(py);
@@ -529,7 +571,7 @@ mod tests {
             assert_eq!(preview.repr()?.extract::<String>()?, text);
             assert_eq!(
                 preview_signature,
-                "(limit=20, *, progress=None, profile=False)"
+                "(limit=20, *, progress=None, profile=False, profiler=None)"
             );
             assert_eq!(
                 preview.call_method0("_repr_html_")?.extract::<String>()?,
@@ -577,6 +619,94 @@ mod tests {
                         .is_err_and(|error| { error.is_instance_of::<PyAttributeError>(py) })
                 );
             }
+            Ok(())
+        })
+    }
+
+    #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+    #[test]
+    fn preview_profiler_requires_a_diagnostics_build_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1(
+                "table_from_sql",
+                ("select cast(1 as bigint) / cast(0 as bigint) as value",),
+            )?;
+            let output = temp_trace_path("profiler-unavailable")?.with_extension("html");
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call1((output.to_string_lossy().as_ref(),))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profiler", profiler)?;
+
+            let error = table
+                .call_method("preview", (), Some(&kwargs))
+                .expect_err("a standard wheel must reject operation profiling");
+
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "profiler"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "not_available"
+            );
+
+            assert!(!output.exists());
+            Ok(())
+        })
+    }
+
+    #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
+    #[test]
+    fn write_profiler_requires_a_diagnostics_build_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+            let output = temp_trace_path("write-profiler-unavailable")?.with_extension("html");
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call1((output.to_string_lossy().as_ref(),))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", "dbo")?;
+            kwargs.set_item("table", "orders")?;
+            kwargs.set_item("load_mode", "append_existing")?;
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profiler", profiler)?;
+
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .expect_err("a standard wheel must reject operation profiling");
+
+            assert!(error.is_instance_of::<DeltaFunnelError>(py));
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "profiler"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "not_available"
+            );
+
+            kwargs.set_item("dry_run", true)?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .expect_err("dry-run operation profiling must be rejected");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(!output.exists());
             Ok(())
         })
     }

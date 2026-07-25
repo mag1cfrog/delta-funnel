@@ -1,4 +1,5 @@
 from os import PathLike
+from pathlib import Path
 from typing import Literal, Mapping, Sequence, TypeAlias, TypedDict, overload
 
 __version__: str
@@ -29,6 +30,18 @@ class DeltaFunnelError(Exception):
     kind: str
     message: str
     context: object | None
+
+
+class ProfilerConfig:
+    output: Path
+    sample_hz: Literal[100, 1000]
+
+    def __init__(
+        self,
+        output: str | PathLike[str],
+        *,
+        sample_hz: Literal[100, 1000] = 1000,
+    ) -> None: ...
 
 
 class Session:
@@ -75,6 +88,7 @@ class Session:
         dry_run: bool | None = None,
         progress: bool | None = None,
         trace_path: str | PathLike[str] | None = None,
+        profiler: ProfilerConfig | None = None,
     ) -> Report: ...
 
 
@@ -104,6 +118,7 @@ class Table:
         *,
         progress: bool | None = None,
         profile: bool | None = False,
+        profiler: ProfilerConfig | None = None,
     ) -> Preview: ...
 
     def show(self, limit: int = 20, *, progress: bool | None = None) -> None: ...
@@ -130,6 +145,7 @@ class Table:
         progress: bool | None = None,
         profile: bool | None = False,
         trace_path: str | PathLike[str] | None = None,
+        profiler: ProfilerConfig | None = None,
     ) -> Report: ...
 
 

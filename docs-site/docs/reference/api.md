@@ -18,6 +18,7 @@ task-oriented examples, start with the
 | Write several outputs | [`Session.write_all`](#session-write-all) |
 | Enable Python logging | [`init_logging`](#init-logging) |
 | Enable Perfetto diagnostics | [`init_perfetto_diagnostics`](#init-perfetto-diagnostics) |
+| Configure an operation-scoped HTML profile | [`ProfilerConfig`](#profiler-config) |
 | Handle a Delta Funnel failure | [`DeltaFunnelError`](#delta-funnel-error) |
 
 ## Rust
@@ -85,9 +86,10 @@ def init_perfetto_diagnostics(
 
 Installs the Python logging bridge and Perfetto profiling layer, then waits for
 a capture to attach. The function is available only in builds compiled with
-Perfetto diagnostics. See
-[Perfetto diagnostics](../contributing/profiling-perfetto.md) for build and
-capture steps.
+Perfetto diagnostics. Use it for an advanced whole-process capture.
+`ProfilerConfig` manages activation automatically for operation-scoped HTML
+reports. See [Perfetto diagnostics](../contributing/profiling-perfetto.md) for
+build and capture steps.
 
 ### Exceptions
 
@@ -113,6 +115,39 @@ Errors raised after an operation finishes can also expose
 See [Troubleshoot a failed run](../advanced/tracing-and-diagnostics.md).
 
 ### Classes
+
+<a id="profiler-config"></a>
+#### `ProfilerConfig`
+
+```python
+class ProfilerConfig:
+    output: Path
+    sample_hz: Literal[100, 1000]
+
+    def __init__(
+        self,
+        output: str | PathLike[str],
+        *,
+        sample_hz: Literal[100, 1000] = 1000,
+    ) -> None
+```
+
+Configures one operation-scoped ranked HTML report. The object is immutable.
+`output` names the report file. Delta Funnel creates missing parent directories
+and replaces an existing file only after the new report is complete.
+
+Use 1000 Hz for short operations and 100 Hz for lower-volume or longer
+captures. Only one operation profile can be active in a process. Passing this
+configuration to a supported operation automatically enables detailed semantic
+and operator profiling.
+
+The type is importable from every wheel, but using it requires a
+diagnostics-enabled Linux build plus `tracebox` and `trace_processor_shell`.
+Dry-run operations reject it.
+
+See
+[Generate an operation-scoped ranked HTML report](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report)
+for examples.
 
 <a id="session"></a>
 #### `Session`
@@ -248,19 +283,23 @@ def write_all(
     dry_run: bool | None = None,
     progress: bool | None = None,
     trace_path: str | PathLike[str] | None = None,
+    profiler: ProfilerConfig | None = None,
 ) -> Report
 ```
 
 Plans or executes several SQL Server output specs in order and returns one
 report. Every spec must come from the same session.
 
-- `dry_run=True` plans without writing and rejects `options` and `trace_path`.
+- `dry_run=True` plans without writing and rejects `options`, `trace_path`, and
+  `profiler`.
 - `options={"cache_mode": "auto"}` enables eligible shared-work caching.
 - `options={"cache_mode": "disabled"}` disables shared-work caching.
 - `options={"profile": True}` attaches profiles to attempted outputs and
   executed cache aliases.
 - `trace_path` requires profiling and exports one Chrome Trace Event JSON
   document for the complete operation.
+- `profiler` automatically enables detailed profiling and writes one
+  operation-scoped ranked HTML report.
 
 See [Multiple outputs and shared caching](../advanced/multiple-outputs.md) for
 workflow examples and
@@ -313,12 +352,15 @@ def preview(
     *,
     progress: bool | None = None,
     profile: bool | None = False,
+    profiler: ProfilerConfig | None = None,
 ) -> Preview
 ```
 
 Executes a bounded query and returns a rendered `Preview`. Phase timings are
 always included. Only the Boolean `True` enables the detailed execution
-profile. The method reads rows but does not contact SQL Server.
+profile directly. Passing `profiler` also enables that profile and writes one
+operation-scoped ranked HTML report. The method reads rows but does not contact
+SQL Server.
 
 <a id="table-show"></a>
 ##### `Table.show`
@@ -371,23 +413,26 @@ def write_to_mssql(
     progress: bool | None = None,
     profile: bool | None = False,
     trace_path: str | PathLike[str] | None = None,
+    profiler: ProfilerConfig | None = None,
 ) -> Report
 ```
 
 Plans or executes one SQL Server output and returns a report.
 
-- `dry_run=True` plans without writing and rejects `profile=True` and
-  `trace_path`.
+- `dry_run=True` plans without writing and rejects `profile=True`,
+  `trace_path`, and `profiler`.
 - `profile=True` attaches `execution_profile` and `operation_timeline` to an
   execute report.
-- `trace_path` requires `profile=True` and exports Chrome Trace Event JSON
+- `trace_path` requires detailed profiling and exports Chrome Trace Event JSON
   after a successful write.
+- `profiler` automatically enables detailed profiling and writes one
+  operation-scoped ranked HTML report.
 - `connection_string` overrides the session default for this call.
 
-If trace export fails after SQL Server succeeds, the raised exception reports
-`deltafunnel_operation_status="completed"` and contains the sanitized report
-in `deltafunnel_operation_report`. Do not treat the export error as evidence
-that a write is safe to retry.
+If trace or HTML report export fails after SQL Server succeeds, the raised
+exception reports `deltafunnel_operation_status="completed"` and contains the
+sanitized report in `deltafunnel_operation_report`. Do not treat the export
+error as evidence that a write is safe to retry.
 
 See [SQL Server writes](../sql-server.md) for load modes and
 [Inspect returned SQL Server output diagnostics](../advanced/execution-profiling.md#inspect-returned-sql-server-output-diagnostics)
@@ -409,8 +454,8 @@ class Preview:
 ```
 
 `text` is the plain-text table. `html` backs notebook display.
-`phase_timings` is always populated. `execution_profile` is populated only
-when `Table.preview(profile=True)` was used.
+`phase_timings` is always populated. `execution_profile` is populated when
+`Table.preview` receives either `profile=True` or a `ProfilerConfig`.
 
 `export_trace` creates or replaces a Chrome Trace Event JSON file. It requires
 a profiled preview, accepts a string or `os.PathLike`, and does not create

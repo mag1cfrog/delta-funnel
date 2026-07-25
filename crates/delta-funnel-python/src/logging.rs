@@ -7,9 +7,9 @@ use std::fmt;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModuleMethods};
 use tracing::{Event, Level, Subscriber, field::Field, field::Visit};
-use tracing_subscriber::{
-    EnvFilter, Layer, Registry, layer::Context, prelude::*, registry::LookupSpan,
-};
+use tracing_subscriber::{EnvFilter, Layer, layer::Context, registry::LookupSpan};
+#[cfg(not(feature = "perfetto-profile"))]
+use tracing_subscriber::{Registry, prelude::*};
 
 use crate::exception::delta_funnel_py_error;
 
@@ -26,11 +26,21 @@ pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyo3(signature = (filter=None, logger=DEFAULT_LOGGER.to_owned()))]
 fn init_logging(py: Python<'_>, filter: Option<String>, logger: String) -> PyResult<bool> {
     let filter = parse_logging_filter(py, filter, env::var(LOG_FILTER_ENV).ok())?;
-    let subscriber = Registry::default()
-        .with(filter)
-        .with(python_logging_layer(logger));
 
-    Ok(tracing::subscriber::set_global_default(subscriber).is_ok())
+    #[cfg(feature = "perfetto-profile")]
+    {
+        Ok(crate::perfetto_diagnostics::install_perfetto_subscriber(
+            filter, logger,
+        ))
+    }
+
+    #[cfg(not(feature = "perfetto-profile"))]
+    {
+        let subscriber = Registry::default()
+            .with(filter)
+            .with(python_logging_layer(logger));
+        Ok(tracing::subscriber::set_global_default(subscriber).is_ok())
+    }
 }
 
 pub(super) fn parse_logging_filter(

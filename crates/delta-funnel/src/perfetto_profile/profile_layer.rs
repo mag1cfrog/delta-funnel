@@ -163,6 +163,7 @@ fn dependency_span_label(name: &str) -> Option<&'static str> {
 #[derive(Clone, Debug, Default)]
 struct ProfileFields {
     operation_id: Option<u64>,
+    capture_scope_id: Option<u64>,
     query_execution_id: Option<u64>,
     query_scope: Option<String>,
     query_owner: Option<String>,
@@ -190,6 +191,7 @@ impl Visit for ProfileFields {
     fn record_u64(&mut self, field: &Field, value: u64) {
         match field.name() {
             "operation_id" => self.operation_id = Some(value),
+            "capture_scope_id" => self.capture_scope_id = (value != 0).then_some(value),
             "query_execution_id" => self.query_execution_id = Some(value),
             "worker_lane_id" => self.worker_lane_id = Some(value),
             "node_id" => self.node_id = Some(value),
@@ -679,6 +681,12 @@ impl ActiveProfileSpan {
         if let Some(operation_id) = self.fields.operation_id {
             context.add_debug_arg("operation_id", TrackEventDebugArg::Uint64(operation_id));
         }
+        if let Some(capture_scope_id) = self.fields.capture_scope_id {
+            context.add_debug_arg(
+                "capture_scope_id",
+                TrackEventDebugArg::Uint64(capture_scope_id),
+            );
+        }
         if let Some(query_execution_id) = self.fields.query_execution_id {
             context.add_debug_arg(
                 "query_execution_id",
@@ -1019,6 +1027,7 @@ mod tests {
     #[test]
     fn completion_records_preserve_begin_identity_and_update_completion_fields() {
         let mut initial = fields(1, 1, 1);
+        initial.capture_scope_id = Some(42);
         initial.query_owner = None;
         initial.parent_node_id = None;
         let mut active = ActiveProfileSpan::from_fields("DataFusion operator activity", initial)
@@ -1026,6 +1035,7 @@ mod tests {
 
         active.record(ProfileFields {
             operation_id: Some(99),
+            capture_scope_id: Some(99),
             query_execution_id: Some(99),
             query_owner: Some("orders".to_owned()),
             worker_lane_id: Some(99),
@@ -1035,6 +1045,7 @@ mod tests {
         });
 
         assert_eq!(active.fields.operation_id, Some(1));
+        assert_eq!(active.fields.capture_scope_id, Some(42));
         assert_eq!(active.fields.query_execution_id, Some(1));
         assert_eq!(active.fields.worker_lane_id, Some(1));
         assert_eq!(active.fields.query_owner.as_deref(), Some("orders"));

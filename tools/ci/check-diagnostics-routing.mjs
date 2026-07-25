@@ -35,6 +35,8 @@ for (const file of [
   "crates/delta-funnel-python/build.rs",
   "crates/delta-funnel-python/pyproject.toml",
   "crates/delta-funnel-python/src/perfetto_diagnostics.rs",
+  "crates/delta-funnel-python/src/profiler.rs",
+  "crates/delta-funnel-python/src/profiler/capture.rs",
   "tools/perfetto/delta-funnel-standard.pbtx",
   ".github/workflows/testpypi-diagnostics-build.yml",
 ]) {

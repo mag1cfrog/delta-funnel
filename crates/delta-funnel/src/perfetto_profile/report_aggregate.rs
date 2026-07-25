@@ -72,12 +72,15 @@ struct CompactFunctionSelf {
 
 pub(super) fn load_ranked_profile(
     input: &Path,
+    capture_scope_id: Option<u64>,
 ) -> Result<RankedProfileDocument, RankedReportFailure> {
     let health_input_sql = capture_health_input_sql(input)?;
+    let selection_sql = report_selection_sql(capture_scope_id);
     let sql = [
         health_input_sql.as_str(),
         "CREATE PERFETTO TABLE delta_funnel_capture_health AS",
         CAPTURE_HEALTH_SQL,
+        selection_sql.as_str(),
         SAMPLE_CORRELATION_SQL,
         RANKED_PROFILE_BASE_SQL,
         RANKED_REPORT_SQL,
@@ -86,6 +89,20 @@ pub(super) fn load_ranked_profile(
     let sanitized = sanitize_trace(input)?;
     let output = run_trace_processor_query(sanitized.path(), sql.as_bytes())?;
     parse_ranked_report_output(&output)
+}
+
+fn report_selection_sql(capture_scope_id: Option<u64>) -> String {
+    capture_scope_id.map_or_else(
+        || {
+            "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT NULL AS capture_scope_id;"
+                .to_owned()
+        },
+        |capture_scope_id| {
+            format!(
+                "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT {capture_scope_id} AS capture_scope_id;"
+            )
+        },
+    )
 }
 
 fn parse_ranked_report_output(output: &[u8]) -> Result<RankedProfileDocument, RankedReportFailure> {
@@ -449,6 +466,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn report_selection_sql_is_unscoped_or_exact() {
+        assert_eq!(
+            report_selection_sql(None),
+            "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT NULL AS capture_scope_id;"
+        );
+        assert_eq!(
+            report_selection_sql(Some(42)),
+            "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT 42 AS capture_scope_id;"
+        );
+    }
+
+    #[test]
     fn parses_and_folds_compact_ranked_records() -> Result<(), Box<dyn std::error::Error>> {
         let output = fixture_output(1, 0, true);
         let document = parse_ranked_report_output(output.as_bytes())?;
@@ -494,7 +523,7 @@ mod tests {
 
         let trace = std::env::var_os("DELTA_FUNNEL_TEST_PERFETTO_TRACE")
             .ok_or("DELTA_FUNNEL_TEST_PERFETTO_TRACE is not set")?;
-        let document = load_ranked_profile(Path::new(&trace))?;
+        let document = load_ranked_profile(Path::new(&trace), None)?;
         assert!(!document.semantics.is_empty());
         assert_eq!(
             document.metadata.direct_sample_count,
