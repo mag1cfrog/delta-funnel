@@ -76,6 +76,7 @@ tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
 .name { font-weight: 650; }
 .name-line { align-items: center; display: flex; gap: .35rem; min-width: 0; }
 .name-label {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
