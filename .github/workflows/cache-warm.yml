@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/cache-warm.yml"
+      - ".github/workflows/ci.yml"
       - ".github/workflows/pypi-build.yml"
       - ".cargo/**"
       - "Cargo.toml"
