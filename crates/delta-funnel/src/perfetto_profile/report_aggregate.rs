@@ -367,25 +367,50 @@ fn collapse_zero_self_runtime_wrappers(
         .filter(|function| function.self_sample_count == 0 && is_runtime_wrapper(&function.name))
         .map(|function| (function.semantic_id, function.function_id))
         .collect::<HashSet<_>>();
+    let mut retained_parents = HashMap::with_capacity(wrappers.len());
 
     for function in functions.iter_mut() {
-        let mut parent = function.parent_function_id;
-        while let Some(parent_id) = parent
-            && wrappers.contains(&(function.semantic_id, parent_id))
-        {
-            parent = *parents
-                .get(&(function.semantic_id, parent_id))
-                .ok_or_else(|| {
-                    aggregate_failure(
-                        "invalid_function_graph",
-                        "runtime wrapper parent is missing",
-                    )
-                })?;
-        }
-        function.parent_function_id = parent;
+        function.parent_function_id = retained_parent(
+            function.semantic_id,
+            function.parent_function_id,
+            &parents,
+            &wrappers,
+            &mut retained_parents,
+        )?;
     }
     functions.retain(|function| !wrappers.contains(&(function.semantic_id, function.function_id)));
     Ok(())
+}
+
+fn retained_parent(
+    semantic_id: i64,
+    mut parent: Option<i64>,
+    parents: &HashMap<(i64, i64), Option<i64>>,
+    wrappers: &HashSet<(i64, i64)>,
+    retained_parents: &mut HashMap<(i64, i64), Option<i64>>,
+) -> Result<Option<i64>, RankedReportFailure> {
+    let mut path = Vec::new();
+    while let Some(parent_id) = parent {
+        let key = (semantic_id, parent_id);
+        if !wrappers.contains(&key) {
+            break;
+        }
+        if let Some(retained) = retained_parents.get(&key) {
+            parent = *retained;
+            break;
+        }
+        path.push(key);
+        parent = *parents.get(&key).ok_or_else(|| {
+            aggregate_failure(
+                "invalid_function_graph",
+                "runtime wrapper parent is missing",
+            )
+        })?;
+    }
+    for key in path {
+        retained_parents.insert(key, parent);
+    }
+    Ok(parent)
 }
 
 fn is_runtime_wrapper(name: &str) -> bool {
@@ -605,6 +630,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(3, None, 7), (4, None, 2)]
         );
+    }
+
+    #[test]
+    fn collapses_deep_runtime_wrapper_chain_with_path_compression() {
+        const WRAPPER_COUNT: i64 = 20_000;
+        let mut functions = (0..WRAPPER_COUNT)
+            .map(|function_id| {
+                function(
+                    function_id,
+                    (function_id != 0).then_some(function_id - 1),
+                    "tokio::runtime::scheduler::worker::run",
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        functions.push(function(
+            WRAPPER_COUNT,
+            Some(WRAPPER_COUNT - 1),
+            "deltafunnel::write_batches",
+            1,
+        ));
+
+        collapse_zero_self_runtime_wrappers(&mut functions)
+            .expect("a deep valid wrapper chain should collapse");
+
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].function_id, WRAPPER_COUNT);
+        assert_eq!(functions[0].parent_function_id, None);
     }
 
     #[test]
