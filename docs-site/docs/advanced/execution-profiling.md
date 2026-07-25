@@ -74,6 +74,11 @@ into its semantic children and sampled native callsites. Exact durations and
 sample counts use different units: a function's self and inclusive CPU values
 are statistical on-CPU samples, not wall-clock time.
 
+To keep that call tree useful, the ranked report omits known runtime wrapper
+frames with no self CPU samples and connects their children to the nearest
+meaningful parent. Runtime frames that consume sampled CPU remain visible. The
+raw `.pftrace` file retains the complete native call stack.
+
 Only one operation profile can be active in a Python process. The output parent
 directory is created when needed, and a completed report replaces an existing
 file at the same path. Operation profiling is unavailable for dry runs.
