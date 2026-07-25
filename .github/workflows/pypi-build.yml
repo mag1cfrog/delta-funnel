@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: none
+      max_parallel:
+        description: "Maximum concurrent wheel builds"
+        required: false
+        type: number
+        default: 4
       version:
         description: "Expected package version, such as 0.1.0 or v0.1.0"
         required: false
@@ -17,6 +22,11 @@ on:
         required: false
         type: boolean
         default: true
+      write_cache:
+        description: "Allow writes to shared build caches"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,6 +40,7 @@ jobs:
         shell: bash
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         include:
           - name: Linux x86_64
@@ -65,7 +76,7 @@ jobs:
       RELEASE_VERSION: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
+      SCCACHE_GHA_RW_MODE: ${{ inputs.write_cache && 'READ_WRITE' || 'READ_ONLY' }}
       RUSTC_WRAPPER: ${{ matrix.host_sccache == 'true' && 'sccache' || '' }}
 
     steps:
@@ -115,7 +126,7 @@ jobs:
         with:
           shared-key: pypi-${{ matrix.artifact }}
           cache-targets: false
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ inputs.write_cache }}
 
       - name: Set up sccache
         if: matrix.host_sccache == 'true'
@@ -135,6 +146,12 @@ jobs:
             --manifest-path crates/delta-funnel-python/Cargo.toml
             --compatibility pypi
             -i ${{ matrix.interpreter }}
+
+      - name: Verify sccache writes
+        if: inputs.write_cache && matrix.host_sccache == 'true'
+        run: >-
+          sccache --show-stats --stats-format json |
+          python -c 'import json, sys; errors = json.load(sys.stdin)["stats"]["cache_write_errors"]; sys.exit(f"sccache reported {errors} cache write errors") if errors else None'
 
       - name: Set up smoke-test Python
         uses: actions/setup-python@v6
