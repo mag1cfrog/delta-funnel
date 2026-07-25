@@ -75,6 +75,7 @@ jobs:
       PUBLISH_TO: ${{ github.event_name == 'release' && 'pypi' || inputs.publish_to || 'none' }}
       RELEASE_VERSION: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
       CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: ${{ matrix.name == 'Windows x86_64' && '-C link-arg=/Brepro' || '' }}
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_RW_MODE: ${{ inputs.write_cache && 'READ_WRITE' || 'READ_ONLY' }}
       RUSTC_WRAPPER: ${{ matrix.host_sccache == 'true' && 'sccache' || '' }}
