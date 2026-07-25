@@ -25,6 +25,9 @@ permissions:
 
 jobs:
   build:
+    if: >-
+      github.event_name != 'release' ||
+      startsWith(github.event.release.tag_name, 'delta-funnel-v')
     uses: ./.github/workflows/pypi-build.yml
     with:
       publish_to: ${{ inputs.publish_to || 'none' }}
@@ -58,7 +61,10 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: build
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_to == 'pypi')
+    if: >-
+      (github.event_name == 'release' &&
+       startsWith(github.event.release.tag_name, 'delta-funnel-v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_to == 'pypi')
     runs-on: ubuntu-latest
     environment:
       name: pypi-release
