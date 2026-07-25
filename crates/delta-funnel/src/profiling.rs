@@ -34,6 +34,7 @@ thread_local! {
     static OPERATION_CAPTURE_SCOPE_ID: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
+#[cfg(feature = "perfetto-profile")]
 pub(crate) fn in_operation_capture_scope<T>(
     capture_scope_id: u64,
     operation: impl FnOnce() -> T,
@@ -49,8 +50,10 @@ fn current_operation_capture_scope_id() -> Option<u64> {
     OPERATION_CAPTURE_SCOPE_ID.get()
 }
 
+#[cfg(feature = "perfetto-profile")]
 struct OperationCaptureScopeReset(Option<u64>);
 
+#[cfg(feature = "perfetto-profile")]
 impl Drop for OperationCaptureScopeReset {
     fn drop(&mut self) {
         OPERATION_CAPTURE_SCOPE_ID.set(self.0);
@@ -676,6 +679,7 @@ mod tests {
         assert_eq!(allocate_id(&counter), None);
     }
 
+    #[cfg(feature = "perfetto-profile")]
     #[test]
     fn operation_capture_scope_restores_nested_and_panicking_calls() {
         assert_eq!(current_operation_capture_scope_id(), None);
@@ -715,10 +719,14 @@ mod tests {
         let capture = TracingCapture::start_with_profile_spans_enabled();
         let application_span = tracing::info_span!("application operation");
         let application_guard = application_span.enter();
+        #[cfg(feature = "perfetto-profile")]
         let completed = in_operation_capture_scope(42, || {
             OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
                 .expect("process tracing should create a context")
         });
+        #[cfg(not(feature = "perfetto-profile"))]
+        let completed = OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
+            .expect("process tracing should create a context");
         let completed_id = completed.operation_id();
         completed.record_process_result("ok");
         drop(completed);
@@ -739,7 +747,14 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].name, "Delta Funnel SQL Server write");
         assert_eq!(spans[0].fields["operation_id"], completed_id.to_string());
-        assert_eq!(spans[0].fields["capture_scope_id"], "42");
+        assert_eq!(
+            spans[0].fields["capture_scope_id"],
+            if cfg!(feature = "perfetto-profile") {
+                "42"
+            } else {
+                "0"
+            }
+        );
         assert_eq!(spans[0].fields["result"], "ok");
         assert_eq!(spans[1].name, "Delta Funnel preview");
         assert_eq!(spans[1].fields["operation_id"], cancelled_id.to_string());
