@@ -284,7 +284,7 @@ mod tests {
         assert!(html.contains(r#""aria-selected","#));
         assert!(html.contains("const maximumBulkSubtreeRows = 1000"));
         assert!(html.contains("const maximumRenderedRows = 1000"));
-        assert!(html.contains("const maximumIndentDepth = 32"));
+        assert!(html.contains("const maximumIndentDepth = 6"));
         assert!(html.contains("const siblingPageSize = 100"));
         assert!(html.contains("const containsFilter = value =>"));
         assert!(html.contains("operationsBody.replaceChildren(fragment)"));
@@ -443,10 +443,15 @@ mod tests {
                     14 => " worker 14",
                     _ => "",
                 };
+                let detail = if function_id == 1 {
+                    format!("{worker} {}", "x".repeat(480))
+                } else {
+                    worker.to_owned()
+                };
                 function(
                     function_id,
                     None,
-                    format!("match function {function_id:03}{worker}"),
+                    format!("match function {function_id:03}{detail}"),
                 )
             })
             .collect::<Vec<_>>();
@@ -568,6 +573,28 @@ mod tests {
       operationsBody.querySelectorAll(".function-row")
     ).find(row => row.textContent.includes("match function 001"));
     check(functionRootRow !== undefined, "nested function root was not rendered");
+    const functionName = functionRootRow.querySelector(".name-label");
+    check(
+      functionName.title === functionName.textContent,
+      "full function symbol was not available on hover"
+    );
+    check(
+      getComputedStyle(functionName).whiteSpace === "nowrap" &&
+        getComputedStyle(functionName).textOverflow === "ellipsis",
+      "function symbol was not constrained to one line"
+    );
+    check(
+      functionName.scrollWidth > functionName.clientWidth,
+      "long function symbol did not actually overflow"
+    );
+    const shortFunctionRow = Array.from(
+      operationsBody.querySelectorAll(".function-row")
+    ).find(row => row.textContent.includes("match function 002"));
+    check(
+      functionRootRow.getBoundingClientRect().height ===
+        shortFunctionRow.getBoundingClientRect().height,
+      "long function symbol increased its row height"
+    );
     functionRootRow.focus();
     functionRootRow.dispatchEvent(new KeyboardEvent("keydown", {
       key: "ArrowRight",
@@ -610,15 +637,14 @@ mod tests {
     ];
     deepKeys.forEach(key => expanded.add(key));
     renderRows();
+    const deepRow = operationsBody.querySelector('[aria-level="42"]');
     check(
-      operationsBody.querySelector('[aria-level="34"] .depth-label').textContent ===
-        "Depth 34",
-      "first capped indentation depth was not labeled"
+      deepRow.querySelector(".depth-label").textContent === "Depth 42",
+      "deep hierarchy was visually flattened"
     );
     check(
-      operationsBody.querySelector('[aria-level="42"] .depth-label').textContent ===
-        "Depth 42",
-      "deep hierarchy was visually flattened"
+      deepRow.querySelector(".name-label").clientWidth > 0,
+      "deep hierarchy left no visible name width"
     );
     deepKeys.forEach(key => expanded.delete(key));
     renderRows();

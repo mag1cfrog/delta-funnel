@@ -118,7 +118,7 @@ const expanded = new Set();
 const disclosureButtons = new Map();
 const maximumBulkSubtreeRows = 1000;
 const maximumRenderedRows = 1000;
-const maximumIndentDepth = 32;
+const maximumIndentDepth = 6;
 const siblingPageSize = 100;
 const siblingPages = new Map();
 const rootPageKey = "roots";
@@ -312,7 +312,9 @@ const nameCell = (
     line.appendChild(depthLabel);
   }
   const label = document.createElement("span");
+  label.className = "name-label";
   label.textContent = name;
+  label.title = name;
   line.appendChild(label);
   if (match) {
     const matchLabel = document.createElement("span");
