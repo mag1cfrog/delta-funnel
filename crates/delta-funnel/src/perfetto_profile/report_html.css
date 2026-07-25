@@ -73,8 +73,14 @@ tbody tr[aria-selected="true"] {
   outline-offset: -2px;
 }
 tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
-.name { font-weight: 650; overflow-wrap: anywhere; }
-.name-line { align-items: center; display: flex; gap: .35rem; }
+.name { font-weight: 650; }
+.name-line { align-items: center; display: flex; gap: .35rem; min-width: 0; }
+.name-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .detail { display: block; font-size: .8rem; margin-top: .2rem; }
 .number { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 .disclosure, .leaf {

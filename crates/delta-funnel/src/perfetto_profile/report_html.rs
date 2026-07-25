@@ -568,6 +568,16 @@ mod tests {
       operationsBody.querySelectorAll(".function-row")
     ).find(row => row.textContent.includes("match function 001"));
     check(functionRootRow !== undefined, "nested function root was not rendered");
+    const functionName = functionRootRow.querySelector(".name-label");
+    check(
+      functionName.title === functionName.textContent,
+      "full function symbol was not available on hover"
+    );
+    check(
+      getComputedStyle(functionName).whiteSpace === "nowrap" &&
+        getComputedStyle(functionName).textOverflow === "ellipsis",
+      "function symbol was not constrained to one line"
+    );
     functionRootRow.focus();
     functionRootRow.dispatchEvent(new KeyboardEvent("keydown", {
       key: "ArrowRight",

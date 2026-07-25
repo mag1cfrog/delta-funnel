@@ -312,7 +312,9 @@ const nameCell = (
     line.appendChild(depthLabel);
   }
   const label = document.createElement("span");
+  label.className = "name-label";
   label.textContent = name;
+  label.title = name;
   line.appendChild(label);
   if (match) {
     const matchLabel = document.createElement("span");
