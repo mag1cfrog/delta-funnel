@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::iter;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -970,9 +970,7 @@ pub(super) fn preflight_ranked_report_paths(
         return Err(RankedReportPathError::OutputHasNoFileName);
     }
     inspect_output_path(&output)?;
-    let output_identity =
-        resolve_output_identity(&output).map_err(RankedReportPathError::OutputInspection)?;
-    match same_file::is_same_file(&input, &output_identity) {
+    match super::output_paths_alias(&input, &output) {
         Ok(true) => return Err(RankedReportPathError::InputOutputAlias),
         Ok(false) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -996,29 +994,6 @@ pub(super) fn preflight_ranked_profile_input(
         .canonicalize()
         .map_err(RankedReportPathError::InputUnreadable)?;
     Ok(input)
-}
-
-fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-            Component::RootDir => resolved.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::Normal(segment) => {
-                resolved.push(segment);
-                match resolved.canonicalize() {
-                    Ok(canonical) => resolved = canonical,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    Ok(resolved)
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {

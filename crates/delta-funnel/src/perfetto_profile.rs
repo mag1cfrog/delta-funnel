@@ -3,7 +3,7 @@
 //! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,44 @@ pub use report_cli::{
 use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;
+
+/// Reports whether two profile destinations resolve to the same file.
+#[doc(hidden)]
+pub fn output_paths_alias(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = resolve_output_identity(left)?;
+    let right = resolve_output_identity(right)?;
+    if left == right {
+        return Ok(true);
+    }
+    match same_file::is_same_file(left, right) {
+        Ok(alias) => Ok(alias),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(segment) => {
+                resolved.push(segment);
+                match resolved.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
 
 /// Generates one self-contained ranked HTML report from a completed Perfetto trace.
 ///

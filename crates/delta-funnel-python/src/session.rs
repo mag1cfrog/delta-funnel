@@ -230,7 +230,8 @@ impl PySession {
                     .to_owned(),
             ));
         }
-        let operation_profile = start_operation_profile(py, profiler.as_deref())?;
+        let operation_profile =
+            start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
         drop(profiler);
         let progress = if requests.is_empty() {
             None
@@ -1401,6 +1402,49 @@ mod tests {
                 .getattr("__text_signature__")?
                 .extract::<String>()?;
             assert!(signature.ends_with("progress=None, trace_path=None, profiler=None)"));
+            Ok(())
+        })
+    }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    #[test]
+    fn write_all_rejects_aliasing_trace_and_profiler_outputs_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let outputs = PyList::empty(py);
+            let output = env_unique_path("write-all-output-alias")?.with_extension("html");
+
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call1((output.to_string_lossy().as_ref(),))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("trace_path", output.to_string_lossy().as_ref())?;
+            kwargs.set_item("profiler", profiler)?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .expect_err("one path cannot hold both profile formats");
+            assert_config_error(py, &error, "invalid_option_value")?;
+            assert!(!output.exists());
+
+            fs::write(&output, b"sentinel").map_err(io_py_error)?;
+            let hard_link = output.with_extension("json");
+            fs::hard_link(&output, &hard_link).map_err(io_py_error)?;
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call1((output.to_string_lossy().as_ref(),))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("trace_path", hard_link.to_string_lossy().as_ref())?;
+            kwargs.set_item("profiler", profiler)?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .expect_err("hard-linked profile destinations must be rejected");
+            assert_config_error(py, &error, "invalid_option_value")?;
+            assert_eq!(fs::read(&output).map_err(io_py_error)?, b"sentinel");
+
+            fs::remove_file(hard_link).map_err(io_py_error)?;
+            fs::remove_file(output).map_err(io_py_error)?;
             Ok(())
         })
     }

@@ -92,6 +92,7 @@ pub(crate) fn in_operation_profile_scope<T>(
 pub(crate) fn start_operation_profile(
     py: Python<'_>,
     config: Option<&PyProfilerConfig>,
+    trace_path: Option<&Path>,
 ) -> PyResult<Option<OperationProfile>> {
     let Some(config) = config else {
         return Ok(None);
@@ -99,7 +100,7 @@ pub(crate) fn start_operation_profile(
 
     #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
     {
-        let _ = config;
+        let _ = (config, trace_path);
         Err(profiler_py_error(
             py,
             "not_available",
@@ -109,6 +110,22 @@ pub(crate) fn start_operation_profile(
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     {
+        if let Some(trace_path) = trace_path
+            && delta_funnel::perfetto_profile::output_paths_alias(config.output_path(), trace_path)
+                .map_err(|_| {
+                    profiler_py_error(
+                        py,
+                        "output_unavailable",
+                        "profile output paths could not be inspected".to_owned(),
+                    )
+                })?
+        {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` and `ProfilerConfig.output` must name different files".to_owned(),
+            ));
+        }
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
         let output = config.output_path().to_owned();
         let sample_hz = config.sampling_frequency();

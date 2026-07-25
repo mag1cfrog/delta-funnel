@@ -231,7 +231,8 @@ impl PyTable {
         } else {
             delta_funnel::ExecutionProfileMode::Disabled
         };
-        let operation_profile = start_operation_profile(py, profiler.as_deref())?;
+        let operation_profile =
+            start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
         drop(profiler);
         let write = in_operation_profile_scope(operation_profile.as_ref(), || {
             self.session.borrow(py).write_to_mssql(
@@ -285,7 +286,7 @@ impl PyTable {
         let options =
             delta_funnel::PreviewOptions::new(limit).with_execution_profile_mode(profile_mode);
         let progress = PythonProgress::for_preview(progress);
-        let operation_profile = start_operation_profile(py, profiler.as_deref())?;
+        let operation_profile = start_operation_profile(py, profiler.as_deref(), None)?;
         drop(profiler);
         let preview = in_operation_profile_scope(operation_profile.as_ref(), || {
             self.session
