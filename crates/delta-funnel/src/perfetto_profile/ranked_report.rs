@@ -81,6 +81,15 @@ pub(super) struct RankedSemantic {
     pub missing_callstack_sample_count: i64,
 }
 
+// Keep this set aligned with missing_terminal_result_count in capture_health.sql
+// after ranked_report.sql maps result-bearing activities to "activity".
+fn semantic_requires_terminal_result(semantic_kind: &str) -> bool {
+    matches!(
+        semantic_kind,
+        "operation" | "phase" | "query_planning" | "activity"
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct RankedFunction {
     pub semantic_id: i64,
@@ -802,13 +811,8 @@ impl RankedProfileDocument {
             .semantics
             .iter()
             .filter(|semantic| {
-                // Keep this set aligned with missing_terminal_result_count in
-                // capture_health.sql. Query instants and stages are excluded there.
                 semantic.result.is_none()
-                    && matches!(
-                        semantic.semantic_kind.as_str(),
-                        "operation" | "phase" | "query_planning" | "activity"
-                    )
+                    && semantic_requires_terminal_result(&semantic.semantic_kind)
             })
             .fold(0_i64, |count, _| count + 1);
         if self.metadata.incomplete_operation_root_count != retained_incomplete_operation_root_count
@@ -887,6 +891,14 @@ impl RankedProfileDocument {
                         return Err(RankedProfileValidationError::InvalidSemanticInterval {
                             semantic_id: semantic.semantic_id,
                             reason: "complete interval has inconsistent bounds",
+                        });
+                    }
+                    if semantic_requires_terminal_result(&semantic.semantic_kind)
+                        && semantic.result.is_none()
+                    {
+                        return Err(RankedProfileValidationError::InvalidSemanticInterval {
+                            semantic_id: semantic.semantic_id,
+                            reason: "complete interval is missing a terminal result",
                         });
                     }
                 }
@@ -2058,6 +2070,16 @@ mod tests {
         valid.semantics[0].duration_ns = None;
         valid.semantics[0].result = None;
         assert_eq!(valid.validate(), Ok(()));
+
+        let mut invalid = document();
+        invalid.metadata.capture_complete = false;
+        invalid.metadata.semantic_complete = false;
+        invalid.metadata.missing_terminal_result_count = 1;
+        invalid.semantics[0].result = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
+        ));
 
         let mut invalid = document();
         invalid.semantics[0].is_complete = false;
