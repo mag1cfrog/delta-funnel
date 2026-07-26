@@ -1307,30 +1307,14 @@ fn require_display_string(
     field: &'static str,
     value: &str,
 ) -> Result<(), RankedProfileValidationError> {
-    require_string_bound(
-        record_kind,
-        record_id,
-        field,
-        value,
-        MAX_DISPLAY_STRING_CHARS,
-    )
-}
-
-fn require_string_bound(
-    record_kind: &'static str,
-    record_id: i64,
-    field: &'static str,
-    value: &str,
-    limit: usize,
-) -> Result<(), RankedProfileValidationError> {
     let char_count = value.chars().count();
-    if char_count > limit {
+    if char_count > MAX_DISPLAY_STRING_CHARS {
         return Err(RankedProfileValidationError::DisplayStringTooLong {
             record_kind,
             record_id,
             field,
             char_count,
-            limit,
+            limit: MAX_DISPLAY_STRING_CHARS,
         });
     }
     Ok(())
