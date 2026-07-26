@@ -70,7 +70,7 @@ const compareSemantic = (left, right) => {
 };
 const compareFunction = (left, right) => {
   const primary = sortField === "name"
-    ? compareText(left.name, right.name)
+    ? compareText(left.display_name, right.display_name)
     : compareValue(functionSortValue(left), functionSortValue(right));
   return (sortDirection === "ascending" ? primary : -primary) ||
     compareValue(left.function_id, right.function_id);
@@ -274,7 +274,8 @@ const nameCell = (
   hasChildren,
   isExpanded,
   match,
-  node
+  node,
+  title = name
 ) => {
   const cell = document.createElement("td");
   cell.className = "name";
@@ -322,7 +323,7 @@ const nameCell = (
   const label = document.createElement("span");
   label.className = "name-label";
   label.textContent = name;
-  label.title = name;
+  label.title = title;
   line.appendChild(label);
   if (match) {
     const matchLabel = document.createElement("span");
@@ -454,14 +455,15 @@ const functionRow = (fn, depth) => {
   if (hasChildren) row.setAttribute("aria-expanded", String(isExpanded));
   row.append(
     nameCell(
-      fn.name,
+      fn.display_name,
       location ? `Sampled function - ${location}` : "Sampled function",
       depth,
       key,
       hasChildren,
       isExpanded,
       match,
-      { kind: "function", value: fn }
+      { kind: "function", value: fn },
+      fn.name
     ),
     textCell("Sampled on-CPU", "Statistical, not exact wall time"),
     textCell("N/A", "No exact function duration", "number"),
@@ -852,6 +854,7 @@ const applyFilter = () => {
         }
       } else {
         const matches = [
+          record.display_name,
           record.name,
           record.module_name,
           functionSourceLocation(record)

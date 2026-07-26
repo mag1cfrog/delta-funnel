@@ -77,6 +77,98 @@ pub(super) struct RankedFunction {
     pub inclusive_sample_count: i64,
 }
 
+impl RankedFunction {
+    pub(super) fn display_name(&self) -> String {
+        compact_function_name(&self.name)
+    }
+}
+
+fn compact_function_name(symbol: &str) -> String {
+    let symbol = symbol
+        .rsplit_once(" (.llvm.")
+        .filter(|(_, suffix)| {
+            suffix
+                .strip_suffix(')')
+                .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .map_or(symbol, |(symbol, _)| symbol);
+    let Some(method_separator) = last_top_level_path_separator(symbol) else {
+        let display_name = trim_function_generics(symbol);
+        return if display_name.is_empty() {
+            symbol.to_owned()
+        } else {
+            display_name.to_owned()
+        };
+    };
+    let method = trim_function_generics(&symbol[method_separator + 2..]);
+    let owner = function_owner(&symbol[..method_separator]);
+    if owner.is_empty() || method.is_empty() {
+        symbol.to_owned()
+    } else {
+        format!("{owner}::{method}")
+    }
+}
+
+fn function_owner(prefix: &str) -> &str {
+    let prefix = prefix.trim();
+    let owner = if prefix.starts_with('<') && prefix.ends_with('>') {
+        let qualified = &prefix[1..prefix.len() - 1];
+        split_top_level_as(qualified).unwrap_or(qualified)
+    } else {
+        prefix
+    };
+    let owner = last_top_level_path_separator(owner)
+        .map_or(owner, |separator| &owner[separator + 2..])
+        .trim_start_matches(['&', '*'])
+        .trim_start_matches("mut ")
+        .trim_start_matches("const ");
+    owner.find('<').map_or(owner, |generic| &owner[..generic])
+}
+
+fn split_top_level_as(value: &str) -> Option<&str> {
+    let mut depth = 0_u32;
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'<' | b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 && value[index..].starts_with(" as ") => {
+                return Some(&value[..index]);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn last_top_level_path_separator(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut depth = 0_u32;
+    let mut last = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'<' | b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
+            b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b':' if depth == 0
+                && bytes.get(index + 1) == Some(&b':')
+                && bytes.get(index + 2) != Some(&b'<') =>
+            {
+                last = Some(index);
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    last
+}
+
+fn trim_function_generics(value: &str) -> &str {
+    value
+        .find('<')
+        .map_or(value, |generic| value[..generic].trim_end_matches("::"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct RankedProfileDocument {
     pub metadata: RankedProfileMetadata,
@@ -1240,6 +1332,44 @@ mod tests {
             line_number: None,
             self_sample_count: 0,
             inclusive_sample_count: 0,
+        }
+    }
+
+    #[test]
+    fn derives_compact_function_names_without_changing_canonical_symbols() {
+        for (symbol, expected) in [
+            (
+                "<tokio::runtime::blocking::task::BlockingTask<F> as core::future::Future>::poll",
+                "BlockingTask::poll",
+            ),
+            (
+                "futures_util::future::future::map::Map<Fut, F>::poll",
+                "Map::poll",
+            ),
+            (
+                "<delta_funnel::orchestrator::runtime::DeltaFunnelRuntime>::preview_table",
+                "DeltaFunnelRuntime::preview_table",
+            ),
+            (
+                "delta_funnel::session::build_preview::{closure#0}",
+                "build_preview::{closure#0}",
+            ),
+            (
+                "delta_funnel::report::finish::<alloc::string::String> (.llvm.1234)",
+                "report::finish",
+            ),
+            (
+                "pyo3::impl_::trampoline::do_call<Result, Handler>",
+                "trampoline::do_call",
+            ),
+            ("do_call<Result, Handler>", "do_call"),
+            ("sqlite3_step", "sqlite3_step"),
+            ("<invalid>", "<invalid>"),
+        ] {
+            let mut function = function(1, 1, None);
+            function.name = symbol.to_owned();
+            assert_eq!(function.display_name(), expected);
+            assert_eq!(function.name, symbol);
         }
     }
 

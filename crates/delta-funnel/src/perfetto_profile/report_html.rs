@@ -2,7 +2,11 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use super::ranked_report::RankedProfileDocument;
+use serde::Serialize;
+
+use super::ranked_report::{
+    RankedFunction, RankedProfileDocument, RankedProfileMetadata, RankedSemantic,
+};
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 
 const HTML_DOCUMENT_PREFIX: &str = r#"<!doctype html>
@@ -78,10 +82,36 @@ const HTML_SUFFIX: &str = r#"</script>
 </html>
 "#;
 
+#[derive(Serialize)]
+struct HtmlProfile<'a> {
+    metadata: &'a RankedProfileMetadata,
+    semantics: &'a [RankedSemantic],
+    functions: Vec<HtmlFunction<'a>>,
+}
+
+#[derive(Serialize)]
+struct HtmlFunction<'a> {
+    #[serde(flatten)]
+    function: &'a RankedFunction,
+    display_name: String,
+}
+
 pub(super) fn render_ranked_profile_html(
     document: &RankedProfileDocument,
 ) -> Result<String, RankedReportFailure> {
-    let json = serde_json::to_string(document).map_err(|_| {
+    let profile = HtmlProfile {
+        metadata: &document.metadata,
+        semantics: &document.semantics,
+        functions: document
+            .functions
+            .iter()
+            .map(|function| HtmlFunction {
+                function,
+                display_name: function.display_name(),
+            })
+            .collect(),
+    };
+    let json = serde_json::to_string(&profile).map_err(|_| {
         RankedReportFailure::new(
             RankedReportFailurePhase::Serialization,
             "json_failed",
@@ -308,6 +338,7 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["name"], dangerous);
+        assert_eq!(decoded["functions"][0]["display_name"], dangerous);
         Ok(())
     }
 
@@ -469,7 +500,9 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        functions.push(function(102, Some(1), "nested target"));
+        let nested_symbol =
+            "<tokio::runtime::blocking::task::BlockingTask<F> as core::future::Future>::poll";
+        functions.push(function(102, Some(1), nested_symbol));
         let mut wide_owner_function = function(103, None, "wide owner native root");
         wide_owner_function.semantic_id = 3_000;
         wide_owner_function.self_sample_count = 1;
@@ -617,8 +650,14 @@ mod tests {
     }));
     const nestedFunctionRow = Array.from(
       operationsBody.querySelectorAll(".function-row")
-    ).find(row => row.textContent.includes("nested target"));
+    ).find(row => row.textContent.includes("BlockingTask::poll"));
     check(nestedFunctionRow !== undefined, "nested function was not expanded");
+    const nestedFunctionName = nestedFunctionRow.querySelector(".name-label");
+    check(
+      nestedFunctionName.textContent === "BlockingTask::poll" &&
+        nestedFunctionName.title.includes("tokio::runtime::blocking"),
+      "compact function name did not preserve the full symbol on hover"
+    );
     check(
       nestedFunctionRow.getAttribute("aria-level") === "3",
       "nested function hierarchy was incorrect"
@@ -631,7 +670,7 @@ mod tests {
       bubbles: true
     }));
     check(
-      !operationsBody.textContent.includes("nested target"),
+      !operationsBody.textContent.includes("BlockingTask::poll"),
       "nested function was not collapsed"
     );
 
@@ -706,6 +745,13 @@ mod tests {
       filterResults.length === 103 &&
         filterResults.every(result => result.function_id !== undefined),
       "source metadata was not searchable"
+    );
+    filterInput.value = "BlockingTask::poll";
+    applyFilter();
+    check(
+      filterResults.length === 1 &&
+        operationsBody.textContent.includes("BlockingTask::poll"),
+      "compact function names were not searchable"
     );
 
     const originalSemanticLookup = semanticsById.get;

@@ -81,10 +81,11 @@ pub(super) struct TerminalProfileIndex<'a> {
     functions: HashMap<(i64, i64), &'a RankedFunction>,
     function_children: HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
     operation_durations: HashMap<i64, Option<i64>>,
+    full_symbols: bool,
 }
 
 impl<'a> TerminalProfileIndex<'a> {
-    pub(super) fn new(document: &'a RankedProfileDocument) -> Self {
+    pub(super) fn new(document: &'a RankedProfileDocument, full_symbols: bool) -> Self {
         let mut semantics = HashMap::with_capacity(document.semantics.len());
         let mut semantic_children = HashMap::new();
         let mut operation_durations = HashMap::new();
@@ -114,6 +115,7 @@ impl<'a> TerminalProfileIndex<'a> {
             functions,
             function_children,
             operation_durations,
+            full_symbols,
         }
     }
 
@@ -243,7 +245,7 @@ pub(super) fn render_terminal_view(
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
-    TerminalProfileIndex::new(document).render(selection, sort, filter, limit, max_depth)
+    TerminalProfileIndex::new(document, false).render(selection, sort, filter, limit, max_depth)
 }
 
 fn render_semantic_view(
@@ -293,7 +295,7 @@ fn render_semantic_view(
                 })
         })
         .collect::<Vec<_>>();
-    function_roots.sort_unstable_by(|left, right| compare_functions(left, right, function_sort));
+    sort_functions(&mut function_roots, function_sort);
     let function_total = function_roots.len();
     let function_rows = function_roots
         .into_iter()
@@ -310,12 +312,17 @@ fn render_semantic_view(
     let captured_function_samples = index.document.metadata.resolved_function_sample_count
         + index.document.metadata.unresolved_function_sample_count;
     let mut output = format!(
-        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
+        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsymbol_format: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
         sort.as_str(),
         shown,
         shown < total,
         terminal_text(&index.document.metadata.exact_time_unit),
         terminal_text(&index.document.metadata.sample_unit),
+        if index.full_symbols {
+            "full"
+        } else {
+            "compact"
+        },
         index.document.metadata.sampled_cpu_count,
         index.document.metadata.resolved_function_sample_count,
         index.document.metadata.unresolved_function_sample_count,
@@ -344,7 +351,13 @@ fn render_semantic_view(
             function_rows.len() < function_total,
         ));
         for function in function_rows {
-            write_function_row(&mut output, 1, function, semantic.direct_sample_count);
+            write_function_row(
+                &mut output,
+                1,
+                function,
+                semantic.direct_sample_count,
+                index.full_symbols,
+            );
         }
     }
     Ok(output)
@@ -513,11 +526,16 @@ fn render_function_view(
     let captured_function_samples = index.document.metadata.resolved_function_sample_count
         + index.document.metadata.unresolved_function_sample_count;
     let mut output = format!(
-        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsymbol_format: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
         sort.as_str(),
         rows.len(),
         rows.len() < total,
         terminal_text(&index.document.metadata.sample_unit),
+        if index.full_symbols {
+            "full"
+        } else {
+            "compact"
+        },
         index.document.metadata.sampled_cpu_count,
         index.document.metadata.resolved_function_sample_count,
         index.document.metadata.unresolved_function_sample_count,
@@ -531,6 +549,7 @@ fn render_function_view(
             depth,
             function,
             selected.inclusive_sample_count,
+            index.full_symbols,
         );
     }
     Ok(output)
@@ -593,6 +612,9 @@ fn function_matches(function: &RankedFunction, filter: &str) -> bool {
         };
         return semantic_id.parse::<i64>() == Ok(function.semantic_id)
             && function_id.parse::<i64>() == Ok(function.function_id);
+    }
+    if function.display_name().contains(filter) {
+        return true;
     }
     [
         Some(function.name.as_str()),
@@ -661,8 +683,22 @@ fn push_sorted_function_siblings<'a>(
         return;
     };
     let mut siblings = siblings.clone();
-    siblings.sort_unstable_by(|left, right| compare_functions(left, right, sort));
+    sort_functions(&mut siblings, sort);
     stack.extend(siblings.into_iter().rev().map(|function| (depth, function)));
+}
+
+fn sort_functions(functions: &mut [&RankedFunction], sort: InspectSort) {
+    if sort == InspectSort::Name {
+        functions.sort_by_cached_key(|function| {
+            (
+                function.display_name(),
+                function.semantic_id,
+                function.function_id,
+            )
+        });
+    } else {
+        functions.sort_unstable_by(|left, right| compare_functions(left, right, sort));
+    }
 }
 
 fn compare_functions(left: &RankedFunction, right: &RankedFunction, sort: InspectSort) -> Ordering {
@@ -671,7 +707,7 @@ fn compare_functions(left: &RankedFunction, right: &RankedFunction, sort: Inspec
             .inclusive_sample_count
             .cmp(&left.inclusive_sample_count),
         InspectSort::SelfCpu => right.self_sample_count.cmp(&left.self_sample_count),
-        InspectSort::Name => left.name.cmp(&right.name),
+        InspectSort::Name => left.display_name().cmp(&right.display_name()),
     };
     ordering
         .then_with(|| left.semantic_id.cmp(&right.semantic_id))
@@ -683,6 +719,7 @@ fn write_function_row(
     depth: usize,
     function: &RankedFunction,
     context_sample_count: i64,
+    full_symbols: bool,
 ) {
     let module = function
         .module_name
@@ -695,11 +732,16 @@ fn write_function_row(
     let line = function
         .line_number
         .map_or_else(|| "null".to_owned(), |line| line.to_string());
+    let symbol = if full_symbols {
+        function.name.clone()
+    } else {
+        function.display_name()
+    };
     output.push_str(&format!(
         "function depth={depth} id=function:{}:{} symbol={} module={module} source={source} line={line} inclusive_cpu_samples={} inclusive_context_percent={} self_cpu_samples={} self_context_percent={}\n",
         function.semantic_id,
         function.function_id,
-        quoted_terminal_text(&function.name),
+        quoted_terminal_text(&symbol),
         function.inclusive_sample_count,
         sample_percent(function.inclusive_sample_count, context_sample_count),
         function.self_sample_count,
@@ -1011,7 +1053,14 @@ mod tests {
             function(1, 12, Some(11), "leaf", 3, 3),
             function(1, 10, None, "first root", 1, 6),
             function(1, 11, Some(10), "child\u{1b}", 2, 5),
-            function(1, 13, Some(10), "other child", 0, 0),
+            function(
+                1,
+                13,
+                Some(10),
+                "<tokio::runtime::blocking::task::BlockingTask<F> as core::future::Future>::poll",
+                0,
+                0,
+            ),
         ];
 
         let semantic = render_terminal_view(
@@ -1065,6 +1114,25 @@ mod tests {
         assert!(function.contains("id=function:1:12"));
         assert!(function.contains("inclusive_context_percent=83.33%"));
         assert!(function.contains(r#"symbol="child\u{1B}""#));
+        assert!(function.contains("symbol=\"BlockingTask::poll\""));
+        assert!(function.contains("symbol_format: compact"));
+
+        let full_symbols = TerminalProfileIndex::new(&document, true)
+            .render(
+                InspectSelection::Function {
+                    semantic_id: 1,
+                    function_id: 10,
+                },
+                InspectSort::InclusiveCpu,
+                None,
+                10,
+                2,
+            )
+            .expect("full function symbols should render");
+        assert!(full_symbols.contains(
+            "symbol=\"<tokio::runtime::blocking::task::BlockingTask<F> as core::future::Future>::poll\""
+        ));
+        assert!(full_symbols.contains("symbol_format: full"));
 
         let filtered = render_terminal_view(
             &document,
