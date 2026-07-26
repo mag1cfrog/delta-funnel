@@ -174,6 +174,13 @@ fn build_document(
     frames: Vec<CompactFrame>,
     function_self: Vec<CompactFunctionSelf>,
 ) -> Result<RankedProfileDocument, RankedReportFailure> {
+    if semantics.is_empty() {
+        return Err(RankedReportFailure::new(
+            RankedReportFailurePhase::Health,
+            "incomplete_capture",
+            "input trace contains no retained Delta Funnel operation",
+        ));
+    }
     if metadata.audit_error_count != 0 {
         return Err(aggregate_failure(
             "audit_failed",
@@ -556,6 +563,17 @@ mod tests {
         let audit = parse_ranked_report_output(fixture_output(1, 1, true, 0).as_bytes())
             .expect_err("failed query audit should fail");
         assert_eq!(audit.kind(), "audit_failed");
+
+        let metadata_only = fixture_output(1, 0, true, 0)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let unavailable = parse_ranked_report_output(metadata_only.as_bytes())
+            .expect_err("capture without an operation should remain unavailable");
+        assert_eq!(unavailable.phase(), RankedReportFailurePhase::Health);
+        assert_eq!(unavailable.kind(), "incomplete_capture");
 
         let incomplete = parse_ranked_report_output(fixture_output(1, 0, false, 0).as_bytes())?;
         assert!(!incomplete.metadata.capture_complete);
