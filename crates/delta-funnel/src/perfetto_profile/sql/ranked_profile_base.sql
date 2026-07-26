@@ -613,6 +613,18 @@ FROM delta_funnel_ranked_sample_ownership AS sample
 LEFT JOIN delta_funnel_ranked_callsite_leaves AS leaf USING (callsite_id)
 WHERE sample.attribution = 'direct';
 
+CREATE PERFETTO TABLE delta_funnel_ranked_semantic_function_sample_counts AS
+SELECT
+  semantic.semantic_id,
+  coalesce(sum(ownership.resolution = 'resolved'), 0)
+    AS available_function_sample_count,
+  coalesce(sum(ownership.resolution = 'unresolved'), 0)
+    AS unavailable_function_sample_count
+FROM delta_funnel_ranked_semantics AS semantic
+LEFT JOIN delta_funnel_ranked_function_sample_ownership AS ownership
+  USING (semantic_id)
+GROUP BY semantic.semantic_id;
+
 -- These are the same Perfetto macros behind cpu_profiling_summary_tree.
 -- Repeated callsite rows preserve sample multiplicity for reconciliation.
 CREATE PERFETTO TABLE delta_funnel_ranked_official_function_frames AS
@@ -633,6 +645,7 @@ FROM _callstacks_self_to_cumulative!((
 CREATE PERFETTO TABLE delta_funnel_ranked_function_self_counts AS
 SELECT semantic_id, function_id, count(*) AS self_sample_count
 FROM delta_funnel_ranked_function_sample_ownership
+WHERE resolution = 'resolved'
 GROUP BY semantic_id, function_id;
 
 CREATE PERFETTO INDEX delta_funnel_ranked_function_self_lookup

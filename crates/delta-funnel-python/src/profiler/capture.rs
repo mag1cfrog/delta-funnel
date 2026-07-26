@@ -1,6 +1,7 @@
 //! Current-process Perfetto capture and ranked report generation.
 
 use std::{
+    collections::BTreeSet,
     env,
     ffi::OsStr,
     fs, io,
@@ -48,13 +49,18 @@ pub(super) struct OperationCapture {
     output: PathBuf,
     trace: PathBuf,
     _directory: tempfile::TempDir,
+    symbolize: bool,
     child: Option<Child>,
     reservation: Option<ProfileReservation>,
     scope: delta_funnel::perfetto_profile::OperationCaptureScope,
 }
 
 impl OperationCapture {
-    pub(super) fn start(output: PathBuf, sample_hz: u16) -> Result<Self, ProfilerFailure> {
+    pub(super) fn start(
+        output: PathBuf,
+        sample_hz: u16,
+        tracebox: PathBuf,
+    ) -> Result<Self, ProfilerFailure> {
         let reservation = ProfileReservation::acquire()?;
         let scope =
             delta_funnel::perfetto_profile::OperationCaptureScope::allocate().ok_or_else(|| {
@@ -70,7 +76,11 @@ impl OperationCapture {
                 "profile output path has no parent directory",
             )
         })?;
+        preflight_tracebox(tracebox.as_os_str())?;
         preflight_trace_processor()?;
+        if sample_hz == 1000 {
+            preflight_traceconv()?;
+        }
         let directory = tempfile::Builder::new()
             .prefix(".delta-funnel-profile.")
             .tempdir_in(parent)
@@ -89,9 +99,8 @@ impl OperationCapture {
                 "temporary Perfetto capture config could not be written",
             )
         })?;
-        let tracebox = env::var_os("TRACEBOX").unwrap_or_else(|| "tracebox".into());
         let child = start_tracebox_with(
-            &tracebox,
+            tracebox.as_os_str(),
             &config_path,
             &trace,
             delta_funnel::perfetto_profile::initialize_perfetto,
@@ -102,6 +111,7 @@ impl OperationCapture {
             output,
             trace,
             _directory: directory,
+            symbolize: sample_hz == 1000,
             child: Some(child),
             reservation: Some(reservation),
             scope,
@@ -123,8 +133,13 @@ impl OperationCapture {
         crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         drop(self.reservation.take());
         stop_result?;
+        let report_trace = if self.symbolize {
+            symbolize_trace(&self.trace, self._directory.path())?
+        } else {
+            self.trace.clone()
+        };
         delta_funnel::perfetto_profile::generate_operation_ranked_profile_report(
-            &self.trace,
+            &report_trace,
             &self.output,
             &self.scope,
         )
@@ -210,9 +225,9 @@ fn prepare_output_path(output: &Path) -> Result<PathBuf, ProfilerFailure> {
 }
 
 fn current_process_capture_config(sample_hz: u16) -> Result<String, ProfilerFailure> {
-    let (template, read_period_ms, ring_buffer_pages) = match sample_hz {
-        100 => (STREAMING_CAPTURE_CONFIG, 100, 256),
-        1000 => (SHORT_CAPTURE_CONFIG, 10, 512),
+    let (template, read_period_ms, ring_buffer_pages, unwind_mode) = match sample_hz {
+        100 => (STREAMING_CAPTURE_CONFIG, 100, 256, "UNWIND_DWARF"),
+        1000 => (SHORT_CAPTURE_CONFIG, 10, 512, "UNWIND_KERNEL_FRAME_POINTER"),
         _ => {
             return Err(ProfilerFailure::new(
                 "invalid_sample_frequency",
@@ -229,6 +244,10 @@ fn current_process_capture_config(sample_hz: u16) -> Result<String, ProfilerFail
         (
             "ring_buffer_read_period_ms: 100",
             format!("ring_buffer_read_period_ms: {read_period_ms}"),
+        ),
+        (
+            "user_frames: UNWIND_DWARF",
+            format!("user_frames: {unwind_mode}"),
         ),
         (
             "target_cmdline: \"delta-funnel-perfetto-preview\"",
@@ -253,6 +272,31 @@ fn replace_one_config_value(
         ));
     }
     Ok(config.replacen(from, to, 1))
+}
+
+fn preflight_tracebox(program: &OsStr) -> Result<(), ProfilerFailure> {
+    let status = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            let kind = if error.kind() == io::ErrorKind::NotFound {
+                "tracebox_unavailable"
+            } else {
+                "tracebox_start_failed"
+            };
+            ProfilerFailure::new(kind, "Perfetto tracebox could not be started")
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ProfilerFailure::new(
+            "tracebox_start_failed",
+            "Perfetto tracebox preflight failed",
+        ))
+    }
 }
 
 fn preflight_trace_processor() -> Result<(), ProfilerFailure> {
@@ -280,6 +324,121 @@ fn preflight_trace_processor() -> Result<(), ProfilerFailure> {
             "Perfetto Trace Processor preflight failed",
         ))
     }
+}
+
+fn preflight_traceconv() -> Result<(), ProfilerFailure> {
+    let program = env::var_os("TRACECONV").unwrap_or_else(|| "traceconv".into());
+    let output = Command::new(program)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            let kind = if error.kind() == io::ErrorKind::NotFound {
+                "traceconv_unavailable"
+            } else {
+                "traceconv_start_failed"
+            };
+            ProfilerFailure::new(kind, "Perfetto traceconv could not be started")
+        })?;
+    if [&output.stdout, &output.stderr].into_iter().any(|help| {
+        help.windows(b" symbolize".len())
+            .any(|line| line == b" symbolize")
+    }) {
+        Ok(())
+    } else {
+        Err(ProfilerFailure::new(
+            "traceconv_start_failed",
+            "Perfetto traceconv preflight failed",
+        ))
+    }
+}
+
+fn symbolize_trace(trace: &Path, directory: &Path) -> Result<PathBuf, ProfilerFailure> {
+    let binary_directory = directory.join("symbol-binaries");
+    fs::create_dir(&binary_directory).map_err(|_| {
+        ProfilerFailure::new(
+            "symbolization_failed",
+            "temporary symbol directory could not be created",
+        )
+    })?;
+    let maps = fs::read_to_string("/proc/self/maps").map_err(|_| {
+        ProfilerFailure::new(
+            "symbolization_failed",
+            "process mappings could not be read for symbolization",
+        )
+    })?;
+    let mut linked = 0_usize;
+    for path in mapped_file_paths(&maps) {
+        if !path.is_file() {
+            continue;
+        }
+        let link = binary_directory.join(linked.to_string());
+        if std::os::unix::fs::symlink(&path, link).is_ok() {
+            linked += 1;
+        }
+    }
+    if linked == 0 {
+        return Err(ProfilerFailure::new(
+            "symbolization_failed",
+            "no mapped binaries were available for symbolization",
+        ));
+    }
+
+    let symbols = directory.join("symbols.pftrace");
+    let program = env::var_os("TRACECONV").unwrap_or_else(|| "traceconv".into());
+    let status = Command::new(program)
+        .args(["symbolize"])
+        .arg(trace)
+        .arg(&symbols)
+        .env("PERFETTO_BINARY_PATH", &binary_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| {
+            ProfilerFailure::new(
+                "symbolization_failed",
+                "Perfetto trace symbolization could not be started",
+            )
+        })?;
+    if !status.success() {
+        return Err(ProfilerFailure::new(
+            "symbolization_failed",
+            "Perfetto trace symbolization failed",
+        ));
+    }
+
+    let symbolized = directory.join("symbolized.pftrace");
+    let mut output = fs::File::create(&symbolized).map_err(|_| {
+        ProfilerFailure::new(
+            "symbolization_failed",
+            "symbolized trace could not be created",
+        )
+    })?;
+    for input in [trace, symbols.as_path()] {
+        let mut input = fs::File::open(input).map_err(|_| {
+            ProfilerFailure::new(
+                "symbolization_failed",
+                "symbolized trace input could not be read",
+            )
+        })?;
+        io::copy(&mut input, &mut output).map_err(|_| {
+            ProfilerFailure::new(
+                "symbolization_failed",
+                "symbolized trace could not be written",
+            )
+        })?;
+    }
+    Ok(symbolized)
+}
+
+fn mapped_file_paths(maps: &str) -> impl Iterator<Item = PathBuf> + '_ {
+    maps.lines()
+        .filter_map(|line| line.get(line.find('/')?..))
+        .map(|path| path.strip_suffix(" (deleted)").unwrap_or(path))
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
 }
 
 fn start_tracebox_with(
@@ -455,15 +614,20 @@ mod tests {
 
     #[test]
     fn current_process_config_scopes_samples_and_applies_both_supported_rates() {
-        for (sample_hz, read_period_ms, ring_buffer_pages) in [(100, 100, 256), (1000, 10, 512)] {
+        for (sample_hz, read_period_ms, ring_buffer_pages, unwind_mode) in [
+            (100, 100, 256, "UNWIND_DWARF"),
+            (1000, 10, 512, "UNWIND_KERNEL_FRAME_POINTER"),
+        ] {
             let config = current_process_capture_config(sample_hz)
                 .expect("the packaged config must support operation capture");
             assert!(config.contains(&format!("frequency: {sample_hz}")));
             assert!(config.contains(&format!("ring_buffer_read_period_ms: {read_period_ms}")));
             assert!(config.contains(&format!("ring_buffer_pages: {ring_buffer_pages}")));
+            assert!(config.contains(&format!("user_frames: {unwind_mode}")));
             assert!(config.contains(&format!("target_pid: {}", std::process::id())));
             assert!(!config.contains("target_cmdline:"));
             assert_eq!(config.contains("write_into_file: true"), sample_hz == 100);
+            assert!(!config.contains("target_cpu:"));
         }
 
         let first = ProfileReservation::acquire().expect("the first profile must reserve capture");
@@ -472,6 +636,24 @@ mod tests {
         assert_eq!(second.kind, "profile_already_active");
         drop(first);
         drop(ProfileReservation::acquire().expect("the released reservation must be reusable"));
+    }
+
+    #[test]
+    fn mapped_file_paths_are_unique_and_preserve_spaces() {
+        let maps = "\
+1000-2000 r-xp 00000000 00:00 0 /tmp/a library.so
+2000-3000 r--p 00000000 00:00 0 /tmp/a library.so
+3000-4000 r-xp 00000000 00:00 0 /tmp/deleted.so (deleted)
+4000-5000 rw-p 00000000 00:00 0 [heap]
+";
+
+        assert_eq!(
+            mapped_file_paths(maps).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/tmp/a library.so"),
+                PathBuf::from("/tmp/deleted.so"),
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -488,7 +670,11 @@ mod tests {
         let script = directory.path().join("tracebox");
         fs::write(
             &script,
-            "#!/bin/sh\ntrap 'exit 0' TERM\nprintf '\\000'\nwhile :; do :; done\n",
+            "#!/bin/sh\n\
+             if [ \"${1:-}\" = --version ]; then exit 0; fi\n\
+             trap 'exit 0' TERM\n\
+             printf '\\000'\n\
+             while :; do :; done\n",
         )?;
         let mut permissions = fs::metadata(&script)?.permissions();
         permissions.set_mode(0o700);
@@ -497,6 +683,7 @@ mod tests {
         fs::write(&config, "test config")?;
         let trace = directory.path().join("capture.pftrace");
 
+        preflight_tracebox(script.as_os_str()).map_err(profiler_test_error)?;
         let child = start_tracebox_with(script.as_os_str(), &config, &trace, || Ok(()), |_| Ok(()))
             .map_err(profiler_test_error)?;
         stop_tracebox(child).map_err(profiler_test_error)

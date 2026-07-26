@@ -61,6 +61,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <p>Exact duration is measured wall-clock or lifecycle time. Parallel semantic children may overlap and are not additive. Direct CPU samples belong to one semantic node. Inclusive CPU samples also include its semantic descendants. Sampling observes on-CPU work and does not prove why a thread was off-CPU.</p>
 <p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
 <p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
+<p>Native stack coverage classifies directly attributed samples as available or unavailable. Unavailable samples remain in coverage totals but are not shown as a function. Profiler samples dropped is a trace-wide Perfetto data-loss diagnostic and is not a function cost.</p>
 <p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Sibling groups are paged 100 rows at a time. Bulk subtree actions and the visible table are limited to 1000 rows.</p>
 </details>
 </main>
@@ -159,14 +160,18 @@ mod tests {
 
     fn metadata() -> RankedProfileMetadata {
         RankedProfileMetadata {
-            schema_version: 1,
+            schema_version: 2,
             sample_frequency_hz: 1000,
+            sampled_cpu_count: 8,
             exact_time_unit: "nanoseconds".to_owned(),
             sample_unit: "samples".to_owned(),
             eligible_sample_count: 0,
             direct_sample_count: 0,
             ambiguous_sample_count: 0,
             unattributed_sample_count: 0,
+            available_function_sample_count: 0,
+            unavailable_function_sample_count: 0,
+            trace_profiler_dropped_sample_count: 0,
         }
     }
 
@@ -208,6 +213,8 @@ mod tests {
             stage_owner_id: None,
             direct_sample_count: 0,
             inclusive_sample_count: 0,
+            available_function_sample_count: 0,
+            unavailable_function_sample_count: 0,
         }
     }
 
@@ -246,6 +253,7 @@ mod tests {
         semantic.result = Some("ok".to_owned());
         semantic.direct_sample_count = 1;
         semantic.inclusive_sample_count = 1;
+        semantic.available_function_sample_count = 1;
         let mut function = function(1, None, dangerous);
         function.module_name = None;
         function.source_file = None;
@@ -255,6 +263,7 @@ mod tests {
         let mut profile_metadata = metadata();
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
+        profile_metadata.available_function_sample_count = 1;
         let document = RankedProfileDocument {
             metadata: profile_metadata,
             semantics: vec![semantic],
@@ -272,6 +281,9 @@ mod tests {
         assert!(html.contains(r#"aria-label="Ranked operations""#));
         assert!(html.contains(r#"id="operations-empty""#));
         assert!(html.contains(r#"id="profile-filter""#));
+        assert!(html.contains("Sampled CPUs"));
+        assert!(html.contains("Native stacks unavailable"));
+        assert!(html.contains("Profiler samples dropped"));
         assert!(html.contains(r#"maxlength="200""#));
         assert!(html.contains(r#"id="previous-filter-page""#));
         assert!(html.contains(r#"id="next-filter-page""#));
@@ -321,7 +333,7 @@ mod tests {
         incomplete.is_complete = false;
         semantics.push(incomplete);
 
-        let mut functions = vec![function(1, None, "[native stack unavailable]")];
+        let mut functions = vec![function(1, None, "root function")];
         for function_id in 2..=5_001 {
             functions.push(function(
                 function_id,
@@ -357,10 +369,7 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(embedded_json(&html)?)?;
         assert_eq!(decoded["semantics"].as_array().map(Vec::len), Some(386));
         assert_eq!(decoded["functions"].as_array().map(Vec::len), Some(5_129));
-        assert_eq!(
-            decoded["functions"][0]["name"],
-            "[native stack unavailable]"
-        );
+        assert_eq!(decoded["functions"][0]["name"], "root function");
         assert_eq!(
             decoded["functions"][1]["name"].as_str().map(str::len),
             Some(512)
@@ -408,6 +417,7 @@ mod tests {
         let mut distributed_cases = semantic(3_000, Some(1), "Distributed cases");
         distributed_cases.direct_sample_count = 1;
         distributed_cases.inclusive_sample_count = 1;
+        distributed_cases.available_function_sample_count = 1;
         semantics[0].inclusive_sample_count = 1;
         semantics.push(distributed_cases);
         let mut distributed_id = 3_001;
@@ -464,6 +474,7 @@ mod tests {
         let mut profile_metadata = metadata();
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
+        profile_metadata.available_function_sample_count = 1;
         let document = RankedProfileDocument {
             metadata: profile_metadata,
             semantics,

@@ -5,7 +5,7 @@ diagnostics build, or export the stable semantic timeline returned by normal
 Delta Funnel preview and SQL Server APIs. Both paths cover preview, one-output,
 and multi-output operations.
 
-Install the diagnostics build and its two Perfetto tools before generating
+Install the diagnostics build and its Perfetto tools before generating
 ranked HTML. See
 [Set up Perfetto diagnostics for Python](../contributing/profiling-perfetto.md).
 For field definitions and lifecycle contracts, use the
@@ -37,6 +37,11 @@ The capture starts immediately before `preview` executes and stops when that
 call reaches its terminal result. Other Python work before or after the call is
 not included. Passing `profiler` automatically enables the existing detailed
 semantic and operator profile; `profile=True` is not also required.
+At 1000 Hz, Delta Funnel collects kernel frame-pointer callchains to bypass
+Perfetto's userspace unwind queue, then resolves those stacks locally with
+`traceconv`. The diagnostics wheel is built with the required native frame
+pointers. Its pinned tracebox build expands Perfetto's callchain queue so both
+100 and 1000 Hz capture sample every CPU allowed by the process affinity.
 Concurrent Delta Funnel operations are excluded from the semantic and native
 function rankings. Process samples without a matching target-operation context
 remain visible only in the report's unattributed coverage count.

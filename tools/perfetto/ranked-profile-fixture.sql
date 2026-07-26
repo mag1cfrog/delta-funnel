@@ -181,7 +181,6 @@ SELECT
   column2 AS function_id,
   column3 AS self_sample_count
 FROM (VALUES
-  (100, -1, 1),
   (100, 1, 2),
   (100, 2, 3),
   (101, 1, 1));
@@ -193,8 +192,7 @@ SELECT
   self_sample_count,
   coalesce((SELECT max(id) FROM fixture_function_frames), -1)
     + row_number() OVER (ORDER BY semantic_id, function_id) AS root_node_id
-FROM fixture_function_self_counts
-WHERE function_id != -1;
+FROM fixture_function_self_counts;
 
 CREATE PERFETTO TABLE fixture_function_graph AS
 SELECT id AS source_node_id, parent_id AS dest_node_id, 1 AS edge_weight
@@ -226,13 +224,7 @@ SELECT
 FROM fixture_function_ancestry AS ancestry
 JOIN fixture_function_roots AS root USING (root_node_id)
 JOIN fixture_function_frames AS frame ON frame.id = ancestry.node_id
-GROUP BY root.semantic_id, ancestry.node_id
-
-UNION ALL
-
-SELECT semantic_id, function_id, self_sample_count
-FROM fixture_function_self_counts
-WHERE function_id = -1;
+GROUP BY root.semantic_id, ancestry.node_id;
 
 CREATE PERFETTO TABLE fixture_expected_function_counts(
   semantic_id LONG,
@@ -244,7 +236,6 @@ SELECT
   column2 AS function_id,
   column3 AS inclusive_sample_count
 FROM (VALUES
-  (100, -1, 1),
   (100, 0, 5),
   (100, 1, 2),
   (100, 2, 3),
@@ -321,12 +312,12 @@ WITH checks AS (
       AS function_cycle_error,
     (
       SELECT sum(self_sample_count) FROM fixture_function_self_counts
-    ) != 7 AS function_self_conservation_error,
+    ) != 6 AS function_self_conservation_error,
     (
       SELECT count(*)
       FROM fixture_function_self_counts
       WHERE function_id = -1
-    ) != 1 AS unresolved_bucket_error,
+    ) != 0 AS unavailable_function_exclusion_error,
     (
       SELECT audit_error_count = 0
       FROM delta_funnel_ranked_aggregate_audit
@@ -347,6 +338,6 @@ SELECT
     + function_rollup_error
     + function_cycle_error
     + function_self_conservation_error
-    + unresolved_bucket_error
+    + unavailable_function_exclusion_error
     + empty_profile_audit_error AS fixture_error_count
 FROM checks;

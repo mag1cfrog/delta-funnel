@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Run Delta Funnel's pinned Perfetto tracebox build."""
+
+import hashlib
+import os
+import shutil
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from urllib.request import urlopen
+
+
+RELEASE = "perfetto-tracebox-v57.2-df1"
+ARCHIVE_URL = (
+    "https://github.com/mag1cfrog/delta-funnel/releases/download/"
+    f"{RELEASE}/tracebox-linux-x86_64.tar.xz"
+)
+ARCHIVE_SHA256 = "db13aaeb86f42908f2f6953d8af549ad21be2733babf4ea1472bad71c05ca313"
+TRACEBOX_SHA256 = "1f9a998baba15b21a6af2e93ed036b0935ce3d9a3df670a052b13bf10e235a1d"
+LICENSE_SHA256 = "9a682a56cffc9524dfa9b0b1c0dca9cb81a19e96d5bd0793aaf02c08a95ee7ca"
+MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
+MAX_MEMBER_BYTES = 16 * 1024 * 1024
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_archive(destination: Path) -> None:
+    total = 0
+    with urlopen(ARCHIVE_URL, timeout=60) as response, destination.open("xb") as output:
+        while chunk := response.read(1024 * 1024):
+            total += len(chunk)
+            if total > MAX_ARCHIVE_BYTES:
+                raise RuntimeError("release archive exceeds the expected size")
+            output.write(chunk)
+    if sha256(destination) != ARCHIVE_SHA256:
+        raise RuntimeError("release archive checksum does not match")
+
+
+def unpack_member(bundle: tarfile.TarFile, name: str, destination: Path) -> None:
+    member = bundle.getmember(name)
+    if not member.isfile() or member.size > MAX_MEMBER_BYTES:
+        raise RuntimeError(f"release member is invalid: {name}")
+    source = bundle.extractfile(member)
+    if source is None:
+        raise RuntimeError(f"release member could not be read: {name}")
+    with source, destination.open("xb") as output:
+        shutil.copyfileobj(source, output)
+
+
+def install_tracebox(cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tracebox = cache_dir / "tracebox"
+    license_file = cache_dir / "LICENSE.perfetto"
+    if (
+        tracebox.is_file()
+        and license_file.is_file()
+        and sha256(tracebox) == TRACEBOX_SHA256
+        and sha256(license_file) == LICENSE_SHA256
+    ):
+        tracebox.chmod(0o755)
+        return tracebox
+
+    with tempfile.TemporaryDirectory(prefix=".install.", dir=cache_dir) as temporary:
+        temporary_dir = Path(temporary)
+        archive = temporary_dir / "tracebox.tar.xz"
+        unpacked_tracebox = temporary_dir / "tracebox"
+        unpacked_license = temporary_dir / "LICENSE.perfetto"
+        download_archive(archive)
+        with tarfile.open(archive, "r:xz") as bundle:
+            if set(bundle.getnames()) != {"tracebox", "LICENSE.perfetto"}:
+                raise RuntimeError("release archive contains unexpected files")
+            unpack_member(bundle, "tracebox", unpacked_tracebox)
+            unpack_member(bundle, "LICENSE.perfetto", unpacked_license)
+        if sha256(unpacked_tracebox) != TRACEBOX_SHA256:
+            raise RuntimeError("tracebox checksum does not match")
+        if sha256(unpacked_license) != LICENSE_SHA256:
+            raise RuntimeError("Perfetto license checksum does not match")
+        unpacked_tracebox.chmod(0o755)
+        os.replace(unpacked_license, license_file)
+        os.replace(unpacked_tracebox, tracebox)
+    return tracebox
+
+
+def main() -> None:
+    cache_root = os.environ.get("XDG_CACHE_HOME")
+    if not cache_root:
+        cache_root = str(Path.home() / ".cache")
+    tracebox = install_tracebox(Path(cache_root) / "delta-funnel" / RELEASE)
+    os.execv(tracebox, [str(tracebox), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, tarfile.TarError) as error:
+        print(f"delta-funnel-tracebox: {error}", file=sys.stderr)
+        raise SystemExit(69) from None

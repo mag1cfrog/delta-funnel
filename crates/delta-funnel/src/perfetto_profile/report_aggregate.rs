@@ -14,7 +14,6 @@ use super::report_trace_sanitizer::sanitize_trace;
 
 const RECORD_HEADER: &[u8] = b"\"record_hex\"";
 const MAX_RECORD_HEX_CHARS: usize = 64 * 1024;
-const UNRESOLVED_FUNCTION_ID: i64 = -1;
 const SAMPLE_CORRELATION_SQL: &str = include_str!("sql/sample_correlation.sql");
 const RANKED_PROFILE_BASE_SQL: &str = include_str!("sql/ranked_profile_base.sql");
 const RANKED_REPORT_SQL: &str = include_str!("sql/ranked_report.sql");
@@ -40,12 +39,16 @@ struct CompactMetadata {
     semantic_complete: bool,
     schema_version: u32,
     sample_frequency_hz: u32,
+    sampled_cpu_count: u32,
     exact_time_unit: String,
     sample_unit: String,
     eligible_sample_count: i64,
     direct_sample_count: i64,
     ambiguous_sample_count: i64,
     unattributed_sample_count: i64,
+    available_function_sample_count: i64,
+    unavailable_function_sample_count: i64,
+    trace_profiler_dropped_sample_count: i64,
     audit_error_count: i64,
 }
 
@@ -166,12 +169,16 @@ fn build_document(
         metadata: RankedProfileMetadata {
             schema_version: metadata.schema_version,
             sample_frequency_hz: metadata.sample_frequency_hz,
+            sampled_cpu_count: metadata.sampled_cpu_count,
             exact_time_unit: metadata.exact_time_unit,
             sample_unit: metadata.sample_unit,
             eligible_sample_count: metadata.eligible_sample_count,
             direct_sample_count: metadata.direct_sample_count,
             ambiguous_sample_count: metadata.ambiguous_sample_count,
             unattributed_sample_count: metadata.unattributed_sample_count,
+            available_function_sample_count: metadata.available_function_sample_count,
+            unavailable_function_sample_count: metadata.unavailable_function_sample_count,
+            trace_profiler_dropped_sample_count: metadata.trace_profiler_dropped_sample_count,
         },
         semantics,
         functions: Vec::new(),
@@ -277,27 +284,6 @@ fn expand_functions(
                 "function self counts are invalid",
             ));
         }
-        if record.function_id == UNRESOLVED_FUNCTION_ID {
-            functions.insert(
-                (record.semantic_id, record.function_id),
-                RankedFunction {
-                    semantic_id: record.semantic_id,
-                    function_id: record.function_id,
-                    parent_function_id: None,
-                    name: "[native stack unavailable]".to_owned(),
-                    module_name: None,
-                    source_file: None,
-                    line_number: None,
-                    self_sample_count: record.self_sample_count,
-                    inclusive_sample_count: 0,
-                },
-            );
-            if functions.len() > MAX_RECORDS_PER_COLLECTION {
-                return Err(result_too_large());
-            }
-            continue;
-        }
-
         let mut function_id = record.function_id;
         let mut is_self = true;
         let mut path = HashSet::new();
@@ -466,10 +452,7 @@ fn reconcile_official_self_counts(
     functions: &[RankedFunction],
 ) -> Result<(), RankedReportFailure> {
     let mut actual = HashMap::<i64, i64>::new();
-    for function in functions
-        .iter()
-        .filter(|function| function.function_id != UNRESOLVED_FUNCTION_ID)
-    {
+    for function in functions {
         let count = actual.entry(function.function_id).or_default();
         *count = count
             .checked_add(function.self_sample_count)
@@ -703,14 +686,18 @@ mod tests {
                 "record": {
                     "capture_complete": capture_complete,
                     "semantic_complete": capture_complete,
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "sample_frequency_hz": 1000,
+                    "sampled_cpu_count": 1,
                     "exact_time_unit": "nanoseconds",
                     "sample_unit": "samples",
                     "eligible_sample_count": 1,
                     "direct_sample_count": 1,
                     "ambiguous_sample_count": 0,
                     "unattributed_sample_count": 0,
+                    "available_function_sample_count": 1,
+                    "unavailable_function_sample_count": 0,
+                    "trace_profiler_dropped_sample_count": 0,
                     "audit_error_count": audit_error_count,
                 }
             }),
@@ -744,6 +731,8 @@ mod tests {
                     "stage_owner_id": null,
                     "direct_sample_count": 1,
                     "inclusive_sample_count": 0,
+                    "available_function_sample_count": 1,
+                    "unavailable_function_sample_count": 0,
                 }
             }),
             frame_record(10, None, 0, official_root_count),

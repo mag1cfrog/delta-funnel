@@ -103,6 +103,8 @@ jobs:
 
       - name: Build diagnostics wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        env:
+          RUSTFLAGS: -C force-frame-pointers=yes
         with:
           command: build
           maturin-version: v1.13.3

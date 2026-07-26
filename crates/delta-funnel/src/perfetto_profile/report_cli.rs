@@ -1051,14 +1051,18 @@ mod tests {
 
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
-                schema_version: 1,
+                schema_version: 2,
                 sample_frequency_hz: 100,
+                sampled_cpu_count: 1,
                 exact_time_unit: "nanoseconds".to_owned(),
                 sample_unit: "samples".to_owned(),
                 eligible_sample_count: 0,
                 direct_sample_count: 0,
                 ambiguous_sample_count: 0,
                 unattributed_sample_count: 0,
+                available_function_sample_count: 0,
+                unavailable_function_sample_count: 0,
+                trace_profiler_dropped_sample_count: 0,
             },
             semantics: vec![
                 interactive_semantic(1, None, "operation"),
@@ -1136,6 +1140,8 @@ mod tests {
             stage_owner_id: None,
             direct_sample_count: 2,
             inclusive_sample_count: 4,
+            available_function_sample_count: 2,
+            unavailable_function_sample_count: 0,
         }
     }
 

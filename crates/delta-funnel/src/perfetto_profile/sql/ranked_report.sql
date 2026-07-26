@@ -7,10 +7,12 @@ WITH
     LIMIT 1
   ),
   sample_config AS (
-    SELECT CAST(substr(
-      value,
-      instr(value, 'frequency:') + length('frequency:')
-    ) AS INTEGER) AS sample_frequency_hz
+    SELECT
+      CAST(substr(
+        value,
+        instr(value, 'frequency:') + length('frequency:')
+      ) AS INTEGER) AS sample_frequency_hz,
+      (SELECT count(DISTINCT cpu) FROM perf_sample) AS sampled_cpu_count
     FROM trace_config
     WHERE instr(value, 'frequency:') > 0
   ),
@@ -30,14 +32,21 @@ WITH
           WHEN health.semantic_complete THEN 'true'
           ELSE 'false'
         END),
-        'schema_version', 1,
+        'schema_version', 2,
         'sample_frequency_hz', sample_config.sample_frequency_hz,
+        'sampled_cpu_count', sample_config.sampled_cpu_count,
         'exact_time_unit', 'nanoseconds',
         'sample_unit', 'samples',
         'eligible_sample_count', coverage.eligible_sample_count,
         'direct_sample_count', coverage.direct_sample_count,
         'ambiguous_sample_count', coverage.ambiguous_sample_count,
         'unattributed_sample_count', coverage.unattributed_sample_count,
+        'available_function_sample_count',
+          function_coverage.available_function_sample_count,
+        'unavailable_function_sample_count',
+          function_coverage.unavailable_function_sample_count,
+        'trace_profiler_dropped_sample_count',
+          profiler_loss.trace_profiler_dropped_sample_count,
         'audit_error_count', audit.audit_error_count
       )))
     FROM sample_config
@@ -50,6 +59,19 @@ WITH
           AS unattributed_sample_count
       FROM delta_funnel_ranked_sample_ownership
     ) AS coverage
+    CROSS JOIN (
+      SELECT
+        coalesce(sum(resolution = 'resolved'), 0)
+          AS available_function_sample_count,
+        coalesce(sum(resolution = 'unresolved'), 0)
+          AS unavailable_function_sample_count
+      FROM delta_funnel_ranked_function_sample_ownership
+    ) AS function_coverage
+    CROSS JOIN (
+      SELECT coalesce(sum(value), 0) AS trace_profiler_dropped_sample_count
+      FROM stats
+      WHERE name = 'perf_samples_skipped_dataloss'
+    ) AS profiler_loss
     CROSS JOIN delta_funnel_ranked_attribution_audit AS audit
     CROSS JOIN delta_funnel_capture_health AS health
 
@@ -99,11 +121,17 @@ WITH
         'execution_stream_id', semantic.execution_stream_id,
         'stage_owner_id', semantic.stage_owner_id,
         'direct_sample_count', sample_count.direct_sample_count,
-        'inclusive_sample_count', 0
+        'inclusive_sample_count', 0,
+        'available_function_sample_count',
+          function_coverage.available_function_sample_count,
+        'unavailable_function_sample_count',
+          function_coverage.unavailable_function_sample_count
       )))
     FROM delta_funnel_ranked_semantics AS semantic
     JOIN delta_funnel_ranked_semantic_parents AS parent USING (semantic_id)
     JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count USING (semantic_id)
+    JOIN delta_funnel_ranked_semantic_function_sample_counts AS function_coverage
+      USING (semantic_id)
 
     UNION ALL
 

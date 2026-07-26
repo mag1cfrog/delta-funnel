@@ -101,7 +101,7 @@ if [[ ! -r $packaged_capture_config || ! -x $script_dir/capture-health ]]; then
   exit 69
 fi
 
-tracebox=${TRACEBOX:-tracebox}
+tracebox=${TRACEBOX:-$script_dir/delta-funnel-tracebox}
 trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
 perf=${PERF:-perf}
 for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od; do

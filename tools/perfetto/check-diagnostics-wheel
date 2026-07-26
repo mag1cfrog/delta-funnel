@@ -55,6 +55,7 @@ required = {
     "deltafunnel/perfetto/capture-health",
     "deltafunnel/perfetto/capture-health.sql",
     "deltafunnel/perfetto/capture-workload",
+    "deltafunnel/perfetto/delta-funnel-tracebox",
     "deltafunnel/perfetto/delta-funnel-deep-system.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard-streaming.pbtx",
     "deltafunnel/perfetto/delta-funnel-standard.pbtx",
@@ -66,7 +67,7 @@ with zipfile.ZipFile(wheel_path) as wheel:
     if missing:
         raise SystemExit("missing diagnostics assets: " + ", ".join(missing))
 
-    for name in ["capture-health", "capture-workload"]:
+    for name in ["capture-health", "capture-workload", "delta-funnel-tracebox"]:
         asset = wheel.getinfo(f"deltafunnel/perfetto/{name}")
         mode = asset.external_attr >> 16
         if mode & 0o111 == 0:
@@ -111,6 +112,7 @@ required = [
     "capture-health",
     "capture-health.sql",
     "capture-workload",
+    "delta-funnel-tracebox",
     *config_names,
 ]
 for name in required:
@@ -143,6 +145,20 @@ if not os.access(health, os.X_OK):
     raise SystemExit("installed capture-health is not executable")
 subprocess.run([health, "--help"], check=True, stdout=subprocess.DEVNULL)
 
+tracebox_launcher = assets.joinpath("delta-funnel-tracebox")
+if not os.access(tracebox_launcher, os.X_OK):
+    raise SystemExit("installed delta-funnel-tracebox is not executable")
+with tempfile.TemporaryDirectory() as tracebox_cache:
+    tracebox_version = subprocess.run(
+        [tracebox_launcher, "--version"],
+        env={**os.environ, "XDG_CACHE_HOME": tracebox_cache},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if "Perfetto v57.2-" not in tracebox_version.stdout + tracebox_version.stderr:
+        raise SystemExit("delta-funnel-tracebox did not run the pinned Perfetto release")
+
 perfetto_cli = Path(sys.executable).with_name("delta-funnel-perfetto")
 if not os.access(perfetto_cli, os.X_OK):
     raise SystemExit("installed delta-funnel-perfetto is not executable")
@@ -174,14 +190,18 @@ with tempfile.TemporaryDirectory() as temp_dir:
             "record": {
                 "capture_complete": True,
                 "semantic_complete": True,
-                "schema_version": 1,
+                "schema_version": 2,
                 "sample_frequency_hz": 1000,
+                "sampled_cpu_count": 1,
                 "exact_time_unit": "nanoseconds",
                 "sample_unit": "samples",
                 "eligible_sample_count": 1,
                 "direct_sample_count": 1,
                 "ambiguous_sample_count": 0,
                 "unattributed_sample_count": 0,
+                "available_function_sample_count": 0,
+                "unavailable_function_sample_count": 1,
+                "trace_profiler_dropped_sample_count": 0,
                 "audit_error_count": 0,
             },
         },
@@ -215,14 +235,8 @@ with tempfile.TemporaryDirectory() as temp_dir:
                 "stage_owner_id": None,
                 "direct_sample_count": 1,
                 "inclusive_sample_count": 0,
-            },
-        },
-        {
-            "record_kind": "function_self",
-            "record": {
-                "semantic_id": 1,
-                "function_id": -1,
-                "self_sample_count": 1,
+                "available_function_sample_count": 0,
+                "unavailable_function_sample_count": 1,
             },
         },
     ]

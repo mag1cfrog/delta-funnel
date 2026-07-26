@@ -53,6 +53,7 @@ data_sources {
           target_cmdline: "delta-funnel-perfetto-preview"
         }
         kernel_frames: true
+        user_frames: UNWIND_DWARF
       }
       # capture-workload doubles this per-CPU kernel buffer at 1000 Hz.
       ring_buffer_pages: 256
