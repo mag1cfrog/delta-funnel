@@ -99,6 +99,10 @@ struct InspectArgs {
     /// Keep the loaded profile open for line-oriented commands.
     #[arg(long)]
     interactive: bool,
+
+    /// Print complete native symbols instead of compact function names.
+    #[arg(long)]
+    full_symbols: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +131,7 @@ struct InspectState {
     filter: Option<String>,
     limit: usize,
     depth: Option<usize>,
+    full_symbols: bool,
 }
 
 impl InspectState {
@@ -469,6 +474,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         filter: args.filter.map(|filter| filter.0),
         limit: usize::from(args.limit),
         depth: args.depth.map(usize::from),
+        full_symbols: args.full_symbols,
     };
     let input = match preflight_ranked_profile_input(&args.input) {
         Ok(input) => input,
@@ -494,19 +500,21 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
                 Err(error) => emit_failure(error),
             }
         }
-        Ok(document) => match state.render(&TerminalProfileIndex::new(&document)) {
-            Ok(output) => {
-                let mut stdout = io::stdout().lock();
-                match stdout
-                    .write_all(output.as_bytes())
-                    .and_then(|()| stdout.flush())
-                {
-                    Ok(()) => 0,
-                    Err(_) => emit_failure(terminal_output_failure()),
+        Ok(document) => {
+            match state.render(&TerminalProfileIndex::new(&document, state.full_symbols)) {
+                Ok(output) => {
+                    let mut stdout = io::stdout().lock();
+                    match stdout
+                        .write_all(output.as_bytes())
+                        .and_then(|()| stdout.flush())
+                    {
+                        Ok(()) => 0,
+                        Err(_) => emit_failure(terminal_output_failure()),
+                    }
                 }
+                Err(error) => emit_failure(error.into()),
             }
-            Err(error) => emit_failure(error.into()),
-        },
+        }
         Err(error) => emit_failure(error),
     }
 }
@@ -519,7 +527,7 @@ fn run_interactive_session(
     error: &mut impl Write,
     prompt: bool,
 ) -> Result<(), RankedReportFailure> {
-    let index = TerminalProfileIndex::new(document);
+    let index = TerminalProfileIndex::new(document, state.full_symbols);
     let initial = state.render(&index).map_err(RankedReportFailure::from)?;
     write_interactive_response(output, &initial)?;
     let mut line = Vec::with_capacity(MAX_INTERACTIVE_COMMAND_BYTES);
@@ -1235,6 +1243,7 @@ mod tests {
         assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
         assert!(help.contains("--filter <TEXT>"));
         assert!(help.contains("--interactive"));
+        assert!(help.contains("--full-symbols"));
         assert!(help.contains("--sort <SORT>"));
         assert!(help.contains("--depth <DEPTH>"));
         let bare_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "inspect"])
@@ -1258,6 +1267,7 @@ mod tests {
                 "--depth",
                 "3",
                 "--interactive",
+                "--full-symbols",
             ])?,
             PerfettoCli {
                 command: PerfettoCommand::Inspect(InspectArgs {
@@ -1269,6 +1279,7 @@ mod tests {
                     sort: Some(InspectSort::SelfCpu),
                     depth: Some(3),
                     interactive: true,
+                    full_symbols: true,
                 }),
             }
         );
@@ -1293,6 +1304,7 @@ mod tests {
                     sort: None,
                     depth: None,
                     interactive: false,
+                    full_symbols: false,
                 }),
             }
         );
@@ -1348,6 +1360,7 @@ mod tests {
             filter: None,
             limit: 20,
             depth: None,
+            full_symbols: false,
         };
         let mut commands = vec![b'a'; MAX_INTERACTIVE_COMMAND_BYTES + 1];
         commands.extend_from_slice(b"\nshow\nunknown\nhelp\nquit\n");
@@ -1384,6 +1397,7 @@ mod tests {
             filter: None,
             limit: 20,
             depth: None,
+            full_symbols: false,
         };
         let mut input = io::Cursor::new([0xff, b'\n']);
         let mut output = Vec::new();
@@ -1415,6 +1429,7 @@ mod tests {
             filter: None,
             limit: 20,
             depth: None,
+            full_symbols: false,
         };
         let commands = b"open semantic:2\nopen semantic:1\nopen function:1:11\nopen function:2:20\nopen function:1:10\nopen function:1:11\nup\nup\nopen semantic:2\nroot\nup\nquit\n";
         let mut input = io::Cursor::new(commands);
@@ -1457,13 +1472,14 @@ mod tests {
     #[test]
     fn interactive_sort_and_limit_validate_before_changing_state() -> Result<(), &'static str> {
         let document = interactive_document();
-        let index = TerminalProfileIndex::new(&document);
+        let index = TerminalProfileIndex::new(&document, false);
         let mut state = InspectState {
             selection: InspectSelection::Root,
             sort: InspectSort::Duration,
             filter: None,
             limit: 20,
             depth: None,
+            full_symbols: false,
         };
 
         assert!(matches!(
@@ -1503,13 +1519,14 @@ mod tests {
     #[test]
     fn interactive_filter_is_bounded_and_clearable() -> Result<(), &'static str> {
         let document = interactive_document();
-        let index = TerminalProfileIndex::new(&document);
+        let index = TerminalProfileIndex::new(&document, false);
         let mut state = InspectState {
             selection: InspectSelection::Semantic(1),
             sort: InspectSort::Duration,
             filter: None,
             limit: 20,
             depth: None,
+            full_symbols: false,
         };
 
         let output = interactive_output(run_interactive_command(
@@ -1572,6 +1589,7 @@ mod tests {
                 sort: Some(InspectSort::Duration),
                 depth: None,
                 interactive: false,
+                full_symbols: false,
             }),
             64
         );

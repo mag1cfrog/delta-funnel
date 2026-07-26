@@ -270,6 +270,10 @@ measurements. Function `self_cpu_samples`, `inclusive_cpu_samples`, and their
 percentages are statistical on-CPU samples. Do not compare their numeric values
 as if they used the same unit.
 
+Function rows use compact names such as `BlockingTask::poll`. HTML reports show
+the complete native symbol on hover. Pass `--full-symbols` to `inspect` when
+terminal output needs the complete symbol.
+
 Use interactive mode when an agent or human needs to navigate repeatedly
 without reloading and aggregating the trace:
 
