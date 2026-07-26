@@ -539,6 +539,14 @@ mod tests {
         assert!(CAPTURE_HEALTH_SQL.contains("AS ranked_semantic_candidate"));
         assert!(CAPTURE_HEALTH_SQL.contains("WHEN ranked_semantic_candidate THEN"));
         assert!(CAPTURE_HEALTH_SQL.contains("time_semantics NOT IN ('wall_clock', 'lifecycle')"));
+        let terminal_result_clause = CAPTURE_HEALTH_SQL
+            .split_once("AS missing_terminal_result_count")
+            .expect("capture health should emit missing terminal results")
+            .0
+            .rsplit_once("coalesce(sum(")
+            .expect("missing terminal results should be an aggregate")
+            .1;
+        assert!(!terminal_result_clause.contains("'operator'"));
         assert!(
             !CAPTURE_HEALTH_SQL.contains("OR extract_arg(s.arg_set_id, 'debug.operation_id') IN")
         );

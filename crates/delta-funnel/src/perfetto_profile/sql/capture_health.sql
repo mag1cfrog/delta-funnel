@@ -143,8 +143,7 @@ missing_fields AS (
           'phase',
           'query_planning',
           'planning_activity',
-          'execution_activity',
-          'operator'
+          'execution_activity'
         )
         THEN result IS NULL
         ELSE 0
