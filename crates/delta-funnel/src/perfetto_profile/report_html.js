@@ -89,10 +89,11 @@ const functionSourceLocation = fn =>
     ? null
     : `${fn.source_file}${fn.line_number === null ? "" : `:${fn.line_number}`}`;
 const semanticChildren = new Map();
-const functionRoots = new Map();
-const functionChildren = new Map();
+let functionRoots = new Map();
+let functionChildren = new Map();
 const semanticsById = new Map();
 const functionsByKey = new Map();
+const showAllFrames = document.getElementById("show-all-frames");
 profile.semantics.forEach(semantic => {
   semanticsById.set(semantic.semantic_id, semantic);
   if (semantic.parent_semantic_id !== null) {
@@ -101,16 +102,27 @@ profile.semantics.forEach(semantic => {
 });
 profile.functions.forEach(fn => {
   functionsByKey.set(functionKey(fn), fn);
-  if (fn.parent_function_id === null) {
-    appendIndexed(functionRoots, fn.semantic_id, fn);
-  } else {
-    appendIndexed(
-      functionChildren,
-      functionParentKey(fn.semantic_id, fn.parent_function_id),
-      fn
-    );
-  }
 });
+const indexFunctionFrames = () => {
+  functionRoots = new Map();
+  functionChildren = new Map();
+  profile.functions.forEach(fn => {
+    if (!showAllFrames.checked && fn.compact_hidden) return;
+    const parentFunctionId = showAllFrames.checked
+      ? fn.parent_function_id
+      : fn.compact_parent_function_id;
+    if (parentFunctionId === null) {
+      appendIndexed(functionRoots, fn.semantic_id, fn);
+    } else {
+      appendIndexed(
+        functionChildren,
+        functionParentKey(fn.semantic_id, parentFunctionId),
+        fn
+      );
+    }
+  });
+};
+indexFunctionFrames();
 const operations = profile.semantics
   .filter(item => item.parent_semantic_id === null);
 const operationDurations = new Map(
@@ -785,10 +797,13 @@ const retainFunction = (fn, visible) => {
     if (visible.has(key)) break;
     if (visible.size >= maximumRenderedRows) return false;
     visible.add(key);
-    current = current.parent_function_id === null
+    const parentFunctionId = showAllFrames.checked
+      ? current.parent_function_id
+      : current.compact_parent_function_id;
+    current = parentFunctionId === null
       ? null
       : functionsByKey.get(
-          `f:${current.semantic_id}:${current.parent_function_id}`
+          `f:${current.semantic_id}:${parentFunctionId}`
         );
   }
   return retainSemantic(semanticsById.get(fn.semantic_id), visible);
@@ -916,6 +931,23 @@ previousFilterPage.addEventListener("click", () => {
 });
 nextFilterPage.addEventListener("click", () => {
   showFilterPage(filterPage + 1);
+});
+showAllFrames.addEventListener("change", () => {
+  indexFunctionFrames();
+  siblingPages.clear();
+  filterOrderCache = [];
+  filterOrderCacheKey = null;
+  if (
+    selectedNode?.kind === "function" &&
+    (showAllFrames.checked || selectedNode.value.compact_hidden)
+  ) {
+    selectedNode = {
+      kind: "semantic",
+      value: semanticsById.get(selectedNode.value.semantic_id)
+    };
+  }
+  if (isFilterActive()) applyFilter();
+  else renderRows();
 });
 expandSubtree.addEventListener("click", () => {
   if (selectedNode === null) return;

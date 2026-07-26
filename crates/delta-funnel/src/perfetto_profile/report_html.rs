@@ -5,7 +5,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use super::ranked_report::{
-    RankedFunction, RankedProfileDocument, RankedProfileMetadata, RankedSemantic,
+    CompactFunctionTree, RankedFunction, RankedProfileDocument, RankedProfileMetadata,
+    RankedSemantic,
 };
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 
@@ -37,6 +38,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <button id="clear-filter" class="clear-filter" type="button" disabled>Clear filter</button>
 <button id="previous-filter-page" class="filter-page" type="button" hidden>Previous matches</button>
 <button id="next-filter-page" class="filter-page" type="button" hidden>Next matches</button>
+<label><input id="show-all-frames" type="checkbox"> Show all native frames</label>
 <output id="filter-status" class="filter-status" for="profile-filter" role="status" aria-live="polite"></output>
 </div>
 <div class="controls tree-controls">
@@ -65,7 +67,8 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <p>Exact duration is measured wall-clock or lifecycle time. Parallel semantic children may overlap and are not additive. Direct CPU samples belong to one semantic node. Inclusive CPU samples also include its semantic descendants. Sampling observes on-CPU work and does not prove why a thread was off-CPU.</p>
 <p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
 <p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
-<p>Native stack coverage classifies directly attributed samples as available or unavailable. Unavailable samples remain in coverage totals but are not shown as a function. Profiler samples dropped is a trace-wide Perfetto data-loss diagnostic and is not a function cost.</p>
+<p>Native stack coverage separates resolved leaf symbols, unresolved leaf symbols, unwind failures, and missing callstacks. Profiler samples dropped is a trace-wide Perfetto data-loss diagnostic and is not a function cost.</p>
+<p>The default compact frame view hides zero-self parents that have one child with the same inclusive sample count. Use Show all native frames to restore the complete captured call chain.</p>
 <p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Sibling groups are paged 100 rows at a time. Bulk subtree actions and the visible table are limited to 1000 rows.</p>
 </details>
 </main>
@@ -94,11 +97,14 @@ struct HtmlFunction<'a> {
     #[serde(flatten)]
     function: &'a RankedFunction,
     display_name: String,
+    compact_parent_function_id: Option<i64>,
+    compact_hidden: bool,
 }
 
 pub(super) fn render_ranked_profile_html(
     document: &RankedProfileDocument,
 ) -> Result<String, RankedReportFailure> {
+    let compact = CompactFunctionTree::new(&document.functions);
     let profile = HtmlProfile {
         metadata: &document.metadata,
         semantics: &document.semantics,
@@ -108,6 +114,8 @@ pub(super) fn render_ranked_profile_html(
             .map(|function| HtmlFunction {
                 function,
                 display_name: function.display_name(),
+                compact_parent_function_id: compact.parent_function_id(function),
+                compact_hidden: !compact.contains(function),
             })
             .collect(),
     };
@@ -321,6 +329,7 @@ mod tests {
         assert!(html.contains(r#"maxlength="200""#));
         assert!(html.contains(r#"id="previous-filter-page""#));
         assert!(html.contains(r#"id="next-filter-page""#));
+        assert!(html.contains(r#"id="show-all-frames""#));
         assert!(html.contains(r#"id="expand-subtree""#));
         assert!(html.contains(r#"id="collapse-subtree""#));
         assert!(html.contains(r#"id="render-limit-status""#));
@@ -339,6 +348,8 @@ mod tests {
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["display_name"], dangerous);
+        assert!(decoded["functions"][0]["compact_parent_function_id"].is_null());
+        assert_eq!(decoded["functions"][0]["compact_hidden"], false);
         Ok(())
     }
 
@@ -503,11 +514,16 @@ mod tests {
         let nested_symbol =
             "<tokio::runtime::blocking::task::BlockingTask<F> as core::future::Future>::poll";
         functions.push(function(102, Some(1), nested_symbol));
-        let mut wide_owner_function = function(103, None, "wide owner native root");
+        functions.push(function(104, Some(1), "second function branch"));
+        let mut wide_owner_function = function(103, Some(105), "wide owner native root");
         wide_owner_function.semantic_id = 3_000;
         wide_owner_function.self_sample_count = 1;
         wide_owner_function.inclusive_sample_count = 1;
         functions.push(wide_owner_function);
+        let mut runtime_wrapper = function(105, None, "runtime wrapper");
+        runtime_wrapper.semantic_id = 3_000;
+        runtime_wrapper.inclusive_sample_count = 1;
+        functions.push(runtime_wrapper);
         let mut profile_metadata = metadata();
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
@@ -599,6 +615,45 @@ mod tests {
     check(
       wideOwnerFunction !== undefined,
       "wide semantic owner did not reveal its native function root"
+    );
+    check(
+      !operationsBody.textContent.includes("runtime wrapper"),
+      "compact view retained a zero-cost single-child frame"
+    );
+    selectedNode = {
+      kind: "function",
+      value: functionsByKey.get("f:3000:103")
+    };
+    showAllFrames.click();
+    check(
+      selectedNode.kind === "semantic" &&
+        selectedNode.value.semantic_id === 3000,
+      "all-frames view did not retain the selected semantic context"
+    );
+    const runtimeWrapper = Array.from(
+      operationsBody.querySelectorAll(".function-row")
+    ).find(row => row.textContent.includes("runtime wrapper"));
+    check(runtimeWrapper !== undefined, "all-frames view omitted a captured frame");
+    check(
+      !operationsBody.textContent.includes("wide owner native root"),
+      "all-frames view flattened a captured parent-child edge"
+    );
+    runtimeWrapper.querySelector(".disclosure").click();
+    check(
+      operationsBody.textContent.includes("wide owner native root"),
+      "all-frames view did not expand the captured child"
+    );
+    selectedNode = {
+      kind: "function",
+      value: functionsByKey.get("f:3000:105")
+    };
+    showAllFrames.click();
+    check(
+      selectedNode.kind === "semantic" &&
+        selectedNode.value.semantic_id === 3000 &&
+        operationsBody.textContent.includes("wide owner native root") &&
+        !operationsBody.textContent.includes("runtime wrapper"),
+      "returning to compact view did not restore a valid selection and tree"
     );
     const wideSemanticPagination = Array.from(
       operationsBody.querySelectorAll(".pagination-row")
@@ -735,14 +790,14 @@ mod tests {
     filterInput.value = "delta_funnel";
     applyFilter();
     check(
-      filterResults.length === 103 &&
+      filterResults.length === 104 &&
         filterResults.every(result => result.function_id !== undefined),
       "module metadata was not searchable"
     );
     filterInput.value = "src/lib.rs:42";
     applyFilter();
     check(
-      filterResults.length === 103 &&
+      filterResults.length === 104 &&
         filterResults.every(result => result.function_id !== undefined),
       "source metadata was not searchable"
     );

@@ -103,6 +103,10 @@ struct InspectArgs {
     /// Print complete native symbols instead of compact function names.
     #[arg(long)]
     full_symbols: bool,
+
+    /// Include zero-cost single-child frames hidden by the compact view.
+    #[arg(long)]
+    all_frames: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +136,7 @@ struct InspectState {
     limit: usize,
     depth: Option<usize>,
     full_symbols: bool,
+    all_frames: bool,
 }
 
 impl InspectState {
@@ -475,6 +480,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         limit: usize::from(args.limit),
         depth: args.depth.map(usize::from),
         full_symbols: args.full_symbols,
+        all_frames: args.all_frames,
     };
     let input = match preflight_ranked_profile_input(&args.input) {
         Ok(input) => input,
@@ -501,7 +507,11 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
             }
         }
         Ok(document) => {
-            match state.render(&TerminalProfileIndex::new(&document, state.full_symbols)) {
+            match state.render(&TerminalProfileIndex::new(
+                &document,
+                state.full_symbols,
+                state.all_frames,
+            )) {
                 Ok(output) => {
                     let mut stdout = io::stdout().lock();
                     match stdout
@@ -527,7 +537,7 @@ fn run_interactive_session(
     error: &mut impl Write,
     prompt: bool,
 ) -> Result<(), RankedReportFailure> {
-    let index = TerminalProfileIndex::new(document, state.full_symbols);
+    let index = TerminalProfileIndex::new(document, state.full_symbols, state.all_frames);
     let initial = state.render(&index).map_err(RankedReportFailure::from)?;
     write_interactive_response(output, &initial)?;
     let mut line = Vec::with_capacity(MAX_INTERACTIVE_COMMAND_BYTES);
@@ -1244,6 +1254,7 @@ mod tests {
         assert!(help.contains("--filter <TEXT>"));
         assert!(help.contains("--interactive"));
         assert!(help.contains("--full-symbols"));
+        assert!(help.contains("--all-frames"));
         assert!(help.contains("--sort <SORT>"));
         assert!(help.contains("--depth <DEPTH>"));
         let bare_help = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "inspect"])
@@ -1268,6 +1279,7 @@ mod tests {
                 "3",
                 "--interactive",
                 "--full-symbols",
+                "--all-frames",
             ])?,
             PerfettoCli {
                 command: PerfettoCommand::Inspect(InspectArgs {
@@ -1280,6 +1292,7 @@ mod tests {
                     depth: Some(3),
                     interactive: true,
                     full_symbols: true,
+                    all_frames: true,
                 }),
             }
         );
@@ -1305,6 +1318,7 @@ mod tests {
                     depth: None,
                     interactive: false,
                     full_symbols: false,
+                    all_frames: false,
                 }),
             }
         );
@@ -1361,6 +1375,7 @@ mod tests {
             limit: 20,
             depth: None,
             full_symbols: false,
+            all_frames: false,
         };
         let mut commands = vec![b'a'; MAX_INTERACTIVE_COMMAND_BYTES + 1];
         commands.extend_from_slice(b"\nshow\nunknown\nhelp\nquit\n");
@@ -1398,6 +1413,7 @@ mod tests {
             limit: 20,
             depth: None,
             full_symbols: false,
+            all_frames: false,
         };
         let mut input = io::Cursor::new([0xff, b'\n']);
         let mut output = Vec::new();
@@ -1430,6 +1446,7 @@ mod tests {
             limit: 20,
             depth: None,
             full_symbols: false,
+            all_frames: false,
         };
         let commands = b"open semantic:2\nopen semantic:1\nopen function:1:11\nopen function:2:20\nopen function:1:10\nopen function:1:11\nup\nup\nopen semantic:2\nroot\nup\nquit\n";
         let mut input = io::Cursor::new(commands);
@@ -1472,7 +1489,7 @@ mod tests {
     #[test]
     fn interactive_sort_and_limit_validate_before_changing_state() -> Result<(), &'static str> {
         let document = interactive_document();
-        let index = TerminalProfileIndex::new(&document, false);
+        let index = TerminalProfileIndex::new(&document, false, false);
         let mut state = InspectState {
             selection: InspectSelection::Root,
             sort: InspectSort::Duration,
@@ -1480,6 +1497,7 @@ mod tests {
             limit: 20,
             depth: None,
             full_symbols: false,
+            all_frames: false,
         };
 
         assert!(matches!(
@@ -1519,7 +1537,7 @@ mod tests {
     #[test]
     fn interactive_filter_is_bounded_and_clearable() -> Result<(), &'static str> {
         let document = interactive_document();
-        let index = TerminalProfileIndex::new(&document, false);
+        let index = TerminalProfileIndex::new(&document, false, false);
         let mut state = InspectState {
             selection: InspectSelection::Semantic(1),
             sort: InspectSort::Duration,
@@ -1527,6 +1545,7 @@ mod tests {
             limit: 20,
             depth: None,
             full_symbols: false,
+            all_frames: false,
         };
 
         let output = interactive_output(run_interactive_command(
@@ -1590,6 +1609,7 @@ mod tests {
                 depth: None,
                 interactive: false,
                 full_symbols: false,
+                all_frames: false,
             }),
             64
         );

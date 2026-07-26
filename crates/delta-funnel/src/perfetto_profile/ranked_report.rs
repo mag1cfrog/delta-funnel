@@ -83,6 +83,105 @@ impl RankedFunction {
     }
 }
 
+pub(super) struct CompactFunctionTree {
+    parents: HashMap<(i64, i64), Option<i64>>,
+}
+
+impl CompactFunctionTree {
+    pub(super) fn new(functions: &[RankedFunction]) -> Self {
+        let parents = functions
+            .iter()
+            .map(|function| {
+                (
+                    (function.semantic_id, function.function_id),
+                    function.parent_function_id,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut children = HashMap::<(i64, i64), (usize, i64)>::new();
+        for function in functions {
+            let Some(parent_id) = function.parent_function_id else {
+                continue;
+            };
+            let child = children
+                .entry((function.semantic_id, parent_id))
+                .or_insert((0, function.inclusive_sample_count));
+            child.0 += 1;
+            child.1 = function.inclusive_sample_count;
+        }
+        let collapsed = functions
+            .iter()
+            .filter(|function| {
+                function.self_sample_count == 0
+                    && children
+                        .get(&(function.semantic_id, function.function_id))
+                        .is_some_and(|(count, child_inclusive)| {
+                            *count == 1 && *child_inclusive == function.inclusive_sample_count
+                        })
+            })
+            .map(|function| (function.semantic_id, function.function_id))
+            .collect::<HashSet<_>>();
+        let mut retained_parents = HashMap::with_capacity(collapsed.len());
+        let mut compact_parents =
+            HashMap::with_capacity(functions.len().saturating_sub(collapsed.len()));
+        for function in functions {
+            let key = (function.semantic_id, function.function_id);
+            if collapsed.contains(&key) {
+                continue;
+            }
+            let parent = retained_function_parent(
+                function.semantic_id,
+                function.parent_function_id,
+                &parents,
+                &collapsed,
+                &mut retained_parents,
+            );
+            compact_parents.insert(key, parent);
+        }
+        Self {
+            parents: compact_parents,
+        }
+    }
+
+    pub(super) fn contains(&self, function: &RankedFunction) -> bool {
+        self.parents
+            .contains_key(&(function.semantic_id, function.function_id))
+    }
+
+    pub(super) fn parent_function_id(&self, function: &RankedFunction) -> Option<i64> {
+        self.parents
+            .get(&(function.semantic_id, function.function_id))
+            .copied()
+            .flatten()
+    }
+}
+
+fn retained_function_parent(
+    semantic_id: i64,
+    mut parent: Option<i64>,
+    parents: &HashMap<(i64, i64), Option<i64>>,
+    collapsed: &HashSet<(i64, i64)>,
+    retained_parents: &mut HashMap<(i64, i64), Option<i64>>,
+) -> Option<i64> {
+    let mut path = Vec::new();
+    while let Some(parent_id) = parent {
+        let key = (semantic_id, parent_id);
+        if !collapsed.contains(&key) {
+            break;
+        }
+        if let Some(retained) = retained_parents.get(&key) {
+            parent = *retained;
+            break;
+        }
+        path.push(key);
+        parent = parents.get(&key).copied().flatten();
+    }
+    for key in path {
+        retained_parents.insert(key, parent);
+    }
+    parent
+}
+
 fn compact_function_name(symbol: &str) -> String {
     let symbol = symbol
         .rsplit_once(" (.llvm.")
@@ -1371,6 +1470,80 @@ mod tests {
             assert_eq!(function.display_name(), expected);
             assert_eq!(function.name, symbol);
         }
+    }
+
+    #[test]
+    fn compacts_only_zero_self_single_child_chains_without_mutating_functions() {
+        let mut functions = vec![
+            function(1, 1, None),
+            function(1, 2, Some(1)),
+            function(1, 3, Some(2)),
+            function(1, 4, None),
+            function(1, 5, Some(4)),
+            function(1, 6, Some(4)),
+            function(1, 7, None),
+            function(1, 8, None),
+        ];
+        for function in &mut functions {
+            match function.function_id {
+                1..=3 => function.inclusive_sample_count = 10,
+                4 => function.inclusive_sample_count = 5,
+                5 => {
+                    function.self_sample_count = 2;
+                    function.inclusive_sample_count = 2;
+                }
+                6 => {
+                    function.self_sample_count = 3;
+                    function.inclusive_sample_count = 3;
+                }
+                8 => function.inclusive_sample_count = 10,
+                _ => {}
+            }
+        }
+        functions[2].self_sample_count = 10;
+        let canonical = functions.clone();
+
+        let compact = CompactFunctionTree::new(&functions);
+
+        assert!(!compact.contains(&functions[0]));
+        assert!(!compact.contains(&functions[1]));
+        assert!(compact.contains(&functions[2]));
+        assert_eq!(compact.parent_function_id(&functions[2]), None);
+        assert!(compact.contains(&functions[3]));
+        assert_eq!(compact.parent_function_id(&functions[4]), Some(4));
+        assert_eq!(compact.parent_function_id(&functions[5]), Some(4));
+        assert!(compact.contains(&functions[6]));
+        assert!(compact.contains(&functions[7]));
+        assert_eq!(functions, canonical);
+    }
+
+    #[test]
+    fn compacts_deep_function_chains_iteratively() {
+        const CHAIN_LENGTH: i64 = 20_000;
+        let mut functions = (0..CHAIN_LENGTH)
+            .map(|function_id| {
+                let mut function = function(
+                    1,
+                    function_id,
+                    (function_id != 0).then_some(function_id - 1),
+                );
+                function.inclusive_sample_count = 1;
+                function
+            })
+            .collect::<Vec<_>>();
+        let mut leaf = function(1, CHAIN_LENGTH, Some(CHAIN_LENGTH - 1));
+        leaf.self_sample_count = 1;
+        leaf.inclusive_sample_count = 1;
+        functions.push(leaf);
+
+        let compact = CompactFunctionTree::new(&functions);
+
+        assert!(compact.contains(functions.last().expect("leaf should exist")));
+        assert_eq!(
+            compact.parent_function_id(functions.last().expect("leaf should exist")),
+            None
+        );
+        assert!(!compact.contains(&functions[0]));
     }
 
     fn document() -> RankedProfileDocument {

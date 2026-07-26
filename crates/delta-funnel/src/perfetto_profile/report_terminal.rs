@@ -4,7 +4,9 @@ use std::fmt;
 
 use clap::ValueEnum;
 
-use super::ranked_report::{RankedFunction, RankedProfileDocument, RankedSemantic};
+use super::ranked_report::{
+    CompactFunctionTree, RankedFunction, RankedProfileDocument, RankedSemantic,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub(super) enum InspectSort {
@@ -79,13 +81,19 @@ pub(super) struct TerminalProfileIndex<'a> {
     semantics: HashMap<i64, &'a RankedSemantic>,
     semantic_children: HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
     functions: HashMap<(i64, i64), &'a RankedFunction>,
+    function_parents: HashMap<(i64, i64), Option<i64>>,
     function_children: HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
     operation_durations: HashMap<i64, Option<i64>>,
     full_symbols: bool,
+    all_frames: bool,
 }
 
 impl<'a> TerminalProfileIndex<'a> {
-    pub(super) fn new(document: &'a RankedProfileDocument, full_symbols: bool) -> Self {
+    pub(super) fn new(
+        document: &'a RankedProfileDocument,
+        full_symbols: bool,
+        all_frames: bool,
+    ) -> Self {
         let mut semantics = HashMap::with_capacity(document.semantics.len());
         let mut semantic_children = HashMap::new();
         let mut operation_durations = HashMap::new();
@@ -100,11 +108,25 @@ impl<'a> TerminalProfileIndex<'a> {
             }
         }
         let mut functions = HashMap::with_capacity(document.functions.len());
+        let mut function_parents = HashMap::with_capacity(document.functions.len());
         let mut function_children = HashMap::new();
+        let compact = CompactFunctionTree::new(&document.functions);
         for function in &document.functions {
+            if !all_frames && !compact.contains(function) {
+                continue;
+            }
+            let parent_function_id = if all_frames {
+                function.parent_function_id
+            } else {
+                compact.parent_function_id(function)
+            };
             functions.insert((function.semantic_id, function.function_id), function);
+            function_parents.insert(
+                (function.semantic_id, function.function_id),
+                parent_function_id,
+            );
             function_children
-                .entry((function.semantic_id, function.parent_function_id))
+                .entry((function.semantic_id, parent_function_id))
                 .or_insert_with(Vec::new)
                 .push(function);
         }
@@ -113,9 +135,11 @@ impl<'a> TerminalProfileIndex<'a> {
             semantics,
             semantic_children,
             functions,
+            function_parents,
             function_children,
             operation_durations,
             full_symbols,
+            all_frames,
         }
     }
 
@@ -191,9 +215,9 @@ impl<'a> TerminalProfileIndex<'a> {
             }
         };
         if self
-            .functions
+            .function_parents
             .get(&(semantic_id, function_id))
-            .map(|function| function.parent_function_id)
+            .copied()
             != Some(parent)
         {
             return Err("function target is not an immediate child");
@@ -220,10 +244,11 @@ impl<'a> TerminalProfileIndex<'a> {
                 semantic_id,
                 function_id,
             } => self
-                .functions
+                .function_parents
                 .get(&(semantic_id, function_id))
-                .map(|function| {
-                    function.parent_function_id.map_or(
+                .copied()
+                .map(|parent_function_id| {
+                    parent_function_id.map_or(
                         InspectSelection::Semantic(semantic_id),
                         |function_id| InspectSelection::Function {
                             semantic_id,
@@ -245,7 +270,8 @@ pub(super) fn render_terminal_view(
     limit: usize,
     max_depth: usize,
 ) -> Result<String, TerminalInspectError> {
-    TerminalProfileIndex::new(document, false).render(selection, sort, filter, limit, max_depth)
+    TerminalProfileIndex::new(document, false, false)
+        .render(selection, sort, filter, limit, max_depth)
 }
 
 fn render_semantic_view(
@@ -312,7 +338,7 @@ fn render_semantic_view(
     let captured_function_samples = index.document.metadata.resolved_function_sample_count
         + index.document.metadata.unresolved_function_sample_count;
     let mut output = format!(
-        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsymbol_format: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
+        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsymbol_format: {}\nframe_view: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
         sort.as_str(),
         shown,
         shown < total,
@@ -323,6 +349,7 @@ fn render_semantic_view(
         } else {
             "compact"
         },
+        if index.all_frames { "all" } else { "compact" },
         index.document.metadata.sampled_cpu_count,
         index.document.metadata.resolved_function_sample_count,
         index.document.metadata.unresolved_function_sample_count,
@@ -526,7 +553,7 @@ fn render_function_view(
     let captured_function_samples = index.document.metadata.resolved_function_sample_count
         + index.document.metadata.unresolved_function_sample_count;
     let mut output = format!(
-        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsymbol_format: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsymbol_format: {}\nframe_view: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
         sort.as_str(),
         rows.len(),
         rows.len() < total,
@@ -536,6 +563,7 @@ fn render_function_view(
         } else {
             "compact"
         },
+        if index.all_frames { "all" } else { "compact" },
         index.document.metadata.sampled_cpu_count,
         index.document.metadata.resolved_function_sample_count,
         index.document.metadata.unresolved_function_sample_count,
@@ -582,9 +610,10 @@ fn contextual_function_matches(
                 }
                 included.insert(id);
                 let Some(parent_id) = index
-                    .functions
+                    .function_parents
                     .get(&(semantic_id, id))
-                    .and_then(|function| function.parent_function_id)
+                    .copied()
+                    .flatten()
                 else {
                     break;
                 };
@@ -1117,7 +1146,7 @@ mod tests {
         assert!(function.contains("symbol=\"BlockingTask::poll\""));
         assert!(function.contains("symbol_format: compact"));
 
-        let full_symbols = TerminalProfileIndex::new(&document, true)
+        let full_symbols = TerminalProfileIndex::new(&document, true, false)
             .render(
                 InspectSelection::Function {
                     semantic_id: 1,
@@ -1183,5 +1212,126 @@ mod tests {
                 function_id: 10,
             })
         );
+    }
+
+    #[test]
+    fn switches_between_compact_and_complete_function_trees() {
+        let mut root = operation(1, "operation", Some(100));
+        root.direct_sample_count = 7;
+        root.inclusive_sample_count = 7;
+        let mut document = document(vec![root]);
+        document.functions = vec![
+            function(1, 10, None, "runtime wrapper", 0, 3),
+            function(1, 11, Some(10), "future wrapper", 0, 3),
+            function(1, 12, Some(11), "useful leaf", 3, 3),
+            function(1, 20, None, "second root", 1, 4),
+            function(1, 21, Some(20), "retained context", 1, 3),
+            function(1, 22, Some(21), "hidden context", 0, 2),
+            function(1, 23, Some(22), "filtered leaf", 2, 2),
+        ];
+
+        let compact_index = TerminalProfileIndex::new(&document, false, false);
+        let compact = compact_index
+            .render(
+                InspectSelection::Semantic(1),
+                InspectSort::InclusiveCpu,
+                None,
+                10,
+                1,
+            )
+            .expect("compact function tree should render");
+        assert!(compact.contains("frame_view: compact"));
+        assert!(compact.contains("id=function:1:12"));
+        assert!(compact.contains("id=function:1:20"));
+        assert!(!compact.contains("id=function:1:10"));
+        assert!(!compact.contains("id=function:1:11"));
+        assert!(!compact.contains("id=function:1:22"));
+        assert_eq!(
+            compact_index.open_function(InspectSelection::Semantic(1), 1, 12),
+            Ok(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 12,
+            })
+        );
+        assert_eq!(
+            compact_index.up(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 12,
+            }),
+            Ok(InspectSelection::Semantic(1))
+        );
+
+        assert_eq!(
+            compact_index.open_function(
+                InspectSelection::Function {
+                    semantic_id: 1,
+                    function_id: 21,
+                },
+                1,
+                23,
+            ),
+            Ok(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 23,
+            })
+        );
+        assert_eq!(
+            compact_index.up(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 23,
+            }),
+            Ok(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 21,
+            })
+        );
+        let filtered = compact_index
+            .render(
+                InspectSelection::Function {
+                    semantic_id: 1,
+                    function_id: 20,
+                },
+                InspectSort::InclusiveCpu,
+                Some("filtered leaf"),
+                10,
+                3,
+            )
+            .expect("compact filter context should render");
+        assert!(filtered.contains("id=function:1:21"));
+        assert!(filtered.contains("id=function:1:23"));
+        assert!(!filtered.contains("id=function:1:22"));
+
+        let all_frames = TerminalProfileIndex::new(&document, false, true)
+            .render(
+                InspectSelection::Semantic(1),
+                InspectSort::InclusiveCpu,
+                None,
+                10,
+                1,
+            )
+            .expect("complete function tree should render");
+        assert!(all_frames.contains("frame_view: all"));
+        assert!(all_frames.contains("id=function:1:10"));
+        assert!(!all_frames.contains("id=function:1:11"));
+
+        let descendants = TerminalProfileIndex::new(&document, false, true)
+            .render(
+                InspectSelection::Function {
+                    semantic_id: 1,
+                    function_id: 10,
+                },
+                InspectSort::InclusiveCpu,
+                None,
+                10,
+                2,
+            )
+            .expect("complete function descendants should render");
+        let wrapper = descendants
+            .find("id=function:1:11")
+            .expect("captured wrapper frame");
+        let leaf = descendants
+            .find("id=function:1:12")
+            .expect("captured leaf frame");
+        assert!(wrapper < leaf);
     }
 }
