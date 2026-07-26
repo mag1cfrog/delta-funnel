@@ -8,7 +8,7 @@ use super::ranked_report::{
     RankedSemantic, fold_inclusive_counts,
 };
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
-use super::report_health::{CAPTURE_HEALTH_SQL, capture_health_input_sql, validate_capture_health};
+use super::report_health::{CAPTURE_HEALTH_SQL, capture_health_input_sql};
 use super::report_trace_processor::run_trace_processor_query;
 use super::report_trace_sanitizer::sanitize_trace;
 
@@ -159,7 +159,6 @@ fn build_document(
     frames: Vec<CompactFrame>,
     function_self: Vec<CompactFunctionSelf>,
 ) -> Result<RankedProfileDocument, RankedReportFailure> {
-    validate_capture_health(metadata.capture_complete, metadata.semantic_complete)?;
     if metadata.audit_error_count != 0 {
         return Err(aggregate_failure(
             "audit_failed",
@@ -169,6 +168,8 @@ fn build_document(
     semantics.sort_by_key(|semantic| (semantic.operation_id, semantic.semantic_id));
     let mut document = RankedProfileDocument {
         metadata: RankedProfileMetadata {
+            capture_complete: metadata.capture_complete,
+            semantic_complete: metadata.semantic_complete,
             schema_version: metadata.schema_version,
             sample_frequency_hz: metadata.sample_frequency_hz,
             sampled_cpu_count: metadata.sampled_cpu_count,
@@ -492,10 +493,13 @@ mod tests {
             .expect_err("failed query audit should fail");
         assert_eq!(audit.kind(), "audit_failed");
 
-        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false).as_bytes())
-            .expect_err("incomplete capture should fail");
-        assert_eq!(incomplete.phase(), RankedReportFailurePhase::Health);
-        assert_eq!(incomplete.kind(), "incomplete_capture");
+        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false).as_bytes())?;
+        assert!(!incomplete.metadata.capture_complete);
+        assert!(!incomplete.metadata.semantic_complete);
+        assert!(!incomplete.semantics[0].is_complete);
+        assert_eq!(incomplete.semantics[0].end_ns, None);
+        assert_eq!(incomplete.semantics[0].duration_ns, None);
+        assert_eq!(incomplete.semantics[0].result, None);
 
         let malformed = parse_ranked_report_output(b"\"record_hex\"\n\"xyz\"\n")
             .expect_err("invalid hex should fail");
@@ -577,11 +581,11 @@ mod tests {
                     "stage_name": null,
                     "activity": null,
                     "start_ns": 10,
-                    "end_ns": 20,
-                    "duration_ns": 10,
+                    "end_ns": capture_complete.then_some(20),
+                    "duration_ns": capture_complete.then_some(10),
                     "time_semantics": "wall_clock",
-                    "result": "ok",
-                    "is_complete": true,
+                    "result": capture_complete.then_some("ok"),
+                    "is_complete": capture_complete,
                     "query_execution_id": null,
                     "query_scope": null,
                     "query_owner": null,

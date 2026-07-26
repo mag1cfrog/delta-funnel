@@ -198,6 +198,8 @@ mod tests {
 
     fn metadata() -> RankedProfileMetadata {
         RankedProfileMetadata {
+            capture_complete: true,
+            semantic_complete: true,
             schema_version: 3,
             sample_frequency_hz: 1000,
             sampled_cpu_count: 8,

@@ -12,6 +12,8 @@ const MAX_DISPLAY_STRING_CHARS: usize = 512;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RankedProfileMetadata {
+    pub capture_complete: bool,
+    pub semantic_complete: bool,
     pub schema_version: u32,
     pub sample_frequency_hz: u32,
     pub sampled_cpu_count: u32,
@@ -1644,6 +1646,8 @@ mod tests {
         phase_leaf.inclusive_sample_count = 2;
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
+                capture_complete: true,
+                semantic_complete: true,
                 schema_version: 3,
                 sample_frequency_hz: 100,
                 sampled_cpu_count: 1,
