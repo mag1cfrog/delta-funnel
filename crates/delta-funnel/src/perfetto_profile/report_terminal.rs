@@ -623,8 +623,6 @@ fn capture_health_header(metadata: &RankedProfileMetadata) -> String {
             metadata.crossing_execution_activity_slice_count,
             metadata.invalid_planning_activity_hierarchy_count,
             metadata.invalid_execution_activity_hierarchy_count,
-            metadata.perf_sample_without_callsite_count,
-            metadata.perf_samples_skipped,
             metadata.buffer_loss_count,
             metadata.data_source_loss_count,
             metadata.flush_failure_count,
@@ -1047,11 +1045,13 @@ mod tests {
 
     #[test]
     fn ranks_and_bounds_operation_roots_with_terminal_safe_text() {
-        let document = document(vec![
+        let mut document = document(vec![
             operation(3, "safe lambda", Some(10)),
             operation(1, "slow\u{1b}[31m\u{2028}\u{202e}\"operation", Some(30)),
             operation(2, "safe snowman \u{2603}", Some(30)),
         ]);
+        document.metadata.perf_sample_without_callsite_count = 1;
+        document.metadata.perf_samples_skipped = 1;
         let rendered = render_terminal_view(
             &document,
             InspectSelection::Root,
