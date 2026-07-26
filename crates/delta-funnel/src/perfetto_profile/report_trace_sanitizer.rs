@@ -39,7 +39,7 @@ const TRUSTED_UID_FIELD: u64 = TracePacketFieldNumber::TrustedUid as u64;
 const LEGACY_COMPOSED_SEQUENCE_ID: u64 = 4_000_000_000;
 const LEGACY_UNIFIED_CATEGORY_PREFIX: &[u8] = b"delta_funnel.unified.";
 const COMPRESSED_CHUNK_BYTES: usize = 384 * 1024;
-// ponytail: This matches the existing production-tested parser bound. Raise it
+// This matches the existing production-tested parser bound. Raise it
 // only when a valid Perfetto trace demonstrates a larger individual packet.
 const MAX_TRACE_PACKET_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_CHUNK_BYTES: u64 = 64 * 1024 * 1024;

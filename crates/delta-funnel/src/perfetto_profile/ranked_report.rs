@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use serde::{Deserialize, Serialize};
 
-// ponytail: This covers the 246,095-node production fixture while bounding
+// This covers the 246,095-node production fixture while bounding
 // report memory. Raise it only with production and browser evidence.
 pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
@@ -192,14 +192,14 @@ fn compact_function_name(symbol: &str) -> String {
         })
         .map_or(symbol, |(symbol, _)| symbol);
     let Some(method_separator) = last_top_level_path_separator(symbol) else {
-        let display_name = trim_function_generics(symbol);
+        let display_name = trim_function_details(symbol);
         return if display_name.is_empty() {
             symbol.to_owned()
         } else {
             display_name.to_owned()
         };
     };
-    let method = trim_function_generics(&symbol[method_separator + 2..]);
+    let method = trim_function_details(&symbol[method_separator + 2..]);
     let owner = function_owner(&symbol[..method_separator]);
     if owner.is_empty() || method.is_empty() {
         symbol.to_owned()
@@ -224,48 +224,108 @@ fn function_owner(prefix: &str) -> &str {
     owner.find('<').map_or(owner, |generic| &owner[..generic])
 }
 
-fn split_top_level_as(value: &str) -> Option<&str> {
-    let mut depth = 0_u32;
-    for (index, byte) in value.bytes().enumerate() {
-        match byte {
-            b'<' | b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
-            b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-            b' ' if depth == 0 && value[index..].starts_with(" as ") => {
-                return Some(&value[..index]);
+#[derive(Default)]
+struct SymbolNesting {
+    angles: u32,
+    parentheses: u32,
+    brackets: u32,
+    braces: u32,
+}
+
+impl SymbolNesting {
+    fn is_top_level(&self) -> bool {
+        self.angles == 0 && self.is_outside_groups()
+    }
+
+    fn is_outside_groups(&self) -> bool {
+        self.parentheses == 0 && self.brackets == 0 && self.braces == 0
+    }
+
+    fn advance(&mut self, value: &str, index: usize) {
+        let bytes = value.as_bytes();
+        match bytes[index] {
+            b'<' if !is_operator_less_than(value, index) => {
+                self.angles = self.angles.saturating_add(1);
             }
+            b'>' if !is_directional_arrow(bytes, index) => {
+                self.angles = self.angles.saturating_sub(1);
+            }
+            b'(' => self.parentheses = self.parentheses.saturating_add(1),
+            b')' => self.parentheses = self.parentheses.saturating_sub(1),
+            b'[' => self.brackets = self.brackets.saturating_add(1),
+            b']' => self.brackets = self.brackets.saturating_sub(1),
+            b'{' => self.braces = self.braces.saturating_add(1),
+            b'}' => self.braces = self.braces.saturating_sub(1),
             _ => {}
         }
+    }
+}
+
+fn split_top_level_as(value: &str) -> Option<&str> {
+    let mut nesting = SymbolNesting::default();
+    for (index, byte) in value.bytes().enumerate() {
+        if byte == b' ' && nesting.is_top_level() && value[index..].starts_with(" as ") {
+            return Some(&value[..index]);
+        }
+        nesting.advance(value, index);
     }
     None
 }
 
 fn last_top_level_path_separator(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
-    let mut depth = 0_u32;
+    let mut nesting = SymbolNesting::default();
     let mut last = None;
     let mut index = 0;
     while index < bytes.len() {
-        match bytes[index] {
-            b'<' | b'(' | b'[' | b'{' => depth = depth.saturating_add(1),
-            b'>' | b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-            b':' if depth == 0
-                && bytes.get(index + 1) == Some(&b':')
-                && bytes.get(index + 2) != Some(&b'<') =>
-            {
-                last = Some(index);
-                index += 1;
-            }
-            _ => {}
+        if bytes[index] == b':'
+            && nesting.is_top_level()
+            && bytes.get(index + 1) == Some(&b':')
+            && bytes.get(index + 2) != Some(&b'<')
+        {
+            last = Some(index);
+            index += 1;
+        } else {
+            nesting.advance(value, index);
         }
         index += 1;
     }
     last
 }
 
-fn trim_function_generics(value: &str) -> &str {
+fn trim_function_details(value: &str) -> &str {
+    let mut nesting = SymbolNesting::default();
+    for (index, byte) in value.bytes().enumerate() {
+        if byte == b'<' && nesting.is_outside_groups() && !is_operator_less_than(value, index) {
+            return value[..index].trim_end_matches("::");
+        }
+        if byte == b'(' && nesting.is_top_level() && !is_call_operator(value, index) {
+            return value[..index].trim_end();
+        }
+        nesting.advance(value, index);
+    }
     value
-        .find('<')
-        .map_or(value, |generic| value[..generic].trim_end_matches("::"))
+}
+
+fn is_call_operator(value: &str, index: usize) -> bool {
+    &value[..index] == "operator" && value.as_bytes().get(index + 1) == Some(&b')')
+}
+
+fn is_operator_less_than(value: &str, index: usize) -> bool {
+    value[..index]
+        .rsplit("::")
+        .next()
+        .unwrap_or_default()
+        .strip_prefix("operator")
+        .is_some_and(|operator| operator.bytes().all(|byte| byte == b'<'))
+        && value
+            .as_bytes()
+            .get(index + 1)
+            .is_none_or(|next| next.is_ascii_whitespace() || matches!(next, b'<' | b'=' | b'('))
+}
+
+fn is_directional_arrow(value: &[u8], index: usize) -> bool {
+    index > 0 && matches!(value[index - 1], b'-' | b'=')
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -649,7 +709,6 @@ impl RankedProfileDocument {
         }
         for function in &self.functions {
             for (field, value) in [
-                ("name", Some(function.name.as_str())),
                 ("module_name", function.module_name.as_deref()),
                 ("source_file", function.source_file.as_deref()),
             ] {
@@ -1461,6 +1520,21 @@ mod tests {
                 "pyo3::impl_::trampoline::do_call<Result, Handler>",
                 "trampoline::do_call",
             ),
+            ("std::ostream::operator<<(int)", "ostream::operator<<"),
+            (
+                "std::strong_ordering::operator<=>(int)",
+                "strong_ordering::operator<=>",
+            ),
+            (
+                "perfetto::ipc::ClientImpl::BeginInvoke(unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, bool)",
+                "ClientImpl::BeginInvoke",
+            ),
+            ("functor::Callable::operator()(int)", "Callable::operator()"),
+            (
+                "std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> core::result::Result<(), alloc::boxed::Box<dyn core::error::Error>>, core::result::Result<(), alloc::boxed::Box<dyn core::error::Error>>>",
+                "backtrace::__rust_begin_short_backtrace",
+            ),
+            ("delta_funnel::operator<Profile>", "delta_funnel::operator"),
             ("do_call<Result, Handler>", "do_call"),
             ("sqlite3_step", "sqlite3_step"),
             ("<invalid>", "<invalid>"),
@@ -1829,7 +1903,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_aggregate_collections_and_display_strings() {
+    fn bounds_aggregate_collections_and_display_strings_without_truncating_symbols() {
         assert!(matches!(
             require_collection_bound("semantic", MAX_RECORDS_PER_COLLECTION + 1),
             Err(RankedProfileValidationError::TooManyRecords {
@@ -1839,13 +1913,13 @@ mod tests {
             }) if count == MAX_RECORDS_PER_COLLECTION + 1
         ));
 
-        let mut invalid = document();
-        invalid.functions[0].name = "x".repeat(MAX_DISPLAY_STRING_CHARS + 1);
+        let mut invalid_display = document();
+        invalid_display.semantics[0].name = "x".repeat(MAX_DISPLAY_STRING_CHARS + 1);
         assert!(matches!(
-            invalid.validate(),
+            invalid_display.validate(),
             Err(RankedProfileValidationError::DisplayStringTooLong {
-                record_kind: "function",
-                record_id: 90,
+                record_kind: "semantic",
+                record_id: 1,
                 field: "name",
                 char_count,
                 limit: MAX_DISPLAY_STRING_CHARS
@@ -1853,7 +1927,7 @@ mod tests {
         ));
 
         let mut valid = document();
-        valid.functions[0].name = "\u{754c}".repeat(MAX_DISPLAY_STRING_CHARS);
+        valid.functions[0].name = "x".repeat(6_537);
         assert_eq!(valid.validate(), Ok(()));
     }
 

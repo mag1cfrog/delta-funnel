@@ -84,6 +84,7 @@ pub(super) struct TerminalProfileIndex<'a> {
     function_parents: HashMap<(i64, i64), Option<i64>>,
     function_children: HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
     operation_durations: HashMap<i64, Option<i64>>,
+    compact_names: HashMap<&'a str, String>,
     full_symbols: bool,
     all_frames: bool,
 }
@@ -110,8 +111,12 @@ impl<'a> TerminalProfileIndex<'a> {
         let mut functions = HashMap::with_capacity(document.functions.len());
         let mut function_parents = HashMap::with_capacity(document.functions.len());
         let mut function_children = HashMap::new();
+        let mut compact_names = HashMap::new();
         let compact = CompactFunctionTree::new(&document.functions);
         for function in &document.functions {
+            compact_names
+                .entry(function.name.as_str())
+                .or_insert_with(|| function.display_name());
             if !all_frames && !compact.contains(function) {
                 continue;
             }
@@ -138,8 +143,23 @@ impl<'a> TerminalProfileIndex<'a> {
             function_parents,
             function_children,
             operation_durations,
+            compact_names,
             full_symbols,
             all_frames,
+        }
+    }
+
+    fn compact_name<'b>(&'b self, function: &'b RankedFunction) -> &'b str {
+        self.compact_names
+            .get(function.name.as_str())
+            .map_or(function.name.as_str(), String::as_str)
+    }
+
+    fn function_name<'b>(&'b self, function: &'b RankedFunction) -> &'b str {
+        if self.full_symbols {
+            &function.name
+        } else {
+            self.compact_name(function)
         }
     }
 
@@ -317,11 +337,11 @@ fn render_semantic_view(
                 .flatten()
                 .copied()
                 .filter(move |function| {
-                    filter.is_none_or(|filter| function_matches(function, filter))
+                    filter.is_none_or(|filter| function_matches(index, function, filter))
                 })
         })
         .collect::<Vec<_>>();
-    sort_functions(&mut function_roots, function_sort);
+    sort_functions(index, &mut function_roots, function_sort);
     let function_total = function_roots.len();
     let function_rows = function_roots
         .into_iter()
@@ -381,9 +401,9 @@ fn render_semantic_view(
             write_function_row(
                 &mut output,
                 1,
+                index,
                 function,
                 semantic.direct_sample_count,
-                index.full_symbols,
             );
         }
     }
@@ -541,7 +561,7 @@ fn render_function_view(
         contextual_function_matches(index, semantic_id, function_id, max_depth, filter)
     });
     let (total, rows) = collect_function_rows(
-        &index.function_children,
+        index,
         (semantic_id, Some(function_id)),
         1,
         max_depth,
@@ -575,9 +595,9 @@ fn render_function_view(
         write_function_row(
             &mut output,
             depth,
+            index,
             function,
             selected.inclusive_sample_count,
-            index.full_symbols,
         );
     }
     Ok(output)
@@ -602,7 +622,7 @@ fn contextual_function_matches(
         .collect::<Vec<_>>();
     let mut included = HashSet::new();
     while let Some((depth, function)) = stack.pop() {
-        if function_matches(function, filter) {
+        if function_matches(index, function, filter) {
             let mut id = function.function_id;
             loop {
                 if id == selected_id {
@@ -634,7 +654,11 @@ fn contextual_function_matches(
     included
 }
 
-fn function_matches(function: &RankedFunction, filter: &str) -> bool {
+fn function_matches(
+    index: &TerminalProfileIndex<'_>,
+    function: &RankedFunction,
+    filter: &str,
+) -> bool {
     if let Some(identity) = filter.strip_prefix("function:") {
         let Some((semantic_id, function_id)) = identity.split_once(':') else {
             return false;
@@ -642,7 +666,7 @@ fn function_matches(function: &RankedFunction, filter: &str) -> bool {
         return semantic_id.parse::<i64>() == Ok(function.semantic_id)
             && function_id.parse::<i64>() == Ok(function.function_id);
     }
-    if function.display_name().contains(filter) {
+    if index.compact_name(function).contains(filter) {
         return true;
     }
     [
@@ -656,7 +680,7 @@ fn function_matches(function: &RankedFunction, filter: &str) -> bool {
 }
 
 fn collect_function_rows<'a>(
-    children: &HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
+    index: &TerminalProfileIndex<'a>,
     parent: (i64, Option<i64>),
     first_depth: usize,
     max_depth: usize,
@@ -670,7 +694,7 @@ fn collect_function_rows<'a>(
     }
     let mut stack = Vec::new();
     push_sorted_function_siblings(
-        children,
+        index,
         semantic_id,
         parent_function_id,
         first_depth,
@@ -688,7 +712,7 @@ fn collect_function_rows<'a>(
         }
         if depth < max_depth {
             push_sorted_function_siblings(
-                children,
+                index,
                 semantic_id,
                 Some(function.function_id),
                 depth + 1,
@@ -701,42 +725,44 @@ fn collect_function_rows<'a>(
 }
 
 fn push_sorted_function_siblings<'a>(
-    children: &HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
+    index: &TerminalProfileIndex<'a>,
     semantic_id: i64,
     parent_function_id: Option<i64>,
     depth: usize,
     sort: InspectSort,
     stack: &mut Vec<(usize, &'a RankedFunction)>,
 ) {
-    let Some(siblings) = children.get(&(semantic_id, parent_function_id)) else {
+    let Some(siblings) = index
+        .function_children
+        .get(&(semantic_id, parent_function_id))
+    else {
         return;
     };
     let mut siblings = siblings.clone();
-    sort_functions(&mut siblings, sort);
+    sort_functions(index, &mut siblings, sort);
     stack.extend(siblings.into_iter().rev().map(|function| (depth, function)));
 }
 
-fn sort_functions(functions: &mut [&RankedFunction], sort: InspectSort) {
-    if sort == InspectSort::Name {
-        functions.sort_by_cached_key(|function| {
-            (
-                function.display_name(),
-                function.semantic_id,
-                function.function_id,
-            )
-        });
-    } else {
-        functions.sort_unstable_by(|left, right| compare_functions(left, right, sort));
-    }
+fn sort_functions(
+    index: &TerminalProfileIndex<'_>,
+    functions: &mut [&RankedFunction],
+    sort: InspectSort,
+) {
+    functions.sort_unstable_by(|left, right| compare_functions(index, left, right, sort));
 }
 
-fn compare_functions(left: &RankedFunction, right: &RankedFunction, sort: InspectSort) -> Ordering {
+fn compare_functions(
+    index: &TerminalProfileIndex<'_>,
+    left: &RankedFunction,
+    right: &RankedFunction,
+    sort: InspectSort,
+) -> Ordering {
     let ordering = match sort {
         InspectSort::Duration | InspectSort::InclusiveCpu => right
             .inclusive_sample_count
             .cmp(&left.inclusive_sample_count),
         InspectSort::SelfCpu => right.self_sample_count.cmp(&left.self_sample_count),
-        InspectSort::Name => left.display_name().cmp(&right.display_name()),
+        InspectSort::Name => index.function_name(left).cmp(index.function_name(right)),
     };
     ordering
         .then_with(|| left.semantic_id.cmp(&right.semantic_id))
@@ -746,9 +772,9 @@ fn compare_functions(left: &RankedFunction, right: &RankedFunction, sort: Inspec
 fn write_function_row(
     output: &mut String,
     depth: usize,
+    index: &TerminalProfileIndex<'_>,
     function: &RankedFunction,
     context_sample_count: i64,
-    full_symbols: bool,
 ) {
     let module = function
         .module_name
@@ -761,16 +787,12 @@ fn write_function_row(
     let line = function
         .line_number
         .map_or_else(|| "null".to_owned(), |line| line.to_string());
-    let symbol = if full_symbols {
-        function.name.clone()
-    } else {
-        function.display_name()
-    };
+    let symbol = index.function_name(function);
     output.push_str(&format!(
         "function depth={depth} id=function:{}:{} symbol={} module={module} source={source} line={line} inclusive_cpu_samples={} inclusive_context_percent={} self_cpu_samples={} self_context_percent={}\n",
         function.semantic_id,
         function.function_id,
-        quoted_terminal_text(&symbol),
+        quoted_terminal_text(symbol),
         function.inclusive_sample_count,
         sample_percent(function.inclusive_sample_count, context_sample_count),
         function.self_sample_count,
@@ -1211,6 +1233,49 @@ mod tests {
                 semantic_id: 2,
                 function_id: 10,
             })
+        );
+    }
+
+    #[test]
+    fn name_sort_uses_the_rendered_symbol_and_caches_compact_names() {
+        let mut root = operation(1, "operation", Some(100));
+        root.direct_sample_count = 3;
+        root.inclusive_sample_count = 3;
+        let mut document = document(vec![root]);
+        document.functions = vec![
+            function(1, 10, None, "z::Alpha::call", 1, 1),
+            function(1, 11, None, "a::Zulu::call", 1, 1),
+            function(1, 12, None, "z::Alpha::call", 1, 1),
+        ];
+
+        let compact_index = TerminalProfileIndex::new(&document, false, false);
+        assert_eq!(compact_index.compact_names.len(), 2);
+        let compact = compact_index
+            .render(
+                InspectSelection::Semantic(1),
+                InspectSort::Name,
+                None,
+                10,
+                1,
+            )
+            .expect("compact names should sort");
+        assert!(
+            compact.find("id=function:1:10").expect("Alpha::call")
+                < compact.find("id=function:1:11").expect("Zulu::call")
+        );
+
+        let full = TerminalProfileIndex::new(&document, true, false)
+            .render(
+                InspectSelection::Semantic(1),
+                InspectSort::Name,
+                None,
+                10,
+                1,
+            )
+            .expect("full symbols should sort");
+        assert!(
+            full.find("id=function:1:11").expect("a::Zulu::call")
+                < full.find("id=function:1:10").expect("z::Alpha::call")
         );
     }
 
