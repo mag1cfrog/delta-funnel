@@ -8,7 +8,7 @@ use super::ranked_report::{
     RankedSemantic, fold_inclusive_counts,
 };
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
-use super::report_health::{CAPTURE_HEALTH_SQL, capture_health_input_sql, validate_capture_health};
+use super::report_health::{CAPTURE_HEALTH_SQL, capture_health_input_sql};
 use super::report_trace_processor::run_trace_processor_query;
 use super::report_trace_sanitizer::sanitize_trace;
 
@@ -37,6 +37,21 @@ enum CompactRecord {
 struct CompactMetadata {
     capture_complete: bool,
     semantic_complete: bool,
+    finalization_observed: bool,
+    incomplete_operation_root_count: i64,
+    truncation_marker_count: i64,
+    missing_identity_field_count: i64,
+    missing_terminal_result_count: i64,
+    crossing_worker_slice_count: i64,
+    crossing_planning_activity_slice_count: i64,
+    crossing_execution_activity_slice_count: i64,
+    invalid_planning_activity_hierarchy_count: i64,
+    invalid_execution_activity_hierarchy_count: i64,
+    perf_sample_without_callsite_count: i64,
+    perf_samples_skipped: i64,
+    buffer_loss_count: i64,
+    data_source_loss_count: i64,
+    flush_failure_count: i64,
     schema_version: u32,
     sample_frequency_hz: u32,
     sampled_cpu_count: u32,
@@ -83,9 +98,9 @@ pub(super) fn load_ranked_profile(
     let selection_sql = report_selection_sql(capture_scope_id);
     let sql = [
         health_input_sql.as_str(),
+        selection_sql.as_str(),
         "CREATE PERFETTO TABLE delta_funnel_capture_health AS",
         CAPTURE_HEALTH_SQL,
-        selection_sql.as_str(),
         SAMPLE_CORRELATION_SQL,
         RANKED_PROFILE_BASE_SQL,
         RANKED_REPORT_SQL,
@@ -159,16 +174,63 @@ fn build_document(
     frames: Vec<CompactFrame>,
     function_self: Vec<CompactFunctionSelf>,
 ) -> Result<RankedProfileDocument, RankedReportFailure> {
-    validate_capture_health(metadata.capture_complete, metadata.semantic_complete)?;
+    if metadata.missing_identity_field_count > 0 {
+        return Err(aggregate_failure(
+            "unsafe_identity",
+            "ranked profile ownership identity is incomplete",
+        ));
+    }
+    if semantics.is_empty() {
+        return Err(RankedReportFailure::new(
+            RankedReportFailurePhase::Health,
+            "incomplete_capture",
+            "input trace contains no retained Delta Funnel operation",
+        ));
+    }
     if metadata.audit_error_count != 0 {
         return Err(aggregate_failure(
             "audit_failed",
             "Trace Processor aggregate audit failed",
         ));
     }
+    if [
+        metadata.crossing_worker_slice_count,
+        metadata.crossing_planning_activity_slice_count,
+        metadata.crossing_execution_activity_slice_count,
+        metadata.invalid_planning_activity_hierarchy_count,
+        metadata.invalid_execution_activity_hierarchy_count,
+    ]
+    .into_iter()
+    .any(|count| count > 0)
+    {
+        return Err(aggregate_failure(
+            "invalid_hierarchy",
+            "ranked profile semantic hierarchy is invalid",
+        ));
+    }
     semantics.sort_by_key(|semantic| (semantic.operation_id, semantic.semantic_id));
     let mut document = RankedProfileDocument {
         metadata: RankedProfileMetadata {
+            capture_complete: metadata.capture_complete,
+            semantic_complete: metadata.semantic_complete,
+            finalization_observed: metadata.finalization_observed,
+            incomplete_operation_root_count: metadata.incomplete_operation_root_count,
+            truncation_marker_count: metadata.truncation_marker_count,
+            missing_identity_field_count: metadata.missing_identity_field_count,
+            missing_terminal_result_count: metadata.missing_terminal_result_count,
+            crossing_worker_slice_count: metadata.crossing_worker_slice_count,
+            crossing_planning_activity_slice_count: metadata.crossing_planning_activity_slice_count,
+            crossing_execution_activity_slice_count: metadata
+                .crossing_execution_activity_slice_count,
+            invalid_planning_activity_hierarchy_count: metadata
+                .invalid_planning_activity_hierarchy_count,
+            invalid_execution_activity_hierarchy_count: metadata
+                .invalid_execution_activity_hierarchy_count,
+            perf_sample_without_callsite_count: metadata.perf_sample_without_callsite_count,
+            perf_samples_skipped: metadata.perf_samples_skipped,
+            buffer_loss_count: metadata.buffer_loss_count,
+            data_source_loss_count: metadata.data_source_loss_count,
+            flush_failure_count: metadata.flush_failure_count,
             schema_version: metadata.schema_version,
             sample_frequency_hz: metadata.sample_frequency_hz,
             sampled_cpu_count: metadata.sampled_cpu_count,
@@ -462,16 +524,45 @@ mod tests {
             report_selection_sql(Some(42)),
             "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT 42 AS capture_scope_id;"
         );
+        assert!(CAPTURE_HEALTH_SQL.contains("selected_operations AS"));
+        assert!(
+            CAPTURE_HEALTH_SQL
+                .contains("selected_operation_tracks(track_id, expected_operation_id) AS")
+        );
+        assert!(CAPTURE_HEALTH_SQL.contains("FROM delta_funnel_report_selection"));
+        assert!(CAPTURE_HEALTH_SQL.contains("JOIN selected_operation_tracks AS parent"));
+        assert!(CAPTURE_HEALTH_SQL.contains("selected.expected_operation_id"));
+        assert!(
+            CAPTURE_HEALTH_SQL
+                .contains("operation_id IS expected_operation_id AS operation_identity_valid")
+        );
+        assert!(CAPTURE_HEALTH_SQL.contains("AS ranked_semantic_candidate"));
+        assert!(CAPTURE_HEALTH_SQL.contains("WHEN ranked_semantic_candidate THEN"));
+        assert!(CAPTURE_HEALTH_SQL.contains("time_semantics NOT IN ('wall_clock', 'lifecycle')"));
+        let terminal_result_clause = CAPTURE_HEALTH_SQL
+            .split_once("AS missing_terminal_result_count")
+            .expect("capture health should emit missing terminal results")
+            .0
+            .rsplit_once("coalesce(sum(")
+            .expect("missing terminal results should be an aggregate")
+            .1;
+        assert!(!terminal_result_clause.contains("'operator'"));
+        assert!(
+            !CAPTURE_HEALTH_SQL.contains("OR extract_arg(s.arg_set_id, 'debug.operation_id') IN")
+        );
         assert!(RANKED_PROFILE_BASE_SQL.contains("nullif(frame.name, '')"));
         assert!(!RANKED_PROFILE_BASE_SQL.contains("substr(frame.name"));
     }
 
     #[test]
     fn parses_and_folds_compact_ranked_records() -> Result<(), Box<dyn std::error::Error>> {
-        let output = fixture_output(1, 0, true);
+        use super::super::report_html::render_ranked_profile_html;
+        use super::super::report_terminal::{InspectSelection, InspectSort};
+
+        let output = fixture_output(1, 0, true, 0);
         let document = parse_ranked_report_output(output.as_bytes())?;
         assert_eq!(document.metadata.direct_sample_count, 1);
-        assert_eq!(document.semantics.len(), 1);
+        assert_eq!(document.semantics.len(), 2);
         assert_eq!(document.semantics[0].inclusive_sample_count, 1);
         assert_eq!(document.functions.len(), 2);
         assert_eq!(document.functions[0].function_id, 10);
@@ -480,7 +571,7 @@ mod tests {
         assert_eq!(document.functions[1].function_id, 11);
         assert_eq!(document.functions[1].self_sample_count, 1);
 
-        let mismatch = parse_ranked_report_output(fixture_output(2, 0, true).as_bytes())
+        let mismatch = parse_ranked_report_output(fixture_output(2, 0, true, 0).as_bytes())
             .expect_err("mismatched official count should fail");
         assert_eq!(
             mismatch.phase(),
@@ -488,14 +579,66 @@ mod tests {
         );
         assert_eq!(mismatch.kind(), "official_count_mismatch");
 
-        let audit = parse_ranked_report_output(fixture_output(1, 1, true).as_bytes())
+        let audit = parse_ranked_report_output(fixture_output(1, 1, true, 0).as_bytes())
             .expect_err("failed query audit should fail");
         assert_eq!(audit.kind(), "audit_failed");
 
-        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false).as_bytes())
-            .expect_err("incomplete capture should fail");
-        assert_eq!(incomplete.phase(), RankedReportFailurePhase::Health);
-        assert_eq!(incomplete.kind(), "incomplete_capture");
+        let metadata_only = |missing_identity_field_count| {
+            fixture_output(1, 0, true, missing_identity_field_count)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let unavailable = parse_ranked_report_output(metadata_only(0).as_bytes())
+            .expect_err("capture without an operation should remain unavailable");
+        assert_eq!(unavailable.phase(), RankedReportFailurePhase::Health);
+        assert_eq!(unavailable.kind(), "incomplete_capture");
+
+        let unsafe_metadata_only = parse_ranked_report_output(metadata_only(1).as_bytes())
+            .expect_err("filtered malformed identity should fail closed");
+        assert_eq!(
+            unsafe_metadata_only.phase(),
+            RankedReportFailurePhase::AggregateValidation
+        );
+        assert_eq!(unsafe_metadata_only.kind(), "unsafe_identity");
+
+        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false, 0).as_bytes())?;
+        assert!(!incomplete.metadata.capture_complete);
+        assert!(!incomplete.metadata.semantic_complete);
+        assert!(incomplete.metadata.finalization_observed);
+        assert_eq!(incomplete.metadata.incomplete_operation_root_count, 1);
+        assert!(!incomplete.semantics[0].is_complete);
+        assert_eq!(incomplete.semantics[0].end_ns, None);
+        assert_eq!(incomplete.semantics[0].duration_ns, None);
+        assert_eq!(incomplete.semantics[0].result, None);
+        let completed_child = &incomplete.semantics[1];
+        assert_eq!(completed_child.parent_semantic_id, Some(1));
+        assert!(completed_child.is_complete);
+        assert_eq!(completed_child.end_ns, Some(18));
+        assert_eq!(completed_child.duration_ns, Some(6));
+        assert_eq!(completed_child.result.as_deref(), Some("ok"));
+
+        let terminal = super::super::render_terminal_view(
+            &incomplete,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            10,
+            1,
+        )?;
+        assert!(terminal.contains(
+            "id=semantic:2 name=\"Completed child\" kind=\"phase\" duration_ns=6 time_basis=exact:wall_clock operation_wall_percent=n/a complete=true result=\"ok\""
+        ));
+        let html = render_ranked_profile_html(&incomplete)?;
+        assert!(html.contains(r#""name":"Completed child""#));
+        assert!(html.contains(r#""end_ns":18,"duration_ns":6"#));
+        assert!(html.contains(r#""result":"ok","is_complete":true"#));
+
+        let unsafe_identity = parse_ranked_report_output(fixture_output(1, 0, false, 1).as_bytes())
+            .expect_err("missing ownership identity should fail");
+        assert_eq!(unsafe_identity.kind(), "unsafe_identity");
 
         let malformed = parse_ranked_report_output(b"\"record_hex\"\n\"xyz\"\n")
             .expect_err("invalid hex should fail");
@@ -536,10 +679,68 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires trace_processor_shell and a real interrupted raw trace"]
+    fn preserves_a_real_interrupted_capture_when_requested()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::report_html::render_ranked_profile_html;
+        use super::super::report_terminal::{InspectSelection, InspectSort};
+
+        let trace = std::env::var_os("DELTA_FUNNEL_TEST_INCOMPLETE_PERFETTO_TRACE")
+            .ok_or("DELTA_FUNNEL_TEST_INCOMPLETE_PERFETTO_TRACE is not set")?;
+        let trace = Path::new(&trace);
+        let original = std::fs::read(trace)?;
+        let document = load_ranked_profile(trace, None)?;
+
+        assert!(!document.metadata.capture_complete);
+        assert!(!document.metadata.semantic_complete);
+        assert!(document.metadata.incomplete_operation_root_count > 0);
+        assert!(document.metadata.missing_terminal_result_count > 0);
+        assert!(
+            document
+                .semantics
+                .iter()
+                .filter(|semantic| !semantic.is_complete)
+                .all(|semantic| {
+                    semantic.end_ns.is_none()
+                        && semantic.duration_ns.is_none()
+                        && semantic.result.is_none()
+                })
+        );
+        assert!(document.semantics.iter().any(|semantic| {
+            semantic.parent_semantic_id.is_some()
+                && semantic.is_complete
+                && semantic.duration_ns.is_some()
+                && semantic.result.is_some()
+        }));
+
+        let terminal = super::super::render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            20,
+            0,
+        )?;
+        assert!(terminal.contains("capture_complete: false"));
+        assert!(terminal.contains("semantic_complete: false"));
+        assert!(terminal.contains("duration_ns=n/a"));
+        assert!(terminal.contains("operation_wall_percent=n/a"));
+        assert!(terminal.contains("result=null"));
+
+        let html = render_ranked_profile_html(&document)?;
+        assert!(html.contains(r#""capture_complete":false"#));
+        assert!(html.contains(r#""semantic_complete":false"#));
+        assert!(html.contains("Capture health"));
+        assert_eq!(std::fs::read(trace)?, original);
+        Ok(())
+    }
+
     fn fixture_output(
         official_root_count: i64,
         audit_error_count: i64,
         capture_complete: bool,
+        missing_identity_field_count: i64,
     ) -> String {
         let records = [
             serde_json::json!({
@@ -547,6 +748,21 @@ mod tests {
                 "record": {
                     "capture_complete": capture_complete,
                     "semantic_complete": capture_complete,
+                    "finalization_observed": true,
+                    "incomplete_operation_root_count": if capture_complete { 0 } else { 1 },
+                    "truncation_marker_count": 0,
+                    "missing_identity_field_count": missing_identity_field_count,
+                    "missing_terminal_result_count": if capture_complete { 0 } else { 1 },
+                    "crossing_worker_slice_count": 0,
+                    "crossing_planning_activity_slice_count": 0,
+                    "crossing_execution_activity_slice_count": 0,
+                    "invalid_planning_activity_hierarchy_count": 0,
+                    "invalid_execution_activity_hierarchy_count": 0,
+                    "perf_sample_without_callsite_count": 0,
+                    "perf_samples_skipped": 0,
+                    "buffer_loss_count": 0,
+                    "data_source_loss_count": 0,
+                    "flush_failure_count": 0,
                     "schema_version": 3,
                     "sample_frequency_hz": 1000,
                     "sampled_cpu_count": 1,
@@ -577,11 +793,11 @@ mod tests {
                     "stage_name": null,
                     "activity": null,
                     "start_ns": 10,
-                    "end_ns": 20,
-                    "duration_ns": 10,
+                    "end_ns": capture_complete.then_some(20),
+                    "duration_ns": capture_complete.then_some(10),
                     "time_semantics": "wall_clock",
-                    "result": "ok",
-                    "is_complete": true,
+                    "result": capture_complete.then_some("ok"),
+                    "is_complete": capture_complete,
                     "query_execution_id": null,
                     "query_scope": null,
                     "query_owner": null,
@@ -595,6 +811,42 @@ mod tests {
                     "direct_sample_count": 1,
                     "inclusive_sample_count": 0,
                     "resolved_function_sample_count": 1,
+                    "unresolved_function_sample_count": 0,
+                    "unwind_error_sample_count": 0,
+                    "missing_callstack_sample_count": 0,
+                }
+            }),
+            serde_json::json!({
+                "record_kind": "semantic",
+                "record": {
+                    "semantic_id": 2,
+                    "parent_semantic_id": 1,
+                    "operation_id": 1,
+                    "name": "Completed child",
+                    "semantic_kind": "phase",
+                    "operation_kind": "preview",
+                    "stage_category": null,
+                    "stage_name": null,
+                    "activity": null,
+                    "start_ns": 12,
+                    "end_ns": 18,
+                    "duration_ns": 6,
+                    "time_semantics": "wall_clock",
+                    "result": "ok",
+                    "is_complete": true,
+                    "query_execution_id": null,
+                    "query_scope": null,
+                    "query_owner": null,
+                    "worker_lane_id": null,
+                    "worker_kind": null,
+                    "node_id": null,
+                    "parent_node_id": null,
+                    "operator_partition": null,
+                    "execution_stream_id": null,
+                    "stage_owner_id": null,
+                    "direct_sample_count": 0,
+                    "inclusive_sample_count": 0,
+                    "resolved_function_sample_count": 0,
                     "unresolved_function_sample_count": 0,
                     "unwind_error_sample_count": 0,
                     "missing_callstack_sample_count": 0,

@@ -12,6 +12,23 @@ const MAX_DISPLAY_STRING_CHARS: usize = 512;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RankedProfileMetadata {
+    pub capture_complete: bool,
+    pub semantic_complete: bool,
+    pub finalization_observed: bool,
+    pub incomplete_operation_root_count: i64,
+    pub truncation_marker_count: i64,
+    pub missing_identity_field_count: i64,
+    pub missing_terminal_result_count: i64,
+    pub crossing_worker_slice_count: i64,
+    pub crossing_planning_activity_slice_count: i64,
+    pub crossing_execution_activity_slice_count: i64,
+    pub invalid_planning_activity_hierarchy_count: i64,
+    pub invalid_execution_activity_hierarchy_count: i64,
+    pub perf_sample_without_callsite_count: i64,
+    pub perf_samples_skipped: i64,
+    pub buffer_loss_count: i64,
+    pub data_source_loss_count: i64,
+    pub flush_failure_count: i64,
     pub schema_version: u32,
     pub sample_frequency_hz: u32,
     pub sampled_cpu_count: u32,
@@ -62,6 +79,15 @@ pub(super) struct RankedSemantic {
     pub unresolved_function_sample_count: i64,
     pub unwind_error_sample_count: i64,
     pub missing_callstack_sample_count: i64,
+}
+
+// Keep this set aligned with missing_terminal_result_count in capture_health.sql
+// after ranked_report.sql maps result-bearing activities to "activity".
+fn semantic_requires_terminal_result(semantic_kind: &str) -> bool {
+    matches!(
+        semantic_kind,
+        "operation" | "phase" | "query_planning" | "activity"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -362,6 +388,9 @@ pub(super) enum RankedProfileValidationError {
         field: &'static str,
         expected: &'static str,
     },
+    InconsistentCaptureHealth {
+        reason: &'static str,
+    },
     InvalidSemanticTimeSemantics {
         semantic_id: i64,
     },
@@ -502,6 +531,12 @@ impl fmt::Display for RankedProfileValidationError {
             }
             Self::InvalidUnit { field, expected } => {
                 write!(formatter, "profile {field} must be {expected}")
+            }
+            Self::InconsistentCaptureHealth { reason } => {
+                write!(
+                    formatter,
+                    "profile capture health is inconsistent: {reason}"
+                )
             }
             Self::InvalidSemanticTimeSemantics { semantic_id } => write!(
                 formatter,
@@ -767,6 +802,68 @@ impl RankedProfileDocument {
                 return Err(RankedProfileValidationError::InvalidUnit { field, expected });
             }
         }
+        let retained_incomplete_operation_root_count = self
+            .semantics
+            .iter()
+            .filter(|semantic| semantic.semantic_kind == "operation" && !semantic.is_complete)
+            .fold(0_i64, |count, _| count + 1);
+        let retained_missing_terminal_result_count = self
+            .semantics
+            .iter()
+            .filter(|semantic| {
+                semantic.result.is_none()
+                    && semantic_requires_terminal_result(&semantic.semantic_kind)
+            })
+            .fold(0_i64, |count, _| count + 1);
+        if self.metadata.incomplete_operation_root_count != retained_incomplete_operation_root_count
+            || self.metadata.missing_terminal_result_count != retained_missing_terminal_result_count
+        {
+            return Err(RankedProfileValidationError::InconsistentCaptureHealth {
+                reason: "semantic health counts do not match retained records",
+            });
+        }
+        if self.metadata.missing_identity_field_count > 0 {
+            return Err(RankedProfileValidationError::InconsistentCaptureHealth {
+                reason: "ownership identity is incomplete",
+            });
+        }
+        if [
+            self.metadata.crossing_worker_slice_count,
+            self.metadata.crossing_planning_activity_slice_count,
+            self.metadata.crossing_execution_activity_slice_count,
+            self.metadata.invalid_planning_activity_hierarchy_count,
+            self.metadata.invalid_execution_activity_hierarchy_count,
+        ]
+        .into_iter()
+        .any(|count| count > 0)
+        {
+            return Err(RankedProfileValidationError::InconsistentCaptureHealth {
+                reason: "semantic hierarchy is invalid",
+            });
+        }
+        let semantic_degraded = [
+            self.metadata.incomplete_operation_root_count,
+            self.metadata.truncation_marker_count,
+            self.metadata.missing_terminal_result_count,
+        ]
+        .into_iter()
+        .any(|count| count > 0);
+        if self.metadata.semantic_complete && semantic_degraded {
+            return Err(RankedProfileValidationError::InconsistentCaptureHealth {
+                reason: "semantic data is complete despite semantic degradation",
+            });
+        }
+        let capture_degraded = !self.metadata.semantic_complete
+            || !self.metadata.finalization_observed
+            || self.metadata.buffer_loss_count > 0
+            || self.metadata.data_source_loss_count > 0
+            || self.metadata.flush_failure_count > 0
+            || self.metadata.trace_profiler_dropped_sample_count > 0;
+        if self.metadata.capture_complete && capture_degraded {
+            return Err(RankedProfileValidationError::InconsistentCaptureHealth {
+                reason: "capture is complete despite capture degradation",
+            });
+        }
 
         for semantic in &self.semantics {
             if !matches!(semantic.time_semantics.as_str(), "wall_clock" | "lifecycle") {
@@ -775,7 +872,13 @@ impl RankedProfileDocument {
                 });
             }
             match (semantic.is_complete, semantic.end_ns, semantic.duration_ns) {
-                (false, None, None) => {}
+                (false, None, None) if semantic.result.is_none() => {}
+                (false, None, None) => {
+                    return Err(RankedProfileValidationError::InvalidSemanticInterval {
+                        semantic_id: semantic.semantic_id,
+                        reason: "incomplete interval has a terminal result",
+                    });
+                }
                 (false, _, _) => {
                     return Err(RankedProfileValidationError::InvalidSemanticInterval {
                         semantic_id: semantic.semantic_id,
@@ -788,6 +891,14 @@ impl RankedProfileDocument {
                         return Err(RankedProfileValidationError::InvalidSemanticInterval {
                             semantic_id: semantic.semantic_id,
                             reason: "complete interval has inconsistent bounds",
+                        });
+                    }
+                    if semantic_requires_terminal_result(&semantic.semantic_kind)
+                        && semantic.result.is_none()
+                    {
+                        return Err(RankedProfileValidationError::InvalidSemanticInterval {
+                            semantic_id: semantic.semantic_id,
+                            reason: "complete interval is missing a terminal result",
                         });
                     }
                 }
@@ -952,6 +1063,53 @@ impl RankedProfileDocument {
 
     fn validate_sample_counts(&self) -> Result<(), RankedProfileValidationError> {
         for (field, value) in [
+            (
+                "incomplete_operation_root_count",
+                self.metadata.incomplete_operation_root_count,
+            ),
+            (
+                "truncation_marker_count",
+                self.metadata.truncation_marker_count,
+            ),
+            (
+                "missing_identity_field_count",
+                self.metadata.missing_identity_field_count,
+            ),
+            (
+                "missing_terminal_result_count",
+                self.metadata.missing_terminal_result_count,
+            ),
+            (
+                "crossing_worker_slice_count",
+                self.metadata.crossing_worker_slice_count,
+            ),
+            (
+                "crossing_planning_activity_slice_count",
+                self.metadata.crossing_planning_activity_slice_count,
+            ),
+            (
+                "crossing_execution_activity_slice_count",
+                self.metadata.crossing_execution_activity_slice_count,
+            ),
+            (
+                "invalid_planning_activity_hierarchy_count",
+                self.metadata.invalid_planning_activity_hierarchy_count,
+            ),
+            (
+                "invalid_execution_activity_hierarchy_count",
+                self.metadata.invalid_execution_activity_hierarchy_count,
+            ),
+            (
+                "perf_sample_without_callsite_count",
+                self.metadata.perf_sample_without_callsite_count,
+            ),
+            ("perf_samples_skipped", self.metadata.perf_samples_skipped),
+            ("buffer_loss_count", self.metadata.buffer_loss_count),
+            (
+                "data_source_loss_count",
+                self.metadata.data_source_loss_count,
+            ),
+            ("flush_failure_count", self.metadata.flush_failure_count),
             ("eligible_sample_count", self.metadata.eligible_sample_count),
             ("direct_sample_count", self.metadata.direct_sample_count),
             (
@@ -1644,6 +1802,23 @@ mod tests {
         phase_leaf.inclusive_sample_count = 2;
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
+                capture_complete: true,
+                semantic_complete: true,
+                finalization_observed: true,
+                incomplete_operation_root_count: 0,
+                truncation_marker_count: 0,
+                missing_identity_field_count: 0,
+                missing_terminal_result_count: 0,
+                crossing_worker_slice_count: 0,
+                crossing_planning_activity_slice_count: 0,
+                crossing_execution_activity_slice_count: 0,
+                invalid_planning_activity_hierarchy_count: 0,
+                invalid_execution_activity_hierarchy_count: 0,
+                perf_sample_without_callsite_count: 0,
+                perf_samples_skipped: 0,
+                buffer_loss_count: 0,
+                data_source_loss_count: 0,
+                flush_failure_count: 0,
                 schema_version: 3,
                 sample_frequency_hz: 100,
                 sampled_cpu_count: 1,
@@ -1657,7 +1832,7 @@ mod tests {
                 unresolved_function_sample_count: 2,
                 unwind_error_sample_count: 0,
                 missing_callstack_sample_count: 1,
-                trace_profiler_dropped_sample_count: 1,
+                trace_profiler_dropped_sample_count: 0,
             },
             semantics: vec![operation, phase, second_operation],
             functions: vec![operation_function, phase_root, phase_leaf],
@@ -1779,6 +1954,17 @@ mod tests {
         ));
 
         let mut invalid = document();
+        invalid.metadata.buffer_loss_count = -1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::NegativeSampleCount {
+                record_kind: "profile",
+                field: "buffer_loss_count",
+                ..
+            })
+        ));
+
+        let mut invalid = document();
         invalid.metadata.eligible_sample_count = 7;
         assert!(matches!(
             invalid.validate(),
@@ -1875,16 +2061,78 @@ mod tests {
         ));
 
         let mut valid = document();
+        valid.metadata.capture_complete = false;
+        valid.metadata.semantic_complete = false;
+        valid.metadata.incomplete_operation_root_count = 1;
+        valid.metadata.missing_terminal_result_count = 1;
         valid.semantics[0].is_complete = false;
         valid.semantics[0].end_ns = None;
         valid.semantics[0].duration_ns = None;
+        valid.semantics[0].result = None;
         assert_eq!(valid.validate(), Ok(()));
+
+        let mut invalid = document();
+        invalid.metadata.capture_complete = false;
+        invalid.metadata.semantic_complete = false;
+        invalid.metadata.missing_terminal_result_count = 1;
+        invalid.semantics[0].result = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
+        ));
+
+        let mut invalid = document();
+        invalid.semantics[0].is_complete = false;
+        invalid.semantics[0].end_ns = None;
+        invalid.semantics[0].duration_ns = None;
+        invalid.semantics[0].result = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
+
+        let mut invalid = document();
+        invalid.semantics[1].result = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
 
         let mut invalid = valid;
         invalid.semantics[0].end_ns = Some(1);
         assert!(matches!(
             invalid.validate(),
             Err(RankedProfileValidationError::InvalidSemanticInterval { semantic_id: 1, .. })
+        ));
+
+        let mut invalid = document();
+        invalid.metadata.capture_complete = false;
+        invalid.metadata.semantic_complete = false;
+        invalid.metadata.missing_identity_field_count = 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
+
+        let mut invalid = document();
+        invalid.metadata.incomplete_operation_root_count = 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
+
+        let mut invalid = document();
+        invalid.metadata.trace_profiler_dropped_sample_count = 1;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
+
+        let mut invalid = document();
+        invalid.metadata.semantic_complete = false;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
         ));
 
         let mut invalid = document();

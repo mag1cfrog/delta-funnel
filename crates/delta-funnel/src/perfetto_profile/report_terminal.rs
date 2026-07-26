@@ -5,7 +5,8 @@ use std::fmt;
 use clap::ValueEnum;
 
 use super::ranked_report::{
-    CompactFunctionTree, RankedFunction, RankedProfileDocument, RankedSemantic,
+    CompactFunctionTree, RankedFunction, RankedProfileDocument, RankedProfileMetadata,
+    RankedSemantic,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -358,8 +359,9 @@ fn render_semantic_view(
     let filter = filter_label(filter);
     let captured_function_samples = index.document.metadata.resolved_function_sample_count
         + index.document.metadata.unresolved_function_sample_count;
+    let capture_health = capture_health_header(&index.document.metadata);
     let mut output = format!(
-        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsymbol_format: {}\nframe_view: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
+        "view: ranked-profile\ncontext: {context}\n{capture_health}sort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsymbol_format: {}\nframe_view: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
         sort.as_str(),
         shown,
         shown < total,
@@ -528,10 +530,12 @@ fn push_sorted_siblings<'a>(
 
 fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: InspectSort) -> Ordering {
     let ordering = match sort {
-        InspectSort::Duration => right
-            .duration_ns
-            .unwrap_or_default()
-            .cmp(&left.duration_ns.unwrap_or_default()),
+        InspectSort::Duration => match (left.duration_ns, right.duration_ns) {
+            (Some(left), Some(right)) => right.cmp(&left),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
         InspectSort::InclusiveCpu => right
             .inclusive_sample_count
             .cmp(&left.inclusive_sample_count),
@@ -573,8 +577,9 @@ fn render_function_view(
     let filter = filter_label(filter);
     let captured_function_samples = index.document.metadata.resolved_function_sample_count
         + index.document.metadata.unresolved_function_sample_count;
+    let capture_health = capture_health_header(&index.document.metadata);
     let mut output = format!(
-        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsymbol_format: {}\nframe_view: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\n{capture_health}sort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsymbol_format: {}\nframe_view: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
         sort.as_str(),
         rows.len(),
         rows.len() < total,
@@ -602,6 +607,51 @@ fn render_function_view(
         );
     }
     Ok(output)
+}
+
+fn capture_health_header(metadata: &RankedProfileMetadata) -> String {
+    if metadata.capture_complete
+        && metadata.semantic_complete
+        && metadata.finalization_observed
+        && [
+            metadata.incomplete_operation_root_count,
+            metadata.truncation_marker_count,
+            metadata.missing_identity_field_count,
+            metadata.missing_terminal_result_count,
+            metadata.crossing_worker_slice_count,
+            metadata.crossing_planning_activity_slice_count,
+            metadata.crossing_execution_activity_slice_count,
+            metadata.invalid_planning_activity_hierarchy_count,
+            metadata.invalid_execution_activity_hierarchy_count,
+            metadata.buffer_loss_count,
+            metadata.data_source_loss_count,
+            metadata.flush_failure_count,
+        ]
+        .into_iter()
+        .all(|count| count == 0)
+    {
+        return String::new();
+    }
+    format!(
+        "capture_complete: {}\nsemantic_complete: {}\nfinalization_observed: {}\nincomplete_operation_root_count: {}\ntruncation_marker_count: {}\nmissing_identity_field_count: {}\nmissing_terminal_result_count: {}\ncrossing_worker_slice_count: {}\ncrossing_planning_activity_slice_count: {}\ncrossing_execution_activity_slice_count: {}\ninvalid_planning_activity_hierarchy_count: {}\ninvalid_execution_activity_hierarchy_count: {}\nperf_sample_without_callsite_count: {}\nperf_samples_skipped: {}\nbuffer_loss_count: {}\ndata_source_loss_count: {}\nflush_failure_count: {}\n",
+        metadata.capture_complete,
+        metadata.semantic_complete,
+        metadata.finalization_observed,
+        metadata.incomplete_operation_root_count,
+        metadata.truncation_marker_count,
+        metadata.missing_identity_field_count,
+        metadata.missing_terminal_result_count,
+        metadata.crossing_worker_slice_count,
+        metadata.crossing_planning_activity_slice_count,
+        metadata.crossing_execution_activity_slice_count,
+        metadata.invalid_planning_activity_hierarchy_count,
+        metadata.invalid_execution_activity_hierarchy_count,
+        metadata.perf_sample_without_callsite_count,
+        metadata.perf_samples_skipped,
+        metadata.buffer_loss_count,
+        metadata.data_source_loss_count,
+        metadata.flush_failure_count,
+    )
 }
 
 fn contextual_function_matches(
@@ -935,6 +985,23 @@ mod tests {
     fn document(semantics: Vec<RankedSemantic>) -> RankedProfileDocument {
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
+                capture_complete: true,
+                semantic_complete: true,
+                finalization_observed: true,
+                incomplete_operation_root_count: 0,
+                truncation_marker_count: 0,
+                missing_identity_field_count: 0,
+                missing_terminal_result_count: 0,
+                crossing_worker_slice_count: 0,
+                crossing_planning_activity_slice_count: 0,
+                crossing_execution_activity_slice_count: 0,
+                invalid_planning_activity_hierarchy_count: 0,
+                invalid_execution_activity_hierarchy_count: 0,
+                perf_sample_without_callsite_count: 0,
+                perf_samples_skipped: 0,
+                buffer_loss_count: 0,
+                data_source_loss_count: 0,
+                flush_failure_count: 0,
                 schema_version: 3,
                 sample_frequency_hz: 100,
                 sampled_cpu_count: 1,
@@ -978,11 +1045,13 @@ mod tests {
 
     #[test]
     fn ranks_and_bounds_operation_roots_with_terminal_safe_text() {
-        let document = document(vec![
+        let mut document = document(vec![
             operation(3, "safe lambda", Some(10)),
             operation(1, "slow\u{1b}[31m\u{2028}\u{202e}\"operation", Some(30)),
             operation(2, "safe snowman \u{2603}", Some(30)),
         ]);
+        document.metadata.perf_sample_without_callsite_count = 1;
+        document.metadata.perf_samples_skipped = 1;
         let rendered = render_terminal_view(
             &document,
             InspectSelection::Root,
@@ -994,6 +1063,8 @@ mod tests {
         .expect("root view should render");
 
         assert!(rendered.contains("showing: 2 of 3; truncated: true"));
+        assert!(!rendered.contains("capture_complete:"));
+        assert!(!rendered.contains("semantic_complete:"));
         let first = rendered.find("id=semantic:1").expect("first root");
         let second = rendered.find("id=semantic:2").expect("second root");
         assert!(first < second);
@@ -1002,6 +1073,70 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains('\u{2028}'));
         assert!(!rendered.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn exposes_incomplete_capture_health_without_fabricating_operation_time() {
+        let mut root = operation(1, "interrupted operation", None);
+        root.result = None;
+        root.is_complete = false;
+        let mut document = document(vec![root]);
+        document.metadata.capture_complete = false;
+        document.metadata.semantic_complete = false;
+        document.metadata.incomplete_operation_root_count = 1;
+        document.metadata.missing_terminal_result_count = 18;
+        document.metadata.perf_sample_without_callsite_count = 1;
+        document.metadata.perf_samples_skipped = 1;
+
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            10,
+            0,
+        )
+        .expect("incomplete capture should render");
+
+        assert!(rendered.contains("capture_complete: false"));
+        assert!(rendered.contains("semantic_complete: false"));
+        assert!(rendered.contains("finalization_observed: true"));
+        assert!(rendered.contains("incomplete_operation_root_count: 1"));
+        assert!(rendered.contains("missing_identity_field_count: 0"));
+        assert!(rendered.contains("missing_terminal_result_count: 18"));
+        assert!(rendered.contains("perf_sample_without_callsite_count: 1"));
+        assert!(rendered.contains("perf_samples_skipped: 1"));
+        assert!(rendered.contains(
+            "duration_ns=n/a time_basis=exact:wall_clock operation_wall_percent=n/a complete=false result=null"
+        ));
+    }
+
+    #[test]
+    fn sorts_unknown_durations_after_known_zero_durations() {
+        let mut unknown = operation(1, "unknown", None);
+        unknown.result = None;
+        unknown.is_complete = false;
+        let document = document(vec![
+            unknown,
+            operation(2, "positive", Some(10)),
+            operation(3, "zero", Some(0)),
+        ]);
+
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            10,
+            0,
+        )
+        .expect("root view should render");
+
+        let positive = rendered.find("id=semantic:2").expect("positive duration");
+        let zero = rendered.find("id=semantic:3").expect("zero duration");
+        let unknown = rendered.find("id=semantic:1").expect("unknown duration");
+        assert!(positive < zero);
+        assert!(zero < unknown);
     }
 
     #[test]

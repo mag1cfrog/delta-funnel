@@ -21,17 +21,3 @@ pub(super) fn capture_health_input_sql(input: &Path) -> Result<String, RankedRep
          {saved_file_bytes} AS saved_file_bytes;"
     ))
 }
-
-pub(super) fn validate_capture_health(
-    is_complete: bool,
-    semantics_are_complete: bool,
-) -> Result<(), RankedReportFailure> {
-    if !is_complete || !semantics_are_complete {
-        return Err(RankedReportFailure::new(
-            RankedReportFailurePhase::Health,
-            "incomplete_capture",
-            "input trace did not pass required capture health checks",
-        ));
-    }
-    Ok(())
-}

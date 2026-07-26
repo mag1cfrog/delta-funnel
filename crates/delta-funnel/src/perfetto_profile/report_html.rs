@@ -68,6 +68,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
 <p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
 <p>Native stack coverage separates resolved leaf symbols, unresolved leaf symbols, unwind failures, and missing callstacks. Profiler samples dropped is a trace-wide Perfetto data-loss diagnostic and is not a function cost.</p>
+<p>An incomplete capture preserves only recorded intervals. Missing tail time, exact duration, and terminal state remain unknown. The summary names the retained capture-health findings instead of inferring missing values.</p>
 <p>The default compact frame view hides zero-self parents that have one child with the same inclusive sample count. Use Show all native frames to restore the complete captured call chain.</p>
 <p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Sibling groups are paged 100 rows at a time. Bulk subtree actions and the visible table are limited to 1000 rows.</p>
 </details>
@@ -198,6 +199,23 @@ mod tests {
 
     fn metadata() -> RankedProfileMetadata {
         RankedProfileMetadata {
+            capture_complete: true,
+            semantic_complete: true,
+            finalization_observed: true,
+            incomplete_operation_root_count: 0,
+            truncation_marker_count: 0,
+            missing_identity_field_count: 0,
+            missing_terminal_result_count: 0,
+            crossing_worker_slice_count: 0,
+            crossing_planning_activity_slice_count: 0,
+            crossing_execution_activity_slice_count: 0,
+            invalid_planning_activity_hierarchy_count: 0,
+            invalid_execution_activity_hierarchy_count: 0,
+            perf_sample_without_callsite_count: 0,
+            perf_samples_skipped: 0,
+            buffer_loss_count: 0,
+            data_source_loss_count: 0,
+            flush_failure_count: 0,
             schema_version: 3,
             sample_frequency_hz: 1000,
             sampled_cpu_count: 8,
@@ -285,6 +303,27 @@ mod tests {
             .ok_or("embedded profile data is missing")
     }
 
+    fn dump_browser_dom(
+        browser: &std::ffi::OsStr,
+        html: &str,
+    ) -> std::io::Result<std::process::Output> {
+        let mut report = tempfile::Builder::new().suffix(".html").tempfile()?;
+        report.write_all(html.as_bytes())?;
+        report.flush()?;
+        std::process::Command::new("timeout")
+            .arg("30s")
+            .arg(browser)
+            .args([
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-background-networking",
+                "--dump-dom",
+            ])
+            .arg(format!("file://{}", report.path().display()))
+            .output()
+    }
+
     #[test]
     fn renders_a_safe_self_contained_report() -> Result<(), Box<dyn std::error::Error>> {
         let dangerous = "</script><img src=x onerror=alert(1)> & \"quoted\" \u{2028} \u{2029} 函数";
@@ -324,6 +363,7 @@ mod tests {
         assert!(html.contains(r#"id="operations-empty""#));
         assert!(html.contains(r#"id="profile-filter""#));
         assert!(html.contains("Sampled CPUs"));
+        assert!(html.contains("Capture health"));
         assert!(html.contains("Leaf symbols unresolved"));
         assert!(html.contains("Profiler samples dropped"));
         assert!(html.contains(r#"maxlength="200""#));
@@ -373,6 +413,7 @@ mod tests {
             parent_semantic_id = semantic_id;
         }
         let mut incomplete = semantic(386, Some(1), "incomplete semantic");
+        incomplete.semantic_kind = "activity".to_owned();
         incomplete.end_ns = None;
         incomplete.duration_ns = None;
         incomplete.result = None;
@@ -401,6 +442,10 @@ mod tests {
             parent_function_id = function_id;
         }
         let mut profile_metadata = metadata();
+        profile_metadata.capture_complete = false;
+        profile_metadata.semantic_complete = false;
+        profile_metadata.missing_terminal_result_count = 1;
+        profile_metadata.perf_sample_without_callsite_count = 3;
         profile_metadata.eligible_sample_count = 2;
         profile_metadata.ambiguous_sample_count = 1;
         profile_metadata.unattributed_sample_count = 1;
@@ -415,6 +460,12 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(embedded_json(&html)?)?;
         assert_eq!(decoded["semantics"].as_array().map(Vec::len), Some(386));
         assert_eq!(decoded["functions"].as_array().map(Vec::len), Some(5_129));
+        assert_eq!(decoded["metadata"]["capture_complete"], false);
+        assert_eq!(decoded["metadata"]["semantic_complete"], false);
+        assert_eq!(decoded["metadata"]["incomplete_operation_root_count"], 0);
+        assert_eq!(decoded["metadata"]["missing_identity_field_count"], 0);
+        assert_eq!(decoded["metadata"]["missing_terminal_result_count"], 1);
+        assert_eq!(decoded["metadata"]["perf_sample_without_callsite_count"], 3);
         assert_eq!(decoded["functions"][0]["name"], "root function");
         assert_eq!(
             decoded["functions"][1]["name"].as_str().map(str::len),
@@ -430,6 +481,28 @@ mod tests {
             return Ok(());
         };
 
+        let mut healthy_metadata = metadata();
+        healthy_metadata.perf_sample_without_callsite_count = 2;
+        healthy_metadata.perf_samples_skipped = 1;
+        let healthy_document = RankedProfileDocument {
+            metadata: healthy_metadata,
+            semantics: vec![semantic(1, None, "Healthy operation")],
+            functions: vec![],
+        };
+        healthy_document.validate()?;
+        let healthy_output =
+            dump_browser_dom(&browser, &render_ranked_profile_html(&healthy_document)?)?;
+        assert!(
+            healthy_output.status.success(),
+            "healthy report browser failed: {}",
+            String::from_utf8_lossy(&healthy_output.stderr)
+        );
+        let healthy_dom = String::from_utf8(healthy_output.stdout)?;
+        assert!(
+            !healthy_dom.contains(r#"<span class="summary-label">Sampling health</span>"#),
+            "sampling-only diagnostics changed the healthy report summary"
+        );
+
         let mut operation = semantic(1, None, "Root operation");
         operation.end_ns = Some(10_000_000);
         operation.duration_ns = Some(10_000_000);
@@ -439,7 +512,16 @@ mod tests {
         let mut alpha = semantic(3, Some(1), "Alpha phase");
         alpha.end_ns = Some(1_000_000);
         alpha.duration_ns = Some(1_000_000);
-        let mut semantics = vec![operation, zeta, alpha];
+        let mut zero = semantic(7_000, Some(3), "Zero duration");
+        zero.end_ns = Some(0);
+        zero.duration_ns = Some(0);
+        let mut unknown = semantic(7_001, Some(3), "Unknown duration");
+        unknown.semantic_kind = "activity".to_owned();
+        unknown.end_ns = None;
+        unknown.duration_ns = None;
+        unknown.result = None;
+        unknown.is_complete = false;
+        let mut semantics = vec![operation, zeta, alpha, zero, unknown];
         for group in 0..10 {
             let group_id = 4 + group * 101;
             semantics.push(semantic(group_id, Some(1), format!("Group {group:02}")));
@@ -525,6 +607,11 @@ mod tests {
         runtime_wrapper.inclusive_sample_count = 1;
         functions.push(runtime_wrapper);
         let mut profile_metadata = metadata();
+        profile_metadata.capture_complete = false;
+        profile_metadata.semantic_complete = false;
+        profile_metadata.missing_terminal_result_count = 1;
+        profile_metadata.buffer_loss_count = 2;
+        profile_metadata.perf_sample_without_callsite_count = 3;
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
         profile_metadata.resolved_function_sample_count = 1;
@@ -548,6 +635,12 @@ mod tests {
     if (!condition) throw new Error(message);
   };
   try {
+    check(
+      summary.textContent.includes("CaptureIncomplete") &&
+        summary.textContent.includes("2 buffer losses") &&
+        summary.textContent.includes("3 perf samples without callsites"),
+      "incomplete capture health was not summarized"
+    );
     check(operationsBody.rows.length === 1, "initial render was not lazy");
     const rootRow = operationsBody.rows[0];
     check(rootRow.getAttribute("aria-selected") === "true", "root was not selected");
@@ -744,6 +837,27 @@ mod tests {
         "Alpha phase,Zeta phase",
       "name sorting flattened or misordered semantic siblings"
     );
+    expanded.add("s:3");
+    document.querySelector('[data-sort="duration"]').click();
+    let durationNames = Array.from(
+      operationsBody.querySelectorAll('.semantic-row[aria-level="3"] .name-line'),
+      line => line.querySelector("span:not(.leaf):not(.match-label)").textContent
+    );
+    check(
+      durationNames.join(",") ===
+        "Deep semantic 2000,Zero duration,Unknown duration",
+      "descending duration sort treated an unknown duration as zero"
+    );
+    document.querySelector('[data-sort="duration"]').click();
+    durationNames = Array.from(
+      operationsBody.querySelectorAll('.semantic-row[aria-level="3"] .name-line'),
+      line => line.querySelector("span:not(.leaf):not(.match-label)").textContent
+    );
+    check(
+      durationNames.join(",") ===
+        "Zero duration,Deep semantic 2000,Unknown duration",
+      "ascending duration sort did not keep an unknown duration last"
+    );
 
     const deepKeys = [
       "s:3",
@@ -902,21 +1016,7 @@ mod tests {
 "#,
         );
 
-        let mut report = tempfile::Builder::new().suffix(".html").tempfile()?;
-        report.write_all(html.as_bytes())?;
-        report.flush()?;
-        let output = std::process::Command::new("timeout")
-            .arg("30s")
-            .arg(browser)
-            .args([
-                "--headless",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-background-networking",
-                "--dump-dom",
-            ])
-            .arg(format!("file://{}", report.path().display()))
-            .output()?;
+        let output = dump_browser_dom(&browser, &html)?;
         assert!(
             output.status.success(),
             "headless browser failed: {}",

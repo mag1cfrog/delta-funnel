@@ -1,5 +1,36 @@
 -- One-row health summary for short and streaming Delta Funnel captures.
-WITH
+WITH RECURSIVE
+selected_operations AS (
+  SELECT
+    s.track_id AS operation_track_id,
+    extract_arg(s.arg_set_id, 'debug.operation_id') AS expected_operation_id
+  FROM slice AS s
+  WHERE s.category = 'delta_funnel.profile'
+    AND s.name IN (
+      'Delta Funnel preview',
+      'Delta Funnel SQL Server write',
+      'Delta Funnel SQL Server write_all'
+    )
+    AND (
+      (
+        SELECT capture_scope_id
+        FROM delta_funnel_report_selection
+      ) IS NULL
+      OR extract_arg(s.arg_set_id, 'debug.capture_scope_id') = (
+        SELECT capture_scope_id
+        FROM delta_funnel_report_selection
+      )
+    )
+),
+selected_operation_tracks(track_id, expected_operation_id) AS (
+  SELECT operation_track_id, expected_operation_id
+  FROM selected_operations
+  UNION
+  SELECT child.id, parent.expected_operation_id
+  FROM track AS child
+  JOIN selected_operation_tracks AS parent
+    ON child.parent_id = parent.track_id
+),
 semantic_slices AS (
   SELECT
     s.*,
@@ -17,13 +48,29 @@ semantic_slices AS (
     extract_arg(s.arg_set_id, 'debug.execution_activity_name')
       AS execution_activity_name,
     extract_arg(s.arg_set_id, 'debug.time_semantics') AS time_semantics,
-    extract_arg(s.arg_set_id, 'debug.result') AS result
+    extract_arg(s.arg_set_id, 'debug.result') AS result,
+    selected.expected_operation_id
   FROM slice AS s
+  LEFT JOIN selected_operation_tracks AS selected
+    ON selected.track_id = s.track_id
   WHERE s.category = 'delta_funnel.profile'
+    AND (
+      (
+        SELECT capture_scope_id
+        FROM delta_funnel_report_selection
+      ) IS NULL
+      OR selected.track_id IS NOT NULL
+    )
 ),
 classified_slices AS (
   SELECT
     *,
+    operation_id IS NOT NULL
+      AND operation_id IS expected_operation_id AS operation_identity_valid,
+    name NOT IN (
+      'Delta Funnel diagnostic group',
+      'Operator activity trace truncated'
+    ) AS ranked_semantic_candidate,
     CASE
       WHEN execution_activity_name IS NOT NULL THEN 'execution_activity'
       WHEN worker_lane_id IS NOT NULL
@@ -47,38 +94,61 @@ classified_slices AS (
 missing_fields AS (
   SELECT
     coalesce(sum(
+      CASE
+        WHEN ranked_semantic_candidate THEN
+          (NOT operation_identity_valid) +
+          CASE
+            WHEN semantic_kind = 'operator' THEN
+              (time_semantics IS NULL OR time_semantics != 'active')
+            ELSE
+              (
+                time_semantics IS NULL
+                OR time_semantics NOT IN ('wall_clock', 'lifecycle')
+              )
+          END
+        ELSE 0
+      END +
       CASE semantic_kind
         WHEN 'operation' THEN
-          (operation_id IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          0
         WHEN 'phase' THEN
-          (operation_id IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          0
         WHEN 'query' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
-          (query_scope IS NULL) + (time_semantics IS NULL)
+          (query_execution_id IS NULL) + (query_scope IS NULL)
         WHEN 'query_planning' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
-          (query_scope IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          (query_execution_id IS NULL) + (query_scope IS NULL)
         WHEN 'planning_activity' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (query_execution_id IS NULL) +
           (query_scope IS NULL) + (planning_activity_name = '') +
-          (activity IS NULL OR activity = '') + (time_semantics IS NULL) +
-          (result IS NULL)
+          (activity IS NULL OR activity = '')
         WHEN 'execution_activity' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (query_execution_id IS NULL) +
           (query_scope IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
           (execution_activity_name = '') +
-          (activity IS NULL OR activity = '') + (time_semantics IS NULL) +
-          (result IS NULL)
+          (activity IS NULL OR activity = '')
         WHEN 'operator' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (query_execution_id IS NULL) +
           (query_scope IS NULL) + (worker_lane_id IS NULL) +
           (worker_kind IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
-          (activity IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          (activity IS NULL)
         ELSE 0
       END
-    ), 0) AS missing_canonical_field_count
+    ), 0) AS missing_identity_field_count,
+    coalesce(sum(
+      CASE
+        WHEN semantic_kind IN (
+          'operation',
+          'phase',
+          'query_planning',
+          'planning_activity',
+          'execution_activity'
+        )
+        THEN result IS NULL
+        ELSE 0
+      END
+    ), 0) AS missing_terminal_result_count
   FROM classified_slices
 ),
 ordered_slices AS (
@@ -271,7 +341,9 @@ health_values AS (
   SELECT
     operation_root_count > 0
       AND incomplete_operation_root_count = 0
-      AND missing_canonical_field_count = 0
+      AND truncation_marker_count = 0
+      AND missing_identity_field_count = 0
+      AND missing_terminal_result_count = 0
       AND crossing_worker_slice_count = 0
       AND crossing_planning_activity_slice_count = 0
       AND crossing_execution_activity_slice_count = 0
@@ -287,7 +359,8 @@ health_values AS (
     planning_activity_slice_count,
     execution_activity_slice_count,
     truncation_marker_count,
-    missing_canonical_field_count,
+    missing_identity_field_count,
+    missing_terminal_result_count,
     crossing_worker_slice_count,
     crossing_planning_activity_slice_count,
     crossing_execution_activity_slice_count,
@@ -314,6 +387,8 @@ SELECT
   semantic_complete
     AND finalization_observed
     AND flush_failure_count = 0
+    AND buffer_loss_count = 0
+    AND data_source_loss_count = 0
     AS capture_complete,
   semantic_complete,
   operation_root_count,
@@ -322,7 +397,8 @@ SELECT
   planning_activity_slice_count,
   execution_activity_slice_count,
   truncation_marker_count,
-  missing_canonical_field_count,
+  missing_identity_field_count,
+  missing_terminal_result_count,
   crossing_worker_slice_count,
   crossing_planning_activity_slice_count,
   crossing_execution_activity_slice_count,
