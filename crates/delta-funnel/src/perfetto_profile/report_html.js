@@ -138,7 +138,7 @@ const compareSemantic = (left, right) => {
       compareValue(left.semantic_id, right.semantic_id);
   }
   const primary = sortField === "name"
-    ? compareText(left.name, right.name)
+    ? compareText(left.display_name, right.display_name)
     : compareValue(semanticSortValue(left), semanticSortValue(right));
   return (sortDirection === "ascending" ? primary : -primary) ||
     compareValue(left.semantic_id, right.semantic_id);
@@ -246,10 +246,7 @@ const entryKey = entry =>
   entry.kind === "semantic"
     ? semanticKey(entry.value)
     : functionKey(entry.value);
-const semanticDisplayName = semantic =>
-  semantic.semantic_kind === "operation"
-    ? `${semantic.name} (operation ${semantic.operation_id})`
-    : semantic.name;
+const semanticDisplayName = semantic => semantic.display_name;
 const entryDisplayName = entry =>
   entry.kind === "semantic"
     ? semanticDisplayName(entry.value)
@@ -946,7 +943,11 @@ const applyFilter = () => {
   if (isFilterActive()) {
     filterCandidatesInCurrentOrder().forEach(record => {
       if (record.function_id === undefined) {
-        if (containsFilter(record.name.toLowerCase())) {
+        if (
+          [record.display_name, record.name].some(value =>
+            containsFilter(value.toLowerCase())
+          )
+        ) {
           filterResults.push(record);
           filterMatches.add(record);
         }

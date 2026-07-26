@@ -89,8 +89,15 @@ const HTML_SUFFIX: &str = r#"</script>
 #[derive(Serialize)]
 struct HtmlProfile<'a> {
     metadata: &'a RankedProfileMetadata,
-    semantics: &'a [RankedSemantic],
+    semantics: Vec<HtmlSemantic<'a>>,
     functions: Vec<HtmlFunction<'a>>,
+}
+
+#[derive(Serialize)]
+struct HtmlSemantic<'a> {
+    #[serde(flatten)]
+    semantic: &'a RankedSemantic,
+    display_name: std::borrow::Cow<'a, str>,
 }
 
 #[derive(Serialize)]
@@ -108,7 +115,14 @@ pub(super) fn render_ranked_profile_html(
     let compact = CompactFunctionTree::new(&document.functions);
     let profile = HtmlProfile {
         metadata: &document.metadata,
-        semantics: &document.semantics,
+        semantics: document
+            .semantics
+            .iter()
+            .map(|semantic| HtmlSemantic {
+                semantic,
+                display_name: semantic.display_name(),
+            })
+            .collect(),
         functions: document
             .functions
             .iter()
@@ -386,6 +400,10 @@ mod tests {
         assert!(!html.contains("innerHTML"));
         let decoded: serde_json::Value = serde_json::from_str(embedded)?;
         assert_eq!(decoded["semantics"][0]["name"], dangerous);
+        assert_eq!(
+            decoded["semantics"][0]["display_name"],
+            format!("{dangerous} (operation 1)")
+        );
         assert_eq!(decoded["functions"][0]["name"], dangerous);
         assert_eq!(decoded["functions"][0]["display_name"], dangerous);
         assert!(decoded["functions"][0]["compact_parent_function_id"].is_null());
@@ -538,6 +556,90 @@ mod tests {
         assert!(
             String::from_utf8(output.stdout)?.contains(r#"data-concurrent-identities="passed""#),
             "concurrent-operation browser assertions did not complete"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_distinguishes_write_all_outputs_and_query_owners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(browser) = std::env::var_os("CHROME_BIN").filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+
+        let root = semantic(1, None, "Delta Funnel SQL Server write_all");
+        let mut first_output = semantic(2, Some(1), "Execute output");
+        first_output.stage_name = Some("Execute output".to_owned());
+        first_output.stage_owner_id = Some(1);
+        let mut second_output = semantic(3, Some(1), "Execute output");
+        second_output.stage_name = Some("Execute output".to_owned());
+        second_output.stage_owner_id = Some(2);
+        let mut west_query = semantic(4, Some(2), "DataFusion query");
+        west_query.semantic_kind = "query".to_owned();
+        west_query.query_owner = Some("west_orders".to_owned());
+        let mut east_query = semantic(5, Some(3), "DataFusion query");
+        east_query.semantic_kind = "query".to_owned();
+        east_query.query_owner = Some("east_orders".to_owned());
+        let document = RankedProfileDocument {
+            metadata: metadata(),
+            semantics: vec![root, first_output, second_output, west_query, east_query],
+            functions: vec![],
+        };
+        document.validate()?;
+
+        let rendered = render_ranked_profile_html(&document)?;
+        let mut html = rendered
+            .strip_suffix(HTML_SUFFIX)
+            .ok_or("report suffix is missing")?
+            .to_owned();
+        html.push_str(
+            r#"</script>
+<script>
+(() => {
+  expandSubtree.click();
+  const labels = Array.from(
+    operationsBody.querySelectorAll(".semantic-row .name-label")
+  ).map(label => label.textContent);
+  for (const expected of [
+    "Execute output (output 1)",
+    "Execute output (output 2)",
+    "DataFusion query (west_orders)",
+    "DataFusion query (east_orders)"
+  ]) {
+    if (!labels.includes(expected)) {
+      throw new Error(`missing shared semantic display label: ${expected}`);
+    }
+  }
+  filterInput.value = "west_orders";
+  applyFilter();
+  const filtered = Array.from(
+    operationsBody.querySelectorAll(".semantic-row .name-label")
+  ).map(label => label.textContent);
+  if (
+    !filtered.includes("Execute output (output 1)") ||
+    !filtered.includes("DataFusion query (west_orders)") ||
+    filtered.includes("Execute output (output 2)") ||
+    filtered.includes("DataFusion query (east_orders)")
+  ) {
+    throw new Error("query-owner filtering did not preserve the exact output branch");
+  }
+  document.body.setAttribute("data-write-all-identities", "passed");
+})();
+</script>
+</body>
+</html>
+"#,
+        );
+
+        let output = dump_browser_dom(&browser, &html)?;
+        assert!(
+            output.status.success(),
+            "write-all identity browser check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8(output.stdout)?.contains(r#"data-write-all-identities="passed""#),
+            "write-all identity browser assertions did not complete"
         );
         Ok(())
     }

@@ -467,7 +467,9 @@ fn semantic_matches(semantic: &RankedSemantic, filter: &str) -> bool {
     if let Some(id) = filter.strip_prefix("semantic:") {
         return id.parse::<i64>() == Ok(semantic.semantic_id);
     }
+    let display_name = semantic.display_name();
     [
+        Some(display_name.as_ref()),
         Some(semantic.name.as_str()),
         Some(semantic.semantic_kind.as_str()),
         semantic.result.as_deref(),
@@ -540,7 +542,7 @@ fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: Inspec
             .inclusive_sample_count
             .cmp(&left.inclusive_sample_count),
         InspectSort::SelfCpu => right.direct_sample_count.cmp(&left.direct_sample_count),
-        InspectSort::Name => left.name.cmp(&right.name),
+        InspectSort::Name => left.display_name().cmp(&right.display_name()),
     };
     ordering.then_with(|| left.semantic_id.cmp(&right.semantic_id))
 }
@@ -889,7 +891,7 @@ fn write_semantic_row(
     output.push_str(&format!(
         "semantic depth={depth} id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={} native_stack_samples_captured={captured_function_samples} native_leaf_symbols_resolved={} native_leaf_symbols_unresolved={} native_unwind_failures={} native_callstacks_missing={}",
         semantic.semantic_id,
-        quoted_terminal_text(&semantic.name),
+        quoted_terminal_text(&semantic.display_name()),
         quoted_terminal_text(&semantic.semantic_kind),
         terminal_text(&semantic.time_semantics),
         semantic.is_complete,
@@ -1068,8 +1070,13 @@ mod tests {
         let first = rendered.find("id=semantic:1").expect("first root");
         let second = rendered.find("id=semantic:2").expect("second root");
         assert!(first < second);
-        assert!(rendered.contains(r#"name="slow\u{1B}[31m\u{2028}\u{202E}\"operation""#));
-        assert!(rendered.contains(&format!("name=\"safe snowman {}\"", '\u{2603}')));
+        assert!(
+            rendered.contains(r#"name="slow\u{1B}[31m\u{2028}\u{202E}\"operation (operation 1)""#)
+        );
+        assert!(rendered.contains(&format!(
+            "name=\"safe snowman {} (operation 2)\"",
+            '\u{2603}'
+        )));
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains('\u{2028}'));
         assert!(!rendered.contains('\u{202e}'));
@@ -1176,7 +1183,7 @@ mod tests {
         assert!(second < grandchild);
         assert!(grandchild < first);
         assert!(rendered.contains(
-            "id=semantic:3 name=\"second\" kind=\"operation\" duration_ns=80 time_basis=exact:wall_clock operation_wall_percent=80.00%"
+            "id=semantic:3 name=\"second (operation 1)\" kind=\"operation\" duration_ns=80 time_basis=exact:wall_clock operation_wall_percent=80.00%"
         ));
         assert_eq!(
             render_terminal_view(
@@ -1227,6 +1234,62 @@ mod tests {
         .expect("exact identity filter should render");
         assert!(exact.contains("id=semantic:1 "));
         assert!(!exact.contains("id=semantic:10 "));
+    }
+
+    #[test]
+    fn distinguishes_write_all_outputs_and_filters_by_query_owner() {
+        let root = operation(1, "Delta Funnel SQL Server write_all", Some(100));
+        let mut west = operation(2, "Execute output", Some(60));
+        west.parent_semantic_id = Some(1);
+        west.operation_id = 1;
+        west.semantic_kind = "stage".to_owned();
+        west.stage_name = Some("Execute output".to_owned());
+        west.stage_owner_id = Some(1);
+        let mut east = operation(3, "Execute output", Some(40));
+        east.parent_semantic_id = Some(1);
+        east.operation_id = 1;
+        east.semantic_kind = "stage".to_owned();
+        east.stage_name = Some("Execute output".to_owned());
+        east.stage_owner_id = Some(2);
+        let mut west_query = operation(4, "DataFusion query", Some(1));
+        west_query.parent_semantic_id = Some(2);
+        west_query.operation_id = 1;
+        west_query.semantic_kind = "query".to_owned();
+        west_query.query_owner = Some("west_orders".to_owned());
+        let mut east_query = operation(5, "DataFusion query", Some(1));
+        east_query.parent_semantic_id = Some(3);
+        east_query.operation_id = 1;
+        east_query.semantic_kind = "query".to_owned();
+        east_query.query_owner = Some("east_orders".to_owned());
+        let document = document(vec![root, west, east, west_query, east_query]);
+
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            10,
+            2,
+        )
+        .expect("write-all identities should render");
+        assert!(rendered.contains(r#"name="Execute output (output 1)""#));
+        assert!(rendered.contains(r#"name="Execute output (output 2)""#));
+        assert!(rendered.contains(r#"name="DataFusion query (west_orders)""#));
+        assert!(rendered.contains(r#"name="DataFusion query (east_orders)""#));
+
+        let filtered = render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            Some("west_orders"),
+            10,
+            2,
+        )
+        .expect("query-owner filtering should render");
+        assert!(filtered.contains(r#"name="Execute output (output 1)""#));
+        assert!(filtered.contains(r#"name="DataFusion query (west_orders)""#));
+        assert!(!filtered.contains(r#"name="Execute output (output 2)""#));
+        assert!(!filtered.contains(r#"name="DataFusion query (east_orders)""#));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
@@ -79,6 +80,38 @@ pub(super) struct RankedSemantic {
     pub unresolved_function_sample_count: i64,
     pub unwind_error_sample_count: i64,
     pub missing_callstack_sample_count: i64,
+}
+
+impl RankedSemantic {
+    pub(super) fn display_name(&self) -> Cow<'_, str> {
+        let qualifier = if self.semantic_kind == "operation" {
+            Some(Cow::Owned(format!("operation {}", self.operation_id)))
+        } else if self.stage_name.as_deref() == Some("Execute output") {
+            self.stage_owner_id
+                .map(|owner_id| Cow::Owned(format!("output {owner_id}")))
+        } else if matches!(self.semantic_kind.as_str(), "query" | "query_planning") {
+            self.query_owner
+                .as_deref()
+                .filter(|owner| !owner.is_empty())
+                .map(Cow::Borrowed)
+        } else {
+            None
+        };
+        qualifier.map_or_else(
+            || Cow::Borrowed(self.name.as_str()),
+            |qualifier| qualified_display_name(&self.name, &qualifier),
+        )
+    }
+}
+
+fn qualified_display_name<'a>(name: &'a str, qualifier: &str) -> Cow<'a, str> {
+    let qualifier_chars = qualifier.chars().count();
+    if qualifier_chars > MAX_DISPLAY_STRING_CHARS.saturating_sub(3) {
+        return Cow::Owned(qualifier.chars().take(MAX_DISPLAY_STRING_CHARS).collect());
+    }
+    let name_chars = MAX_DISPLAY_STRING_CHARS - qualifier_chars - 3;
+    let name = name.chars().take(name_chars).collect::<String>();
+    Cow::Owned(format!("{name} ({qualifier})"))
 }
 
 // Keep this set aligned with missing_terminal_result_count in capture_health.sql
@@ -1702,6 +1735,36 @@ mod tests {
             assert_eq!(function.display_name(), expected);
             assert_eq!(function.name, symbol);
         }
+    }
+
+    #[test]
+    fn derives_bounded_semantic_display_names_without_changing_canonical_names() {
+        let mut root = semantic(1, None, 7, "operation");
+        root.name = "Delta Funnel SQL Server write_all".to_owned();
+        assert_eq!(
+            root.display_name(),
+            "Delta Funnel SQL Server write_all (operation 7)"
+        );
+
+        let mut output = semantic(2, Some(1), 7, "stage");
+        output.name = "Execute output".to_owned();
+        output.stage_name = Some("Execute output".to_owned());
+        output.stage_owner_id = Some(2);
+        assert_eq!(output.display_name(), "Execute output (output 2)");
+
+        let mut query = semantic(3, Some(2), 7, "query");
+        query.name = "DataFusion query".to_owned();
+        query.query_owner = Some("east_orders".to_owned());
+        assert_eq!(query.display_name(), "DataFusion query (east_orders)");
+
+        query.query_owner = Some("x".repeat(MAX_DISPLAY_STRING_CHARS));
+        assert_eq!(
+            query.display_name().chars().count(),
+            MAX_DISPLAY_STRING_CHARS
+        );
+        assert_eq!(root.name, "Delta Funnel SQL Server write_all");
+        assert_eq!(output.name, "Execute output");
+        assert_eq!(query.name, "DataFusion query");
     }
 
     #[test]
