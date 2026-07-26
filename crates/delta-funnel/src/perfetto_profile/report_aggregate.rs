@@ -600,6 +600,63 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires trace_processor_shell and a real interrupted raw trace"]
+    fn preserves_a_real_interrupted_capture_when_requested()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::report_html::render_ranked_profile_html;
+        use super::super::report_terminal::{InspectSelection, InspectSort};
+
+        let trace = std::env::var_os("DELTA_FUNNEL_TEST_INCOMPLETE_PERFETTO_TRACE")
+            .ok_or("DELTA_FUNNEL_TEST_INCOMPLETE_PERFETTO_TRACE is not set")?;
+        let trace = Path::new(&trace);
+        let original = std::fs::read(trace)?;
+        let document = load_ranked_profile(trace, None)?;
+
+        assert!(!document.metadata.capture_complete);
+        assert!(!document.metadata.semantic_complete);
+        assert!(document.metadata.incomplete_operation_root_count > 0);
+        assert!(document.metadata.missing_terminal_result_count > 0);
+        assert!(
+            document
+                .semantics
+                .iter()
+                .filter(|semantic| !semantic.is_complete)
+                .all(|semantic| {
+                    semantic.end_ns.is_none()
+                        && semantic.duration_ns.is_none()
+                        && semantic.result.is_none()
+                })
+        );
+        assert!(document.semantics.iter().any(|semantic| {
+            semantic.parent_semantic_id.is_some()
+                && semantic.is_complete
+                && semantic.duration_ns.is_some()
+                && semantic.result.is_some()
+        }));
+
+        let terminal = super::super::render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            20,
+            0,
+        )?;
+        assert!(terminal.contains("capture_complete: false"));
+        assert!(terminal.contains("semantic_complete: false"));
+        assert!(terminal.contains("duration_ns=n/a"));
+        assert!(terminal.contains("operation_wall_percent=n/a"));
+        assert!(terminal.contains("result=null"));
+
+        let html = render_ranked_profile_html(&document)?;
+        assert!(html.contains(r#""capture_complete":false"#));
+        assert!(html.contains(r#""semantic_complete":false"#));
+        assert!(html.contains("Capture health"));
+        assert_eq!(std::fs::read(trace)?, original);
+        Ok(())
+    }
+
     fn fixture_output(
         official_root_count: i64,
         audit_error_count: i64,
