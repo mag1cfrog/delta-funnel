@@ -1507,6 +1507,7 @@ mod tests {
         let output = interactive_output(run_interactive_command(&index, &mut state, "limit 1"))?;
         assert_eq!(state.limit, 1);
         assert!(output.contains("showing: 1 of 2; truncated: true"));
+        assert!(output.contains("id=function:1:10"));
         assert!(matches!(
             run_interactive_command(&index, &mut state, "limit 0"),
             Err("limit must be between 1 and 200")
