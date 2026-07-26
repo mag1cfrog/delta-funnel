@@ -111,6 +111,18 @@ jobs:
         if: matrix.task == 'Lints and Docs'
         run: node --check crates/delta-funnel/src/perfetto_profile/report_html.js
 
+      - name: Check ranked profile SQL
+        if: matrix.task == 'Lints and Docs' && needs.changes.outputs.diagnostics == 'true'
+        run: |
+          trace_processor="$RUNNER_TEMP/trace_processor_shell"
+          curl -fsSL \
+            https://commondatastorage.googleapis.com/perfetto-luci-artifacts/v57.2/linux-amd64/trace_processor_shell \
+            -o "$trace_processor"
+          echo "55ba613fc6d4f71df81eee2dbfc293020063655c241b3e314bff75345b802684  $trace_processor" |
+            sha256sum --check
+          chmod +x "$trace_processor"
+          TRACE_PROCESSOR_SHELL="$trace_processor" tools/perfetto/check-ranked-profile-sql
+
       - name: Check Rust API documentation
         if: matrix.task == 'Lints and Docs'
         run: |
