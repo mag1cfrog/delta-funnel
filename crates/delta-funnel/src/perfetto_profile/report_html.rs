@@ -620,7 +620,16 @@ mod tests {
       !operationsBody.textContent.includes("runtime wrapper"),
       "compact view retained a zero-cost single-child frame"
     );
+    selectedNode = {
+      kind: "function",
+      value: functionsByKey.get("f:3000:103")
+    };
     showAllFrames.click();
+    check(
+      selectedNode.kind === "semantic" &&
+        selectedNode.value.semantic_id === 3000,
+      "all-frames view did not retain the selected semantic context"
+    );
     const runtimeWrapper = Array.from(
       operationsBody.querySelectorAll(".function-row")
     ).find(row => row.textContent.includes("runtime wrapper"));

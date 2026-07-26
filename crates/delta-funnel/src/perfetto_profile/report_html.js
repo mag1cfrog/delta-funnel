@@ -938,9 +938,8 @@ showAllFrames.addEventListener("change", () => {
   filterOrderCache = [];
   filterOrderCacheKey = null;
   if (
-    !showAllFrames.checked &&
     selectedNode?.kind === "function" &&
-    selectedNode.value.compact_hidden
+    (showAllFrames.checked || selectedNode.value.compact_hidden)
   ) {
     selectedNode = {
       kind: "semantic",
