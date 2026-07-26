@@ -160,7 +160,7 @@ mod tests {
 
     fn metadata() -> RankedProfileMetadata {
         RankedProfileMetadata {
-            schema_version: 2,
+            schema_version: 3,
             sample_frequency_hz: 1000,
             sampled_cpu_count: 8,
             exact_time_unit: "nanoseconds".to_owned(),
@@ -169,8 +169,10 @@ mod tests {
             direct_sample_count: 0,
             ambiguous_sample_count: 0,
             unattributed_sample_count: 0,
-            available_function_sample_count: 0,
-            unavailable_function_sample_count: 0,
+            resolved_function_sample_count: 0,
+            unresolved_function_sample_count: 0,
+            unwind_error_sample_count: 0,
+            missing_callstack_sample_count: 0,
             trace_profiler_dropped_sample_count: 0,
         }
     }
@@ -213,8 +215,10 @@ mod tests {
             stage_owner_id: None,
             direct_sample_count: 0,
             inclusive_sample_count: 0,
-            available_function_sample_count: 0,
-            unavailable_function_sample_count: 0,
+            resolved_function_sample_count: 0,
+            unresolved_function_sample_count: 0,
+            unwind_error_sample_count: 0,
+            missing_callstack_sample_count: 0,
         }
     }
 
@@ -253,7 +257,7 @@ mod tests {
         semantic.result = Some("ok".to_owned());
         semantic.direct_sample_count = 1;
         semantic.inclusive_sample_count = 1;
-        semantic.available_function_sample_count = 1;
+        semantic.resolved_function_sample_count = 1;
         let mut function = function(1, None, dangerous);
         function.module_name = None;
         function.source_file = None;
@@ -263,7 +267,7 @@ mod tests {
         let mut profile_metadata = metadata();
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
-        profile_metadata.available_function_sample_count = 1;
+        profile_metadata.resolved_function_sample_count = 1;
         let document = RankedProfileDocument {
             metadata: profile_metadata,
             semantics: vec![semantic],
@@ -282,7 +286,7 @@ mod tests {
         assert!(html.contains(r#"id="operations-empty""#));
         assert!(html.contains(r#"id="profile-filter""#));
         assert!(html.contains("Sampled CPUs"));
-        assert!(html.contains("Native stacks unavailable"));
+        assert!(html.contains("Leaf symbols unresolved"));
         assert!(html.contains("Profiler samples dropped"));
         assert!(html.contains(r#"maxlength="200""#));
         assert!(html.contains(r#"id="previous-filter-page""#));
@@ -417,7 +421,7 @@ mod tests {
         let mut distributed_cases = semantic(3_000, Some(1), "Distributed cases");
         distributed_cases.direct_sample_count = 1;
         distributed_cases.inclusive_sample_count = 1;
-        distributed_cases.available_function_sample_count = 1;
+        distributed_cases.resolved_function_sample_count = 1;
         semantics[0].inclusive_sample_count = 1;
         semantics.push(distributed_cases);
         let mut distributed_id = 3_001;
@@ -474,7 +478,7 @@ mod tests {
         let mut profile_metadata = metadata();
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
-        profile_metadata.available_function_sample_count = 1;
+        profile_metadata.resolved_function_sample_count = 1;
         let document = RankedProfileDocument {
             metadata: profile_metadata,
             semantics,

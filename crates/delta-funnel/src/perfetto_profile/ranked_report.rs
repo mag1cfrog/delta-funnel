@@ -21,8 +21,10 @@ pub(super) struct RankedProfileMetadata {
     pub direct_sample_count: i64,
     pub ambiguous_sample_count: i64,
     pub unattributed_sample_count: i64,
-    pub available_function_sample_count: i64,
-    pub unavailable_function_sample_count: i64,
+    pub resolved_function_sample_count: i64,
+    pub unresolved_function_sample_count: i64,
+    pub unwind_error_sample_count: i64,
+    pub missing_callstack_sample_count: i64,
     pub trace_profiler_dropped_sample_count: i64,
 }
 
@@ -56,8 +58,10 @@ pub(super) struct RankedSemantic {
     pub stage_owner_id: Option<i64>,
     pub direct_sample_count: i64,
     pub inclusive_sample_count: i64,
-    pub available_function_sample_count: i64,
-    pub unavailable_function_sample_count: i64,
+    pub resolved_function_sample_count: i64,
+    pub unresolved_function_sample_count: i64,
+    pub unwind_error_sample_count: i64,
+    pub missing_callstack_sample_count: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -193,7 +197,7 @@ pub(super) enum RankedProfileValidationError {
     },
     FunctionSelfMismatch {
         semantic_id: i64,
-        available_sample_count: i64,
+        captured_sample_count: i64,
         function_sample_count: i64,
     },
     FunctionInclusiveMismatch {
@@ -387,11 +391,11 @@ impl fmt::Display for RankedProfileValidationError {
             ),
             Self::FunctionSelfMismatch {
                 semantic_id,
-                available_sample_count,
+                captured_sample_count,
                 function_sample_count,
             } => write!(
                 formatter,
-                "semantic ID {semantic_id} available native stack count {available_sample_count} does not equal function self count {function_sample_count}"
+                "semantic ID {semantic_id} captured native stack count {captured_sample_count} does not equal function self count {function_sample_count}"
             ),
             Self::FunctionInclusiveMismatch {
                 semantic_id,
@@ -493,7 +497,7 @@ impl RankedProfileDocument {
     }
 
     fn validate_metadata_and_intervals(&self) -> Result<(), RankedProfileValidationError> {
-        if self.metadata.schema_version != 2 {
+        if self.metadata.schema_version != 3 {
             return Err(RankedProfileValidationError::UnsupportedSchemaVersion {
                 schema_version: self.metadata.schema_version,
             });
@@ -709,12 +713,20 @@ impl RankedProfileDocument {
                 self.metadata.unattributed_sample_count,
             ),
             (
-                "available_function_sample_count",
-                self.metadata.available_function_sample_count,
+                "resolved_function_sample_count",
+                self.metadata.resolved_function_sample_count,
             ),
             (
-                "unavailable_function_sample_count",
-                self.metadata.unavailable_function_sample_count,
+                "unresolved_function_sample_count",
+                self.metadata.unresolved_function_sample_count,
+            ),
+            (
+                "unwind_error_sample_count",
+                self.metadata.unwind_error_sample_count,
+            ),
+            (
+                "missing_callstack_sample_count",
+                self.metadata.missing_callstack_sample_count,
             ),
             (
                 "trace_profiler_dropped_sample_count",
@@ -738,8 +750,10 @@ impl RankedProfileDocument {
         validate_function_coverage(
             None,
             self.metadata.direct_sample_count,
-            self.metadata.available_function_sample_count,
-            self.metadata.unavailable_function_sample_count,
+            self.metadata.resolved_function_sample_count,
+            self.metadata.unresolved_function_sample_count,
+            self.metadata.unwind_error_sample_count,
+            self.metadata.missing_callstack_sample_count,
         )?;
 
         let semantic_parents = self
@@ -749,8 +763,7 @@ impl RankedProfileDocument {
             .collect::<HashMap<_, _>>();
         let mut semantic_direct = HashMap::with_capacity(self.semantics.len());
         let mut semantic_direct_total = 0_i64;
-        let mut semantic_available_total = 0_i64;
-        let mut semantic_unavailable_total = 0_i64;
+        let mut semantic_function_totals = [0_i64; 4];
         for semantic in &self.semantics {
             require_nonnegative(
                 "semantic",
@@ -764,23 +777,33 @@ impl RankedProfileDocument {
                 "inclusive_sample_count",
                 semantic.inclusive_sample_count,
             )?;
-            require_nonnegative(
-                "semantic",
-                semantic.semantic_id,
-                "available_function_sample_count",
-                semantic.available_function_sample_count,
-            )?;
-            require_nonnegative(
-                "semantic",
-                semantic.semantic_id,
-                "unavailable_function_sample_count",
-                semantic.unavailable_function_sample_count,
-            )?;
+            for (field, value) in [
+                (
+                    "resolved_function_sample_count",
+                    semantic.resolved_function_sample_count,
+                ),
+                (
+                    "unresolved_function_sample_count",
+                    semantic.unresolved_function_sample_count,
+                ),
+                (
+                    "unwind_error_sample_count",
+                    semantic.unwind_error_sample_count,
+                ),
+                (
+                    "missing_callstack_sample_count",
+                    semantic.missing_callstack_sample_count,
+                ),
+            ] {
+                require_nonnegative("semantic", semantic.semantic_id, field, value)?;
+            }
             validate_function_coverage(
                 Some(semantic.semantic_id),
                 semantic.direct_sample_count,
-                semantic.available_function_sample_count,
-                semantic.unavailable_function_sample_count,
+                semantic.resolved_function_sample_count,
+                semantic.unresolved_function_sample_count,
+                semantic.unwind_error_sample_count,
+                semantic.missing_callstack_sample_count,
             )?;
             semantic_direct.insert(semantic.semantic_id, semantic.direct_sample_count);
             semantic_direct_total = semantic_direct_total
@@ -788,16 +811,18 @@ impl RankedProfileDocument {
                 .ok_or(RankedProfileValidationError::SampleCountOverflow {
                     scope: "semantic direct",
                 })?;
-            semantic_available_total = semantic_available_total
-                .checked_add(semantic.available_function_sample_count)
-                .ok_or(RankedProfileValidationError::SampleCountOverflow {
-                    scope: "semantic available native stacks",
-                })?;
-            semantic_unavailable_total = semantic_unavailable_total
-                .checked_add(semantic.unavailable_function_sample_count)
-                .ok_or(RankedProfileValidationError::SampleCountOverflow {
-                    scope: "semantic unavailable native stacks",
-                })?;
+            for (total, value) in semantic_function_totals.iter_mut().zip([
+                semantic.resolved_function_sample_count,
+                semantic.unresolved_function_sample_count,
+                semantic.unwind_error_sample_count,
+                semantic.missing_callstack_sample_count,
+            ]) {
+                *total = total.checked_add(value).ok_or(
+                    RankedProfileValidationError::SampleCountOverflow {
+                        scope: "semantic function coverage",
+                    },
+                )?;
+            }
         }
         if semantic_direct_total != self.metadata.direct_sample_count {
             return Err(RankedProfileValidationError::DirectSampleMismatch {
@@ -807,14 +832,24 @@ impl RankedProfileDocument {
         }
         for (field, declared_sample_count, semantic_sample_count) in [
             (
-                "available_function_sample_count",
-                self.metadata.available_function_sample_count,
-                semantic_available_total,
+                "resolved_function_sample_count",
+                self.metadata.resolved_function_sample_count,
+                semantic_function_totals[0],
             ),
             (
-                "unavailable_function_sample_count",
-                self.metadata.unavailable_function_sample_count,
-                semantic_unavailable_total,
+                "unresolved_function_sample_count",
+                self.metadata.unresolved_function_sample_count,
+                semantic_function_totals[1],
+            ),
+            (
+                "unwind_error_sample_count",
+                self.metadata.unwind_error_sample_count,
+                semantic_function_totals[2],
+            ),
+            (
+                "missing_callstack_sample_count",
+                self.metadata.missing_callstack_sample_count,
+                semantic_function_totals[3],
             ),
         ] {
             if declared_sample_count != semantic_sample_count {
@@ -893,10 +928,16 @@ impl RankedProfileDocument {
                 .get(&semantic.semantic_id)
                 .copied()
                 .unwrap_or_default();
-            if semantic.available_function_sample_count != function_sample_count {
+            let captured_sample_count = semantic
+                .resolved_function_sample_count
+                .checked_add(semantic.unresolved_function_sample_count)
+                .ok_or(RankedProfileValidationError::SampleCountOverflow {
+                    scope: "captured native stacks",
+                })?;
+            if captured_sample_count != function_sample_count {
                 return Err(RankedProfileValidationError::FunctionSelfMismatch {
                     semantic_id: semantic.semantic_id,
-                    available_sample_count: semantic.available_function_sample_count,
+                    captured_sample_count,
                     function_sample_count,
                 });
             }
@@ -1049,11 +1090,15 @@ fn require_nonnegative(
 fn validate_function_coverage(
     semantic_id: Option<i64>,
     direct_sample_count: i64,
-    available_sample_count: i64,
-    unavailable_sample_count: i64,
+    resolved_sample_count: i64,
+    unresolved_sample_count: i64,
+    unwind_error_sample_count: i64,
+    missing_callstack_sample_count: i64,
 ) -> Result<(), RankedProfileValidationError> {
-    let classified_sample_count = available_sample_count
-        .checked_add(unavailable_sample_count)
+    let classified_sample_count = resolved_sample_count
+        .checked_add(unresolved_sample_count)
+        .and_then(|count| count.checked_add(unwind_error_sample_count))
+        .and_then(|count| count.checked_add(missing_callstack_sample_count))
         .ok_or(RankedProfileValidationError::SampleCountOverflow {
             scope: "native stack coverage",
         })?;
@@ -1173,8 +1218,10 @@ mod tests {
             stage_owner_id: None,
             direct_sample_count: 0,
             inclusive_sample_count: 0,
-            available_function_sample_count: 0,
-            unavailable_function_sample_count: 0,
+            resolved_function_sample_count: 0,
+            unresolved_function_sample_count: 0,
+            unwind_error_sample_count: 0,
+            missing_callstack_sample_count: 0,
         }
     }
 
@@ -1200,15 +1247,15 @@ mod tests {
         let mut operation = semantic(1, None, 10, "operation");
         operation.direct_sample_count = 1;
         operation.inclusive_sample_count = 3;
-        operation.available_function_sample_count = 1;
+        operation.resolved_function_sample_count = 1;
         let mut phase = semantic(2, Some(1), 10, "phase");
         phase.direct_sample_count = 2;
         phase.inclusive_sample_count = 2;
-        phase.available_function_sample_count = 2;
+        phase.unresolved_function_sample_count = 2;
         let mut second_operation = semantic(3, None, 20, "operation");
         second_operation.direct_sample_count = 1;
         second_operation.inclusive_sample_count = 1;
-        second_operation.unavailable_function_sample_count = 1;
+        second_operation.missing_callstack_sample_count = 1;
 
         let mut operation_function = function(1, 90, None);
         operation_function.self_sample_count = 1;
@@ -1220,7 +1267,7 @@ mod tests {
         phase_leaf.inclusive_sample_count = 2;
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
-                schema_version: 2,
+                schema_version: 3,
                 sample_frequency_hz: 100,
                 sampled_cpu_count: 1,
                 exact_time_unit: "nanoseconds".to_owned(),
@@ -1229,8 +1276,10 @@ mod tests {
                 direct_sample_count: 4,
                 ambiguous_sample_count: 1,
                 unattributed_sample_count: 1,
-                available_function_sample_count: 3,
-                unavailable_function_sample_count: 1,
+                resolved_function_sample_count: 1,
+                unresolved_function_sample_count: 2,
+                unwind_error_sample_count: 0,
+                missing_callstack_sample_count: 1,
                 trace_profiler_dropped_sample_count: 1,
             },
             semantics: vec![operation, phase, second_operation],
@@ -1360,7 +1409,7 @@ mod tests {
         ));
 
         let mut invalid = document();
-        invalid.semantics[2].unavailable_function_sample_count = 0;
+        invalid.semantics[2].missing_callstack_sample_count = 0;
         assert!(matches!(
             invalid.validate(),
             Err(RankedProfileValidationError::FunctionCoverageMismatch {
@@ -1372,7 +1421,7 @@ mod tests {
         let mut invalid = document();
         invalid.metadata.direct_sample_count = 5;
         invalid.metadata.eligible_sample_count = 7;
-        invalid.metadata.unavailable_function_sample_count = 2;
+        invalid.metadata.missing_callstack_sample_count = 2;
         assert!(matches!(
             invalid.validate(),
             Err(RankedProfileValidationError::DirectSampleMismatch { .. })
@@ -1418,10 +1467,10 @@ mod tests {
     #[test]
     fn validates_metadata_units_and_semantic_intervals() {
         let mut invalid = document();
-        invalid.metadata.schema_version = 3;
+        invalid.metadata.schema_version = 2;
         assert!(matches!(
             invalid.validate(),
-            Err(RankedProfileValidationError::UnsupportedSchemaVersion { schema_version: 3 })
+            Err(RankedProfileValidationError::UnsupportedSchemaVersion { schema_version: 2 })
         ));
 
         let mut invalid = document();

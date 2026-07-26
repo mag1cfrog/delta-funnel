@@ -1,14 +1,33 @@
 # Set Up Perfetto Diagnostics for Python
 
-This guide installs the diagnostics wheel and the two external Perfetto tools
-needed to generate an operation-scoped ranked HTML report directly from
-`Table.preview`, `Table.write_to_mssql`, or `Session.write_all`.
+This guide installs the diagnostics wheel, Perfetto tools, and native
+symbolizer needed to generate an operation-scoped ranked HTML report directly
+from `Table.preview`, `Table.write_to_mssql`, or `Session.write_all`.
 
 Perfetto diagnostics are intended for occasional local investigation, not
 continuous collection. The TestPyPI wheel supports CPython 3.10 or newer on
 Linux x86_64 with glibc 2.28 or newer.
 
 ## 1. Prepare the Linux host
+
+Install `llvm-symbolizer` and `debuginfod-find` for the host distribution.
+
+Fedora:
+
+```sh
+sudo dnf install llvm elfutils-debuginfod-client
+```
+
+Ubuntu or Debian:
+
+```sh
+sudo apt update
+sudo apt install llvm debuginfod
+```
+
+On another glibc Linux distribution, install the packages that provide the
+`llvm-symbolizer` and `debuginfod-find` commands. The diagnostics wheel does
+not currently support macOS, Windows, or musl Linux.
 
 Download the official Trace Processor and traceconv launchers. Saving the Trace
 Processor launcher as `trace_processor_shell` matches the command Delta Funnel
@@ -29,6 +48,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 trace_processor_shell --help >/dev/null
 traceconv --help 2>&1 | grep -q symbolize
+llvm-symbolizer --version >/dev/null
 ```
 
 The launchers download and cache the matching native binaries on first use.
@@ -79,6 +99,53 @@ perfetto_assets="$(uv run python -c \
   'from importlib.resources import files; print(files("deltafunnel") / "perfetto")')"
 "$perfetto_assets/delta-funnel-tracebox" --version
 ```
+
+For a 1000 Hz profile, select the official debuginfod service for the host
+distribution:
+
+```sh
+# Fedora
+export DEBUGINFOD_URLS=https://debuginfod.fedoraproject.org/
+
+# Ubuntu
+export DEBUGINFOD_URLS=https://debuginfod.ubuntu.com/
+
+# Debian
+export DEBUGINFOD_URLS=https://debuginfod.debian.net/
+```
+
+Run only the matching `export` command. Then cache the exact glibc and CPython
+debuginfo used by the workload:
+
+```sh
+python_executable="$(uv run python -c 'import sys; print(sys.executable)')"
+python_library="$(uv run python -c \
+  'import pathlib, sysconfig; print(pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY"))')"
+libc_library="$(ldd "$python_executable" | awk '$1 == "libc.so.6" { print $3; exit }')"
+test -n "$libc_library"
+
+debuginfod-find debuginfo "$libc_library" >/dev/null
+if llvm-readelf -n "$python_library" | grep -q "Build ID:"; then
+  debuginfod-find debuginfo "$python_library" >/dev/null
+fi
+```
+
+This downloads matching debug files into the user's local debuginfod cache. It
+does not upload the trace. `debuginfod-find` reads each binary's Build ID and
+fetches the matching debug file, so no manual Build ID lookup is needed. Run
+these commands once on each machine and again after upgrading glibc or the
+Python runtime used by the workload. Delta Funnel searches the cache and
+`/usr/lib/debug` automatically when `traceconv` symbolizes a 1000 Hz operation
+profile.
+
+Some standalone Python distributions include unstripped symbols but no Build
+ID. They do not need a separate debuginfo download. A stripped Python runtime
+without a Build ID cannot be resolved through debuginfod; use the
+distribution's Python or another diagnostics-capable Python build.
+
+On another distribution, use its official or organization-provided
+`DEBUGINFOD_URLS`. If no debuginfod service is available, install matching
+debug packages under `/usr/lib/debug` instead.
 
 The generated `uv.lock` records the exact diagnostics version and TestPyPI
 source. Keep it with the report when reproducibility matters.

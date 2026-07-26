@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs, io,
     io::Read,
     path::{Path, PathBuf},
@@ -80,6 +80,7 @@ impl OperationCapture {
         preflight_trace_processor()?;
         if sample_hz == 1000 {
             preflight_traceconv()?;
+            preflight_llvm_symbolizer()?;
         }
         let directory = tempfile::Builder::new()
             .prefix(".delta-funnel-profile.")
@@ -353,6 +354,31 @@ fn preflight_traceconv() -> Result<(), ProfilerFailure> {
     }
 }
 
+fn preflight_llvm_symbolizer() -> Result<(), ProfilerFailure> {
+    Command::new("llvm-symbolizer")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            let kind = if error.kind() == io::ErrorKind::NotFound {
+                "llvm_symbolizer_unavailable"
+            } else {
+                "llvm_symbolizer_start_failed"
+            };
+            ProfilerFailure::new(kind, "llvm-symbolizer could not be started")
+        })
+        .and_then(|status| {
+            status.success().then_some(()).ok_or_else(|| {
+                ProfilerFailure::new(
+                    "llvm_symbolizer_start_failed",
+                    "llvm-symbolizer preflight failed",
+                )
+            })
+        })
+}
+
 fn symbolize_trace(trace: &Path, directory: &Path) -> Result<PathBuf, ProfilerFailure> {
     let binary_directory = directory.join("symbol-binaries");
     fs::create_dir(&binary_directory).map_err(|_| {
@@ -384,13 +410,15 @@ fn symbolize_trace(trace: &Path, directory: &Path) -> Result<PathBuf, ProfilerFa
         ));
     }
 
+    let symbol_search_path = symbol_search_path(&binary_directory)?;
     let symbols = directory.join("symbols.pftrace");
     let program = env::var_os("TRACECONV").unwrap_or_else(|| "traceconv".into());
     let status = Command::new(program)
         .args(["symbolize"])
         .arg(trace)
         .arg(&symbols)
-        .env("PERFETTO_BINARY_PATH", &binary_directory)
+        .env("PERFETTO_BINARY_PATH", symbol_search_path)
+        .env("PERFETTO_SYMBOLIZER_MODE", "index")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -430,6 +458,35 @@ fn symbolize_trace(trace: &Path, directory: &Path) -> Result<PathBuf, ProfilerFa
         })?;
     }
     Ok(symbolized)
+}
+
+fn symbol_search_path(binary_directory: &Path) -> Result<OsString, ProfilerFailure> {
+    let mut paths = vec![binary_directory.to_owned()];
+    let system_debug = PathBuf::from("/usr/lib/debug");
+    if system_debug.is_dir() {
+        paths.push(system_debug);
+    }
+    let debuginfod_cache = env::var_os("DEBUGINFOD_CACHE_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("debuginfod_client"))
+        })
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".cache/debuginfod_client"))
+        });
+    if let Some(cache) = debuginfod_cache.filter(|path| path.is_dir()) {
+        paths.push(cache);
+    }
+    env::join_paths(paths).map_err(|_| {
+        ProfilerFailure::new(
+            "symbolization_failed",
+            "symbol search paths could not be configured",
+        )
+    })
 }
 
 fn mapped_file_paths(maps: &str) -> impl Iterator<Item = PathBuf> + '_ {

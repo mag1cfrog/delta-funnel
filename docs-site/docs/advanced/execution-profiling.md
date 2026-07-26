@@ -39,9 +39,11 @@ not included. Passing `profiler` automatically enables the existing detailed
 semantic and operator profile; `profile=True` is not also required.
 At 1000 Hz, Delta Funnel collects kernel frame-pointer callchains to bypass
 Perfetto's userspace unwind queue, then resolves those stacks locally with
-`traceconv`. The diagnostics wheel is built with the required native frame
-pointers. Its pinned tracebox build expands Perfetto's callchain queue so both
-100 and 1000 Hz capture sample every CPU allowed by the process affinity.
+`traceconv`, `llvm-symbolizer`, and matching debug files from `/usr/lib/debug`
+or the user's debuginfod cache. The diagnostics wheel is built with the
+required native frame pointers. Its pinned tracebox build expands Perfetto's
+callchain queue so both 100 and 1000 Hz capture sample every CPU allowed by the
+process affinity.
 Concurrent Delta Funnel operations are excluded from the semantic and native
 function rankings. Process samples without a matching target-operation context
 remain visible only in the report's unattributed coverage count.
@@ -78,6 +80,19 @@ ranks exact semantic operation durations and lets you expand each operation
 into its semantic children and sampled native callsites. Exact durations and
 sample counts use different units: a function's self and inclusive CPU values
 are statistical on-CPU samples, not wall-clock time.
+
+The summary separates native capture quality into four mutually exclusive
+outcomes:
+
+- `Leaf symbols resolved` means the sampled leaf function has a readable name.
+- `Leaf symbols unresolved` means a stack was captured, but its leaf function
+  could not be named.
+- `Unwind failures` means Perfetto reported a native unwind error.
+- `Native stacks missing` means no usable callstack remained for the sample.
+
+`Native stacks captured` is the sum of resolved and unresolved leaf symbols.
+If unresolved coverage is high on Fedora, fetch matching debuginfo using the
+setup guide and run the operation profile again.
 
 To keep that call tree useful, the ranked report omits known runtime wrapper
 frames with no self CPU samples and connects their children to the nearest

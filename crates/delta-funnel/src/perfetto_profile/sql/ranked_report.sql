@@ -32,7 +32,7 @@ WITH
           WHEN health.semantic_complete THEN 'true'
           ELSE 'false'
         END),
-        'schema_version', 2,
+        'schema_version', 3,
         'sample_frequency_hz', sample_config.sample_frequency_hz,
         'sampled_cpu_count', sample_config.sampled_cpu_count,
         'exact_time_unit', 'nanoseconds',
@@ -41,10 +41,14 @@ WITH
         'direct_sample_count', coverage.direct_sample_count,
         'ambiguous_sample_count', coverage.ambiguous_sample_count,
         'unattributed_sample_count', coverage.unattributed_sample_count,
-        'available_function_sample_count',
-          function_coverage.available_function_sample_count,
-        'unavailable_function_sample_count',
-          function_coverage.unavailable_function_sample_count,
+        'resolved_function_sample_count',
+          function_coverage.resolved_function_sample_count,
+        'unresolved_function_sample_count',
+          function_coverage.unresolved_function_sample_count,
+        'unwind_error_sample_count',
+          function_coverage.unwind_error_sample_count,
+        'missing_callstack_sample_count',
+          function_coverage.missing_callstack_sample_count,
         'trace_profiler_dropped_sample_count',
           profiler_loss.trace_profiler_dropped_sample_count,
         'audit_error_count', audit.audit_error_count
@@ -62,9 +66,13 @@ WITH
     CROSS JOIN (
       SELECT
         coalesce(sum(resolution = 'resolved'), 0)
-          AS available_function_sample_count,
+          AS resolved_function_sample_count,
         coalesce(sum(resolution = 'unresolved'), 0)
-          AS unavailable_function_sample_count
+          AS unresolved_function_sample_count,
+        coalesce(sum(resolution = 'unwind_error'), 0)
+          AS unwind_error_sample_count,
+        coalesce(sum(resolution = 'missing'), 0)
+          AS missing_callstack_sample_count
       FROM delta_funnel_ranked_function_sample_ownership
     ) AS function_coverage
     CROSS JOIN (
@@ -122,10 +130,14 @@ WITH
         'stage_owner_id', semantic.stage_owner_id,
         'direct_sample_count', sample_count.direct_sample_count,
         'inclusive_sample_count', 0,
-        'available_function_sample_count',
-          function_coverage.available_function_sample_count,
-        'unavailable_function_sample_count',
-          function_coverage.unavailable_function_sample_count
+        'resolved_function_sample_count',
+          function_coverage.resolved_function_sample_count,
+        'unresolved_function_sample_count',
+          function_coverage.unresolved_function_sample_count,
+        'unwind_error_sample_count',
+          function_coverage.unwind_error_sample_count,
+        'missing_callstack_sample_count',
+          function_coverage.missing_callstack_sample_count
       )))
     FROM delta_funnel_ranked_semantics AS semantic
     JOIN delta_funnel_ranked_semantic_parents AS parent USING (semantic_id)
