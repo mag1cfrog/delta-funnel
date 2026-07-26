@@ -315,16 +315,6 @@ fn render_semantic_view(
     let included_semantics = filter
         .map(|filter| contextual_semantic_matches(index, selected_semantic_id, max_depth, filter));
 
-    let first_depth = usize::from(selected_semantic_id.is_some());
-    let (semantic_total, semantic_rows) = collect_semantic_rows(
-        &index.semantic_children,
-        selected_semantic_id,
-        first_depth,
-        max_depth,
-        limit,
-        sort,
-        included_semantics.as_ref(),
-    );
     let function_sort = sort.for_functions();
     let mut function_roots = selected_semantic
         .filter(|_| max_depth > 0)
@@ -343,6 +333,17 @@ fn render_semantic_view(
         .collect::<Vec<_>>();
     sort_functions(index, &mut function_roots, function_sort);
     let function_total = function_roots.len();
+    let semantic_limit = limit.saturating_sub(usize::from(function_total > 0));
+    let first_depth = usize::from(selected_semantic_id.is_some());
+    let (semantic_total, semantic_rows) = collect_semantic_rows(
+        &index.semantic_children,
+        selected_semantic_id,
+        first_depth,
+        max_depth,
+        semantic_limit,
+        sort,
+        included_semantics.as_ref(),
+    );
     let function_rows = function_roots
         .into_iter()
         .take(limit.saturating_sub(semantic_rows.len()))
@@ -1234,6 +1235,39 @@ mod tests {
                 function_id: 10,
             })
         );
+    }
+
+    #[test]
+    fn reserves_bounded_semantic_views_for_function_root_discovery() {
+        let mut root = operation(1, "operation", Some(100));
+        root.direct_sample_count = 1;
+        root.inclusive_sample_count = 1;
+        let mut semantics = vec![root];
+        semantics.extend((2..=202).map(|semantic_id| {
+            let mut child = operation(semantic_id, "child", Some(10));
+            child.parent_semantic_id = Some(1);
+            child.operation_id = 1;
+            child
+        }));
+        let mut document = document(semantics);
+        document.functions = vec![function(1, 500, None, "native root", 1, 1)];
+
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Semantic(1),
+            InspectSort::Duration,
+            None,
+            200,
+            1,
+        )
+        .expect("mixed semantic and function view should render");
+
+        assert!(rendered.contains("showing: 200 of 202; truncated: true"));
+        assert_eq!(rendered.matches("semantic depth=1").count(), 199);
+        assert!(rendered.contains(
+            "transition: semantic:1 -> function-roots; sort: inclusive-cpu; showing: 1 of 1; truncated: false; sample_basis: sampled-cpu"
+        ));
+        assert!(rendered.contains("id=function:1:500"));
     }
 
     #[test]
