@@ -1,0 +1,44 @@
+diff --git a/src/profiling/perf/unwinding.cc b/src/profiling/perf/unwinding.cc
+index 78b0ff81..10931cfb 100644
+--- a/src/profiling/perf/unwinding.cc
++++ b/src/profiling/perf/unwinding.cc
+@@ -551,11 +551,23 @@ std::vector<unwindstack::FrameData> Unwinder::SymbolizeKernelSuppliedUserFrames(
+   // libunwindstack/FP unwinders rely on for emission, just driven directly
+   // by the IPs the kernel returned.
+   // TODO(rsavitski): add vdso redirect and remove fd_mem.
++  bool is_leaf = true;
+   for (; it != sample.kernel_ips.end(); ++it) {
+-    ret.emplace_back(unwindstack::Unwinder::BuildFrameFromPcOnly(
++    unwindstack::FrameData frame =
++        unwindstack::Unwinder::BuildFrameFromPcOnly(
+         *it, unwindstack::Regs::CurrentArch(), &user_state->fd_maps,
+         /*jit_debug=*/nullptr, user_state->fd_mem,
+-        /*resolve_names=*/false));
++        /*resolve_names=*/false);
++    if (is_leaf) {
++      // BuildFrameFromPcOnly treats its input as a return address and adjusts
++      // it back into the caller. The kernel callchain's first userspace IP is
++      // the sampled instruction rather than a return address, so preserve it.
++      PERFETTO_DCHECK(frame.pc <= *it);
++      frame.rel_pc += *it - frame.pc;
++      frame.pc = *it;
++      is_leaf = false;
++    }
++    ret.emplace_back(std::move(frame));
+   }
+   return ret;
+ }
+
+diff --git a/src/profiling/perf/unwinding.h b/src/profiling/perf/unwinding.h
+index 50b41077..4a16e71f 100644
+--- a/src/profiling/perf/unwinding.h
++++ b/src/profiling/perf/unwinding.h
+@@ -40,7 +40,7 @@
+ namespace perfetto {
+ namespace profiling {
+ 
+-constexpr static uint32_t kUnwindQueueCapacity = 1024;
++constexpr static uint32_t kUnwindQueueCapacity = 8192;
+ 
+ // Unwinds and symbolises callstacks. For userspace this uses the sampled stack
+ // and register state (see |ParsedSample|). For kernelspace, the kernel itself

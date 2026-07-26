@@ -19,7 +19,7 @@ jobs:
       contents: write
     env:
       PERFETTO_COMMIT: da1d152cff27890903d158fe96751de3aab883cc
-      RELEASE_TAG: perfetto-tracebox-v57.2-df1
+      RELEASE_TAG: perfetto-tracebox-v57.2-df2
 
     steps:
       - name: Checkout Delta Funnel
@@ -35,7 +35,7 @@ jobs:
           git -C perfetto checkout --detach FETCH_HEAD
           test "$(git -C perfetto rev-parse HEAD)" = "$PERFETTO_COMMIT"
           git -C perfetto apply \
-            "$GITHUB_WORKSPACE/tools/perfetto/perfetto-v57.2-unwind-queue-8192.patch"
+            "$GITHUB_WORKSPACE/tools/perfetto/perfetto-v57.2-delta-funnel.patch"
 
       - name: Build tracebox
         run: |
@@ -84,5 +84,5 @@ jobs:
             dist/tracebox-linux-x86_64.tar.xz \
             dist/tracebox-linux-x86_64.tar.xz.sha256 \
             --target "$GITHUB_SHA" \
-            --title "Perfetto tracebox v57.2 for Delta Funnel diagnostics" \
-            --notes "Perfetto v57.2 with only the traced_perf unwind queue capacity increased from 1024 to 8192. The archive includes the upstream Apache-2.0 license."
+            --title "Perfetto tracebox v57.2 df2 for Delta Funnel diagnostics" \
+            --notes "Perfetto v57.2 with the traced_perf unwind queue capacity increased from 1024 to 8192 and kernel frame-pointer leaf PCs preserved without return-address adjustment. The archive includes the upstream Apache-2.0 license."
