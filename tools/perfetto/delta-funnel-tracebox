@@ -11,13 +11,13 @@ from pathlib import Path
 from urllib.request import urlopen
 
 
-RELEASE = "perfetto-tracebox-v57.2-df1"
+RELEASE = "perfetto-tracebox-v57.2-df2"
 ARCHIVE_URL = (
     "https://github.com/mag1cfrog/delta-funnel/releases/download/"
     f"{RELEASE}/tracebox-linux-x86_64.tar.xz"
 )
-ARCHIVE_SHA256 = "db13aaeb86f42908f2f6953d8af549ad21be2733babf4ea1472bad71c05ca313"
-TRACEBOX_SHA256 = "1f9a998baba15b21a6af2e93ed036b0935ce3d9a3df670a052b13bf10e235a1d"
+ARCHIVE_SHA256 = "c58d1feb351015698334e9898bc098dce921b176900ff104c7370417c1697cd7"
+TRACEBOX_SHA256 = "aa5746add7b6cbf9595a30fa6ebb7b928f70f0e674fc8f8df36d6218fada6a79"
 LICENSE_SHA256 = "9a682a56cffc9524dfa9b0b1c0dca9cb81a19e96d5bd0793aaf02c08a95ee7ca"
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
 MAX_MEMBER_BYTES = 16 * 1024 * 1024
