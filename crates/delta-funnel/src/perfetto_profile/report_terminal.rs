@@ -81,6 +81,7 @@ pub(super) struct TerminalProfileIndex<'a> {
     semantics: HashMap<i64, &'a RankedSemantic>,
     semantic_children: HashMap<Option<i64>, Vec<&'a RankedSemantic>>,
     functions: HashMap<(i64, i64), &'a RankedFunction>,
+    function_parents: HashMap<(i64, i64), Option<i64>>,
     function_children: HashMap<(i64, Option<i64>), Vec<&'a RankedFunction>>,
     operation_durations: HashMap<i64, Option<i64>>,
     full_symbols: bool,
@@ -107,6 +108,7 @@ impl<'a> TerminalProfileIndex<'a> {
             }
         }
         let mut functions = HashMap::with_capacity(document.functions.len());
+        let mut function_parents = HashMap::with_capacity(document.functions.len());
         let mut function_children = HashMap::new();
         let compact = CompactFunctionTree::new(&document.functions);
         for function in &document.functions {
@@ -119,6 +121,10 @@ impl<'a> TerminalProfileIndex<'a> {
                 compact.parent_function_id(function)
             };
             functions.insert((function.semantic_id, function.function_id), function);
+            function_parents.insert(
+                (function.semantic_id, function.function_id),
+                parent_function_id,
+            );
             function_children
                 .entry((function.semantic_id, parent_function_id))
                 .or_insert_with(Vec::new)
@@ -129,6 +135,7 @@ impl<'a> TerminalProfileIndex<'a> {
             semantics,
             semantic_children,
             functions,
+            function_parents,
             function_children,
             operation_durations,
             full_symbols,
@@ -208,9 +215,9 @@ impl<'a> TerminalProfileIndex<'a> {
             }
         };
         if self
-            .functions
+            .function_parents
             .get(&(semantic_id, function_id))
-            .map(|function| function.parent_function_id)
+            .copied()
             != Some(parent)
         {
             return Err("function target is not an immediate child");
@@ -237,10 +244,11 @@ impl<'a> TerminalProfileIndex<'a> {
                 semantic_id,
                 function_id,
             } => self
-                .functions
+                .function_parents
                 .get(&(semantic_id, function_id))
-                .map(|function| {
-                    function.parent_function_id.map_or(
+                .copied()
+                .map(|parent_function_id| {
+                    parent_function_id.map_or(
                         InspectSelection::Semantic(semantic_id),
                         |function_id| InspectSelection::Function {
                             semantic_id,
@@ -602,9 +610,10 @@ fn contextual_function_matches(
                 }
                 included.insert(id);
                 let Some(parent_id) = index
-                    .functions
+                    .function_parents
                     .get(&(semantic_id, id))
-                    .and_then(|function| function.parent_function_id)
+                    .copied()
+                    .flatten()
                 else {
                     break;
                 };
@@ -1208,16 +1217,21 @@ mod tests {
     #[test]
     fn switches_between_compact_and_complete_function_trees() {
         let mut root = operation(1, "operation", Some(100));
-        root.direct_sample_count = 3;
-        root.inclusive_sample_count = 3;
+        root.direct_sample_count = 7;
+        root.inclusive_sample_count = 7;
         let mut document = document(vec![root]);
         document.functions = vec![
             function(1, 10, None, "runtime wrapper", 0, 3),
             function(1, 11, Some(10), "future wrapper", 0, 3),
             function(1, 12, Some(11), "useful leaf", 3, 3),
+            function(1, 20, None, "second root", 1, 4),
+            function(1, 21, Some(20), "retained context", 1, 3),
+            function(1, 22, Some(21), "hidden context", 0, 2),
+            function(1, 23, Some(22), "filtered leaf", 2, 2),
         ];
 
-        let compact = TerminalProfileIndex::new(&document, false, false)
+        let compact_index = TerminalProfileIndex::new(&document, false, false);
+        let compact = compact_index
             .render(
                 InspectSelection::Semantic(1),
                 InspectSort::InclusiveCpu,
@@ -1228,8 +1242,64 @@ mod tests {
             .expect("compact function tree should render");
         assert!(compact.contains("frame_view: compact"));
         assert!(compact.contains("id=function:1:12"));
+        assert!(compact.contains("id=function:1:20"));
         assert!(!compact.contains("id=function:1:10"));
         assert!(!compact.contains("id=function:1:11"));
+        assert!(!compact.contains("id=function:1:22"));
+        assert_eq!(
+            compact_index.open_function(InspectSelection::Semantic(1), 1, 12),
+            Ok(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 12,
+            })
+        );
+        assert_eq!(
+            compact_index.up(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 12,
+            }),
+            Ok(InspectSelection::Semantic(1))
+        );
+
+        assert_eq!(
+            compact_index.open_function(
+                InspectSelection::Function {
+                    semantic_id: 1,
+                    function_id: 21,
+                },
+                1,
+                23,
+            ),
+            Ok(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 23,
+            })
+        );
+        assert_eq!(
+            compact_index.up(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 23,
+            }),
+            Ok(InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 21,
+            })
+        );
+        let filtered = compact_index
+            .render(
+                InspectSelection::Function {
+                    semantic_id: 1,
+                    function_id: 20,
+                },
+                InspectSort::InclusiveCpu,
+                Some("filtered leaf"),
+                10,
+                3,
+            )
+            .expect("compact filter context should render");
+        assert!(filtered.contains("id=function:1:21"));
+        assert!(filtered.contains("id=function:1:23"));
+        assert!(!filtered.contains("id=function:1:22"));
 
         let all_frames = TerminalProfileIndex::new(&document, false, true)
             .render(
