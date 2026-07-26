@@ -264,8 +264,20 @@ fn last_top_level_path_separator(value: &str) -> Option<usize> {
 
 fn trim_function_generics(value: &str) -> &str {
     value
-        .find('<')
+        .match_indices('<')
+        .map(|(index, _)| index)
+        .find(|index| !is_operator_less_than(value, *index))
         .map_or(value, |generic| value[..generic].trim_end_matches("::"))
+}
+
+fn is_operator_less_than(value: &str, index: usize) -> bool {
+    value[..index]
+        .strip_prefix("operator")
+        .is_some_and(|operator| operator.bytes().all(|byte| byte == b'<'))
+        && value
+            .as_bytes()
+            .get(index + 1)
+            .is_none_or(|next| next.is_ascii_whitespace() || matches!(next, b'<' | b'=' | b'('))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1461,6 +1473,12 @@ mod tests {
                 "pyo3::impl_::trampoline::do_call<Result, Handler>",
                 "trampoline::do_call",
             ),
+            ("std::ostream::operator<<(int)", "ostream::operator<<(int)"),
+            (
+                "std::strong_ordering::operator<=>(int)",
+                "strong_ordering::operator<=>(int)",
+            ),
+            ("delta_funnel::operator<Profile>", "delta_funnel::operator"),
             ("do_call<Result, Handler>", "do_call"),
             ("sqlite3_step", "sqlite3_step"),
             ("<invalid>", "<invalid>"),
