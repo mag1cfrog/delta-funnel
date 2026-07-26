@@ -355,8 +355,12 @@ fn preflight_traceconv() -> Result<(), ProfilerFailure> {
 }
 
 fn preflight_llvm_symbolizer() -> Result<(), ProfilerFailure> {
-    Command::new("llvm-symbolizer")
-        .arg("--version")
+    preflight_llvm_symbolizer_with(OsStr::new("llvm-symbolizer"))
+}
+
+fn preflight_llvm_symbolizer_with(program: &OsStr) -> Result<(), ProfilerFailure> {
+    Command::new(program)
+        .arg("--output-style=JSON")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -373,7 +377,7 @@ fn preflight_llvm_symbolizer() -> Result<(), ProfilerFailure> {
             status.success().then_some(()).ok_or_else(|| {
                 ProfilerFailure::new(
                     "llvm_symbolizer_start_failed",
-                    "llvm-symbolizer preflight failed",
+                    "llvm-symbolizer does not support JSON output required by Perfetto",
                 )
             })
         })
@@ -711,6 +715,25 @@ mod tests {
                 PathBuf::from("/tmp/deleted.so"),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llvm_symbolizer_preflight_requires_json_output() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let script = directory.path().join("llvm-symbolizer");
+        fs::write(&script, "#!/bin/sh\n[ \"${1:-}\" = --version ]\n")?;
+        let mut permissions = fs::metadata(&script)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions)?;
+
+        assert!(Command::new(&script).arg("--version").status()?.success());
+        let error = preflight_llvm_symbolizer_with(script.as_os_str())
+            .expect_err("version output alone must not satisfy Perfetto");
+        assert_eq!(error.kind, "llvm_symbolizer_start_failed");
+
+        fs::write(&script, "#!/bin/sh\n[ \"${1:-}\" = --output-style=JSON ]\n")?;
+        preflight_llvm_symbolizer_with(script.as_os_str()).map_err(profiler_test_error)
     }
 
     #[cfg(unix)]
