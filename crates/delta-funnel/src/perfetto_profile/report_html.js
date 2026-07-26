@@ -171,6 +171,8 @@ const entryKey = entry =>
   entry.kind === "semantic"
     ? semanticKey(entry.value)
     : functionKey(entry.value);
+const entryDisplayName = entry =>
+  entry.kind === "semantic" ? entry.value.name : entry.value.display_name;
 const isVisible = (kind, value) =>
   !isFilterActive() ||
   filterVisible.has(kind === "semantic" ? semanticKey(value) : functionKey(value));
@@ -310,7 +312,7 @@ const nameCell = (
     button.disabled = isFilterActive();
     button.addEventListener("click", () => {
       selectedNode = node;
-      treeStatus.textContent = `Selected: ${node.value.name}`;
+      treeStatus.textContent = `Selected: ${entryDisplayName(node)}`;
       if (expanded.has(key)) expanded.delete(key);
       else expanded.add(key);
       renderRows();
@@ -601,7 +603,7 @@ const renderRows = (focusKey = null, focusPaginationKey = null) => {
           entry.depth + 1,
           rendered.key,
           { kind: "function", value: entry.value },
-          `${entry.value.name} children`
+          `${entry.value.display_name} children`
         );
       }
     }
@@ -648,7 +650,7 @@ const configureRenderedRows = (rows, focusKey, focusPaginationKey) => {
     if (active.kind !== "pagination") {
       selectedNode = { kind: active.kind, value: active.value };
       selectedKey = active.key;
-      treeStatus.textContent = `Selected: ${active.value.name}`;
+      treeStatus.textContent = `Selected: ${entryDisplayName(active)}`;
     }
     rows.forEach((entry, index) => {
       entry.row.setAttribute(
@@ -732,7 +734,7 @@ const updateTreeControls = rows => {
   ) {
     treeStatus.textContent = selectedNode === null
       ? ""
-      : `Selected: ${selectedNode.value.name}`;
+      : `Selected: ${entryDisplayName(selectedNode)}`;
   }
 };
 const childEntries = entry => {

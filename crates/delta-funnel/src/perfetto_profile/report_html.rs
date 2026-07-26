@@ -713,6 +713,11 @@ mod tests {
         nestedFunctionName.title.includes("tokio::runtime::blocking"),
       "compact function name did not preserve the full symbol on hover"
     );
+    nestedFunctionRow.click();
+    check(
+      treeStatus.textContent === "Selected: BlockingTask::poll",
+      "selected function status did not use the compact name"
+    );
     check(
       nestedFunctionRow.getAttribute("aria-level") === "3",
       "nested function hierarchy was incorrect"
