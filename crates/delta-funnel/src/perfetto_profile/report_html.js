@@ -121,13 +121,20 @@ let sortDirection = "descending";
 const semanticSortValue = semantic => {
   if (sortField === "direct") return semantic.direct_sample_count;
   if (sortField === "inclusive") return semantic.inclusive_sample_count;
-  return semantic.duration_ns || 0;
+  return semantic.duration_ns;
 };
 const functionSortValue = fn => {
   if (sortField === "direct") return fn.self_sample_count;
   return fn.inclusive_sample_count;
 };
 const compareSemantic = (left, right) => {
+  if (
+    sortField === "duration" &&
+    (left.duration_ns === null || right.duration_ns === null)
+  ) {
+    return compareValue(left.duration_ns === null, right.duration_ns === null) ||
+      compareValue(left.semantic_id, right.semantic_id);
+  }
   const primary = sortField === "name"
     ? compareText(left.name, right.name)
     : compareValue(semanticSortValue(left), semanticSortValue(right));

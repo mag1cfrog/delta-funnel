@@ -530,10 +530,12 @@ fn push_sorted_siblings<'a>(
 
 fn compare_semantics(left: &RankedSemantic, right: &RankedSemantic, sort: InspectSort) -> Ordering {
     let ordering = match sort {
-        InspectSort::Duration => right
-            .duration_ns
-            .unwrap_or_default()
-            .cmp(&left.duration_ns.unwrap_or_default()),
+        InspectSort::Duration => match (left.duration_ns, right.duration_ns) {
+            (Some(left), Some(right)) => right.cmp(&left),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
         InspectSort::InclusiveCpu => right
             .inclusive_sample_count
             .cmp(&left.inclusive_sample_count),
@@ -1083,6 +1085,34 @@ mod tests {
         assert!(rendered.contains(
             "duration_ns=n/a time_basis=exact:wall_clock operation_wall_percent=n/a complete=false result=null"
         ));
+    }
+
+    #[test]
+    fn sorts_unknown_durations_after_known_zero_durations() {
+        let mut unknown = operation(1, "unknown", None);
+        unknown.result = None;
+        unknown.is_complete = false;
+        let document = document(vec![
+            unknown,
+            operation(2, "positive", Some(10)),
+            operation(3, "zero", Some(0)),
+        ]);
+
+        let rendered = render_terminal_view(
+            &document,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            10,
+            0,
+        )
+        .expect("root view should render");
+
+        let positive = rendered.find("id=semantic:2").expect("positive duration");
+        let zero = rendered.find("id=semantic:3").expect("zero duration");
+        let unknown = rendered.find("id=semantic:1").expect("unknown duration");
+        assert!(positive < zero);
+        assert!(zero < unknown);
     }
 
     #[test]

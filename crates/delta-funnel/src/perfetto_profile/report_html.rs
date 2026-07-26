@@ -469,7 +469,15 @@ mod tests {
         let mut alpha = semantic(3, Some(1), "Alpha phase");
         alpha.end_ns = Some(1_000_000);
         alpha.duration_ns = Some(1_000_000);
-        let mut semantics = vec![operation, zeta, alpha];
+        let mut zero = semantic(7_000, Some(3), "Zero duration");
+        zero.end_ns = Some(0);
+        zero.duration_ns = Some(0);
+        let mut unknown = semantic(7_001, Some(3), "Unknown duration");
+        unknown.end_ns = None;
+        unknown.duration_ns = None;
+        unknown.result = None;
+        unknown.is_complete = false;
+        let mut semantics = vec![operation, zeta, alpha, zero, unknown];
         for group in 0..10 {
             let group_id = 4 + group * 101;
             semantics.push(semantic(group_id, Some(1), format!("Group {group:02}")));
@@ -556,6 +564,8 @@ mod tests {
         functions.push(runtime_wrapper);
         let mut profile_metadata = metadata();
         profile_metadata.capture_complete = false;
+        profile_metadata.semantic_complete = false;
+        profile_metadata.missing_terminal_result_count = 1;
         profile_metadata.buffer_loss_count = 2;
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
@@ -780,6 +790,27 @@ mod tests {
       semanticNames.filter(name => name.endsWith(" phase")).join(",") ===
         "Alpha phase,Zeta phase",
       "name sorting flattened or misordered semantic siblings"
+    );
+    expanded.add("s:3");
+    document.querySelector('[data-sort="duration"]').click();
+    let durationNames = Array.from(
+      operationsBody.querySelectorAll('.semantic-row[aria-level="3"] .name-line'),
+      line => line.querySelector("span:not(.leaf):not(.match-label)").textContent
+    );
+    check(
+      durationNames.join(",") ===
+        "Deep semantic 2000,Zero duration,Unknown duration",
+      "descending duration sort treated an unknown duration as zero"
+    );
+    document.querySelector('[data-sort="duration"]').click();
+    durationNames = Array.from(
+      operationsBody.querySelectorAll('.semantic-row[aria-level="3"] .name-line'),
+      line => line.querySelector("span:not(.leaf):not(.match-label)").textContent
+    );
+    check(
+      durationNames.join(",") ===
+        "Zero duration,Deep semantic 2000,Unknown duration",
+      "ascending duration sort did not keep an unknown duration last"
     );
 
     const deepKeys = [
