@@ -526,10 +526,13 @@ mod tests {
 
     #[test]
     fn parses_and_folds_compact_ranked_records() -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::report_html::render_ranked_profile_html;
+        use super::super::report_terminal::{InspectSelection, InspectSort};
+
         let output = fixture_output(1, 0, true, 0);
         let document = parse_ranked_report_output(output.as_bytes())?;
         assert_eq!(document.metadata.direct_sample_count, 1);
-        assert_eq!(document.semantics.len(), 1);
+        assert_eq!(document.semantics.len(), 2);
         assert_eq!(document.semantics[0].inclusive_sample_count, 1);
         assert_eq!(document.functions.len(), 2);
         assert_eq!(document.functions[0].function_id, 10);
@@ -559,6 +562,28 @@ mod tests {
         assert_eq!(incomplete.semantics[0].end_ns, None);
         assert_eq!(incomplete.semantics[0].duration_ns, None);
         assert_eq!(incomplete.semantics[0].result, None);
+        let completed_child = &incomplete.semantics[1];
+        assert_eq!(completed_child.parent_semantic_id, Some(1));
+        assert!(completed_child.is_complete);
+        assert_eq!(completed_child.end_ns, Some(18));
+        assert_eq!(completed_child.duration_ns, Some(6));
+        assert_eq!(completed_child.result.as_deref(), Some("ok"));
+
+        let terminal = super::super::render_terminal_view(
+            &incomplete,
+            InspectSelection::Root,
+            InspectSort::Duration,
+            None,
+            10,
+            1,
+        )?;
+        assert!(terminal.contains(
+            "id=semantic:2 name=\"Completed child\" kind=\"phase\" duration_ns=6 time_basis=exact:wall_clock operation_wall_percent=n/a complete=true result=\"ok\""
+        ));
+        let html = render_ranked_profile_html(&incomplete)?;
+        assert!(html.contains(r#""name":"Completed child""#));
+        assert!(html.contains(r#""end_ns":18,"duration_ns":6"#));
+        assert!(html.contains(r#""result":"ok","is_complete":true"#));
 
         let unsafe_identity = parse_ranked_report_output(fixture_output(1, 0, false, 1).as_bytes())
             .expect_err("missing ownership identity should fail");
@@ -735,6 +760,42 @@ mod tests {
                     "direct_sample_count": 1,
                     "inclusive_sample_count": 0,
                     "resolved_function_sample_count": 1,
+                    "unresolved_function_sample_count": 0,
+                    "unwind_error_sample_count": 0,
+                    "missing_callstack_sample_count": 0,
+                }
+            }),
+            serde_json::json!({
+                "record_kind": "semantic",
+                "record": {
+                    "semantic_id": 2,
+                    "parent_semantic_id": 1,
+                    "operation_id": 1,
+                    "name": "Completed child",
+                    "semantic_kind": "phase",
+                    "operation_kind": "preview",
+                    "stage_category": null,
+                    "stage_name": null,
+                    "activity": null,
+                    "start_ns": 12,
+                    "end_ns": 18,
+                    "duration_ns": 6,
+                    "time_semantics": "wall_clock",
+                    "result": "ok",
+                    "is_complete": true,
+                    "query_execution_id": null,
+                    "query_scope": null,
+                    "query_owner": null,
+                    "worker_lane_id": null,
+                    "worker_kind": null,
+                    "node_id": null,
+                    "parent_node_id": null,
+                    "operator_partition": null,
+                    "execution_stream_id": null,
+                    "stage_owner_id": null,
+                    "direct_sample_count": 0,
+                    "inclusive_sample_count": 0,
+                    "resolved_function_sample_count": 0,
                     "unresolved_function_sample_count": 0,
                     "unwind_error_sample_count": 0,
                     "missing_callstack_sample_count": 0,
