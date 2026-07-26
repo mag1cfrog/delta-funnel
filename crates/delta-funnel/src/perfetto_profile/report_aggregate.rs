@@ -453,7 +453,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_selection_sql_is_unscoped_or_exact() {
+    fn ranked_sql_scopes_reports_and_preserves_function_symbols() {
         assert_eq!(
             report_selection_sql(None),
             "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT NULL AS capture_scope_id;"
@@ -462,6 +462,8 @@ mod tests {
             report_selection_sql(Some(42)),
             "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT 42 AS capture_scope_id;"
         );
+        assert!(RANKED_PROFILE_BASE_SQL.contains("nullif(frame.name, '')"));
+        assert!(!RANKED_PROFILE_BASE_SQL.contains("substr(frame.name"));
     }
 
     #[test]

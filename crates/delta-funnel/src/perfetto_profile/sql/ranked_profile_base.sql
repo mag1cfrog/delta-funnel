@@ -717,7 +717,7 @@ WITH RECURSIVE
 SELECT
   frame.id AS function_id,
   frame.parent_id AS parent_function_id,
-  coalesce(nullif(substr(frame.name, 1, 512), ''), '[unresolved]') AS name,
+  coalesce(nullif(frame.name, ''), '[unresolved]') AS name,
   module.module_name,
   source.source_file,
   frame.line_number

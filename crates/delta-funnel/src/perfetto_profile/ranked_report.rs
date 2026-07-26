@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 // report memory. Raise it only with production and browser evidence.
 pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
+// ponytail: The production aggregate maximum is 4007 characters. The 4096
+// bound also keeps worst-case JSON escaping below the 64 KiB record limit.
+const MAX_FUNCTION_SYMBOL_CHARS: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -701,8 +704,14 @@ impl RankedProfileDocument {
             }
         }
         for function in &self.functions {
+            require_string_bound(
+                "function",
+                function.function_id,
+                "name",
+                &function.name,
+                MAX_FUNCTION_SYMBOL_CHARS,
+            )?;
             for (field, value) in [
-                ("name", Some(function.name.as_str())),
                 ("module_name", function.module_name.as_deref()),
                 ("source_file", function.source_file.as_deref()),
             ] {
@@ -1301,14 +1310,30 @@ fn require_display_string(
     field: &'static str,
     value: &str,
 ) -> Result<(), RankedProfileValidationError> {
+    require_string_bound(
+        record_kind,
+        record_id,
+        field,
+        value,
+        MAX_DISPLAY_STRING_CHARS,
+    )
+}
+
+fn require_string_bound(
+    record_kind: &'static str,
+    record_id: i64,
+    field: &'static str,
+    value: &str,
+    limit: usize,
+) -> Result<(), RankedProfileValidationError> {
     let char_count = value.chars().count();
-    if char_count > MAX_DISPLAY_STRING_CHARS {
+    if char_count > limit {
         return Err(RankedProfileValidationError::DisplayStringTooLong {
             record_kind,
             record_id,
             field,
             char_count,
-            limit: MAX_DISPLAY_STRING_CHARS,
+            limit,
         });
     }
     Ok(())
@@ -1896,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_aggregate_collections_and_display_strings() {
+    fn bounds_aggregate_collections_display_strings_and_function_symbols() {
         assert!(matches!(
             require_collection_bound("semantic", MAX_RECORDS_PER_COLLECTION + 1),
             Err(RankedProfileValidationError::TooManyRecords {
@@ -1906,21 +1931,34 @@ mod tests {
             }) if count == MAX_RECORDS_PER_COLLECTION + 1
         ));
 
-        let mut invalid = document();
-        invalid.functions[0].name = "x".repeat(MAX_DISPLAY_STRING_CHARS + 1);
+        let mut invalid_display = document();
+        invalid_display.semantics[0].name = "x".repeat(MAX_DISPLAY_STRING_CHARS + 1);
         assert!(matches!(
-            invalid.validate(),
+            invalid_display.validate(),
             Err(RankedProfileValidationError::DisplayStringTooLong {
-                record_kind: "function",
-                record_id: 90,
+                record_kind: "semantic",
+                record_id: 1,
                 field: "name",
                 char_count,
                 limit: MAX_DISPLAY_STRING_CHARS
             }) if char_count == MAX_DISPLAY_STRING_CHARS + 1
         ));
 
+        let mut invalid_symbol = document();
+        invalid_symbol.functions[0].name = "x".repeat(MAX_FUNCTION_SYMBOL_CHARS + 1);
+        assert!(matches!(
+            invalid_symbol.validate(),
+            Err(RankedProfileValidationError::DisplayStringTooLong {
+                record_kind: "function",
+                record_id: 90,
+                field: "name",
+                char_count,
+                limit: MAX_FUNCTION_SYMBOL_CHARS
+            }) if char_count == MAX_FUNCTION_SYMBOL_CHARS + 1
+        ));
+
         let mut valid = document();
-        valid.functions[0].name = "\u{754c}".repeat(MAX_DISPLAY_STRING_CHARS);
+        valid.functions[0].name = "\u{754c}".repeat(MAX_FUNCTION_SYMBOL_CHARS);
         assert_eq!(valid.validate(), Ok(()));
     }
 
