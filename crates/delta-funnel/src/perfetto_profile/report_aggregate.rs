@@ -194,7 +194,6 @@ fn build_document(
 
     let frames = validate_frames(frames)?;
     document.functions = expand_functions(&frames, function_self)?;
-    collapse_zero_self_runtime_wrappers(&mut document.functions)?;
     document
         .functions
         .sort_by_key(|function| (function.semantic_id, function.function_id));
@@ -338,86 +337,6 @@ fn expand_functions(
         }
     }
     Ok(functions.into_values().collect())
-}
-
-fn collapse_zero_self_runtime_wrappers(
-    functions: &mut Vec<RankedFunction>,
-) -> Result<(), RankedReportFailure> {
-    let parents = functions
-        .iter()
-        .map(|function| {
-            (
-                (function.semantic_id, function.function_id),
-                function.parent_function_id,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let wrappers = functions
-        .iter()
-        .filter(|function| function.self_sample_count == 0 && is_runtime_wrapper(&function.name))
-        .map(|function| (function.semantic_id, function.function_id))
-        .collect::<HashSet<_>>();
-    let mut retained_parents = HashMap::with_capacity(wrappers.len());
-
-    for function in functions.iter_mut() {
-        function.parent_function_id = retained_parent(
-            function.semantic_id,
-            function.parent_function_id,
-            &parents,
-            &wrappers,
-            &mut retained_parents,
-        )?;
-    }
-    functions.retain(|function| !wrappers.contains(&(function.semantic_id, function.function_id)));
-    Ok(())
-}
-
-fn retained_parent(
-    semantic_id: i64,
-    mut parent: Option<i64>,
-    parents: &HashMap<(i64, i64), Option<i64>>,
-    wrappers: &HashSet<(i64, i64)>,
-    retained_parents: &mut HashMap<(i64, i64), Option<i64>>,
-) -> Result<Option<i64>, RankedReportFailure> {
-    let mut path = Vec::new();
-    while let Some(parent_id) = parent {
-        let key = (semantic_id, parent_id);
-        if !wrappers.contains(&key) {
-            break;
-        }
-        if let Some(retained) = retained_parents.get(&key) {
-            parent = *retained;
-            break;
-        }
-        path.push(key);
-        parent = *parents.get(&key).ok_or_else(|| {
-            aggregate_failure(
-                "invalid_function_graph",
-                "runtime wrapper parent is missing",
-            )
-        })?;
-    }
-    for key in path {
-        retained_parents.insert(key, parent);
-    }
-    Ok(parent)
-}
-
-fn is_runtime_wrapper(name: &str) -> bool {
-    let name = name.strip_prefix('<').unwrap_or(name);
-    [
-        "tokio::runtime::",
-        "tokio::task::",
-        "tracing::instrument::Instrumented",
-        "std::sys::backtrace::__rust_begin_short_backtrace",
-        "std::sys::pal::unix::thread::Thread::new::thread_start",
-        "std::sys::pal::windows::thread::Thread::new::thread_start",
-        "core::ops::function::FnOnce::call_once",
-    ]
-    .iter()
-    .any(|prefix| name.starts_with(prefix))
-        || (name.starts_with("core::pin::Pin<") || name.starts_with("alloc::sync::Arc<"))
-            && name.ends_with("::poll")
 }
 
 fn fold_functions(functions: &mut [RankedFunction]) -> Result<(), RankedReportFailure> {
@@ -584,70 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn collapses_zero_self_runtime_wrappers_but_keeps_runtime_costs() {
-        let mut functions = vec![
-            function(
-                1,
-                None,
-                "std::sys::pal::unix::thread::Thread::new::thread_start",
-                0,
-            ),
-            function(
-                2,
-                Some(1),
-                "tokio::runtime::scheduler::multi_thread::worker::run",
-                0,
-            ),
-            function(3, Some(2), "deltafunnel::write_batches", 7),
-            function(4, Some(2), "tokio::runtime::scheduler::park", 2),
-        ];
-
-        collapse_zero_self_runtime_wrappers(&mut functions)
-            .expect("valid wrapper chains should collapse");
-        functions.sort_by_key(|function| function.function_id);
-
-        assert_eq!(
-            functions
-                .iter()
-                .map(|function| (
-                    function.function_id,
-                    function.parent_function_id,
-                    function.self_sample_count
-                ))
-                .collect::<Vec<_>>(),
-            vec![(3, None, 7), (4, None, 2)]
-        );
-    }
-
-    #[test]
-    fn collapses_deep_runtime_wrapper_chain_with_path_compression() {
-        const WRAPPER_COUNT: i64 = 20_000;
-        let mut functions = (0..WRAPPER_COUNT)
-            .map(|function_id| {
-                function(
-                    function_id,
-                    (function_id != 0).then_some(function_id - 1),
-                    "tokio::runtime::scheduler::worker::run",
-                    0,
-                )
-            })
-            .collect::<Vec<_>>();
-        functions.push(function(
-            WRAPPER_COUNT,
-            Some(WRAPPER_COUNT - 1),
-            "deltafunnel::write_batches",
-            1,
-        ));
-
-        collapse_zero_self_runtime_wrappers(&mut functions)
-            .expect("a deep valid wrapper chain should collapse");
-
-        assert_eq!(functions.len(), 1);
-        assert_eq!(functions[0].function_id, WRAPPER_COUNT);
-        assert_eq!(functions[0].parent_function_id, None);
-    }
-
-    #[test]
     #[ignore = "requires trace_processor_shell and a real raw trace"]
     fn loads_and_renders_a_real_raw_trace_when_requested() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -785,24 +640,5 @@ mod tests {
                 "official_inclusive_sample_count": inclusive_count,
             }
         })
-    }
-
-    fn function(
-        function_id: i64,
-        parent_function_id: Option<i64>,
-        name: &str,
-        self_sample_count: i64,
-    ) -> RankedFunction {
-        RankedFunction {
-            semantic_id: 1,
-            function_id,
-            parent_function_id,
-            name: name.to_owned(),
-            module_name: None,
-            source_file: None,
-            line_number: None,
-            self_sample_count,
-            inclusive_sample_count: 0,
-        }
     }
 }

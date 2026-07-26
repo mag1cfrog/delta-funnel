@@ -274,6 +274,11 @@ Function rows use compact names such as `BlockingTask::poll`. HTML reports show
 the complete native symbol on hover. Pass `--full-symbols` to `inspect` when
 terminal output needs the complete symbol.
 
+HTML and terminal reports also compact zero-self single-child call chains by
+default. This changes only the view; the complete captured tree remains in the
+report model. Select **Show all native frames** in HTML or pass `--all-frames`
+to `inspect` to restore every frame.
+
 Use interactive mode when an agent or human needs to navigate repeatedly
 without reloading and aggregating the trace:
 
