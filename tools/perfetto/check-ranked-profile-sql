@@ -12,14 +12,15 @@ fi
 
 output=$({
   printf '%s\n' \
+    "CREATE PERFETTO TABLE delta_funnel_capture_health_input AS" \
+    "SELECT NULL AS configured_file_cap_bytes, 0 AS saved_file_bytes;" \
     "CREATE PERFETTO TABLE delta_funnel_report_selection AS" \
-    "SELECT NULL AS capture_scope_id;"
+    "SELECT NULL AS capture_scope_id;" \
+    "CREATE PERFETTO TABLE delta_funnel_capture_health AS"
+  sed -n '1,$p' "$sql_dir/capture_health.sql"
   sed -n '1,$p' "$sql_dir/sample_correlation.sql"
   sed -n '1,$p' "$sql_dir/ranked_profile_base.sql"
   sed -n '1,$p' "$script_dir/ranked-profile.sql"
-  printf '%s\n' \
-    "CREATE PERFETTO TABLE delta_funnel_capture_health AS" \
-    "SELECT 1 AS capture_complete, 1 AS semantic_complete;"
   sed -n '1,$p' "$sql_dir/ranked_report.sql"
   sed -n '1,$p' "$script_dir/ranked-profile-fixture.sql"
 } | "$trace_processor" query --query-file - /dev/null)

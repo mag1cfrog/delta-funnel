@@ -525,9 +525,18 @@ mod tests {
             "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT 42 AS capture_scope_id;"
         );
         assert!(CAPTURE_HEALTH_SQL.contains("selected_operations AS"));
-        assert!(CAPTURE_HEALTH_SQL.contains("selected_operation_tracks(track_id) AS"));
+        assert!(
+            CAPTURE_HEALTH_SQL
+                .contains("selected_operation_tracks(track_id, expected_operation_id) AS")
+        );
         assert!(CAPTURE_HEALTH_SQL.contains("FROM delta_funnel_report_selection"));
         assert!(CAPTURE_HEALTH_SQL.contains("JOIN selected_operation_tracks AS parent"));
+        assert!(CAPTURE_HEALTH_SQL.contains("selected.expected_operation_id"));
+        assert!(
+            CAPTURE_HEALTH_SQL
+                .contains("operation_id IS expected_operation_id AS operation_identity_valid")
+        );
+        assert!(CAPTURE_HEALTH_SQL.contains("(NOT operation_identity_valid)"));
         assert!(
             !CAPTURE_HEALTH_SQL.contains("OR extract_arg(s.arg_set_id, 'debug.operation_id') IN")
         );

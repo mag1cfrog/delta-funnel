@@ -1,7 +1,9 @@
 -- One-row health summary for short and streaming Delta Funnel captures.
 WITH RECURSIVE
 selected_operations AS (
-  SELECT s.track_id AS operation_track_id
+  SELECT
+    s.track_id AS operation_track_id,
+    extract_arg(s.arg_set_id, 'debug.operation_id') AS expected_operation_id
   FROM slice AS s
   WHERE s.category = 'delta_funnel.profile'
     AND s.name IN (
@@ -20,11 +22,11 @@ selected_operations AS (
       )
     )
 ),
-selected_operation_tracks(track_id) AS (
-  SELECT operation_track_id
+selected_operation_tracks(track_id, expected_operation_id) AS (
+  SELECT operation_track_id, expected_operation_id
   FROM selected_operations
   UNION
-  SELECT child.id
+  SELECT child.id, parent.expected_operation_id
   FROM track AS child
   JOIN selected_operation_tracks AS parent
     ON child.parent_id = parent.track_id
@@ -46,23 +48,25 @@ semantic_slices AS (
     extract_arg(s.arg_set_id, 'debug.execution_activity_name')
       AS execution_activity_name,
     extract_arg(s.arg_set_id, 'debug.time_semantics') AS time_semantics,
-    extract_arg(s.arg_set_id, 'debug.result') AS result
+    extract_arg(s.arg_set_id, 'debug.result') AS result,
+    selected.expected_operation_id
   FROM slice AS s
+  LEFT JOIN selected_operation_tracks AS selected
+    ON selected.track_id = s.track_id
   WHERE s.category = 'delta_funnel.profile'
     AND (
       (
         SELECT capture_scope_id
         FROM delta_funnel_report_selection
       ) IS NULL
-      OR s.track_id IN (
-        SELECT track_id
-        FROM selected_operation_tracks
-      )
+      OR selected.track_id IS NOT NULL
     )
 ),
 classified_slices AS (
   SELECT
     *,
+    operation_id IS NOT NULL
+      AND operation_id IS expected_operation_id AS operation_identity_valid,
     CASE
       WHEN execution_activity_name IS NOT NULL THEN 'execution_activity'
       WHEN worker_lane_id IS NOT NULL
@@ -88,27 +92,27 @@ missing_fields AS (
     coalesce(sum(
       CASE semantic_kind
         WHEN 'operation' THEN
-          (operation_id IS NULL) + (time_semantics IS NULL)
+          (NOT operation_identity_valid) + (time_semantics IS NULL)
         WHEN 'phase' THEN
-          (operation_id IS NULL) + (time_semantics IS NULL)
+          (NOT operation_identity_valid) + (time_semantics IS NULL)
         WHEN 'query' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (time_semantics IS NULL)
         WHEN 'query_planning' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (time_semantics IS NULL)
         WHEN 'planning_activity' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (planning_activity_name = '') +
           (activity IS NULL OR activity = '') + (time_semantics IS NULL)
         WHEN 'execution_activity' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
           (execution_activity_name = '') +
           (activity IS NULL OR activity = '') + (time_semantics IS NULL)
         WHEN 'operator' THEN
-          (operation_id IS NULL) + (query_execution_id IS NULL) +
+          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (worker_lane_id IS NULL) +
           (worker_kind IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
