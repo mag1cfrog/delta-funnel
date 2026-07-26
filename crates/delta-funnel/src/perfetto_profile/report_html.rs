@@ -68,6 +68,7 @@ const HTML_PROFILE_PREFIX: &str = r#"</style>
 <p>Self CPU samples were observed directly in one function. Inclusive CPU samples also include sampled callees. Function percentages use direct samples from the owning semantic node as their denominator. Sample counts are statistical observations, not exact function milliseconds.</p>
 <p>Eligible samples are the on-CPU samples considered for attribution. Directly attributed samples have one semantic owner. Ambiguous samples have more than one possible owner. Unattributed samples have no semantic owner. Linux sampling does not measure off-CPU waiting time.</p>
 <p>Native stack coverage separates resolved leaf symbols, unresolved leaf symbols, unwind failures, and missing callstacks. Profiler samples dropped is a trace-wide Perfetto data-loss diagnostic and is not a function cost.</p>
+<p>An incomplete capture preserves only recorded intervals. Missing tail time, exact duration, and terminal state remain unknown. The summary names the retained capture-health findings instead of inferring missing values.</p>
 <p>The default compact frame view hides zero-self parents that have one child with the same inclusive sample count. Use Show all native frames to restore the complete captured call chain.</p>
 <p>Select a row to use the subtree controls. Arrow Up and Arrow Down move between visible rows. Arrow Right expands a row or moves to its first child. Arrow Left collapses a row or moves to its parent. Sibling groups are paged 100 rows at a time. Bulk subtree actions and the visible table are limited to 1000 rows.</p>
 </details>
@@ -200,6 +201,21 @@ mod tests {
         RankedProfileMetadata {
             capture_complete: true,
             semantic_complete: true,
+            finalization_observed: true,
+            incomplete_operation_root_count: 0,
+            truncation_marker_count: 0,
+            missing_identity_field_count: 0,
+            missing_terminal_result_count: 0,
+            crossing_worker_slice_count: 0,
+            crossing_planning_activity_slice_count: 0,
+            crossing_execution_activity_slice_count: 0,
+            invalid_planning_activity_hierarchy_count: 0,
+            invalid_execution_activity_hierarchy_count: 0,
+            perf_sample_without_callsite_count: 0,
+            perf_samples_skipped: 0,
+            buffer_loss_count: 0,
+            data_source_loss_count: 0,
+            flush_failure_count: 0,
             schema_version: 3,
             sample_frequency_hz: 1000,
             sampled_cpu_count: 8,
@@ -326,6 +342,7 @@ mod tests {
         assert!(html.contains(r#"id="operations-empty""#));
         assert!(html.contains(r#"id="profile-filter""#));
         assert!(html.contains("Sampled CPUs"));
+        assert!(html.contains("Capture health"));
         assert!(html.contains("Leaf symbols unresolved"));
         assert!(html.contains("Profiler samples dropped"));
         assert!(html.contains(r#"maxlength="200""#));
@@ -403,6 +420,11 @@ mod tests {
             parent_function_id = function_id;
         }
         let mut profile_metadata = metadata();
+        profile_metadata.capture_complete = false;
+        profile_metadata.semantic_complete = false;
+        profile_metadata.incomplete_operation_root_count = 1;
+        profile_metadata.missing_terminal_result_count = 4;
+        profile_metadata.perf_sample_without_callsite_count = 3;
         profile_metadata.eligible_sample_count = 2;
         profile_metadata.ambiguous_sample_count = 1;
         profile_metadata.unattributed_sample_count = 1;
@@ -417,6 +439,12 @@ mod tests {
         let decoded: serde_json::Value = serde_json::from_str(embedded_json(&html)?)?;
         assert_eq!(decoded["semantics"].as_array().map(Vec::len), Some(386));
         assert_eq!(decoded["functions"].as_array().map(Vec::len), Some(5_129));
+        assert_eq!(decoded["metadata"]["capture_complete"], false);
+        assert_eq!(decoded["metadata"]["semantic_complete"], false);
+        assert_eq!(decoded["metadata"]["incomplete_operation_root_count"], 1);
+        assert_eq!(decoded["metadata"]["missing_identity_field_count"], 0);
+        assert_eq!(decoded["metadata"]["missing_terminal_result_count"], 4);
+        assert_eq!(decoded["metadata"]["perf_sample_without_callsite_count"], 3);
         assert_eq!(decoded["functions"][0]["name"], "root function");
         assert_eq!(
             decoded["functions"][1]["name"].as_str().map(str::len),
@@ -527,6 +555,8 @@ mod tests {
         runtime_wrapper.inclusive_sample_count = 1;
         functions.push(runtime_wrapper);
         let mut profile_metadata = metadata();
+        profile_metadata.capture_complete = false;
+        profile_metadata.buffer_loss_count = 2;
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
         profile_metadata.resolved_function_sample_count = 1;
@@ -550,6 +580,11 @@ mod tests {
     if (!condition) throw new Error(message);
   };
   try {
+    check(
+      summary.textContent.includes("CaptureIncomplete") &&
+        summary.textContent.includes("2 buffer losses"),
+      "incomplete capture health was not summarized"
+    );
     check(operationsBody.rows.length === 1, "initial render was not lazy");
     const rootRow = operationsBody.rows[0];
     check(rootRow.getAttribute("aria-selected") === "true", "root was not selected");

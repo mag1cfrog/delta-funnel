@@ -37,6 +37,21 @@ enum CompactRecord {
 struct CompactMetadata {
     capture_complete: bool,
     semantic_complete: bool,
+    finalization_observed: bool,
+    incomplete_operation_root_count: i64,
+    truncation_marker_count: i64,
+    missing_identity_field_count: i64,
+    missing_terminal_result_count: i64,
+    crossing_worker_slice_count: i64,
+    crossing_planning_activity_slice_count: i64,
+    crossing_execution_activity_slice_count: i64,
+    invalid_planning_activity_hierarchy_count: i64,
+    invalid_execution_activity_hierarchy_count: i64,
+    perf_sample_without_callsite_count: i64,
+    perf_samples_skipped: i64,
+    buffer_loss_count: i64,
+    data_source_loss_count: i64,
+    flush_failure_count: i64,
     schema_version: u32,
     sample_frequency_hz: u32,
     sampled_cpu_count: u32,
@@ -165,11 +180,50 @@ fn build_document(
             "Trace Processor aggregate audit failed",
         ));
     }
+    if metadata.missing_identity_field_count > 0 {
+        return Err(aggregate_failure(
+            "unsafe_identity",
+            "ranked profile ownership identity is incomplete",
+        ));
+    }
+    if [
+        metadata.crossing_worker_slice_count,
+        metadata.crossing_planning_activity_slice_count,
+        metadata.crossing_execution_activity_slice_count,
+        metadata.invalid_planning_activity_hierarchy_count,
+        metadata.invalid_execution_activity_hierarchy_count,
+    ]
+    .into_iter()
+    .any(|count| count > 0)
+    {
+        return Err(aggregate_failure(
+            "invalid_hierarchy",
+            "ranked profile semantic hierarchy is invalid",
+        ));
+    }
     semantics.sort_by_key(|semantic| (semantic.operation_id, semantic.semantic_id));
     let mut document = RankedProfileDocument {
         metadata: RankedProfileMetadata {
             capture_complete: metadata.capture_complete,
             semantic_complete: metadata.semantic_complete,
+            finalization_observed: metadata.finalization_observed,
+            incomplete_operation_root_count: metadata.incomplete_operation_root_count,
+            truncation_marker_count: metadata.truncation_marker_count,
+            missing_identity_field_count: metadata.missing_identity_field_count,
+            missing_terminal_result_count: metadata.missing_terminal_result_count,
+            crossing_worker_slice_count: metadata.crossing_worker_slice_count,
+            crossing_planning_activity_slice_count: metadata.crossing_planning_activity_slice_count,
+            crossing_execution_activity_slice_count: metadata
+                .crossing_execution_activity_slice_count,
+            invalid_planning_activity_hierarchy_count: metadata
+                .invalid_planning_activity_hierarchy_count,
+            invalid_execution_activity_hierarchy_count: metadata
+                .invalid_execution_activity_hierarchy_count,
+            perf_sample_without_callsite_count: metadata.perf_sample_without_callsite_count,
+            perf_samples_skipped: metadata.perf_samples_skipped,
+            buffer_loss_count: metadata.buffer_loss_count,
+            data_source_loss_count: metadata.data_source_loss_count,
+            flush_failure_count: metadata.flush_failure_count,
             schema_version: metadata.schema_version,
             sample_frequency_hz: metadata.sample_frequency_hz,
             sampled_cpu_count: metadata.sampled_cpu_count,
@@ -469,7 +523,7 @@ mod tests {
 
     #[test]
     fn parses_and_folds_compact_ranked_records() -> Result<(), Box<dyn std::error::Error>> {
-        let output = fixture_output(1, 0, true);
+        let output = fixture_output(1, 0, true, 0);
         let document = parse_ranked_report_output(output.as_bytes())?;
         assert_eq!(document.metadata.direct_sample_count, 1);
         assert_eq!(document.semantics.len(), 1);
@@ -481,7 +535,7 @@ mod tests {
         assert_eq!(document.functions[1].function_id, 11);
         assert_eq!(document.functions[1].self_sample_count, 1);
 
-        let mismatch = parse_ranked_report_output(fixture_output(2, 0, true).as_bytes())
+        let mismatch = parse_ranked_report_output(fixture_output(2, 0, true, 0).as_bytes())
             .expect_err("mismatched official count should fail");
         assert_eq!(
             mismatch.phase(),
@@ -489,17 +543,23 @@ mod tests {
         );
         assert_eq!(mismatch.kind(), "official_count_mismatch");
 
-        let audit = parse_ranked_report_output(fixture_output(1, 1, true).as_bytes())
+        let audit = parse_ranked_report_output(fixture_output(1, 1, true, 0).as_bytes())
             .expect_err("failed query audit should fail");
         assert_eq!(audit.kind(), "audit_failed");
 
-        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false).as_bytes())?;
+        let incomplete = parse_ranked_report_output(fixture_output(1, 0, false, 0).as_bytes())?;
         assert!(!incomplete.metadata.capture_complete);
         assert!(!incomplete.metadata.semantic_complete);
+        assert!(incomplete.metadata.finalization_observed);
+        assert_eq!(incomplete.metadata.incomplete_operation_root_count, 1);
         assert!(!incomplete.semantics[0].is_complete);
         assert_eq!(incomplete.semantics[0].end_ns, None);
         assert_eq!(incomplete.semantics[0].duration_ns, None);
         assert_eq!(incomplete.semantics[0].result, None);
+
+        let unsafe_identity = parse_ranked_report_output(fixture_output(1, 0, false, 1).as_bytes())
+            .expect_err("missing ownership identity should fail");
+        assert_eq!(unsafe_identity.kind(), "unsafe_identity");
 
         let malformed = parse_ranked_report_output(b"\"record_hex\"\n\"xyz\"\n")
             .expect_err("invalid hex should fail");
@@ -544,6 +604,7 @@ mod tests {
         official_root_count: i64,
         audit_error_count: i64,
         capture_complete: bool,
+        missing_identity_field_count: i64,
     ) -> String {
         let records = [
             serde_json::json!({
@@ -551,6 +612,21 @@ mod tests {
                 "record": {
                     "capture_complete": capture_complete,
                     "semantic_complete": capture_complete,
+                    "finalization_observed": true,
+                    "incomplete_operation_root_count": if capture_complete { 0 } else { 1 },
+                    "truncation_marker_count": 0,
+                    "missing_identity_field_count": missing_identity_field_count,
+                    "missing_terminal_result_count": if capture_complete { 0 } else { 1 },
+                    "crossing_worker_slice_count": 0,
+                    "crossing_planning_activity_slice_count": 0,
+                    "crossing_execution_activity_slice_count": 0,
+                    "invalid_planning_activity_hierarchy_count": 0,
+                    "invalid_execution_activity_hierarchy_count": 0,
+                    "perf_sample_without_callsite_count": 0,
+                    "perf_samples_skipped": 0,
+                    "buffer_loss_count": 0,
+                    "data_source_loss_count": 0,
+                    "flush_failure_count": 0,
                     "schema_version": 3,
                     "sample_frequency_hz": 1000,
                     "sampled_cpu_count": 1,

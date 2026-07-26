@@ -36,6 +36,72 @@ const formatFunctionCoverage = value =>
 const capturedFunctionSamples = coverage =>
   coverage.resolved_function_sample_count +
     coverage.unresolved_function_sample_count;
+const captureHealthFindings = [
+  [
+    profile.metadata.incomplete_operation_root_count,
+    "incomplete operation root",
+    "incomplete operation roots"
+  ],
+  [profile.metadata.truncation_marker_count, "truncation marker", "truncation markers"],
+  [
+    profile.metadata.missing_identity_field_count,
+    "missing identity field",
+    "missing identity fields"
+  ],
+  [
+    profile.metadata.missing_terminal_result_count,
+    "missing terminal result",
+    "missing terminal results"
+  ],
+  [
+    profile.metadata.crossing_worker_slice_count,
+    "crossing worker slice",
+    "crossing worker slices"
+  ],
+  [
+    profile.metadata.crossing_planning_activity_slice_count,
+    "crossing planning activity",
+    "crossing planning activities"
+  ],
+  [
+    profile.metadata.crossing_execution_activity_slice_count,
+    "crossing execution activity",
+    "crossing execution activities"
+  ],
+  [
+    profile.metadata.invalid_planning_activity_hierarchy_count,
+    "invalid planning hierarchy",
+    "invalid planning hierarchies"
+  ],
+  [
+    profile.metadata.invalid_execution_activity_hierarchy_count,
+    "invalid execution hierarchy",
+    "invalid execution hierarchies"
+  ],
+  [profile.metadata.buffer_loss_count, "buffer loss", "buffer losses"],
+  [profile.metadata.data_source_loss_count, "data-source loss", "data-source losses"],
+  [profile.metadata.flush_failure_count, "flush failure", "flush failures"],
+  [
+    profile.metadata.trace_profiler_dropped_sample_count,
+    "profiler sample dropped",
+    "profiler samples dropped"
+  ]
+]
+  .filter(([count]) => count > 0)
+  .map(([count, singular, plural]) => `${count} ${count === 1 ? singular : plural}`);
+const samplingHealthFindings = [
+  [
+    profile.metadata.perf_sample_without_callsite_count,
+    "perf sample without a callsite",
+    "perf samples without callsites"
+  ],
+  [profile.metadata.perf_samples_skipped, "perf sample skipped", "perf samples skipped"]
+]
+  .filter(([count]) => count > 0)
+  .map(([count, singular, plural]) => `${count} ${count === 1 ? singular : plural}`);
+if (!profile.metadata.finalization_observed) {
+  captureHealthFindings.push("finalization not observed");
+}
 const compareValue = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 const compareText = (left, right) => {
   let leftIndex = 0;
@@ -974,6 +1040,29 @@ collapseSubtree.addEventListener("click", () => {
     `Collapsed ${collapsedCount} expanded rows in the selected subtree.`;
   renderRows(entryKey(selectedNode));
 });
+if (
+  !profile.metadata.capture_complete ||
+  !profile.metadata.semantic_complete ||
+  captureHealthFindings.length > 0
+) {
+  addSummary(
+    "Capture",
+    profile.metadata.capture_complete ? "Complete" : "Incomplete"
+  );
+  addSummary(
+    "Semantic data",
+    profile.metadata.semantic_complete ? "Complete" : "Incomplete"
+  );
+  addSummary(
+    "Capture health",
+    captureHealthFindings.length === 0
+      ? "No loss counters reported"
+      : captureHealthFindings.join(", ")
+  );
+}
+if (samplingHealthFindings.length > 0) {
+  addSummary("Sampling health", samplingHealthFindings.join(", "));
+}
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);
 addSummary("Sampled CPUs", profile.metadata.sampled_cpu_count);
 addSummary("Eligible CPU samples", profile.metadata.eligible_sample_count);

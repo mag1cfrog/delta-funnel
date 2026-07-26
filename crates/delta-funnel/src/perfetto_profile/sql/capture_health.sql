@@ -49,36 +49,48 @@ missing_fields AS (
     coalesce(sum(
       CASE semantic_kind
         WHEN 'operation' THEN
-          (operation_id IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          (operation_id IS NULL) + (time_semantics IS NULL)
         WHEN 'phase' THEN
-          (operation_id IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          (operation_id IS NULL) + (time_semantics IS NULL)
         WHEN 'query' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (time_semantics IS NULL)
         WHEN 'query_planning' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
-          (query_scope IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          (query_scope IS NULL) + (time_semantics IS NULL)
         WHEN 'planning_activity' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (planning_activity_name = '') +
-          (activity IS NULL OR activity = '') + (time_semantics IS NULL) +
-          (result IS NULL)
+          (activity IS NULL OR activity = '') + (time_semantics IS NULL)
         WHEN 'execution_activity' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
           (execution_activity_name = '') +
-          (activity IS NULL OR activity = '') + (time_semantics IS NULL) +
-          (result IS NULL)
+          (activity IS NULL OR activity = '') + (time_semantics IS NULL)
         WHEN 'operator' THEN
           (operation_id IS NULL) + (query_execution_id IS NULL) +
           (query_scope IS NULL) + (worker_lane_id IS NULL) +
           (worker_kind IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
-          (activity IS NULL) + (time_semantics IS NULL) + (result IS NULL)
+          (activity IS NULL) + (time_semantics IS NULL)
         ELSE 0
       END
-    ), 0) AS missing_canonical_field_count
+    ), 0) AS missing_identity_field_count,
+    coalesce(sum(
+      CASE
+        WHEN semantic_kind IN (
+          'operation',
+          'phase',
+          'query_planning',
+          'planning_activity',
+          'execution_activity',
+          'operator'
+        )
+        THEN result IS NULL
+        ELSE 0
+      END
+    ), 0) AS missing_terminal_result_count
   FROM classified_slices
 ),
 ordered_slices AS (
@@ -271,7 +283,9 @@ health_values AS (
   SELECT
     operation_root_count > 0
       AND incomplete_operation_root_count = 0
-      AND missing_canonical_field_count = 0
+      AND truncation_marker_count = 0
+      AND missing_identity_field_count = 0
+      AND missing_terminal_result_count = 0
       AND crossing_worker_slice_count = 0
       AND crossing_planning_activity_slice_count = 0
       AND crossing_execution_activity_slice_count = 0
@@ -287,7 +301,8 @@ health_values AS (
     planning_activity_slice_count,
     execution_activity_slice_count,
     truncation_marker_count,
-    missing_canonical_field_count,
+    missing_identity_field_count,
+    missing_terminal_result_count,
     crossing_worker_slice_count,
     crossing_planning_activity_slice_count,
     crossing_execution_activity_slice_count,
@@ -314,6 +329,8 @@ SELECT
   semantic_complete
     AND finalization_observed
     AND flush_failure_count = 0
+    AND buffer_loss_count = 0
+    AND data_source_loss_count = 0
     AS capture_complete,
   semantic_complete,
   operation_root_count,
@@ -322,7 +339,8 @@ SELECT
   planning_activity_slice_count,
   execution_activity_slice_count,
   truncation_marker_count,
-  missing_canonical_field_count,
+  missing_identity_field_count,
+  missing_terminal_result_count,
   crossing_worker_slice_count,
   crossing_planning_activity_slice_count,
   crossing_execution_activity_slice_count,

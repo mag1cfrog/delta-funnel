@@ -25,13 +25,40 @@ WITH
         'record_kind', 'metadata',
         'record', json_object(
         'capture_complete', json(CASE
-          WHEN health.capture_complete THEN 'true'
+          WHEN health.capture_complete
+            AND profiler_loss.trace_profiler_dropped_sample_count = 0
+          THEN 'true'
           ELSE 'false'
         END),
         'semantic_complete', json(CASE
           WHEN health.semantic_complete THEN 'true'
           ELSE 'false'
         END),
+        'finalization_observed', json(CASE
+          WHEN health.finalization_observed THEN 'true'
+          ELSE 'false'
+        END),
+        'incomplete_operation_root_count',
+          health.incomplete_operation_root_count,
+        'truncation_marker_count', health.truncation_marker_count,
+        'missing_identity_field_count', health.missing_identity_field_count,
+        'missing_terminal_result_count',
+          health.missing_terminal_result_count,
+        'crossing_worker_slice_count', health.crossing_worker_slice_count,
+        'crossing_planning_activity_slice_count',
+          health.crossing_planning_activity_slice_count,
+        'crossing_execution_activity_slice_count',
+          health.crossing_execution_activity_slice_count,
+        'invalid_planning_activity_hierarchy_count',
+          health.invalid_planning_activity_hierarchy_count,
+        'invalid_execution_activity_hierarchy_count',
+          health.invalid_execution_activity_hierarchy_count,
+        'perf_sample_without_callsite_count',
+          health.perf_sample_without_callsite_count,
+        'perf_samples_skipped', health.perf_samples_skipped,
+        'buffer_loss_count', health.buffer_loss_count,
+        'data_source_loss_count', health.data_source_loss_count,
+        'flush_failure_count', health.flush_failure_count,
         'schema_version', 3,
         'sample_frequency_hz', sample_config.sample_frequency_hz,
         'sampled_cpu_count', sample_config.sampled_cpu_count,
