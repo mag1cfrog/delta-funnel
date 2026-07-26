@@ -476,6 +476,73 @@ mod tests {
     }
 
     #[test]
+    fn browser_distinguishes_same_name_operation_roots() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(browser) = std::env::var_os("CHROME_BIN").filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+
+        let mut first = semantic(1, None, "Concurrent preview");
+        first.end_ns = Some(2_000_000);
+        first.duration_ns = Some(2_000_000);
+        let mut second = semantic(2, None, "Concurrent preview");
+        second.operation_id = 2;
+        let document = RankedProfileDocument {
+            metadata: metadata(),
+            semantics: vec![first, second],
+            functions: vec![],
+        };
+        document.validate()?;
+
+        let rendered = render_ranked_profile_html(&document)?;
+        let mut html = rendered
+            .strip_suffix(HTML_SUFFIX)
+            .ok_or("report suffix is missing")?
+            .to_owned();
+        html.push_str(
+            r#"</script>
+<script>
+(() => {
+  const rows = Array.from(
+    operationsBody.querySelectorAll('.semantic-row[aria-level="1"]')
+  );
+  const labels = rows.map(row =>
+    row.querySelector(".name-label").textContent
+  );
+  if (
+    labels.join("|") !==
+      "Concurrent preview (operation 1)|Concurrent preview (operation 2)"
+  ) {
+    throw new Error("same-name operation rows were not distinguishable");
+  }
+  if (treeStatus.textContent !== "Selected: Concurrent preview (operation 1)") {
+    throw new Error("initial operation selection was not distinguishable");
+  }
+  rows[1].click();
+  if (treeStatus.textContent !== "Selected: Concurrent preview (operation 2)") {
+    throw new Error("updated operation selection was not distinguishable");
+  }
+  document.body.setAttribute("data-concurrent-identities", "passed");
+})();
+</script>
+</body>
+</html>
+"#,
+        );
+
+        let output = dump_browser_dom(&browser, &html)?;
+        assert!(
+            output.status.success(),
+            "concurrent-operation browser check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8(output.stdout)?.contains(r#"data-concurrent-identities="passed""#),
+            "concurrent-operation browser assertions did not complete"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exercises_the_viewer_in_a_configured_browser() -> Result<(), Box<dyn std::error::Error>> {
         let Some(browser) = std::env::var_os("CHROME_BIN").filter(|value| !value.is_empty()) else {
             return Ok(());
