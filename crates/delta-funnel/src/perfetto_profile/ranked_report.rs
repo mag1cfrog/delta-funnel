@@ -8,9 +8,6 @@ use serde::{Deserialize, Serialize};
 // report memory. Raise it only with production and browser evidence.
 pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
-// ponytail: The production aggregate maximum is 4007 characters. The 4096
-// bound also keeps worst-case JSON escaping below the 64 KiB record limit.
-const MAX_FUNCTION_SYMBOL_CHARS: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -711,13 +708,6 @@ impl RankedProfileDocument {
             }
         }
         for function in &self.functions {
-            require_string_bound(
-                "function",
-                function.function_id,
-                "name",
-                &function.name,
-                MAX_FUNCTION_SYMBOL_CHARS,
-            )?;
             for (field, value) in [
                 ("module_name", function.module_name.as_deref()),
                 ("source_file", function.source_file.as_deref()),
@@ -1929,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_aggregate_collections_display_strings_and_function_symbols() {
+    fn bounds_aggregate_collections_and_display_strings_without_truncating_symbols() {
         assert!(matches!(
             require_collection_bound("semantic", MAX_RECORDS_PER_COLLECTION + 1),
             Err(RankedProfileValidationError::TooManyRecords {
@@ -1952,21 +1942,8 @@ mod tests {
             }) if char_count == MAX_DISPLAY_STRING_CHARS + 1
         ));
 
-        let mut invalid_symbol = document();
-        invalid_symbol.functions[0].name = "x".repeat(MAX_FUNCTION_SYMBOL_CHARS + 1);
-        assert!(matches!(
-            invalid_symbol.validate(),
-            Err(RankedProfileValidationError::DisplayStringTooLong {
-                record_kind: "function",
-                record_id: 90,
-                field: "name",
-                char_count,
-                limit: MAX_FUNCTION_SYMBOL_CHARS
-            }) if char_count == MAX_FUNCTION_SYMBOL_CHARS + 1
-        ));
-
         let mut valid = document();
-        valid.functions[0].name = "\u{754c}".repeat(MAX_FUNCTION_SYMBOL_CHARS);
+        valid.functions[0].name = "x".repeat(6_537);
         assert_eq!(valid.validate(), Ok(()));
     }
 
