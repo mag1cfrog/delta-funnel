@@ -355,8 +355,12 @@ fn preflight_traceconv() -> Result<(), ProfilerFailure> {
 }
 
 fn preflight_llvm_symbolizer() -> Result<(), ProfilerFailure> {
-    Command::new("llvm-symbolizer")
-        .arg("--version")
+    preflight_llvm_symbolizer_with(OsStr::new("llvm-symbolizer"))
+}
+
+fn preflight_llvm_symbolizer_with(program: &OsStr) -> Result<(), ProfilerFailure> {
+    Command::new(program)
+        .arg("--output-style=JSON")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -373,7 +377,7 @@ fn preflight_llvm_symbolizer() -> Result<(), ProfilerFailure> {
             status.success().then_some(()).ok_or_else(|| {
                 ProfilerFailure::new(
                     "llvm_symbolizer_start_failed",
-                    "llvm-symbolizer preflight failed",
+                    "llvm-symbolizer does not support JSON output required by Perfetto",
                 )
             })
         })
@@ -466,18 +470,11 @@ fn symbol_search_path(binary_directory: &Path) -> Result<OsString, ProfilerFailu
     if system_debug.is_dir() {
         paths.push(system_debug);
     }
-    let debuginfod_cache = env::var_os("DEBUGINFOD_CACHE_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join("debuginfod_client"))
-        })
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|path| path.join(".cache/debuginfod_client"))
-        });
+    let debuginfod_cache = debuginfod_cache_path(
+        env::var_os("DEBUGINFOD_CACHE_PATH").map(PathBuf::from),
+        env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+    );
     if let Some(cache) = debuginfod_cache.filter(|path| path.is_dir()) {
         paths.push(cache);
     }
@@ -487,6 +484,21 @@ fn symbol_search_path(binary_directory: &Path) -> Result<OsString, ProfilerFailu
             "symbol search paths could not be configured",
         )
     })
+}
+
+fn debuginfod_cache_path(
+    explicit: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    explicit
+        .or_else(|| {
+            home.as_ref()
+                .map(|path| path.join(".debuginfod_client_cache"))
+                .filter(|path| path.is_dir())
+        })
+        .or_else(|| xdg_cache_home.map(|path| path.join("debuginfod_client")))
+        .or_else(|| home.map(|path| path.join(".cache/debuginfod_client")))
 }
 
 fn mapped_file_paths(maps: &str) -> impl Iterator<Item = PathBuf> + '_ {
@@ -711,6 +723,68 @@ mod tests {
                 PathBuf::from("/tmp/deleted.so"),
             ]
         );
+    }
+
+    #[test]
+    fn debuginfod_cache_path_matches_elfutils_precedence() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let home = temporary.path().join("home");
+        let xdg_cache_home = temporary.path().join("xdg");
+        let explicit = temporary.path().join("explicit");
+        let legacy = home.join(".debuginfod_client_cache");
+        fs::create_dir_all(&legacy).expect("legacy cache should be created");
+
+        assert_eq!(
+            debuginfod_cache_path(
+                Some(explicit.clone()),
+                Some(xdg_cache_home.clone()),
+                Some(home.clone()),
+            ),
+            Some(explicit),
+        );
+        assert_eq!(
+            debuginfod_cache_path(None, Some(xdg_cache_home.clone()), Some(home.clone())),
+            Some(legacy.clone()),
+        );
+
+        fs::remove_dir(&legacy).expect("legacy cache should be removed");
+        assert_eq!(
+            debuginfod_cache_path(None, Some(xdg_cache_home.clone()), Some(home.clone())),
+            Some(xdg_cache_home.join("debuginfod_client")),
+        );
+        assert_eq!(
+            debuginfod_cache_path(None, None, Some(home.clone())),
+            Some(home.join(".cache/debuginfod_client")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn llvm_symbolizer_preflight_requires_json_output() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let version_only = directory.path().join("version-only-symbolizer");
+        fs::write(&version_only, "#!/bin/sh\n[ \"${1:-}\" = --version ]\n")?;
+        let mut permissions = fs::metadata(&version_only)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&version_only, permissions.clone())?;
+
+        assert!(
+            Command::new(&version_only)
+                .arg("--version")
+                .status()?
+                .success()
+        );
+        let error = preflight_llvm_symbolizer_with(version_only.as_os_str())
+            .expect_err("version output alone must not satisfy Perfetto");
+        assert_eq!(error.kind, "llvm_symbolizer_start_failed");
+
+        let json_capable = directory.path().join("json-capable-symbolizer");
+        fs::write(
+            &json_capable,
+            "#!/bin/sh\n[ \"${1:-}\" = --output-style=JSON ]\n",
+        )?;
+        fs::set_permissions(&json_capable, permissions)?;
+        preflight_llvm_symbolizer_with(json_capable.as_os_str()).map_err(profiler_test_error)
     }
 
     #[cfg(unix)]
