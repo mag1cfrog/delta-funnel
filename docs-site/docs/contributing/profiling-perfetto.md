@@ -143,10 +143,10 @@ Python runtime used by the workload. Delta Funnel searches the cache and
 `/usr/lib/debug` automatically when `traceconv` symbolizes a 1000 Hz operation
 profile.
 
-Some standalone Python distributions include unstripped symbols but no Build
-ID. They do not need a separate debuginfo download. A stripped Python runtime
-without a Build ID cannot be resolved through debuginfod; use the
-distribution's Python or another diagnostics-capable Python build.
+Perfetto's offline symbol lookup requires a Build ID even when the Python
+runtime contains unstripped symbols. If the runtime has no Build ID, use the
+distribution's Python or another diagnostics-capable Python build before
+recording a 1000 Hz profile.
 
 On another distribution, use its official or organization-provided
 `DEBUGINFOD_URLS`. If no debuginfod service is available, install matching
