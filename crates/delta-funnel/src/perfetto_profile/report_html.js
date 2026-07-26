@@ -246,8 +246,14 @@ const entryKey = entry =>
   entry.kind === "semantic"
     ? semanticKey(entry.value)
     : functionKey(entry.value);
+const semanticDisplayName = semantic =>
+  semantic.semantic_kind === "operation"
+    ? `${semantic.name} (operation ${semantic.operation_id})`
+    : semantic.name;
 const entryDisplayName = entry =>
-  entry.kind === "semantic" ? entry.value.name : entry.value.display_name;
+  entry.kind === "semantic"
+    ? semanticDisplayName(entry.value)
+    : entry.value.display_name;
 const isVisible = (kind, value) =>
   !isFilterActive() ||
   filterVisible.has(kind === "semantic" ? semanticKey(value) : functionKey(value));
@@ -487,7 +493,7 @@ const semanticRow = (semantic, depth) => {
   if (hasChildren) row.setAttribute("aria-expanded", String(isExpanded));
   row.append(
     nameCell(
-      semantic.name,
+      semanticDisplayName(semantic),
       `Exact semantic: ${semantic.operation_kind || semantic.semantic_kind}`,
       depth,
       key,
