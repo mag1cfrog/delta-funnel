@@ -91,12 +91,14 @@ outcomes:
 - `Native stacks missing` means no usable callstack remained for the sample.
 
 `Native stacks captured` is the sum of resolved and unresolved leaf symbols.
-If unresolved coverage is high on Fedora, fetch matching debuginfo using the
-setup guide and run the operation profile again.
+If unresolved coverage is high, fetch matching debuginfo for the host using
+the setup guide and run the operation profile again.
 
-To keep that call tree useful, the ranked report omits known runtime wrapper
-frames with no self CPU samples and connects their children to the nearest
-meaningful parent. Runtime frames that consume sampled CPU remain visible.
+HTML and terminal reports compact zero-self single-child call chains by
+default when the child carries the parent's complete inclusive sample count.
+This changes only the view; the complete captured tree remains in the report
+model. Select **Show all native frames** in HTML or pass `--all-frames` to
+`inspect` to restore every frame.
 `ProfilerConfig` keeps only the requested HTML report after deleting its
 temporary capture. When you generate a report from your own `.pftrace` file,
 that input remains unchanged and retains the complete native call stack.
