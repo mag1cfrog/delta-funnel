@@ -195,14 +195,14 @@ fn compact_function_name(symbol: &str) -> String {
         })
         .map_or(symbol, |(symbol, _)| symbol);
     let Some(method_separator) = last_top_level_path_separator(symbol) else {
-        let display_name = trim_function_generics(symbol);
+        let display_name = trim_function_details(symbol);
         return if display_name.is_empty() {
             symbol.to_owned()
         } else {
             display_name.to_owned()
         };
     };
-    let method = trim_function_generics(&symbol[method_separator + 2..]);
+    let method = trim_function_details(&symbol[method_separator + 2..]);
     let owner = function_owner(&symbol[..method_separator]);
     if owner.is_empty() || method.is_empty() {
         symbol.to_owned()
@@ -296,15 +296,22 @@ fn last_top_level_path_separator(value: &str) -> Option<usize> {
     last
 }
 
-fn trim_function_generics(value: &str) -> &str {
+fn trim_function_details(value: &str) -> &str {
     let mut nesting = SymbolNesting::default();
     for (index, byte) in value.bytes().enumerate() {
         if byte == b'<' && nesting.is_outside_groups() && !is_operator_less_than(value, index) {
             return value[..index].trim_end_matches("::");
         }
+        if byte == b'(' && nesting.is_top_level() && !is_call_operator(value, index) {
+            return value[..index].trim_end();
+        }
         nesting.advance(value, index);
     }
     value
+}
+
+fn is_call_operator(value: &str, index: usize) -> bool {
+    &value[..index] == "operator" && value.as_bytes().get(index + 1) == Some(&b')')
 }
 
 fn is_operator_less_than(value: &str, index: usize) -> bool {
@@ -1539,15 +1546,16 @@ mod tests {
                 "pyo3::impl_::trampoline::do_call<Result, Handler>",
                 "trampoline::do_call",
             ),
-            ("std::ostream::operator<<(int)", "ostream::operator<<(int)"),
+            ("std::ostream::operator<<(int)", "ostream::operator<<"),
             (
                 "std::strong_ordering::operator<=>(int)",
-                "strong_ordering::operator<=>(int)",
+                "strong_ordering::operator<=>",
             ),
             (
                 "perfetto::ipc::ClientImpl::BeginInvoke(unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, bool)",
-                "ClientImpl::BeginInvoke(unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, bool)",
+                "ClientImpl::BeginInvoke",
             ),
+            ("functor::Callable::operator()(int)", "Callable::operator()"),
             (
                 "std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> core::result::Result<(), alloc::boxed::Box<dyn core::error::Error>>, core::result::Result<(), alloc::boxed::Box<dyn core::error::Error>>>",
                 "backtrace::__rust_begin_short_backtrace",
