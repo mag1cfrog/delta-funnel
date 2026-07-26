@@ -99,6 +99,8 @@ const samplingHealthFindings = [
 ]
   .filter(([count]) => count > 0)
   .map(([count, singular, plural]) => `${count} ${count === 1 ? singular : plural}`);
+const profileIncomplete =
+  !profile.metadata.capture_complete || !profile.metadata.semantic_complete;
 if (!profile.metadata.finalization_observed) {
   captureHealthFindings.push("finalization not observed");
 }
@@ -1048,8 +1050,7 @@ collapseSubtree.addEventListener("click", () => {
   renderRows(entryKey(selectedNode));
 });
 if (
-  !profile.metadata.capture_complete ||
-  !profile.metadata.semantic_complete ||
+  profileIncomplete ||
   captureHealthFindings.length > 0
 ) {
   addSummary(
@@ -1067,7 +1068,7 @@ if (
       : captureHealthFindings.join(", ")
   );
 }
-if (samplingHealthFindings.length > 0) {
+if (profileIncomplete && samplingHealthFindings.length > 0) {
   addSummary("Sampling health", samplingHealthFindings.join(", "));
 }
 addSummary("Sample frequency", `${profile.metadata.sample_frequency_hz} Hz`);

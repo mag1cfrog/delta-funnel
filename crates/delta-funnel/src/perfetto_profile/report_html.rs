@@ -303,6 +303,27 @@ mod tests {
             .ok_or("embedded profile data is missing")
     }
 
+    fn dump_browser_dom(
+        browser: &std::ffi::OsStr,
+        html: &str,
+    ) -> std::io::Result<std::process::Output> {
+        let mut report = tempfile::Builder::new().suffix(".html").tempfile()?;
+        report.write_all(html.as_bytes())?;
+        report.flush()?;
+        std::process::Command::new("timeout")
+            .arg("30s")
+            .arg(browser)
+            .args([
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-background-networking",
+                "--dump-dom",
+            ])
+            .arg(format!("file://{}", report.path().display()))
+            .output()
+    }
+
     #[test]
     fn renders_a_safe_self_contained_report() -> Result<(), Box<dyn std::error::Error>> {
         let dangerous = "</script><img src=x onerror=alert(1)> & \"quoted\" \u{2028} \u{2029} 函数";
@@ -460,6 +481,28 @@ mod tests {
             return Ok(());
         };
 
+        let mut healthy_metadata = metadata();
+        healthy_metadata.perf_sample_without_callsite_count = 2;
+        healthy_metadata.perf_samples_skipped = 1;
+        let healthy_document = RankedProfileDocument {
+            metadata: healthy_metadata,
+            semantics: vec![semantic(1, None, "Healthy operation")],
+            functions: vec![],
+        };
+        healthy_document.validate()?;
+        let healthy_output =
+            dump_browser_dom(&browser, &render_ranked_profile_html(&healthy_document)?)?;
+        assert!(
+            healthy_output.status.success(),
+            "healthy report browser failed: {}",
+            String::from_utf8_lossy(&healthy_output.stderr)
+        );
+        let healthy_dom = String::from_utf8(healthy_output.stdout)?;
+        assert!(
+            !healthy_dom.contains(r#"<span class="summary-label">Sampling health</span>"#),
+            "sampling-only diagnostics changed the healthy report summary"
+        );
+
         let mut operation = semantic(1, None, "Root operation");
         operation.end_ns = Some(10_000_000);
         operation.duration_ns = Some(10_000_000);
@@ -568,6 +611,7 @@ mod tests {
         profile_metadata.semantic_complete = false;
         profile_metadata.missing_terminal_result_count = 1;
         profile_metadata.buffer_loss_count = 2;
+        profile_metadata.perf_sample_without_callsite_count = 3;
         profile_metadata.eligible_sample_count = 1;
         profile_metadata.direct_sample_count = 1;
         profile_metadata.resolved_function_sample_count = 1;
@@ -593,7 +637,8 @@ mod tests {
   try {
     check(
       summary.textContent.includes("CaptureIncomplete") &&
-        summary.textContent.includes("2 buffer losses"),
+        summary.textContent.includes("2 buffer losses") &&
+        summary.textContent.includes("3 perf samples without callsites"),
       "incomplete capture health was not summarized"
     );
     check(operationsBody.rows.length === 1, "initial render was not lazy");
@@ -971,21 +1016,7 @@ mod tests {
 "#,
         );
 
-        let mut report = tempfile::Builder::new().suffix(".html").tempfile()?;
-        report.write_all(html.as_bytes())?;
-        report.flush()?;
-        let output = std::process::Command::new("timeout")
-            .arg("30s")
-            .arg(browser)
-            .args([
-                "--headless",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-background-networking",
-                "--dump-dom",
-            ])
-            .arg(format!("file://{}", report.path().display()))
-            .output()?;
+        let output = dump_browser_dom(&browser, &html)?;
         assert!(
             output.status.success(),
             "headless browser failed: {}",
