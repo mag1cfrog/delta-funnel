@@ -610,6 +610,30 @@ fn render_function_view(
 }
 
 fn capture_health_header(metadata: &RankedProfileMetadata) -> String {
+    if metadata.capture_complete
+        && metadata.semantic_complete
+        && metadata.finalization_observed
+        && [
+            metadata.incomplete_operation_root_count,
+            metadata.truncation_marker_count,
+            metadata.missing_identity_field_count,
+            metadata.missing_terminal_result_count,
+            metadata.crossing_worker_slice_count,
+            metadata.crossing_planning_activity_slice_count,
+            metadata.crossing_execution_activity_slice_count,
+            metadata.invalid_planning_activity_hierarchy_count,
+            metadata.invalid_execution_activity_hierarchy_count,
+            metadata.perf_sample_without_callsite_count,
+            metadata.perf_samples_skipped,
+            metadata.buffer_loss_count,
+            metadata.data_source_loss_count,
+            metadata.flush_failure_count,
+        ]
+        .into_iter()
+        .all(|count| count == 0)
+    {
+        return String::new();
+    }
     format!(
         "capture_complete: {}\nsemantic_complete: {}\nfinalization_observed: {}\nincomplete_operation_root_count: {}\ntruncation_marker_count: {}\nmissing_identity_field_count: {}\nmissing_terminal_result_count: {}\ncrossing_worker_slice_count: {}\ncrossing_planning_activity_slice_count: {}\ncrossing_execution_activity_slice_count: {}\ninvalid_planning_activity_hierarchy_count: {}\ninvalid_execution_activity_hierarchy_count: {}\nperf_sample_without_callsite_count: {}\nperf_samples_skipped: {}\nbuffer_loss_count: {}\ndata_source_loss_count: {}\nflush_failure_count: {}\n",
         metadata.capture_complete,
@@ -1039,8 +1063,8 @@ mod tests {
         .expect("root view should render");
 
         assert!(rendered.contains("showing: 2 of 3; truncated: true"));
-        assert!(rendered.contains("capture_complete: true"));
-        assert!(rendered.contains("semantic_complete: true"));
+        assert!(!rendered.contains("capture_complete:"));
+        assert!(!rendered.contains("semantic_complete:"));
         let first = rendered.find("id=semantic:1").expect("first root");
         let second = rendered.find("id=semantic:2").expect("second root");
         assert!(first < second);
