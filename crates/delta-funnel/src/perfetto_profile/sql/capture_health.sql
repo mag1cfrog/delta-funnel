@@ -1,9 +1,7 @@
 -- One-row health summary for short and streaming Delta Funnel captures.
-WITH
+WITH RECURSIVE
 selected_operations AS (
-  SELECT
-    s.track_id AS operation_track_id,
-    extract_arg(s.arg_set_id, 'debug.operation_id') AS operation_id
+  SELECT s.track_id AS operation_track_id
   FROM slice AS s
   WHERE s.category = 'delta_funnel.profile'
     AND s.name IN (
@@ -21,6 +19,15 @@ selected_operations AS (
         FROM delta_funnel_report_selection
       )
     )
+),
+selected_operation_tracks(track_id) AS (
+  SELECT operation_track_id
+  FROM selected_operations
+  UNION
+  SELECT child.id
+  FROM track AS child
+  JOIN selected_operation_tracks AS parent
+    ON child.parent_id = parent.track_id
 ),
 semantic_slices AS (
   SELECT
@@ -48,13 +55,8 @@ semantic_slices AS (
         FROM delta_funnel_report_selection
       ) IS NULL
       OR s.track_id IN (
-        SELECT operation_track_id
-        FROM selected_operations
-      )
-      OR extract_arg(s.arg_set_id, 'debug.operation_id') IN (
-        SELECT operation_id
-        FROM selected_operations
-        WHERE operation_id IS NOT NULL
+        SELECT track_id
+        FROM selected_operation_tracks
       )
     )
 ),
