@@ -6,7 +6,7 @@ use std::thread;
 
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
 
-// ponytail: This is above the largest validated compact aggregate (95.3 MiB).
+// This is above the largest validated compact aggregate (95.3 MiB).
 // Raise it only with a larger production aggregate and memory evidence.
 const MAX_QUERY_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 

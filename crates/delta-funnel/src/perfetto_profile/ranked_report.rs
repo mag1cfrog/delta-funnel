@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use serde::{Deserialize, Serialize};
 
-// ponytail: This covers the 246,095-node production fixture while bounding
+// This covers the 246,095-node production fixture while bounding
 // report memory. Raise it only with production and browser evidence.
 pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
