@@ -793,6 +793,31 @@ impl RankedProfileDocument {
                 return Err(RankedProfileValidationError::InvalidUnit { field, expected });
             }
         }
+        let retained_incomplete_operation_root_count = self
+            .semantics
+            .iter()
+            .filter(|semantic| semantic.semantic_kind == "operation" && !semantic.is_complete)
+            .fold(0_i64, |count, _| count + 1);
+        let retained_missing_terminal_result_count = self
+            .semantics
+            .iter()
+            .filter(|semantic| {
+                // Keep this set aligned with missing_terminal_result_count in
+                // capture_health.sql. Query instants and stages are excluded there.
+                semantic.result.is_none()
+                    && matches!(
+                        semantic.semantic_kind.as_str(),
+                        "operation" | "phase" | "query_planning" | "activity"
+                    )
+            })
+            .fold(0_i64, |count, _| count + 1);
+        if self.metadata.incomplete_operation_root_count != retained_incomplete_operation_root_count
+            || self.metadata.missing_terminal_result_count != retained_missing_terminal_result_count
+        {
+            return Err(RankedProfileValidationError::InconsistentCaptureHealth {
+                reason: "semantic health counts do not match retained records",
+            });
+        }
         if self.metadata.missing_identity_field_count > 0 {
             return Err(RankedProfileValidationError::InconsistentCaptureHealth {
                 reason: "ownership identity is incomplete",
@@ -2033,6 +2058,23 @@ mod tests {
         valid.semantics[0].duration_ns = None;
         valid.semantics[0].result = None;
         assert_eq!(valid.validate(), Ok(()));
+
+        let mut invalid = document();
+        invalid.semantics[0].is_complete = false;
+        invalid.semantics[0].end_ns = None;
+        invalid.semantics[0].duration_ns = None;
+        invalid.semantics[0].result = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
+
+        let mut invalid = document();
+        invalid.semantics[1].result = None;
+        assert!(matches!(
+            invalid.validate(),
+            Err(RankedProfileValidationError::InconsistentCaptureHealth { .. })
+        ));
 
         let mut invalid = valid;
         invalid.semantics[0].end_ns = Some(1);

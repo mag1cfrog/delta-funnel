@@ -392,6 +392,7 @@ mod tests {
             parent_semantic_id = semantic_id;
         }
         let mut incomplete = semantic(386, Some(1), "incomplete semantic");
+        incomplete.semantic_kind = "activity".to_owned();
         incomplete.end_ns = None;
         incomplete.duration_ns = None;
         incomplete.result = None;
@@ -422,8 +423,7 @@ mod tests {
         let mut profile_metadata = metadata();
         profile_metadata.capture_complete = false;
         profile_metadata.semantic_complete = false;
-        profile_metadata.incomplete_operation_root_count = 1;
-        profile_metadata.missing_terminal_result_count = 4;
+        profile_metadata.missing_terminal_result_count = 1;
         profile_metadata.perf_sample_without_callsite_count = 3;
         profile_metadata.eligible_sample_count = 2;
         profile_metadata.ambiguous_sample_count = 1;
@@ -441,9 +441,9 @@ mod tests {
         assert_eq!(decoded["functions"].as_array().map(Vec::len), Some(5_129));
         assert_eq!(decoded["metadata"]["capture_complete"], false);
         assert_eq!(decoded["metadata"]["semantic_complete"], false);
-        assert_eq!(decoded["metadata"]["incomplete_operation_root_count"], 1);
+        assert_eq!(decoded["metadata"]["incomplete_operation_root_count"], 0);
         assert_eq!(decoded["metadata"]["missing_identity_field_count"], 0);
-        assert_eq!(decoded["metadata"]["missing_terminal_result_count"], 4);
+        assert_eq!(decoded["metadata"]["missing_terminal_result_count"], 1);
         assert_eq!(decoded["metadata"]["perf_sample_without_callsite_count"], 3);
         assert_eq!(decoded["functions"][0]["name"], "root function");
         assert_eq!(
@@ -473,6 +473,7 @@ mod tests {
         zero.end_ns = Some(0);
         zero.duration_ns = Some(0);
         let mut unknown = semantic(7_001, Some(3), "Unknown duration");
+        unknown.semantic_kind = "activity".to_owned();
         unknown.end_ns = None;
         unknown.duration_ns = None;
         unknown.result = None;
