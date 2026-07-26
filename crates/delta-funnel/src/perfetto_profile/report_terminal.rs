@@ -307,16 +307,20 @@ fn render_semantic_view(
         |semantic_id| format!("semantic:{semantic_id}"),
     );
     let filter = filter_label(filter);
+    let captured_function_samples = index.document.metadata.resolved_function_sample_count
+        + index.document.metadata.unresolved_function_sample_count;
     let mut output = format!(
-        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_available: {}\nnative_stack_samples_unavailable: {}\ntrace_profiler_samples_dropped: {}\n",
+        "view: ranked-profile\ncontext: {context}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\ntime_unit: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\n",
         sort.as_str(),
         shown,
         shown < total,
         terminal_text(&index.document.metadata.exact_time_unit),
         terminal_text(&index.document.metadata.sample_unit),
         index.document.metadata.sampled_cpu_count,
-        index.document.metadata.available_function_sample_count,
-        index.document.metadata.unavailable_function_sample_count,
+        index.document.metadata.resolved_function_sample_count,
+        index.document.metadata.unresolved_function_sample_count,
+        index.document.metadata.unwind_error_sample_count,
+        index.document.metadata.missing_callstack_sample_count,
         index.document.metadata.trace_profiler_dropped_sample_count,
     );
     for (depth, semantic) in semantic_rows {
@@ -506,15 +510,19 @@ fn render_function_view(
         included_functions.as_ref(),
     );
     let filter = filter_label(filter);
+    let captured_function_samples = index.document.metadata.resolved_function_sample_count
+        + index.document.metadata.unresolved_function_sample_count;
     let mut output = format!(
-        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_available: {}\nnative_stack_samples_unavailable: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
+        "view: ranked-profile\ncontext: function:{semantic_id}:{function_id}\nsort: {}\nfilter: {filter}\ndepth: {max_depth}\nshowing: {} of {total}; truncated: {}\nsample_unit: {}\nsampled_cpu_count: {}\nnative_stack_samples_captured: {captured_function_samples}\nnative_leaf_symbols_resolved: {}\nnative_leaf_symbols_unresolved: {}\nnative_unwind_failures: {}\nnative_callstacks_missing: {}\ntrace_profiler_samples_dropped: {}\nmetric_basis: sampled-cpu; exact_wall_time: not-applicable\n",
         sort.as_str(),
         rows.len(),
         rows.len() < total,
         terminal_text(&index.document.metadata.sample_unit),
         index.document.metadata.sampled_cpu_count,
-        index.document.metadata.available_function_sample_count,
-        index.document.metadata.unavailable_function_sample_count,
+        index.document.metadata.resolved_function_sample_count,
+        index.document.metadata.unresolved_function_sample_count,
+        index.document.metadata.unwind_error_sample_count,
+        index.document.metadata.missing_callstack_sample_count,
         index.document.metadata.trace_profiler_dropped_sample_count,
     );
     for (depth, function) in rows {
@@ -732,8 +740,10 @@ fn write_semantic_row(
         .result
         .as_deref()
         .map_or_else(|| "null".to_owned(), quoted_terminal_text);
+    let captured_function_samples =
+        semantic.resolved_function_sample_count + semantic.unresolved_function_sample_count;
     output.push_str(&format!(
-        "semantic depth={depth} id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={} native_stack_samples_available={} native_stack_samples_unavailable={}",
+        "semantic depth={depth} id=semantic:{} name={} kind={} duration_ns={duration} time_basis=exact:{} operation_wall_percent={wall_percent} complete={} result={result} direct_cpu_samples={} inclusive_cpu_samples={} native_stack_samples_captured={captured_function_samples} native_leaf_symbols_resolved={} native_leaf_symbols_unresolved={} native_unwind_failures={} native_callstacks_missing={}",
         semantic.semantic_id,
         quoted_terminal_text(&semantic.name),
         quoted_terminal_text(&semantic.semantic_kind),
@@ -741,8 +751,10 @@ fn write_semantic_row(
         semantic.is_complete,
         semantic.direct_sample_count,
         semantic.inclusive_sample_count,
-        semantic.available_function_sample_count,
-        semantic.unavailable_function_sample_count,
+        semantic.resolved_function_sample_count,
+        semantic.unresolved_function_sample_count,
+        semantic.unwind_error_sample_count,
+        semantic.missing_callstack_sample_count,
     ));
     output.push('\n');
 }
@@ -819,15 +831,17 @@ mod tests {
             stage_owner_id: None,
             direct_sample_count: semantic_id,
             inclusive_sample_count: semantic_id + 1,
-            available_function_sample_count: 0,
-            unavailable_function_sample_count: semantic_id,
+            resolved_function_sample_count: 0,
+            unresolved_function_sample_count: 0,
+            unwind_error_sample_count: 0,
+            missing_callstack_sample_count: semantic_id,
         }
     }
 
     fn document(semantics: Vec<RankedSemantic>) -> RankedProfileDocument {
         RankedProfileDocument {
             metadata: RankedProfileMetadata {
-                schema_version: 2,
+                schema_version: 3,
                 sample_frequency_hz: 100,
                 sampled_cpu_count: 1,
                 exact_time_unit: "nanoseconds".to_owned(),
@@ -836,8 +850,10 @@ mod tests {
                 direct_sample_count: 0,
                 ambiguous_sample_count: 0,
                 unattributed_sample_count: 0,
-                available_function_sample_count: 0,
-                unavailable_function_sample_count: 0,
+                resolved_function_sample_count: 0,
+                unresolved_function_sample_count: 0,
+                unwind_error_sample_count: 0,
+                missing_callstack_sample_count: 0,
                 trace_profiler_dropped_sample_count: 0,
             },
             semantics,

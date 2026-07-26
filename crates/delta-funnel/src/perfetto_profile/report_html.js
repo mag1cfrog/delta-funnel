@@ -33,6 +33,9 @@ const formatFunctionCoverage = value =>
     value,
     profile.metadata.direct_sample_count
   )} of direct)`;
+const capturedFunctionSamples = coverage =>
+  coverage.resolved_function_sample_count +
+    coverage.unresolved_function_sample_count;
 const compareValue = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 const compareText = (left, right) => {
   let leftIndex = 0;
@@ -418,8 +421,11 @@ const semanticRow = (semantic, depth) => {
     ),
     textCell(
       String(semantic.direct_sample_count),
-      `${semantic.available_function_sample_count} native stacks available; ` +
-        `${semantic.unavailable_function_sample_count} unavailable`,
+      `${capturedFunctionSamples(semantic)} native stacks captured: ` +
+        `${semantic.resolved_function_sample_count} resolved leaf symbols, ` +
+        `${semantic.unresolved_function_sample_count} unresolved; ` +
+        `${semantic.unwind_error_sample_count} unwind failures, ` +
+        `${semantic.missing_callstack_sample_count} missing`,
       "number"
     ),
     textCell(String(semantic.inclusive_sample_count), "Semantic subtree", "number")
@@ -938,12 +944,24 @@ addSummary("Directly attributed", formatCoverage(profile.metadata.direct_sample_
 addSummary("Ambiguous", formatCoverage(profile.metadata.ambiguous_sample_count));
 addSummary("Unattributed", formatCoverage(profile.metadata.unattributed_sample_count));
 addSummary(
-  "Native stacks available",
-  formatFunctionCoverage(profile.metadata.available_function_sample_count)
+  "Native stacks captured",
+  formatFunctionCoverage(capturedFunctionSamples(profile.metadata))
 );
 addSummary(
-  "Native stacks unavailable",
-  formatFunctionCoverage(profile.metadata.unavailable_function_sample_count)
+  "Leaf symbols resolved",
+  formatFunctionCoverage(profile.metadata.resolved_function_sample_count)
+);
+addSummary(
+  "Leaf symbols unresolved",
+  formatFunctionCoverage(profile.metadata.unresolved_function_sample_count)
+);
+addSummary(
+  "Unwind failures",
+  formatFunctionCoverage(profile.metadata.unwind_error_sample_count)
+);
+addSummary(
+  "Native stacks missing",
+  formatFunctionCoverage(profile.metadata.missing_callstack_sample_count)
 );
 addSummary(
   "Profiler samples dropped",

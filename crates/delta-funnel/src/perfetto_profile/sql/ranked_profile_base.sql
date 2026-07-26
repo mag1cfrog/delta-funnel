@@ -587,10 +587,26 @@ CREATE PERFETTO TABLE delta_funnel_ranked_callsite_leaves AS
 SELECT
   callsite_id,
   count(*) AS leaf_count,
-  min(function_id) AS function_id
+  min(function_id) AS function_id,
+  min(name) AS name
 FROM delta_funnel_ranked_expanded_callstacks
 WHERE is_leaf
 GROUP BY callsite_id;
+
+CREATE PERFETTO FUNCTION delta_funnel_function_resolution(
+  callsite_id LONG,
+  unwind_error STRING,
+  leaf_count LONG,
+  leaf_name STRING
+)
+RETURNS STRING AS
+SELECT CASE
+  WHEN $unwind_error IS NOT NULL THEN 'unwind_error'
+  WHEN $callsite_id IS NULL OR coalesce($leaf_count, 0) != 1 THEN 'missing'
+  WHEN coalesce(nullif($leaf_name, ''), '[unresolved]') = '[unresolved]'
+    THEN 'unresolved'
+  ELSE 'resolved'
+END;
 
 CREATE PERFETTO TABLE delta_funnel_ranked_function_sample_ownership AS
 SELECT
@@ -603,12 +619,12 @@ SELECT
       AND leaf.leaf_count = 1 THEN leaf.function_id
     ELSE -1
   END AS function_id,
-  CASE
-    WHEN sample.callsite_id IS NOT NULL
-      AND sample.unwind_error IS NULL
-      AND leaf.leaf_count = 1 THEN 'resolved'
-    ELSE 'unresolved'
-  END AS resolution
+  delta_funnel_function_resolution(
+    sample.callsite_id,
+    sample.unwind_error,
+    leaf.leaf_count,
+    leaf.name
+  ) AS resolution
 FROM delta_funnel_ranked_sample_ownership AS sample
 LEFT JOIN delta_funnel_ranked_callsite_leaves AS leaf USING (callsite_id)
 WHERE sample.attribution = 'direct';
@@ -617,9 +633,13 @@ CREATE PERFETTO TABLE delta_funnel_ranked_semantic_function_sample_counts AS
 SELECT
   semantic.semantic_id,
   coalesce(sum(ownership.resolution = 'resolved'), 0)
-    AS available_function_sample_count,
+    AS resolved_function_sample_count,
   coalesce(sum(ownership.resolution = 'unresolved'), 0)
-    AS unavailable_function_sample_count
+    AS unresolved_function_sample_count,
+  coalesce(sum(ownership.resolution = 'unwind_error'), 0)
+    AS unwind_error_sample_count,
+  coalesce(sum(ownership.resolution = 'missing'), 0)
+    AS missing_callstack_sample_count
 FROM delta_funnel_ranked_semantics AS semantic
 LEFT JOIN delta_funnel_ranked_function_sample_ownership AS ownership
   USING (semantic_id)
@@ -632,7 +652,7 @@ SELECT *
 FROM _callstacks_for_callsites!((
   SELECT callsite_id
   FROM delta_funnel_ranked_function_sample_ownership
-  WHERE resolution = 'resolved'
+  WHERE resolution IN ('resolved', 'unresolved')
 ));
 
 CREATE PERFETTO TABLE delta_funnel_ranked_official_function_summary AS
@@ -645,7 +665,7 @@ FROM _callstacks_self_to_cumulative!((
 CREATE PERFETTO TABLE delta_funnel_ranked_function_self_counts AS
 SELECT semantic_id, function_id, count(*) AS self_sample_count
 FROM delta_funnel_ranked_function_sample_ownership
-WHERE resolution = 'resolved'
+WHERE resolution IN ('resolved', 'unresolved')
 GROUP BY semantic_id, function_id;
 
 CREATE PERFETTO INDEX delta_funnel_ranked_function_self_lookup

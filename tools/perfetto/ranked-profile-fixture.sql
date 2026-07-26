@@ -141,6 +141,29 @@ FROM (VALUES
   (4, 1, 2, 'ambiguous'),
   (5, 1, 1, 'direct'));
 
+CREATE PERFETTO TABLE fixture_function_resolution(
+  sample_id LONG,
+  callsite_id LONG,
+  unwind_error STRING,
+  leaf_count LONG,
+  leaf_name STRING,
+  expected STRING
+) AS
+SELECT
+  column1 AS sample_id,
+  column2 AS callsite_id,
+  column3 AS unwind_error,
+  column4 AS leaf_count,
+  column5 AS leaf_name,
+  column6 AS expected
+FROM (VALUES
+  (1, 10, NULL, 1, 'named_function', 'resolved'),
+  (2, 11, NULL, 1, '[unresolved]', 'unresolved'),
+  (3, 12, NULL, 1, '', 'unresolved'),
+  (4, 13, 'unwind_failed', 1, 'named_function', 'unwind_error'),
+  (5, NULL, NULL, NULL, NULL, 'missing'),
+  (6, 14, NULL, 0, NULL, 'missing'));
+
 CREATE PERFETTO TABLE fixture_function_frames(
   id LONG,
   parent_id LONG
@@ -297,6 +320,16 @@ WITH checks AS (
     ) AS operation_resolution_error,
     (
       SELECT count(*)
+      FROM fixture_function_resolution
+      WHERE delta_funnel_function_resolution(
+        callsite_id,
+        unwind_error,
+        leaf_count,
+        leaf_name
+      ) != expected
+    ) AS function_resolution_error,
+    (
+      SELECT count(*)
       FROM fixture_expected_function_counts AS expected
       LEFT JOIN fixture_function_inclusive_counts AS actual
         USING (semantic_id, function_id, inclusive_sample_count)
@@ -335,6 +368,7 @@ SELECT
     + owner_selection_error
     + attribution_conservation_error
     + operation_resolution_error
+    + function_resolution_error
     + function_rollup_error
     + function_cycle_error
     + function_self_conservation_error

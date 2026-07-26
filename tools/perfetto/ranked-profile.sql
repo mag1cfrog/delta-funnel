@@ -140,11 +140,19 @@ SELECT
   coalesce((
     SELECT sum(resolution = 'resolved')
     FROM delta_funnel_ranked_function_sample_ownership
-  ), 0) AS available_function_sample_count,
+  ), 0) AS resolved_function_sample_count,
   coalesce((
     SELECT sum(resolution = 'unresolved')
     FROM delta_funnel_ranked_function_sample_ownership
-  ), 0) AS unavailable_function_sample_count,
+  ), 0) AS unresolved_function_sample_count,
+  coalesce((
+    SELECT sum(resolution = 'unwind_error')
+    FROM delta_funnel_ranked_function_sample_ownership
+  ), 0) AS unwind_error_sample_count,
+  coalesce((
+    SELECT sum(resolution = 'missing')
+    FROM delta_funnel_ranked_function_sample_ownership
+  ), 0) AS missing_callstack_sample_count,
   (
     SELECT count(*)
     FROM (
@@ -196,7 +204,7 @@ SELECT
   (
     SELECT count(*)
     FROM delta_funnel_ranked_function_sample_ownership
-    WHERE resolution = 'resolved'
+    WHERE resolution IN ('resolved', 'unresolved')
   ) - coalesce((
     SELECT sum(self_sample_count)
     FROM delta_funnel_ranked_function_self_counts
@@ -252,8 +260,10 @@ SELECT
   semantic.stage_owner_id,
   sample_count.direct_sample_count,
   sample_count.inclusive_sample_count,
-  function_sample_count.available_function_sample_count,
-  function_sample_count.unavailable_function_sample_count
+  function_sample_count.resolved_function_sample_count,
+  function_sample_count.unresolved_function_sample_count,
+  function_sample_count.unwind_error_sample_count,
+  function_sample_count.missing_callstack_sample_count
 FROM delta_funnel_ranked_semantics AS semantic
 JOIN delta_funnel_ranked_semantic_parents AS parent USING (semantic_id)
 JOIN delta_funnel_ranked_semantic_sample_counts AS sample_count USING (semantic_id)
@@ -273,11 +283,19 @@ SELECT
   (
     SELECT coalesce(sum(resolution = 'resolved'), 0)
     FROM delta_funnel_ranked_function_sample_ownership
-  ) AS available_function_sample_count,
+  ) AS resolved_function_sample_count,
   (
     SELECT coalesce(sum(resolution = 'unresolved'), 0)
     FROM delta_funnel_ranked_function_sample_ownership
-  ) AS unavailable_function_sample_count
+  ) AS unresolved_function_sample_count,
+  (
+    SELECT coalesce(sum(resolution = 'unwind_error'), 0)
+    FROM delta_funnel_ranked_function_sample_ownership
+  ) AS unwind_error_sample_count,
+  (
+    SELECT coalesce(sum(resolution = 'missing'), 0)
+    FROM delta_funnel_ranked_function_sample_ownership
+  ) AS missing_callstack_sample_count
 FROM delta_funnel_ranked_sample_ownership;
 
 -- Measure the exact UTF-8 JSON Lines representation without emitting it or
@@ -314,8 +332,10 @@ SELECT
       'stage_owner_id', stage_owner_id,
       'direct_sample_count', direct_sample_count,
       'inclusive_sample_count', inclusive_sample_count,
-      'available_function_sample_count', available_function_sample_count,
-      'unavailable_function_sample_count', unavailable_function_sample_count
+      'resolved_function_sample_count', resolved_function_sample_count,
+      'unresolved_function_sample_count', unresolved_function_sample_count,
+      'unwind_error_sample_count', unwind_error_sample_count,
+      'missing_callstack_sample_count', missing_callstack_sample_count
     ) AS BLOB))) + count(*), 0)
     FROM delta_funnel_ranked_semantic_aggregates
   ) AS semantic_aggregate_json_bytes,
@@ -343,8 +363,10 @@ SELECT
       'ambiguous_sample_count', ambiguous_sample_count,
       'unattributed_sample_count', unattributed_sample_count,
       'sampled_cpu_count', sampled_cpu_count,
-      'available_function_sample_count', available_function_sample_count,
-      'unavailable_function_sample_count', unavailable_function_sample_count
+      'resolved_function_sample_count', resolved_function_sample_count,
+      'unresolved_function_sample_count', unresolved_function_sample_count,
+      'unwind_error_sample_count', unwind_error_sample_count,
+      'missing_callstack_sample_count', missing_callstack_sample_count
     ) AS BLOB))) + count(*), 0)
     FROM delta_funnel_ranked_coverage_aggregate
   ) AS coverage_aggregate_json_bytes;
@@ -370,8 +392,10 @@ SELECT
     SELECT sampled_cpu_count
     FROM delta_funnel_ranked_coverage_aggregate
   ) AS sampled_cpu_count,
-  function.available_function_sample_count,
-  function.unavailable_function_sample_count,
+  function.resolved_function_sample_count,
+  function.unresolved_function_sample_count,
+  function.unwind_error_sample_count,
+  function.missing_callstack_sample_count,
   function.official_summary_mismatch_count,
   size.semantic_aggregate_json_bytes,
   size.function_aggregate_json_bytes,
