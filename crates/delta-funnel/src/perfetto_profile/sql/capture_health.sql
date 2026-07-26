@@ -1,5 +1,27 @@
 -- One-row health summary for short and streaming Delta Funnel captures.
 WITH
+selected_operations AS (
+  SELECT
+    s.track_id AS operation_track_id,
+    extract_arg(s.arg_set_id, 'debug.operation_id') AS operation_id
+  FROM slice AS s
+  WHERE s.category = 'delta_funnel.profile'
+    AND s.name IN (
+      'Delta Funnel preview',
+      'Delta Funnel SQL Server write',
+      'Delta Funnel SQL Server write_all'
+    )
+    AND (
+      (
+        SELECT capture_scope_id
+        FROM delta_funnel_report_selection
+      ) IS NULL
+      OR extract_arg(s.arg_set_id, 'debug.capture_scope_id') = (
+        SELECT capture_scope_id
+        FROM delta_funnel_report_selection
+      )
+    )
+),
 semantic_slices AS (
   SELECT
     s.*,
@@ -20,6 +42,21 @@ semantic_slices AS (
     extract_arg(s.arg_set_id, 'debug.result') AS result
   FROM slice AS s
   WHERE s.category = 'delta_funnel.profile'
+    AND (
+      (
+        SELECT capture_scope_id
+        FROM delta_funnel_report_selection
+      ) IS NULL
+      OR s.track_id IN (
+        SELECT operation_track_id
+        FROM selected_operations
+      )
+      OR extract_arg(s.arg_set_id, 'debug.operation_id') IN (
+        SELECT operation_id
+        FROM selected_operations
+        WHERE operation_id IS NOT NULL
+      )
+    )
 ),
 classified_slices AS (
   SELECT

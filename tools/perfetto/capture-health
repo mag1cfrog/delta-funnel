@@ -49,6 +49,8 @@ saved_file_bytes=$(stat --format='%s' -- "$trace_path")
   printf '%s\n' \
     "CREATE PERFETTO TABLE delta_funnel_capture_health_input AS" \
     "SELECT $configured_file_cap_bytes AS configured_file_cap_bytes," \
-    "       $saved_file_bytes AS saved_file_bytes;"
+    "       $saved_file_bytes AS saved_file_bytes;" \
+    "CREATE PERFETTO TABLE delta_funnel_report_selection AS" \
+    "SELECT NULL AS capture_scope_id;"
   sed -n '1,$p' "$health_sql"
 } | "$trace_processor" query --query-file - "$trace_path"

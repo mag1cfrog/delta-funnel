@@ -29,7 +29,7 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
          set -eu\n\
          query=$(cat)\n\
          case \"$query\" in\n\
-           *delta_funnel_capture_health_input*'CREATE PERFETTO TABLE delta_funnel_capture_health AS'*record_kind*) ;;\n\
+           *delta_funnel_capture_health_input*'CREATE PERFETTO TABLE delta_funnel_report_selection AS'*'CREATE PERFETTO TABLE delta_funnel_capture_health AS'*record_kind*) ;;\n\
            *) exit 65 ;;\n\
          esac\n\
          cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n",

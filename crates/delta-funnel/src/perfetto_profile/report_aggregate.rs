@@ -98,9 +98,9 @@ pub(super) fn load_ranked_profile(
     let selection_sql = report_selection_sql(capture_scope_id);
     let sql = [
         health_input_sql.as_str(),
+        selection_sql.as_str(),
         "CREATE PERFETTO TABLE delta_funnel_capture_health AS",
         CAPTURE_HEALTH_SQL,
-        selection_sql.as_str(),
         SAMPLE_CORRELATION_SQL,
         RANKED_PROFILE_BASE_SQL,
         RANKED_REPORT_SQL,
@@ -517,6 +517,9 @@ mod tests {
             report_selection_sql(Some(42)),
             "CREATE PERFETTO TABLE delta_funnel_report_selection AS\nSELECT 42 AS capture_scope_id;"
         );
+        assert!(CAPTURE_HEALTH_SQL.contains("selected_operations AS"));
+        assert!(CAPTURE_HEALTH_SQL.contains("FROM delta_funnel_report_selection"));
+        assert!(CAPTURE_HEALTH_SQL.contains("SELECT operation_track_id"));
         assert!(RANKED_PROFILE_BASE_SQL.contains("nullif(frame.name, '')"));
         assert!(!RANKED_PROFILE_BASE_SQL.contains("substr(frame.name"));
     }
