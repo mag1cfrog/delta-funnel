@@ -67,6 +67,10 @@ classified_slices AS (
     *,
     operation_id IS NOT NULL
       AND operation_id IS expected_operation_id AS operation_identity_valid,
+    name NOT IN (
+      'Delta Funnel diagnostic group',
+      'Operator activity trace truncated'
+    ) AS ranked_semantic_candidate,
     CASE
       WHEN execution_activity_name IS NOT NULL THEN 'execution_activity'
       WHEN worker_lane_id IS NOT NULL
@@ -90,33 +94,45 @@ classified_slices AS (
 missing_fields AS (
   SELECT
     coalesce(sum(
+      CASE
+        WHEN ranked_semantic_candidate THEN
+          (NOT operation_identity_valid) +
+          CASE
+            WHEN semantic_kind = 'operator' THEN
+              (time_semantics IS NULL OR time_semantics != 'active')
+            ELSE
+              (
+                time_semantics IS NULL
+                OR time_semantics NOT IN ('wall_clock', 'lifecycle')
+              )
+          END
+        ELSE 0
+      END +
       CASE semantic_kind
         WHEN 'operation' THEN
-          (NOT operation_identity_valid) + (time_semantics IS NULL)
+          0
         WHEN 'phase' THEN
-          (NOT operation_identity_valid) + (time_semantics IS NULL)
+          0
         WHEN 'query' THEN
-          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
-          (query_scope IS NULL) + (time_semantics IS NULL)
+          (query_execution_id IS NULL) + (query_scope IS NULL)
         WHEN 'query_planning' THEN
-          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
-          (query_scope IS NULL) + (time_semantics IS NULL)
+          (query_execution_id IS NULL) + (query_scope IS NULL)
         WHEN 'planning_activity' THEN
-          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
+          (query_execution_id IS NULL) +
           (query_scope IS NULL) + (planning_activity_name = '') +
-          (activity IS NULL OR activity = '') + (time_semantics IS NULL)
+          (activity IS NULL OR activity = '')
         WHEN 'execution_activity' THEN
-          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
+          (query_execution_id IS NULL) +
           (query_scope IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
           (execution_activity_name = '') +
-          (activity IS NULL OR activity = '') + (time_semantics IS NULL)
+          (activity IS NULL OR activity = '')
         WHEN 'operator' THEN
-          (NOT operation_identity_valid) + (query_execution_id IS NULL) +
+          (query_execution_id IS NULL) +
           (query_scope IS NULL) + (worker_lane_id IS NULL) +
           (worker_kind IS NULL) + (node_id IS NULL) +
           (operator_partition IS NULL) + (execution_stream_id IS NULL) +
-          (activity IS NULL) + (time_semantics IS NULL)
+          (activity IS NULL)
         ELSE 0
       END
     ), 0) AS missing_identity_field_count,

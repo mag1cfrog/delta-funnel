@@ -536,7 +536,9 @@ mod tests {
             CAPTURE_HEALTH_SQL
                 .contains("operation_id IS expected_operation_id AS operation_identity_valid")
         );
-        assert!(CAPTURE_HEALTH_SQL.contains("(NOT operation_identity_valid)"));
+        assert!(CAPTURE_HEALTH_SQL.contains("AS ranked_semantic_candidate"));
+        assert!(CAPTURE_HEALTH_SQL.contains("WHEN ranked_semantic_candidate THEN"));
+        assert!(CAPTURE_HEALTH_SQL.contains("time_semantics NOT IN ('wall_clock', 'lifecycle')"));
         assert!(
             !CAPTURE_HEALTH_SQL.contains("OR extract_arg(s.arg_set_id, 'debug.operation_id') IN")
         );
