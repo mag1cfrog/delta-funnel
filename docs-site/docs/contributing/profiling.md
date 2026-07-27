@@ -1,62 +1,129 @@
 # Choose a Delta Funnel Profiling Method
 
-Use this guide to choose between exact semantic timelines and sampled native
-call stacks when diagnosing Python-driven Delta Funnel workloads on Linux.
-Stable semantic JSON works with normal Python builds. Samply is intended for
-experienced developers working from a source checkout. Perfetto diagnostics
-can use either the Linux x86_64 diagnostics wheel published from `main` to
-TestPyPI or a local source build. Stable PyPI wheels do not include the optional
-Perfetto producer.
+Delta Funnel provides two ways to explore the same ranked profiling data:
 
-## Choose the diagnostic mode
+- Open the self-contained HTML report for interactive exploration.
+- Use the deterministic terminal CLI for scripts and agent-assisted analysis.
 
-| Goal | Mode |
-| --- | --- |
-| Inspect exact operation, phase, query, worker, and operator timing | Stable semantic JSON export |
-| Drill from one Python operation into ranked semantic work and native functions | [Operation-scoped ranked HTML](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report) |
-| Find native Rust CPU hotspots and source lines with the smallest capture | [Samply](profiling-samply.md) |
-| Capture several operations or a whole Python process | [Manual Perfetto capture](profiling-perfetto.md#advanced-capture-a-whole-python-process) |
-| Correlate a workload expected to run for up to ten minutes | [Standard streaming Perfetto](profiling-perfetto.md#record-a-longer-workload) |
-| Add scheduler and wakeup context to a short standard capture | [Deep-system Perfetto](profiling-perfetto.md#add-scheduler-context) |
+Both views start with exact operation and phase timings, then drill into
+sampled native Rust functions.
 
-Start with operation-scoped ranked HTML for one preview or write. Use manual
-short capture when the scope must include several operations, and streaming
-mode when the expected duration exceeds two minutes. Operation-scoped and
-manual short captures sample native call stacks at 1000 Hz by default;
-streaming and deep-system modes default to 100 Hz. These are statistical
-samples, so nearby runs can have different sample counts. On Linux, native
-sampling is on-CPU only. Time blocked on I/O, locks, or sleep is absent from
-the sampled stacks; use deep-system mode only when scheduler context is needed.
+Perfetto diagnostics currently require a diagnostics-enabled build on Linux
+x86_64. Follow [Set up Perfetto diagnostics for Python](profiling-perfetto.md)
+once before using either view.
 
-See the [profiling validation report](profiling-validation-report.md) for the
-canonical 13.4M-row performance comparison, 10-minute streaming result, and
-production correctness matrix behind these recommendations.
+The existing `profile=True` and `trace_path` APIs remain a separate,
+diagnostics-free path for semantic and operator data. They do not collect
+native CPU stacks.
 
-## Export the stable semantic timeline
+## Explore one operation in HTML
 
-Use stable semantic JSON when the question is about exact wall-clock phase,
-query, worker, or operator ordering and native function stacks are not needed.
-This path requires no diagnostic build or external capture process.
-
-For a preview, enable detailed profiling and export the returned timeline:
+Create a profiler configuration and pass it directly to the operation:
 
 ```python
-preview = table.preview(limit=100_000, profile=True)
-preview.export_trace("preview-trace.json")
+from deltafunnel import ProfilerConfig
+
+preview = table.preview(
+    limit=100_000,
+    profiler=ProfilerConfig(
+        "target/profiles/preview.profile.html",
+        sample_hz=1000,
+        artifact_output="target/profiles/preview.dfprofile",
+    ),
+)
 ```
 
-For a single SQL Server write, pass `profile=True` and `trace_path` to the
-execute call. For `write_all`, pass `options={"profile": True}` and
-`trace_path`. See the exact preview, write, and write-all examples in
-[Export and inspect execution profiles](../advanced/execution-profiling.md#inspect-returned-preview-diagnostics).
+Open `target/profiles/preview.profile.html` in a browser. The report is
+self-contained and stays on the local machine. `artifact_output` is optional;
+it preserves the same validated ranked model for later terminal inspection.
 
-Open the JSON with VizTracer's viewer or any compatible Chrome Trace Event
-viewer:
+[![Ranked profiling report showing capture quality, controls, and the top-level operation](../assets/ranked-profile-overview.png)](../assets/ranked-profile-overview.png)
 
-```bash
-vizviewer preview-trace.json
+The overview keeps capture quality, filtering, sorting, and the operation
+ranking in one viewport. Click either screenshot to open it at full resolution.
+
+Start with the operation row. Expand its longest semantic phase, then continue
+into native function rows. Function children are ranked by inclusive CPU
+samples by default. Self CPU samples show where samples ended directly.
+
+[![Ranked profiling report filtered to show exact semantic phases leading into sampled native functions](../assets/ranked-profile-native-functions.png)](../assets/ranked-profile-native-functions.png)
+
+The expanded view follows exact operation and phase rows into sampled
+functions while keeping exact duration, self CPU, and inclusive CPU separate.
+
+Use 1000 Hz for short investigations that need more native-stack detail. Use
+100 Hz to reduce capture volume. Both values are statistical sampling
+frequencies, not timing precision guarantees.
+
+The same `ProfilerConfig` works with `Table.write_to_mssql` and
+`Session.write_all`. See the complete preview and write examples in
+[Generate an operation-scoped ranked HTML report](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report).
+
+## Investigate with an agent or script
+
+Set `artifact_output` in the same `ProfilerConfig` used for HTML. The resulting
+`.dfprofile` contains the same operation-scoped hierarchy and metrics without
+retaining the larger temporary raw capture or repeating Trace Processor
+analysis.
+
+Show a bounded one-shot view:
+
+```sh
+uv run delta-funnel-perfetto inspect target/profiles/preview.dfprofile
 ```
 
-The export contains exact semantic wall-clock intervals. Operator lifecycle
-bars can include waiting, and parallel intervals can overlap. Do not add their
-durations and interpret the sum as elapsed wall time.
+Keep the profile loaded while running multiple commands:
+
+```sh
+uv run delta-funnel-perfetto inspect \
+  target/profiles/preview.dfprofile \
+  --interactive
+```
+
+The CLI prints stable identifiers such as `semantic:ID` and
+`function:SEMANTIC_ID:FUNCTION_ID`. It accepts commands such as `open`, `up`,
+`root`, `sort`, and `filter`, and terminates every response with `-- end --`.
+See
+[Inspect ranked results in the terminal](profiling-perfetto.md#inspect-ranked-results-in-the-terminal)
+for bounded traversal, exact identity selection, and full command examples.
+
+## Read the measurements correctly
+
+| Measurement | Meaning |
+| --- | --- |
+| Exact duration | Exact wall-clock or explicitly labeled lifecycle duration |
+| Self CPU samples | Samples whose deepest captured function is this function |
+| Inclusive CPU samples | Samples containing this function or one of its descendants |
+| Attributed | Samples assigned to one valid semantic context |
+| Ambiguous | Samples matching more than one valid context |
+| Unattributed | Samples that cannot be assigned to a semantic context |
+
+Exact duration and CPU samples use different units. Function sample counts are
+not exact function wall time. Parallel semantic children may overlap, so their
+durations may sum to more than their parent.
+
+Linux native sampling records on-CPU work. It does not by itself explain time
+blocked on I/O, locks, or sleep. Use a deep-system capture and inspect its raw
+trace when scheduler context is needed.
+
+## Choose another mode when needed
+
+| Goal | Method |
+| --- | --- |
+| Profile one preview or write interactively | [Operation-scoped ranked HTML](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report) |
+| Inspect the same operation-scoped result from a terminal | [Terminal inspector](profiling-perfetto.md#inspect-ranked-results-in-the-terminal) |
+| Inspect exact semantic timing without native stacks | [Stable semantic JSON](../advanced/execution-profiling.md#inspect-returned-preview-diagnostics) |
+| Capture several operations or retain a raw trace | [Whole-process Perfetto capture](profiling-perfetto.md#advanced-capture-a-whole-python-process) |
+| Record a workload expected to run for more than two minutes | [Streaming Perfetto capture](profiling-perfetto.md#record-a-longer-workload) |
+| Investigate scheduler and wakeup behavior | [Deep-system Perfetto capture](profiling-perfetto.md#add-scheduler-context) |
+| Find native CPU hotspots and source lines with a minimal standalone capture | [Samply](profiling-samply.md) |
+
+The raw `.pftrace` remains the advanced source for chronology, scheduler, I/O,
+and event-level investigation. Use ranked HTML for interactive exploration and
+the terminal inspector for deterministic scripted or agent-assisted analysis.
+
+## Keep reports private
+
+Profiling artifacts can contain process names, local paths, library names,
+symbols, and timing data. Keep them local unless they have been reviewed and
+explicitly approved for sharing.

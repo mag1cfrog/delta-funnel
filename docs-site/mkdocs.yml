@@ -60,5 +60,4 @@ nav:
           - Provider read scheduling: internals/provider-read-scheduling.md
       - Performance:
           - Delta scan benchmarks: contributing/scan-benchmarks.md
-          - Profiling validation report: contributing/profiling-validation-report.md
           - Reproduce profiling validation: contributing/profiling-validation-reproduction.md
