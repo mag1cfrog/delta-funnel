@@ -152,8 +152,13 @@ pub fn generate_operation_ranked_profile_outputs(
         })
         .transpose()?;
     if let Some(artifact) = &artifact_output
-        && output_paths_alias(&paths.output, &artifact.output)
-            .map_err(|_| profile_outputs_alias_failure())?
+        && output_paths_alias(&paths.output, &artifact.output).map_err(|_| {
+            RankedReportFailure::new(
+                RankedReportFailurePhase::Output,
+                "inspection_failed",
+                "profile output paths could not be inspected",
+            )
+        })?
     {
         return Err(profile_outputs_alias_failure());
     }

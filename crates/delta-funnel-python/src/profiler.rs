@@ -426,6 +426,8 @@ mod tests {
                 .artifact_output_path()
                 .map(|output| resolve_output_path(py, output))
                 .transpose()?;
+            assert!(output.is_absolute());
+            assert!(artifact_output.as_deref().is_some_and(Path::is_absolute));
             let error = validate_output_paths(py, &output, artifact_output.as_deref(), None)
                 .expect_err("HTML and artifact outputs must not alias");
             assert_eq!(
@@ -444,6 +446,9 @@ mod tests {
                 .map(|output| resolve_output_path(py, output))
                 .transpose()?;
             let trace_path = resolve_output_path(py, Path::new("./profile.dfprofile"))?;
+            assert!(output.is_absolute());
+            assert!(artifact_output.as_deref().is_some_and(Path::is_absolute));
+            assert!(trace_path.is_absolute());
             let error =
                 validate_output_paths(py, &output, artifact_output.as_deref(), Some(&trace_path))
                     .expect_err("trace and artifact outputs must not alias");

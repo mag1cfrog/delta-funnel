@@ -867,8 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn output_path_is_frozen_before_the_profiled_operation_can_change_directory() -> io::Result<()>
-    {
+    fn prepares_relative_output_as_an_absolute_path() -> io::Result<()> {
         let directory = tempfile::tempdir_in(".")?;
         let directory_name = directory
             .path()
