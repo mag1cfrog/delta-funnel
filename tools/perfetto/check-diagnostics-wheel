@@ -480,14 +480,19 @@ with tempfile.TemporaryDirectory() as temp_dir:
     )
     if (
         config_failure.returncode != 69
-        or status["workload_status"] != "125"
-        or status["tracebox_status"] != "125"
-        or status["health_status"] != "125"
-        or status["report_status"] != "125"
+        or status.get("workload_status") != "125"
+        or status.get("tracebox_status") != "125"
+        or status.get("health_status") != "125"
+        or status.get("report_status") != "125"
         or trace.exists()
         or report.exists()
     ):
-        raise SystemExit("capture config failure omitted terminal outcomes")
+        raise SystemExit(
+            "capture config failure omitted terminal outcomes: "
+            f"returncode={config_failure.returncode}, "
+            f"stdout={config_failure.stdout!r}, "
+            f"stderr={config_failure.stderr!r}"
+        )
 
     service_failure, trace, report, status = run_capture(
         "service-failure",

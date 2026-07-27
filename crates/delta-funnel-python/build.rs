@@ -29,6 +29,7 @@ fn main() -> io::Result<()> {
     let destination_dir = out_dir.join("perfetto");
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PERFETTO_PROFILE");
+    println!("cargo:rerun-if-env-changed=DELTA_FUNNEL_PERFETTO_ASSET_HASH");
     for asset in PERFETTO_ASSETS {
         println!(
             "cargo:rerun-if-changed={}",
