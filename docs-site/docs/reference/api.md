@@ -1,8 +1,7 @@
 # API Reference
 
 Use this page to look up public entry points and exact Python signatures. For
-task-oriented examples, start with the
-[Python quickstart](../python-api-walkthrough.md) or
+examples, start with the [Python quickstart](../python-api-walkthrough.md) or
 [Rust quickstart](../rust-quickstart.md).
 
 ## Find an Entry Point
@@ -18,7 +17,8 @@ task-oriented examples, start with the
 | Write several outputs | [`Session.write_all`](#session-write-all) |
 | Enable Python logging | [`init_logging`](#init-logging) |
 | Enable Perfetto diagnostics | [`init_perfetto_diagnostics`](#init-perfetto-diagnostics) |
-| Configure an operation-scoped HTML profile | [`ProfilerConfig`](#profiler-config) |
+| Configure exact execution profiling | [`ExecutionProfileConfig`](#execution-profile-config) |
+| Configure a ranked native CPU profile | [`RankedProfileConfig`](#ranked-profile-config) |
 | Handle a Delta Funnel failure | [`DeltaFunnelError`](#delta-funnel-error) |
 
 ## Rust
@@ -50,7 +50,6 @@ Options: TypeAlias = Mapping[str, object]
 
 class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
-    profile: bool | None
 ```
 
 Reports are JSON-compatible Python dictionaries. See
@@ -87,9 +86,10 @@ def init_perfetto_diagnostics(
 Installs the Python logging bridge and Perfetto profiling layer, then waits for
 a capture to attach. The function is available only in builds compiled with
 Perfetto diagnostics. Use it for an advanced whole-process capture.
-`ProfilerConfig` manages activation automatically for operation-scoped HTML
-reports. See [Perfetto diagnostics](../contributing/profiling-perfetto.md) for
-build and capture steps.
+`RankedProfileConfig` manages activation automatically for operation-scoped
+HTML reports. See
+[Perfetto diagnostics](../contributing/profiling-perfetto.md) for build and
+capture steps.
 
 ### Exceptions
 
@@ -116,43 +116,54 @@ See [Troubleshoot a failed run](../advanced/tracing-and-diagnostics.md).
 
 ### Classes
 
-<a id="profiler-config"></a>
-#### `ProfilerConfig`
+<a id="execution-profile-config"></a>
+#### `ExecutionProfileConfig`
 
 ```python
-class ProfilerConfig:
-    output: Path
-    sample_hz: Literal[100, 1000]
-    artifact_output: Path | None
+class ExecutionProfileConfig:
+    chrome_trace_path: Path | None
 
     def __init__(
         self,
-        output: str | PathLike[str],
         *,
-        sample_hz: Literal[100, 1000] = 1000,
-        artifact_output: str | PathLike[str] | None = None,
+        chrome_trace_path: str | PathLike[str] | None = None,
     ) -> None
 ```
 
-Configures one operation-scoped ranked HTML report. The object is immutable.
-`output` names the report file. Delta Funnel creates missing parent directories
-and replaces an existing file only after the new report is complete. Set
-`artifact_output` to retain the same operation-scoped ranked model as a
-`.dfprofile` file for later HTML or terminal inspection. The default `None`
-keeps only the HTML report.
+Enables the exact semantic timeline and DataFusion operator profile returned by
+one operation. Set `chrome_trace_path` to also write Chrome Trace Event JSON.
+The immutable configuration works in normal wheels. The trace parent directory
+must exist. The destination is opened before execution and replaced only after
+the trace is ready. Dry runs reject this configuration.
 
-Use 1000 Hz for short operations and 100 Hz for lower-volume or longer
-captures. Only one operation profile can be active in a process. Passing this
-configuration to a supported operation automatically enables detailed semantic
-and operator profiling.
+<a id="ranked-profile-config"></a>
+#### `RankedProfileConfig`
 
-The type is importable from every wheel, but using it requires a
-diagnostics-enabled Linux build plus `tracebox` and `trace_processor_shell`.
-Dry-run operations reject it.
+```python
+class RankedProfileConfig:
+    report_path: Path
+    sample_hz: Literal[100, 1000]
+    artifact_path: Path | None
 
-See
-[Generate an operation-scoped ranked HTML report](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report)
-for examples.
+    def __init__(
+        self,
+        report_path: str | PathLike[str],
+        *,
+        sample_hz: Literal[100, 1000] = 1000,
+        artifact_path: str | PathLike[str] | None = None,
+    ) -> None
+```
+
+Configures one operation-scoped ranked HTML report. Set `artifact_path` to
+retain the same model as a `.dfprofile` file for later HTML or terminal
+inspection. The configuration is immutable. Delta Funnel creates missing
+parent directories. Use 1000 Hz for short operations and 100 Hz for longer
+captures.
+
+Only one ranked profile can be active in a process. The type is importable from
+every wheel, but using it requires a diagnostics-enabled Linux build. It does
+not enable the exact profile, and dry runs reject it. See
+[Generate a ranked HTML report](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report).
 
 <a id="session"></a>
 #### `Session`
@@ -287,24 +298,22 @@ def write_all(
     options: WriteAllExecutionOptions | None = None,
     dry_run: bool | None = None,
     progress: bool | None = None,
-    trace_path: str | PathLike[str] | None = None,
-    profiler: ProfilerConfig | None = None,
+    execution_profile: ExecutionProfileConfig | None = None,
+    ranked_profile: RankedProfileConfig | None = None,
 ) -> Report
 ```
 
 Plans or executes several SQL Server output specs in order and returns one
 report. Every spec must come from the same session.
 
-- `dry_run=True` plans without writing and rejects `options`, `trace_path`, and
-  `profiler`.
+- `dry_run=True` plans without writing and rejects `options`,
+  `execution_profile`, and `ranked_profile`.
 - `options={"cache_mode": "auto"}` enables eligible shared-work caching.
 - `options={"cache_mode": "disabled"}` disables shared-work caching.
-- `options={"profile": True}` attaches profiles to attempted outputs and
-  executed cache aliases.
-- `trace_path` requires profiling and exports one Chrome Trace Event JSON
+- `execution_profile` attaches exact profiles to attempted outputs and executed
+  cache aliases. Its `chrome_trace_path` exports one Chrome Trace Event JSON
   document for the complete operation.
-- `profiler` automatically enables detailed profiling and writes one
-  operation-scoped ranked HTML report.
+- `ranked_profile` writes an operation-scoped ranked HTML report.
 
 See [Multiple outputs and shared caching](../advanced/multiple-outputs.md) for
 workflow examples and
@@ -356,16 +365,16 @@ def preview(
     limit: int = 20,
     *,
     progress: bool | None = None,
-    profile: bool | None = False,
-    profiler: ProfilerConfig | None = None,
+    execution_profile: ExecutionProfileConfig | None = None,
+    ranked_profile: RankedProfileConfig | None = None,
 ) -> Preview
 ```
 
 Executes a bounded query and returns a rendered `Preview`. Phase timings are
-always included. Only the Boolean `True` enables the detailed execution
-profile directly. Passing `profiler` also enables that profile and writes one
-operation-scoped ranked HTML report. The method reads rows but does not contact
-SQL Server.
+always included. `execution_profile` enables the returned exact profile and
+optional Chrome trace. `ranked_profile` writes a sampled native CPU report
+without implicitly enabling the exact profile. The method reads rows but does
+not contact SQL Server.
 
 <a id="table-show"></a>
 ##### `Table.show`
@@ -416,22 +425,19 @@ def write_to_mssql(
     name: str | None = None,
     connection_string: str | None = None,
     progress: bool | None = None,
-    profile: bool | None = False,
-    trace_path: str | PathLike[str] | None = None,
-    profiler: ProfilerConfig | None = None,
+    execution_profile: ExecutionProfileConfig | None = None,
+    ranked_profile: RankedProfileConfig | None = None,
 ) -> Report
 ```
 
 Plans or executes one SQL Server output and returns a report.
 
-- `dry_run=True` plans without writing and rejects `profile=True`,
-  `trace_path`, and `profiler`.
-- `profile=True` attaches `execution_profile` and `operation_timeline` to an
-  execute report.
-- `trace_path` requires detailed profiling and exports Chrome Trace Event JSON
-  after a successful write.
-- `profiler` automatically enables detailed profiling and writes one
-  operation-scoped ranked HTML report.
+- `dry_run=True` plans without writing and rejects `execution_profile` and
+  `ranked_profile`.
+- `execution_profile` attaches `execution_profile` and `operation_timeline` to
+  an execute report. Its `chrome_trace_path` also exports Chrome Trace Event
+  JSON.
+- `ranked_profile` writes an operation-scoped ranked HTML report.
 - `connection_string` overrides the session default for this call.
 
 If trace or HTML report export fails after SQL Server succeeds, the raised
@@ -453,19 +459,14 @@ class Preview:
     phase_timings: list[dict[str, object]]
     execution_profile: dict[str, object] | None
 
-    def export_trace(self, path: str | PathLike[str]) -> None
     def __str__(self) -> str
     def _repr_html_(self) -> str
 ```
 
 `text` is the plain-text table. `html` backs notebook display.
 `phase_timings` is always populated. `execution_profile` is populated when
-`Table.preview` receives either `profile=True` or a `ProfilerConfig`.
-
-`export_trace` creates or replaces a Chrome Trace Event JSON file. It requires
-a profiled preview, accepts a string or `os.PathLike`, and does not create
-missing parent directories. See
-[Export a preview trace](../advanced/execution-profiling.md#export-a-preview-trace).
+`Table.preview` receives an `ExecutionProfileConfig`. Configure
+`chrome_trace_path` before calling `preview` to export Chrome Trace Event JSON.
 
 <a id="mssql-output-spec"></a>
 #### `MssqlOutputSpec`

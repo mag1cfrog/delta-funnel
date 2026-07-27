@@ -12,29 +12,28 @@ Perfetto diagnostics currently require a diagnostics-enabled build on Linux
 x86_64. Follow [Set up Perfetto diagnostics for Python](profiling-perfetto.md)
 once before using either view.
 
-The existing `profile=True` and `trace_path` APIs remain a separate,
-diagnostics-free path for semantic and operator data. They do not collect
-native CPU stacks.
+`ExecutionProfileConfig` provides a separate, diagnostics-free path for exact
+semantic and operator data. It does not collect native CPU stacks.
 
 ## Explore one operation in HTML
 
-Create a profiler configuration and pass it directly to the operation:
+Create a ranked profile configuration and pass it directly to the operation:
 
 ```python
-from deltafunnel import ProfilerConfig
+from deltafunnel import RankedProfileConfig
 
 preview = table.preview(
     limit=100_000,
-    profiler=ProfilerConfig(
+    ranked_profile=RankedProfileConfig(
         "target/profiles/preview.profile.html",
         sample_hz=1000,
-        artifact_output="target/profiles/preview.dfprofile",
+        artifact_path="target/profiles/preview.dfprofile",
     ),
 )
 ```
 
 Open `target/profiles/preview.profile.html` in a browser. The report is
-self-contained and stays on the local machine. `artifact_output` is optional;
+self-contained and stays on the local machine. `artifact_path` is optional;
 it preserves the same validated ranked model for later terminal inspection.
 
 [![Ranked profiling report showing capture quality, controls, and the top-level operation](../assets/ranked-profile-overview.png)](../assets/ranked-profile-overview.png)
@@ -55,16 +54,16 @@ Use 1000 Hz for short investigations that need more native-stack detail. Use
 100 Hz to reduce capture volume. Both values are statistical sampling
 frequencies, not timing precision guarantees.
 
-The same `ProfilerConfig` works with `Table.write_to_mssql` and
+The same `RankedProfileConfig` works with `Table.write_to_mssql` and
 `Session.write_all`. See the complete preview and write examples in
 [Generate an operation-scoped ranked HTML report](../advanced/execution-profiling.md#generate-an-operation-scoped-ranked-html-report).
 
 ## Investigate with an agent or script
 
-Set `artifact_output` in the same `ProfilerConfig` used for HTML. The resulting
-`.dfprofile` contains the same operation-scoped hierarchy and metrics without
-retaining the larger temporary raw capture or repeating Trace Processor
-analysis.
+Set `artifact_path` in the same `RankedProfileConfig` used for HTML. The
+resulting `.dfprofile` contains the same operation-scoped hierarchy and metrics
+without retaining the larger temporary raw capture or repeating Trace
+Processor analysis.
 
 Show a bounded one-shot view:
 

@@ -23,10 +23,17 @@ def main():
     with tempfile.TemporaryDirectory(prefix="semantic-parity-") as temp_dir:
         source_uri = delta_table_uri(temp_dir)
         table = deltafunnel.Session().delta_lake(source_uri, name="orders")
-        preview = table.preview(limit=2, progress=False, profile=True)
+        preview = table.preview(
+            limit=2,
+            progress=False,
+            execution_profile=deltafunnel.ExecutionProfileConfig(
+                chrome_trace_path=args.stable_trace,
+            ),
+        )
         if "| id |" not in preview.text:
-            raise RuntimeError("deterministic Delta preview did not return the fixture row")
-        preview.export_trace(args.stable_trace)
+            raise RuntimeError(
+                "deterministic Delta preview did not return the fixture row"
+            )
 
 
 if __name__ == "__main__":

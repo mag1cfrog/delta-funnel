@@ -205,20 +205,27 @@ with tempfile.TemporaryDirectory() as artifact_temp_dir:
     }
 
     aliased_output = artifact_temp.joinpath("aliased.profile.html")
-    profiler = deltafunnel.ProfilerConfig(
+    ranked_profile = deltafunnel.RankedProfileConfig(
         aliased_output,
-        artifact_output=aliased_output,
+        artifact_path=aliased_output,
     )
     session = deltafunnel.Session()
     table = session.table_from_sql("select 1 as value")
     for operation_name, operation in [
         (
             "preview",
-            lambda: table.preview(progress=False, profiler=profiler),
+            lambda: table.preview(
+                progress=False,
+                ranked_profile=ranked_profile,
+            ),
         ),
         (
             "write_all",
-            lambda: session.write_all([], progress=False, profiler=profiler),
+            lambda: session.write_all(
+                [],
+                progress=False,
+                ranked_profile=ranked_profile,
+            ),
         ),
     ]:
         try:
