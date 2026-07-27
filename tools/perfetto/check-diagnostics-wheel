@@ -402,8 +402,12 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "  printf '\\1' >&3\n"
         "  exit 69\n"
         "fi\n"
+        "if [[ ${DELTA_FUNNEL_TEST_TRACEBOX_IGNORE_TERM:-0} == 1 ]]; then\n"
+        "  trap '' TERM\n"
+        "else\n"
+        "  trap 'exit \"${DELTA_FUNNEL_TEST_TRACEBOX_STOP_STATUS:-0}\"' TERM\n"
+        "fi\n"
         "printf '\\0' >&3\n"
-        "trap 'exit \"${DELTA_FUNNEL_TEST_TRACEBOX_STOP_STATUS:-0}\"' TERM\n"
         "while :; do sleep 1; done\n"
     )
     fake_tracebox.chmod(0o700)
@@ -659,6 +663,23 @@ with tempfile.TemporaryDirectory() as temp_dir:
         or not report.is_file()
     ):
         raise SystemExit("tracebox failure did not preserve independent outcomes")
+
+    stuck_tracebox, trace, report, status = run_capture(
+        "stuck-tracebox",
+        DELTA_FUNNEL_TEST_TRACEBOX_IGNORE_TERM="1",
+    )
+    if (
+        stuck_tracebox.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "137"
+        or status["health_status"] != "0"
+        or status["report_status"] != "0"
+        or status["report"] != str(report)
+        or not trace.is_file()
+        or not report.is_file()
+        or "do not retry" not in stuck_tracebox.stderr
+    ):
+        raise SystemExit("capture-workload did not bound an unresponsive tracebox")
 
     readiness, trace, report, status = run_capture(
         "readiness-failure",

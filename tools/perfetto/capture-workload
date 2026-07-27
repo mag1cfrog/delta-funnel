@@ -202,6 +202,7 @@ report_status=125
 report_output=
 health_output_file=$runtime_dir/capture-health.out
 stop_grace_polls=100
+tracebox_stop_grace_polls=1000
 
 emit_status() {
   local workload_status=$1
@@ -224,8 +225,7 @@ stop_tracebox() {
   if [[ -z $trace_pid ]]; then
     return
   fi
-  kill -TERM "$trace_pid" 2>/dev/null || true
-  if wait "$trace_pid"; then
+  if stop_process_group "$trace_pid" TERM "$tracebox_stop_grace_polls"; then
     tracebox_status=0
   else
     tracebox_status=$?
@@ -247,13 +247,15 @@ process_finished() {
 stop_process_group() {
   local pid=$1
   local signal=$2
+  local grace_polls=${3:-$stop_grace_polls}
   local status=0
   local waited=0
   local poll
 
-  kill "-$signal" "$pid" 2>/dev/null || true
-  kill "-$signal" -- "-$pid" 2>/dev/null || true
-  for (( poll = 0; poll < stop_grace_polls; poll++ )); do
+  kill "-$signal" -- "-$pid" 2>/dev/null ||
+    kill "-$signal" "$pid" 2>/dev/null ||
+    true
+  for (( poll = 0; poll < grace_polls; poll++ )); do
     if (( waited == 0 )) && process_finished "$pid"; then
       if wait "$pid" 2>/dev/null; then
         status=0
@@ -268,8 +270,9 @@ stop_process_group() {
     sleep 0.01
   done
 
-  kill -KILL -- "-$pid" 2>/dev/null || true
-  kill -KILL "$pid" 2>/dev/null || true
+  kill -KILL -- "-$pid" 2>/dev/null ||
+    kill -KILL "$pid" 2>/dev/null ||
+    true
   if (( waited == 0 )); then
     if wait "$pid" 2>/dev/null; then
       status=0
@@ -423,7 +426,7 @@ fi
 }
 
 mkfifo "$ready_fifo"
-"$tracebox" --txt --system-sockets --no-clobber \
+setsid --wait "$tracebox" --txt --system-sockets --no-clobber \
   --notify-fd 3 \
   --config "$capture_config" \
   --out "$capture_path" \
