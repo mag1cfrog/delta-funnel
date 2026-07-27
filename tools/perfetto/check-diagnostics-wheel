@@ -276,6 +276,9 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
         "$query == *record_kind* ]]; then\n"
         "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
+        "elif [[ $query == *delta_funnel_capture_health_input* && "
+        "$query == *selected_operations* ]]; then\n"
+        "  printf '\"capture_complete\"\\n1\\n'\n"
         "else\n"
         "  exit 65\n"
         "fi\n"
@@ -346,6 +349,87 @@ invalid_sample_hz = subprocess.run(
 )
 if invalid_sample_hz.returncode != 64:
     raise SystemExit("capture-workload did not reject an invalid sample frequency")
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp = Path(temp_dir)
+    aggregate = temp.joinpath("aggregate.csv")
+    aggregate.write_text(
+        '"record_hex"\n'
+        + "".join(
+            f'"{json.dumps(record, separators=(",", ":")).encode().hex()}"\n'
+            for record in records
+        )
+    )
+    fake_trace_processor = temp.joinpath("trace_processor_shell")
+    fake_trace_processor.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "query=$(cat)\n"
+        "if [[ $query == *delta_funnel_capture_health_input* && "
+        "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
+        "$query == *record_kind* ]]; then\n"
+        "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
+        "elif [[ $query == *delta_funnel_capture_health_input* && "
+        "$query == *selected_operations* ]]; then\n"
+        "  printf '\"capture_complete\"\\n1\\n'\n"
+        "else\n"
+        "  exit 65\n"
+        "fi\n"
+    )
+    fake_trace_processor.chmod(0o700)
+    fake_tracebox = temp.joinpath("tracebox")
+    fake_tracebox.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ \" $* \" == *' --query '* ]]; then exit 0; fi\n"
+        "output=\n"
+        "while (( $# > 0 )); do\n"
+        "  if [[ $1 == --out ]]; then output=$2; shift 2; else shift; fi\n"
+        "done\n"
+        "printf '\\x0a\\x00' >\"$output\"\n"
+        "printf '\\0' >&3\n"
+        "trap 'exit 0' TERM\n"
+        "while :; do sleep 1; done\n"
+    )
+    fake_tracebox.chmod(0o700)
+    fake_perf = temp.joinpath("perf")
+    fake_perf.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_perf.chmod(0o700)
+    trace = temp.joinpath("captures", "successful.pftrace")
+    report = temp.joinpath("captures", "successful.profile.html")
+    captured = subprocess.run(
+        [
+            capture,
+            "--output",
+            trace,
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+        env={
+            **os.environ,
+            "TRACEBOX": str(fake_tracebox),
+            "PERF": str(fake_perf),
+            "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
+            "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    status = captured.stdout.splitlines()[-1]
+    expected_status = (
+        "workload_status=0 tracebox_status=0 health_status=0 "
+        "report_status=0 sample_hz=1000 "
+        f"trace={trace} report={report}"
+    )
+    if status != expected_status:
+        raise SystemExit(f"capture-workload returned an invalid status: {status}")
+    if trace.read_bytes() != trace_bytes:
+        raise SystemExit("automatic report generation modified the raw trace")
+    if not report.is_file() or "Delta Funnel preview" not in report.read_text():
+        raise SystemExit("capture-workload did not generate the ranked report")
 
 if not callable(deltafunnel.init_perfetto_diagnostics):
     raise SystemExit("Perfetto diagnostics initializer is not callable")

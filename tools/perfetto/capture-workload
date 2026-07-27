@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: capture-workload [--mode short|streaming|deep-system] [--sample-hz 100|1000] --output TRACE -- COMMAND [ARG...]
 
-Record one diagnostics-enabled Python workload and check the saved trace.
+Record one diagnostics-enabled Python workload, check the saved trace, and
+generate a sibling ranked HTML report.
 The default mode is short. Short mode defaults to 1000 Hz; other modes default
 to 100 Hz.
 EOF
@@ -135,6 +136,14 @@ if [[ -e $capture_path ]]; then
   printf 'capture-workload: output already exists: %s\n' "$capture_path" >&2
   exit 73
 fi
+case $capture_path in
+  *.pftrace)
+    report_path=${capture_path%.pftrace}.profile.html
+    ;;
+  *)
+    report_path=$capture_path.profile.html
+    ;;
+esac
 
 target=$1
 if [[ $target != */* ]]; then
@@ -151,6 +160,19 @@ shift
 
 target_dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd -P)
 target_name=$(basename -- "$target")
+report_cli=$target_dir/delta-funnel-perfetto
+if [[ ! -x $report_cli ]]; then
+  report_cli=$(command -v delta-funnel-perfetto) || {
+    printf '%s\n' \
+      'capture-workload: required command is unavailable: delta-funnel-perfetto' >&2
+    exit 127
+  }
+fi
+if ! "$report_cli" report --help >/dev/null; then
+  printf '%s\n' \
+    'capture-workload: ranked report command is unavailable' >&2
+  exit 69
+fi
 launcher=$target_dir/delta-funnel-perfetto-preview
 if [[ -e $launcher || -L $launcher ]]; then
   if [[ ! -x $launcher ]] || [[ ! $launcher -ef $target ]]; then
@@ -279,10 +301,26 @@ else
   health_status=$?
 fi
 
-printf 'workload_status=%s tracebox_status=%s health_status=%s sample_hz=%s trace=%s\n' \
-  "$workload_status" "${tracebox_status:-125}" "$health_status" "$sample_hz" \
-  "$capture_path"
-if (( workload_status == 0 && (tracebox_status != 0 || health_status != 0) )); then
+report_status=125
+report_output=
+if (( health_status == 0 )); then
+  if "$report_cli" report "$capture_path" --output "$report_path"; then
+    report_status=0
+    report_output=$report_path
+  else
+    report_status=$?
+  fi
+fi
+
+printf 'workload_status=%s tracebox_status=%s health_status=%s report_status=%s sample_hz=%s trace=%s' \
+  "$workload_status" "${tracebox_status:-125}" "$health_status" "$report_status" \
+  "$sample_hz" "$capture_path"
+if [[ -n $report_output ]]; then
+  printf ' report=%s' "$report_output"
+fi
+printf '\n'
+if (( workload_status == 0 &&
+      (tracebox_status != 0 || health_status != 0 || report_status != 0) )); then
   printf '%s\n' \
     'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2
 fi
