@@ -1,18 +1,16 @@
 //! Python session wrapper.
 
-use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
-use crate::exception::{attach_operation_result, delta_funnel_error_to_py, delta_funnel_py_error};
+use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::profiler::{
-    PyExecutionProfileConfig, PyRankedProfileConfig, execution_profile_mode,
-    in_ranked_profile_scope, start_ranked_profile,
+    PyRankedProfileConfig, execution_profile_mode, in_ranked_profile_scope, start_ranked_profile,
 };
 use crate::progress::PythonProgress;
-use crate::table::{PyTable, TraceDestination};
+use crate::table::PyTable;
 
 /// Delta Funnel workflow session.
 ///
@@ -143,10 +141,9 @@ impl PySession {
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept the
     /// `cache_mode` option. Pass
-    /// `execution_profile=ExecutionProfileConfig(...)` to attach an exact
-    /// execution profile to each attempted output and executed cache alias and
-    /// optionally export one Chrome Trace Event JSON file for the complete
-    /// write-all wall clock. Cache profiles are under
+    /// `execution_profile=True` to attach an exact execution profile to each
+    /// attempted output and executed cache alias.
+    /// Cache profiles are under
     /// `report["cache"]["aliases"]`, or under `error.context["aliases"]` for
     /// cache orchestration failures. Pass
     /// `ranked_profile=RankedProfileConfig(...)` to record the complete
@@ -155,7 +152,7 @@ impl PySession {
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.
-    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None, execution_profile=None, ranked_profile=None))]
+    #[pyo3(signature = (outputs, *, options=None, dry_run=None, progress=None, execution_profile=false, ranked_profile=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_all(
         slf: Py<Self>,
@@ -164,7 +161,7 @@ impl PySession {
         options: Option<&Bound<'_, PyDict>>,
         dry_run: Option<bool>,
         progress: Option<bool>,
-        execution_profile: Option<PyRef<'_, PyExecutionProfileConfig>>,
+        execution_profile: bool,
         ranked_profile: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<Py<PyAny>> {
         for output in &outputs {
@@ -188,7 +185,7 @@ impl PySession {
             .collect::<Vec<_>>();
 
         if dry_run == Some(true) {
-            if execution_profile.is_some() || ranked_profile.is_some() {
+            if execution_profile || ranked_profile.is_some() {
                 return Err(config_py_error(
                     py,
                     "invalid_option_value",
@@ -212,33 +209,17 @@ impl PySession {
         }
 
         let options = parse_write_all_options(py, options)?
-            .with_execution_profile_mode(execution_profile_mode(execution_profile.as_deref()));
-        let trace_path = execution_profile
-            .as_deref()
-            .and_then(PyExecutionProfileConfig::chrome_trace_path)
-            .map(std::path::absolute)
-            .transpose()
-            .map_err(PyOSError::new_err)?;
-        let trace_destination = trace_path
-            .as_deref()
-            .map(TraceDestination::open)
-            .transpose()?;
-        let ranked_capture =
-            start_ranked_profile(py, ranked_profile.as_deref(), trace_path.as_deref())?;
-        drop((execution_profile, ranked_profile));
+            .with_execution_profile_mode(execution_profile_mode(execution_profile));
+        let ranked_capture = start_ranked_profile(py, ranked_profile.as_deref())?;
+        drop(ranked_profile);
         let progress = if requests.is_empty() {
             None
         } else {
             PythonProgress::new(progress)
         };
         let write = in_ranked_profile_scope(ranked_capture.as_ref(), || {
-            slf.borrow(py).execute_write_all(
-                py,
-                &requests,
-                options,
-                progress.as_ref(),
-                trace_destination,
-            )
+            slf.borrow(py)
+                .execute_write_all(py, &requests, options, progress.as_ref())
         });
         let ranked_result = ranked_capture
             .map(|ranked_capture| ranked_capture.finish(py))
@@ -339,7 +320,6 @@ impl PySession {
         request: &delta_funnel::OutputWritePlan,
         profile_mode: delta_funnel::ExecutionProfileMode,
         progress: Option<&PythonProgress>,
-        trace_destination: Option<TraceDestination>,
     ) -> PyResult<Py<PyAny>> {
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_to_mssql_with_profile_mode_and_progress(
@@ -358,18 +338,7 @@ impl PySession {
             progress.finish(py, report.as_ref().err(), None)?;
         }
         let report = report?;
-        let report_value = report.to_json_value();
-        if let Some(trace_destination) = trace_destination {
-            write_completed_trace(
-                py,
-                trace_destination,
-                report.to_trace_event_json_value(),
-                "write trace export requires exact execution profiling",
-                "completed",
-                &report_value,
-            )?;
-        }
-        json_value_to_py(py, &report_value)
+        json_value_to_py(py, &report.to_json_value())
     }
 
     #[allow(
@@ -433,7 +402,6 @@ impl PySession {
         requests: &[delta_funnel::OutputWritePlan],
         options: delta_funnel::WriteAllOptions,
         progress: Option<&PythonProgress>,
-        trace_destination: Option<TraceDestination>,
     ) -> PyResult<(Py<PyAny>, &'static str)> {
         let report = py.detach(|| match progress {
             Some(progress) => self.runtime.write_all_with_progress(
@@ -462,40 +430,8 @@ impl PySession {
             "completed_with_failures"
         };
         let report_value = report.to_json_value();
-        if let Some(trace_destination) = trace_destination {
-            write_completed_trace(
-                py,
-                trace_destination,
-                report.to_trace_event_json_value(),
-                "write-all trace export requires exact execution profiling",
-                status,
-                &report_value,
-            )?;
-        }
         Ok((json_value_to_py(py, &report_value)?, status))
     }
-}
-
-fn write_completed_trace(
-    py: Python<'_>,
-    destination: TraceDestination,
-    trace: Option<serde_json::Value>,
-    unavailable_message: &'static str,
-    status: &str,
-    report: &serde_json::Value,
-) -> PyResult<()> {
-    trace
-        .ok_or_else(|| {
-            config_py_error(
-                py,
-                "execution_profile_unavailable",
-                unavailable_message.to_owned(),
-            )
-        })
-        .and_then(|trace| destination.write(&trace))
-        .inspect_err(|error| {
-            attach_operation_result(py, error, status, None, Some(report));
-        })
 }
 
 /// Unregistered Delta source returned by `Session.delta_lake(...)` without `name`.
@@ -1221,7 +1157,7 @@ mod tests {
         MssqlTableName, MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions,
         TargetValidationMode, connect_mssql_client_from_ado_string,
     };
-    use pyo3::exceptions::{PyAssertionError, PyKeyError, PyOSError, PyTypeError};
+    use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
     use std::{
@@ -1322,75 +1258,22 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once(") -> Report:"))
             .map_or("", |(signature, _)| signature);
         assert!(signature.contains("options: WriteAllExecutionOptions | None = None"));
-        assert!(signature.contains("execution_profile: ExecutionProfileConfig | None = None"));
+        assert!(signature.contains("execution_profile: bool = False"));
         assert!(signature.contains("ranked_profile: RankedProfileConfig | None = None"));
         assert!(!signature.contains("trace_path:"));
         assert!(!signature.contains("profiler:"));
         assert!(!signature.contains("options: Options"));
     }
 
-    #[test]
-    fn write_all_execution_profile_config_exports_chrome_json() -> PyResult<()> {
-        Python::attach(|py| {
-            let module = PyModule::new(py, "deltafunnel")?;
-            deltafunnel(&module)?;
-            let session = module.getattr("Session")?.call0()?;
-            let outputs = PyList::empty(py);
-            let trace_path = env_unique_path("write-all-trace")?.with_extension("json");
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("chrome_trace_path", trace_path.to_string_lossy().as_ref())?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&config_kwargs))?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("execution_profile", execution_profile)?;
-            session.call_method("write_all", (&outputs,), Some(&kwargs))?;
-
-            let trace: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&trace_path).map_err(io_py_error)?)
-                    .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
-            assert!(trace.get("traceEvents").is_some());
-            assert!(trace.get("delta_funnel_write_all_report").is_some());
-            fs::remove_file(trace_path).map_err(io_py_error)?;
-
-            let signature = module
-                .getattr("Session")?
-                .getattr("write_all")?
-                .getattr("__text_signature__")?
-                .extract::<String>()?;
-            assert!(
-                signature.ends_with("progress=None, execution_profile=None, ranked_profile=None)")
-            );
-            Ok(())
-        })
-    }
-
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     #[test]
-    fn write_all_rejects_aliasing_profile_destinations_before_execution() -> PyResult<()> {
+    fn write_all_rejects_aliasing_ranked_destinations_before_execution() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
             let session = module.getattr("Session")?.call0()?;
             let outputs = PyList::empty(py);
             let output = env_unique_path("write-all-output-alias")?.with_extension("html");
-
-            let ranked_profile = module
-                .getattr("RankedProfileConfig")?
-                .call1((output.to_string_lossy().as_ref(),))?;
-            let execution_kwargs = PyDict::new(py);
-            execution_kwargs.set_item("chrome_trace_path", output.to_string_lossy().as_ref())?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&execution_kwargs))?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("execution_profile", execution_profile)?;
-            kwargs.set_item("ranked_profile", ranked_profile)?;
-            let error = session
-                .call_method("write_all", (&outputs,), Some(&kwargs))
-                .expect_err("one path cannot hold both profile formats");
-            assert_config_error(py, &error, "invalid_option_value")?;
-            assert!(!output.exists());
 
             let ranked_kwargs = PyDict::new(py);
             ranked_kwargs.set_item("artifact_path", output.to_string_lossy().as_ref())?;
@@ -1404,29 +1287,6 @@ mod tests {
                 .expect_err("HTML and artifact outputs must not alias");
             assert_config_error(py, &error, "invalid_option_value")?;
             assert!(!output.exists());
-
-            fs::write(&output, b"sentinel").map_err(io_py_error)?;
-            let hard_link = output.with_extension("json");
-            fs::hard_link(&output, &hard_link).map_err(io_py_error)?;
-            let ranked_profile = module
-                .getattr("RankedProfileConfig")?
-                .call1((output.to_string_lossy().as_ref(),))?;
-            let execution_kwargs = PyDict::new(py);
-            execution_kwargs.set_item("chrome_trace_path", hard_link.to_string_lossy().as_ref())?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&execution_kwargs))?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("execution_profile", execution_profile)?;
-            kwargs.set_item("ranked_profile", ranked_profile)?;
-            let error = session
-                .call_method("write_all", (&outputs,), Some(&kwargs))
-                .expect_err("hard-linked profile destinations must be rejected");
-            assert_config_error(py, &error, "invalid_option_value")?;
-            assert_eq!(fs::read(&output).map_err(io_py_error)?, b"sentinel");
-
-            fs::remove_file(hard_link).map_err(io_py_error)?;
-            fs::remove_file(output).map_err(io_py_error)?;
             Ok(())
         })
     }
@@ -1601,7 +1461,7 @@ mod tests {
                 .extract::<String>()?;
             assert!(write_all_doc.contains("dry_run=True"));
             assert!(write_all_doc.contains("cache_mode"));
-            assert!(write_all_doc.contains("ExecutionProfileConfig"));
+            assert!(write_all_doc.contains("execution_profile=True"));
             assert!(write_all_doc.contains("RankedProfileConfig"));
             assert!(write_all_doc.contains("plain Python `dict` report"));
 
@@ -1620,7 +1480,7 @@ mod tests {
                 .getattr("__doc__")?
                 .extract::<String>()?;
             assert!(write_to_mssql_doc.contains("dry_run=True"));
-            assert!(write_to_mssql_doc.contains("ExecutionProfileConfig"));
+            assert!(write_to_mssql_doc.contains("execution_profile=True"));
             assert!(write_to_mssql_doc.contains("RankedProfileConfig"));
             assert!(write_to_mssql_doc.contains("plain Python"));
 
@@ -2714,37 +2574,12 @@ mod tests {
                 .unwrap_err();
             assert_missing_connection_error(py, &error)?;
 
-            let trace_path = env_unique_path("failed-write-all-trace")?.with_extension("json");
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("chrome_trace_path", trace_path.to_string_lossy().as_ref())?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&config_kwargs))?;
-            kwargs.set_item("execution_profile", execution_profile)?;
+            kwargs.set_item("execution_profile", true)?;
             let error = session
                 .bind(py)
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .unwrap_err();
             assert_missing_connection_error(py, &error)?;
-            assert!(!trace_path.exists());
-
-            let missing_parent = env_unique_path("missing-trace-parent")?;
-            let invalid_trace_path = missing_parent.join("trace.json");
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item(
-                "chrome_trace_path",
-                invalid_trace_path.to_string_lossy().as_ref(),
-            )?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&config_kwargs))?;
-            kwargs.set_item("execution_profile", execution_profile)?;
-            let error = session
-                .bind(py)
-                .call_method("write_all", (&outputs,), Some(&kwargs))
-                .unwrap_err();
-            assert!(error.is_instance_of::<PyOSError>(py));
-            assert!(!missing_parent.exists());
 
             Ok(())
         })
@@ -3428,12 +3263,31 @@ union all select cast(902 as bigint) as order_id",),
     }
 
     #[test]
-    fn write_all_profile_option_is_retired() -> PyResult<()> {
+    fn write_all_execution_profile_is_strict_and_legacy_option_is_retired() -> PyResult<()> {
         Python::attach(|py| {
             assert_eq!(
                 parse_write_all_options(py, None)?.execution_profile_mode(),
                 ExecutionProfileMode::Disabled
             );
+
+            let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
+            let outputs = PyList::empty(py);
+            for invalid in [0, 1] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("execution_profile", invalid)?;
+                let error = session
+                    .bind(py)
+                    .call_method("write_all", (&outputs,), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("execution_profile", py.None())?;
+            let error = session
+                .bind(py)
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
 
             let options = PyDict::new(py);
             options.set_item("profile", true)?;

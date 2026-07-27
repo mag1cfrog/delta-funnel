@@ -31,16 +31,6 @@ class DeltaFunnelError(Exception):
     context: object | None
 
 
-class ExecutionProfileConfig:
-    chrome_trace_path: Path | None
-
-    def __init__(
-        self,
-        *,
-        chrome_trace_path: str | PathLike[str] | None = None,
-    ) -> None: ...
-
-
 class RankedProfileConfig:
     report_path: Path
     sample_hz: Literal[100, 1000]
@@ -98,7 +88,7 @@ class Session:
         options: WriteAllExecutionOptions | None = None,
         dry_run: bool | None = None,
         progress: bool | None = None,
-        execution_profile: ExecutionProfileConfig | None = None,
+        execution_profile: bool = False,
         ranked_profile: RankedProfileConfig | None = None,
     ) -> Report: ...
 
@@ -126,7 +116,7 @@ class Table:
         limit: int = 20,
         *,
         progress: bool | None = None,
-        execution_profile: ExecutionProfileConfig | None = None,
+        execution_profile: bool = False,
         ranked_profile: RankedProfileConfig | None = None,
     ) -> Preview: ...
 
@@ -152,7 +142,7 @@ class Table:
         name: str | None = None,
         connection_string: str | None = None,
         progress: bool | None = None,
-        execution_profile: ExecutionProfileConfig | None = None,
+        execution_profile: bool = False,
         ranked_profile: RankedProfileConfig | None = None,
     ) -> Report: ...
 

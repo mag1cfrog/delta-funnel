@@ -1,12 +1,5 @@
 //! Python lazy table wrapper.
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
-
-use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
 
@@ -14,8 +7,7 @@ use crate::exception::attach_operation_result;
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
 use crate::profiler::{
-    PyExecutionProfileConfig, PyRankedProfileConfig, execution_profile_mode,
-    in_ranked_profile_scope, start_ranked_profile,
+    PyRankedProfileConfig, execution_profile_mode, in_ranked_profile_scope, start_ranked_profile,
 };
 use crate::progress::PythonProgress;
 use crate::session::{PySession, borrow_session_mut, config_py_error};
@@ -139,12 +131,11 @@ impl PyTable {
     /// Writes this table to SQL Server, or runs a dry-run plan when requested.
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
-    /// `dict` report. Pass `execution_profile=ExecutionProfileConfig(...)` to
-    /// attach an exact query execution profile and optionally export Chrome
-    /// Trace Event JSON. Pass `ranked_profile=RankedProfileConfig(...)` to
-    /// record this write and export an interactive ranked HTML report plus an
-    /// optional reusable ranked artifact. Profiling is not available for dry
-    /// runs.
+    /// `dict` report. Pass `execution_profile=True` to attach an exact query
+    /// execution profile. Pass
+    /// `ranked_profile=RankedProfileConfig(...)` to record this write and
+    /// export an interactive ranked HTML report plus an optional reusable
+    /// ranked artifact. Profiling is not available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -158,7 +149,7 @@ impl PyTable {
     /// cleanup before raising the interruption. When possible, the exception
     /// includes `deltafunnel_operation_status` and, for a failed action,
     /// `deltafunnel_operation_error`.
-    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, execution_profile=None, ranked_profile=None))]
+    #[pyo3(signature = (*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, execution_profile=false, ranked_profile=None))]
     #[allow(clippy::too_many_arguments)]
     fn write_to_mssql(
         &self,
@@ -170,10 +161,10 @@ impl PyTable {
         name: Option<String>,
         connection_string: Option<String>,
         progress: Option<bool>,
-        execution_profile: Option<PyRef<'_, PyExecutionProfileConfig>>,
+        execution_profile: bool,
         ranked_profile: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<Py<PyAny>> {
-        if dry_run == Some(true) && (execution_profile.is_some() || ranked_profile.is_some()) {
+        if dry_run == Some(true) && (execution_profile || ranked_profile.is_some()) {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
@@ -199,27 +190,15 @@ impl PyTable {
             );
         }
 
-        let profile_mode = execution_profile_mode(execution_profile.as_deref());
-        let trace_path = execution_profile
-            .as_deref()
-            .and_then(PyExecutionProfileConfig::chrome_trace_path)
-            .map(std::path::absolute)
-            .transpose()
-            .map_err(PyOSError::new_err)?;
-        let trace_destination = trace_path
-            .as_deref()
-            .map(TraceDestination::open)
-            .transpose()?;
-        let ranked_capture =
-            start_ranked_profile(py, ranked_profile.as_deref(), trace_path.as_deref())?;
-        drop((execution_profile, ranked_profile));
+        let profile_mode = execution_profile_mode(execution_profile);
+        let ranked_capture = start_ranked_profile(py, ranked_profile.as_deref())?;
+        drop(ranked_profile);
         let write = in_ranked_profile_scope(ranked_capture.as_ref(), || {
             self.session.borrow(py).write_to_mssql(
                 py,
                 &spec.write_plan(delta_funnel::RunMode::Execute),
                 profile_mode,
                 progress.as_ref(),
-                trace_destination,
             )
         });
         let ranked_result = ranked_capture
@@ -246,73 +225,40 @@ impl PyTable {
     /// Pass `progress=True` to force it or `progress=False` to disable it. The
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass
-    /// `execution_profile=ExecutionProfileConfig(...)` to also attach the
-    /// exact execution profile and optionally export Chrome Trace Event
-    /// JSON. Pass `ranked_profile=RankedProfileConfig(...)` to record this
-    /// preview and write an interactive ranked HTML report plus an optional
-    /// reusable ranked artifact.
-    #[pyo3(signature = (limit=20, *, progress=None, execution_profile=None, ranked_profile=None))]
+    /// `execution_profile=True` to also attach the exact execution profile.
+    /// Pass `ranked_profile=RankedProfileConfig(...)` to
+    /// record this preview and write an interactive ranked HTML report plus an
+    /// optional reusable ranked artifact.
+    #[pyo3(signature = (limit=20, *, progress=None, execution_profile=false, ranked_profile=None))]
     fn preview(
         &self,
         py: Python<'_>,
         limit: usize,
         progress: Option<bool>,
-        execution_profile: Option<PyRef<'_, PyExecutionProfileConfig>>,
+        execution_profile: bool,
         ranked_profile: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<PyPreview> {
-        let profile_mode = execution_profile_mode(execution_profile.as_deref());
+        let profile_mode = execution_profile_mode(execution_profile);
         let options =
             delta_funnel::PreviewOptions::new(limit).with_execution_profile_mode(profile_mode);
         let progress = PythonProgress::for_preview(progress);
-        let trace_path = execution_profile
-            .as_deref()
-            .and_then(PyExecutionProfileConfig::chrome_trace_path)
-            .map(std::path::absolute)
-            .transpose()
-            .map_err(PyOSError::new_err)?;
-        let trace_destination = trace_path
-            .as_deref()
-            .map(TraceDestination::open)
-            .transpose()?;
-        let ranked_capture =
-            start_ranked_profile(py, ranked_profile.as_deref(), trace_path.as_deref())?;
-        drop((execution_profile, ranked_profile));
+        let ranked_capture = start_ranked_profile(py, ranked_profile.as_deref())?;
+        drop(ranked_profile);
         let preview = in_ranked_profile_scope(ranked_capture.as_ref(), || {
             self.session
                 .borrow(py)
                 .preview_table(py, &self.inner, options, progress.as_ref())
         });
-        let trace_result = preview
-            .as_ref()
-            .ok()
-            .zip(trace_destination)
-            .map(|(preview, destination)| {
-                preview
-                    .to_trace_event_json_value()
-                    .ok_or_else(|| {
-                        config_py_error(
-                            py,
-                            "execution_profile_unavailable",
-                            "preview trace export requires exact execution profiling".to_owned(),
-                        )
-                    })
-                    .and_then(|trace| destination.write(&trace))
-                    .inspect_err(|error| {
-                        attach_operation_result(py, error, "completed", None, None);
-                    })
-            })
-            .transpose();
         let ranked_result = ranked_capture
             .map(|ranked_capture| ranked_capture.finish(py))
             .transpose();
-        match (preview, trace_result, ranked_result) {
-            (Err(error), _, _) => Err(error),
-            (Ok(_), Err(error), _) => Err(error),
-            (Ok(_), Ok(_), Err(error)) => {
+        match (preview, ranked_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => {
                 attach_operation_result(py, &error, "completed", None, None);
                 Err(error)
             }
-            (Ok(preview), Ok(_), Ok(_)) => PyPreview::new(py, preview),
+            (Ok(preview), Ok(_)) => PyPreview::new(py, preview),
         }
     }
 
@@ -356,56 +302,6 @@ impl PyTable {
     }
 }
 
-/// A trace file opened before a mutating operation starts.
-pub(crate) struct TraceDestination {
-    path: PathBuf,
-    file: fs::File,
-    remove_on_drop: bool,
-}
-
-impl TraceDestination {
-    pub(crate) fn open(path: &Path) -> PyResult<Self> {
-        let (file, remove_on_drop) = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => (file, true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .map_err(PyOSError::new_err)?,
-                false,
-            ),
-            Err(error) => return Err(PyOSError::new_err(error)),
-        };
-        Ok(Self {
-            path: path.to_owned(),
-            file,
-            remove_on_drop,
-        })
-    }
-
-    pub(crate) fn write(mut self, trace: &serde_json::Value) -> PyResult<()> {
-        let bytes = serde_json::to_vec(trace)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        self.file.set_len(0).map_err(PyOSError::new_err)?;
-        self.file.write_all(&bytes).map_err(PyOSError::new_err)?;
-        self.file.flush().map_err(PyOSError::new_err)?;
-        self.remove_on_drop = false;
-        Ok(())
-    }
-}
-
-impl Drop for TraceDestination {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
 pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyPreview>()?;
     module.add_class::<PyTable>()
@@ -414,20 +310,17 @@ pub(crate) fn add_table(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::TraceDestination;
     use crate::{
         deltafunnel, exception::DeltaFunnelError, progress::adapter_creation_count,
         test_support::python_state,
     };
-    use pyo3::exceptions::{PyAttributeError, PyKeyError, PyOSError, PyRuntimeError, PyTypeError};
+    use pyo3::exceptions::{PyAttributeError, PyKeyError, PyRuntimeError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
-    use serde_json::Value;
 
     const PREVIEW_PHASES: [&str; 7] = [
         "preview_dataframe_planning",
@@ -438,28 +331,6 @@ mod tests {
         "preview_format_html",
         "preview_total",
     ];
-
-    #[test]
-    fn unused_trace_destination_preserves_the_preoperation_file_state() -> PyResult<()> {
-        let new_path = temp_trace_path("preflight-new")?;
-        let destination = TraceDestination::open(&new_path)?;
-        assert!(new_path.exists());
-        drop(destination);
-        assert!(!new_path.exists());
-
-        let existing_path = temp_trace_path("preflight-existing")?;
-        fs::write(&existing_path, b"existing trace")
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let destination = TraceDestination::open(&existing_path)?;
-        drop(destination);
-        assert_eq!(
-            fs::read(&existing_path).map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-            b"existing trace"
-        );
-        fs::remove_file(existing_path)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        Ok(())
-    }
 
     #[test]
     fn module_exports_table_type() -> PyResult<()> {
@@ -487,13 +358,13 @@ mod tests {
         let stub = include_str!("../deltafunnel.pyi");
 
         assert!(!stub.contains("def export_trace("));
-        assert!(stub.contains("execution_profile: ExecutionProfileConfig | None = None"));
+        assert!(stub.contains("execution_profile: bool = False"));
         assert!(stub.contains("ranked_profile: RankedProfileConfig | None = None"));
     }
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     #[test]
-    fn preview_and_write_reject_artifact_output_collisions_before_execution() -> PyResult<()> {
+    fn preview_rejects_ranked_output_collisions_before_execution() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
@@ -501,7 +372,8 @@ mod tests {
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let ranked_type = module.getattr("RankedProfileConfig")?;
 
-            let preview_output = temp_trace_path("preview-artifact-alias")?.with_extension("html");
+            let preview_output =
+                temp_profile_path("preview-artifact-alias")?.with_extension("html");
             let config_kwargs = PyDict::new(py);
             config_kwargs.set_item("artifact_path", preview_output.to_string_lossy().as_ref())?;
             let ranked_profile = ranked_type.call(
@@ -523,49 +395,12 @@ mod tests {
                 "invalid_option_value"
             );
             assert!(!preview_output.exists());
-
-            let write_output = temp_trace_path("write-profile")?.with_extension("html");
-            let artifact_output = temp_trace_path("write-artifact")?.with_extension("dfprofile");
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("artifact_path", artifact_output.to_string_lossy().as_ref())?;
-            let ranked_profile = ranked_type.call(
-                (write_output.to_string_lossy().as_ref(),),
-                Some(&config_kwargs),
-            )?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("schema", "dbo")?;
-            kwargs.set_item("table", "orders")?;
-            kwargs.set_item("load_mode", "append_existing")?;
-            kwargs.set_item("progress", false)?;
-            let execution_kwargs = PyDict::new(py);
-            execution_kwargs.set_item(
-                "chrome_trace_path",
-                artifact_output.to_string_lossy().as_ref(),
-            )?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&execution_kwargs))?;
-            kwargs.set_item("execution_profile", execution_profile)?;
-            kwargs.set_item("ranked_profile", ranked_profile)?;
-            let error = table
-                .call_method("write_to_mssql", (), Some(&kwargs))
-                .expect_err("write trace and artifact outputs must not alias");
-            assert_eq!(
-                error.value(py).getattr("phase")?.extract::<String>()?,
-                "config"
-            );
-            assert_eq!(
-                error.value(py).getattr("kind")?.extract::<String>()?,
-                "invalid_option_value"
-            );
-            assert!(!write_output.exists());
-            assert!(!artifact_output.exists());
             Ok(())
         })
     }
 
     #[test]
-    fn table_write_retires_legacy_profile_arguments_and_preflights_chrome_output() -> PyResult<()> {
+    fn table_write_retires_legacy_profile_arguments() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
@@ -575,7 +410,7 @@ mod tests {
                 .import("inspect")?
                 .call_method1("signature", (table.getattr("write_to_mssql")?,))?
                 .to_string();
-            assert!(signature.ends_with("execution_profile=None, ranked_profile=None)"));
+            assert!(signature.ends_with("execution_profile=False, ranked_profile=None)"));
 
             for retired in ["profile", "trace_path", "profiler"] {
                 let kwargs = PyDict::new(py);
@@ -588,24 +423,6 @@ mod tests {
                     .unwrap_err();
                 assert!(error.is_instance_of::<PyTypeError>(py));
             }
-
-            let missing_parent = temp_trace_path("missing-trace-parent")?;
-            let trace_path = missing_parent.join("trace.json");
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("chrome_trace_path", trace_path.to_string_lossy().as_ref())?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&config_kwargs))?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("schema", "dbo")?;
-            kwargs.set_item("table", "orders")?;
-            kwargs.set_item("load_mode", "append_existing")?;
-            kwargs.set_item("execution_profile", execution_profile)?;
-            let error = table
-                .call_method("write_to_mssql", (), Some(&kwargs))
-                .unwrap_err();
-            assert!(error.is_instance_of::<PyOSError>(py));
-            assert!(!missing_parent.exists());
             Ok(())
         })
     }
@@ -640,7 +457,7 @@ mod tests {
             assert_eq!(preview.repr()?.extract::<String>()?, text);
             assert_eq!(
                 preview_signature,
-                "(limit=20, *, progress=None, execution_profile=None, ranked_profile=None)"
+                "(limit=20, *, progress=None, execution_profile=False, ranked_profile=None)"
             );
             assert_eq!(
                 preview.call_method0("_repr_html_")?.extract::<String>()?,
@@ -694,7 +511,7 @@ mod tests {
                 "table_from_sql",
                 ("select cast(1 as bigint) / cast(0 as bigint) as value",),
             )?;
-            let output = temp_trace_path("ranked-profile-unavailable")?.with_extension("html");
+            let output = temp_profile_path("ranked-profile-unavailable")?.with_extension("html");
             let ranked_profile = module
                 .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
@@ -730,7 +547,7 @@ mod tests {
             let session = module.getattr("Session")?.call0()?;
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let output =
-                temp_trace_path("write-ranked-profile-unavailable")?.with_extension("html");
+                temp_profile_path("write-ranked-profile-unavailable")?.with_extension("html");
             let ranked_profile = module
                 .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
@@ -782,19 +599,9 @@ mod tests {
                 "table_from_sql",
                 ("select 1 as id union all select 2 as id",),
             )?;
-            let path = temp_trace_path("detailed")?;
-            let path_object = py
-                .import("pathlib")?
-                .getattr("Path")?
-                .call1((path.to_string_lossy().as_ref(),))?;
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("chrome_trace_path", path_object)?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&config_kwargs))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("progress", false)?;
-            kwargs.set_item("execution_profile", execution_profile)?;
+            kwargs.set_item("execution_profile", true)?;
 
             let preview = table.call_method("preview", (1,), Some(&kwargs))?;
             let profile = preview
@@ -821,45 +628,6 @@ mod tests {
             );
 
             assert!(preview.getattr("export_trace").is_err());
-            let trace: Value = serde_json::from_slice(
-                &fs::read(&path).map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
-            )
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            let _ = fs::remove_file(path);
-
-            assert_eq!(trace["delta_funnel_profile"]["scope"], "preview");
-            assert_eq!(trace["delta_funnel_timeline"]["name"], "Preview total");
-            let total_duration = trace["delta_funnel_timeline"]["total_duration_micros"]
-                .as_u64()
-                .ok_or_else(|| PyRuntimeError::new_err("missing preview total duration"))?;
-            let events = trace["traceEvents"]
-                .as_array()
-                .ok_or_else(|| PyRuntimeError::new_err("missing trace events"))?;
-            assert!(events.iter().any(|event| {
-                event["name"] == "Preview total"
-                    && event["ts"] == 0
-                    && event["dur"] == total_duration
-            }));
-            assert!(events.iter().any(|event| {
-                event["name"] == "Physical planning"
-                    && event["args"]["time_semantics"] == "wall_clock"
-            }));
-            assert!(
-                events
-                    .iter()
-                    .filter(|event| event["cat"] == "datafusion.operator.lifecycle")
-                    .all(|event| event["args"]["time_semantics"] == "lifecycle")
-            );
-            assert!(
-                events
-                    .iter()
-                    .filter(|event| event["ph"] == "X")
-                    .all(|event| {
-                        event["ts"].as_u64().zip(event["dur"].as_u64()).is_some_and(
-                            |(start, duration)| start.saturating_add(duration) <= total_duration,
-                        )
-                    })
-            );
             Ok(())
         })
     }
@@ -874,15 +642,9 @@ mod tests {
                 "table_from_sql",
                 ("select cast(1 as bigint) / cast(0 as bigint) as value",),
             )?;
-            let trace_path = temp_trace_path("failed-preview-trace")?;
-            let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("chrome_trace_path", trace_path.to_string_lossy().as_ref())?;
-            let execution_profile = module
-                .getattr("ExecutionProfileConfig")?
-                .call((), Some(&config_kwargs))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("progress", false)?;
-            kwargs.set_item("execution_profile", execution_profile)?;
+            kwargs.set_item("execution_profile", true)?;
 
             let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
             assert!(error.is_instance_of::<DeltaFunnelError>(py));
@@ -924,7 +686,6 @@ mod tests {
                 required_item(&timeline, "status")?.extract::<String>()?,
                 "failed"
             );
-            assert!(!trace_path.exists());
             Ok(())
         })
     }
@@ -965,14 +726,19 @@ mod tests {
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let initial_count = adapter_creation_count();
 
-            for argument in ["execution_profile", "ranked_profile"] {
-                for invalid in [0, 1] {
-                    let kwargs = PyDict::new(py);
-                    kwargs.set_item("progress", true)?;
-                    kwargs.set_item(argument, invalid)?;
-                    let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
-                    assert!(error.is_instance_of::<PyTypeError>(py));
-                }
+            for invalid in [0, 1] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", true)?;
+                kwargs.set_item("execution_profile", invalid)?;
+                let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+            for invalid in [0, 1] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("progress", true)?;
+                kwargs.set_item("ranked_profile", invalid)?;
+                let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
             }
 
             let kwargs = PyDict::new(py);
@@ -982,13 +748,18 @@ mod tests {
             assert!(error.is_instance_of::<PyTypeError>(py));
             assert_eq!(adapter_creation_count(), initial_count);
 
-            for argument in ["execution_profile", "ranked_profile"] {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("progress", false)?;
-                kwargs.set_item(argument, py.None())?;
-                let preview = table.call_method("preview", (), Some(&kwargs))?;
-                assert!(preview.getattr("execution_profile")?.is_none());
-            }
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("execution_profile", false)?;
+            kwargs.set_item("ranked_profile", py.None())?;
+            let preview = table.call_method("preview", (), Some(&kwargs))?;
+            assert!(preview.getattr("execution_profile")?.is_none());
+
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("execution_profile", py.None())?;
+            let error = table.call_method("preview", (), Some(&kwargs)).unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
 
             for method in ["preview", "show"] {
                 let kwargs = PyDict::new(py);
@@ -1028,13 +799,13 @@ mod tests {
             .ok_or_else(|| PyKeyError::new_err(key.to_owned()))
     }
 
-    fn temp_trace_path(name: &str) -> PyResult<PathBuf> {
+    fn temp_profile_path(name: &str) -> PyResult<PathBuf> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
             .as_nanos();
         Ok(std::env::temp_dir().join(format!(
-            "delta-funnel-preview-trace-{name}-{}-{nanos}.json",
+            "delta-funnel-profile-{name}-{}-{nanos}",
             std::process::id()
         )))
     }

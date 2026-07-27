@@ -17,7 +17,7 @@ examples, start with the [Python quickstart](../python-api-walkthrough.md) or
 | Write several outputs | [`Session.write_all`](#session-write-all) |
 | Enable Python logging | [`init_logging`](#init-logging) |
 | Enable Perfetto diagnostics | [`init_perfetto_diagnostics`](#init-perfetto-diagnostics) |
-| Configure exact execution profiling | [`ExecutionProfileConfig`](#execution-profile-config) |
+| Enable exact execution profiling | Pass `execution_profile=True` to an operation |
 | Configure a ranked native CPU profile | [`RankedProfileConfig`](#ranked-profile-config) |
 | Handle a Delta Funnel failure | [`DeltaFunnelError`](#delta-funnel-error) |
 
@@ -115,26 +115,6 @@ Errors raised after an operation finishes can also expose
 See [Troubleshoot a failed run](../advanced/tracing-and-diagnostics.md).
 
 ### Classes
-
-<a id="execution-profile-config"></a>
-#### `ExecutionProfileConfig`
-
-```python
-class ExecutionProfileConfig:
-    chrome_trace_path: Path | None
-
-    def __init__(
-        self,
-        *,
-        chrome_trace_path: str | PathLike[str] | None = None,
-    ) -> None
-```
-
-Enables the exact semantic timeline and DataFusion operator profile returned by
-one operation. Set `chrome_trace_path` to also write Chrome Trace Event JSON.
-The immutable configuration works in normal wheels. The trace parent directory
-must exist. The destination is opened before execution and replaced only after
-the trace is ready. Dry runs reject this configuration.
 
 <a id="ranked-profile-config"></a>
 #### `RankedProfileConfig`
@@ -298,7 +278,7 @@ def write_all(
     options: WriteAllExecutionOptions | None = None,
     dry_run: bool | None = None,
     progress: bool | None = None,
-    execution_profile: ExecutionProfileConfig | None = None,
+    execution_profile: bool = False,
     ranked_profile: RankedProfileConfig | None = None,
 ) -> Report
 ```
@@ -310,15 +290,14 @@ report. Every spec must come from the same session.
   `execution_profile`, and `ranked_profile`.
 - `options={"cache_mode": "auto"}` enables eligible shared-work caching.
 - `options={"cache_mode": "disabled"}` disables shared-work caching.
-- `execution_profile` attaches exact profiles to attempted outputs and executed
-  cache aliases. Its `chrome_trace_path` exports one Chrome Trace Event JSON
-  document for the complete operation.
+- `execution_profile=True` attaches exact profiles to attempted outputs and executed
+  cache aliases.
 - `ranked_profile` writes an operation-scoped ranked HTML report.
 
 See [Multiple outputs and shared caching](../advanced/multiple-outputs.md) for
 workflow examples and
-[Export a write-all trace](../advanced/execution-profiling.md#export-a-write-all-trace)
-for profile ownership and trace behavior.
+[Inspect write-all profiles](../advanced/execution-profiling.md#inspect-write-all-profiles)
+for profile ownership.
 
 <a id="pending-delta-source"></a>
 #### `PendingDeltaSource`
@@ -365,16 +344,15 @@ def preview(
     limit: int = 20,
     *,
     progress: bool | None = None,
-    execution_profile: ExecutionProfileConfig | None = None,
+    execution_profile: bool = False,
     ranked_profile: RankedProfileConfig | None = None,
 ) -> Preview
 ```
 
 Executes a bounded query and returns a rendered `Preview`. Phase timings are
-always included. `execution_profile` enables the returned exact profile and
-optional Chrome trace. `ranked_profile` writes a sampled native CPU report
-without implicitly enabling the exact profile. The method reads rows but does
-not contact SQL Server.
+always included. `execution_profile=True` enables the returned exact profile.
+`ranked_profile` writes a sampled native CPU report without implicitly enabling
+the exact profile. The method reads rows but does not contact SQL Server.
 
 <a id="table-show"></a>
 ##### `Table.show`
@@ -425,7 +403,7 @@ def write_to_mssql(
     name: str | None = None,
     connection_string: str | None = None,
     progress: bool | None = None,
-    execution_profile: ExecutionProfileConfig | None = None,
+    execution_profile: bool = False,
     ranked_profile: RankedProfileConfig | None = None,
 ) -> Report
 ```
@@ -434,20 +412,19 @@ Plans or executes one SQL Server output and returns a report.
 
 - `dry_run=True` plans without writing and rejects `execution_profile` and
   `ranked_profile`.
-- `execution_profile` attaches `execution_profile` and `operation_timeline` to
-  an execute report. Its `chrome_trace_path` also exports Chrome Trace Event
-  JSON.
+- `execution_profile=True` attaches `execution_profile` and `operation_timeline` to
+  an execute report.
 - `ranked_profile` writes an operation-scoped ranked HTML report.
 - `connection_string` overrides the session default for this call.
 
-If trace or HTML report export fails after SQL Server succeeds, the raised
+If ranked report export fails after SQL Server succeeds, the raised
 exception reports `deltafunnel_operation_status="completed"` and contains the
 sanitized report in `deltafunnel_operation_report`. Do not treat the export
 error as evidence that a write is safe to retry.
 
 See [SQL Server writes](../sql-server.md) for load modes and
 [Inspect returned SQL Server output diagnostics](../advanced/execution-profiling.md#inspect-returned-sql-server-output-diagnostics)
-for profile and trace details.
+for profile details.
 
 <a id="preview"></a>
 #### `Preview`
@@ -465,8 +442,7 @@ class Preview:
 
 `text` is the plain-text table. `html` backs notebook display.
 `phase_timings` is always populated. `execution_profile` is populated when
-`Table.preview` receives an `ExecutionProfileConfig`. Configure
-`chrome_trace_path` before calling `preview` to export Chrome Trace Event JSON.
+`Table.preview` receives `execution_profile=True`.
 
 <a id="mssql-output-spec"></a>
 #### `MssqlOutputSpec`
