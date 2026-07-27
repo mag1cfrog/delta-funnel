@@ -25,6 +25,7 @@ from deltafunnel import ProfilerConfig
 profiler = ProfilerConfig(
     "target/profiles/preview.profile.html",
     sample_hz=1000,
+    artifact_output="target/profiles/preview.dfprofile",
 )
 
 preview = table.preview(
@@ -81,6 +82,16 @@ into its semantic children and sampled native callsites. Exact durations and
 sample counts use different units: a function's self and inclusive CPU values
 are statistical on-CPU samples, not wall-clock time.
 
+`artifact_output` is optional. When present, it retains the validated ranked
+model used to build the HTML report, not the much larger raw Perfetto capture.
+Inspect it later without Trace Processor or SQL:
+
+```bash
+delta-funnel-perfetto inspect target/profiles/preview.dfprofile
+delta-funnel-perfetto report target/profiles/preview.dfprofile \
+  --output target/profiles/preview-again.profile.html
+```
+
 The summary separates native capture quality into four mutually exclusive
 outcomes:
 
@@ -99,9 +110,11 @@ default when the child carries the parent's complete inclusive sample count.
 This changes only the view; the complete captured tree remains in the report
 model. Select **Show all native frames** in HTML or pass `--all-frames` to
 `inspect` to restore every frame.
-`ProfilerConfig` keeps only the requested HTML report after deleting its
-temporary capture. When you generate a report from your own `.pftrace` file,
-that input remains unchanged and retains the complete native call stack.
+By default, `ProfilerConfig` keeps only the requested HTML report after
+deleting its temporary capture. Set `artifact_output` to write the same
+in-memory ranked document when an agent or later terminal session needs the
+operation-scoped data. When you generate a report from your own `.pftrace`
+file, that input remains unchanged and retains the complete native call stack.
 
 Only one operation profile can be active in a Python process. The output parent
 directory is created when needed, and a completed report replaces an existing

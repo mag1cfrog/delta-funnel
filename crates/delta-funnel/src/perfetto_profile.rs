@@ -23,6 +23,7 @@ use crate::profiling::{allocate_id, in_operation_capture_scope};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
+mod ranked_profile_artifact;
 mod ranked_report;
 mod report_aggregate;
 mod report_cli;
@@ -33,15 +34,25 @@ mod report_trace_processor;
 mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
+use ranked_profile_artifact::{
+    has_ranked_profile_artifact_magic, read_ranked_profile_artifact, write_ranked_profile_artifact,
+};
+use ranked_report::RankedProfileDocument;
 use report_aggregate::load_ranked_profile;
 use report_cli::preflight_ranked_report_paths;
 pub use report_cli::{
     RankedReportFailure, RankedReportFailurePhase, run_perfetto_diagnostics_cli,
     run_perfetto_diagnostics_cli_with_args,
 };
-use report_html::{ExistingOutputPolicy, render_ranked_profile_html, write_ranked_profile_html};
+use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingOutputPolicy {
+    Replace,
+    Preserve,
+}
 
 /// Reports whether two profile destinations resolve to the same file.
 #[doc(hidden)]
@@ -56,6 +67,17 @@ pub fn output_paths_alias(left: &Path, right: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn open_profile_input(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
 }
 
 fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
@@ -81,11 +103,11 @@ fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Generates one self-contained ranked HTML report from a completed Perfetto trace.
+/// Generates one self-contained ranked HTML report from a completed Perfetto trace or artifact.
 ///
 /// # Errors
 ///
-/// Returns a structured failure when the trace, Trace Processor query, aggregate,
+/// Returns a structured failure when the input, analysis, aggregate,
 /// serialization, or output write fails.
 pub fn generate_ranked_profile_report(
     input: &Path,
@@ -113,11 +135,54 @@ pub fn generate_operation_ranked_profile_report(
     output: &Path,
     capture_scope: &OperationCaptureScope,
 ) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_report_for_scope(
-        input,
-        output,
-        Some(capture_scope.id),
-        ExistingOutputPolicy::Replace,
+    generate_operation_ranked_profile_outputs(input, output, None, capture_scope)
+}
+
+/// Generates one operation-scoped HTML report and optional reusable artifact.
+///
+/// # Errors
+///
+/// Returns a structured failure when an output aliases another path, the
+/// selected operation is unavailable, or either output cannot be completed.
+#[doc(hidden)]
+pub fn generate_operation_ranked_profile_outputs(
+    input: &Path,
+    output: &Path,
+    artifact_output: Option<&Path>,
+    capture_scope: &OperationCaptureScope,
+) -> Result<PathBuf, RankedReportFailure> {
+    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
+    let artifact_output = artifact_output
+        .map(|artifact_output| {
+            preflight_ranked_report_paths(input, artifact_output).map_err(RankedReportFailure::from)
+        })
+        .transpose()?;
+    if let Some(artifact) = &artifact_output
+        && output_paths_alias(&paths.output, &artifact.output).map_err(|_| {
+            RankedReportFailure::new(
+                RankedReportFailurePhase::Output,
+                "inspection_failed",
+                "profile output paths could not be inspected",
+            )
+        })?
+    {
+        return Err(profile_outputs_alias_failure());
+    }
+
+    let document = load_ranked_profile(&paths.input, Some(capture_scope.id))?;
+    let html = render_ranked_profile_html(&document)?;
+    if let Some(artifact) = artifact_output {
+        write_ranked_profile_artifact(&artifact.output, &document, ExistingOutputPolicy::Replace)?;
+    }
+    write_ranked_profile_html(&paths.output, &html, ExistingOutputPolicy::Replace)?;
+    Ok(paths.output)
+}
+
+fn profile_outputs_alias_failure() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Output,
+        "profile_outputs_alias",
+        "ranked HTML and artifact outputs must name different files",
     )
 }
 
@@ -128,10 +193,25 @@ fn generate_ranked_profile_report_for_scope(
     existing_output: ExistingOutputPolicy,
 ) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = load_ranked_profile(&paths.input, capture_scope_id)?;
+    let document = match capture_scope_id {
+        Some(capture_scope_id) => load_ranked_profile(&paths.input, Some(capture_scope_id))?,
+        None => load_ranked_profile_input(&paths.input)?,
+    };
     let html = render_ranked_profile_html(&document)?;
     write_ranked_profile_html(&paths.output, &html, existing_output)?;
     Ok(paths.output)
+}
+
+fn load_ranked_profile_input(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {
+    let artifact_extension = input
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfprofile"));
+    if artifact_extension || has_ranked_profile_artifact_magic(input)? {
+        read_ranked_profile_artifact(input)
+    } else {
+        load_ranked_profile(input, None)
+    }
 }
 
 const CATEGORY: &str = "delta_funnel.profile";
@@ -613,6 +693,25 @@ mod tests {
             .expect_err("the report must never replace its input trace");
         assert_eq!(error.phase(), RankedReportFailurePhase::Output);
         assert_eq!(error.kind(), "aliases_input");
+        assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
+        Ok(())
+    }
+
+    #[test]
+    fn operation_report_rejects_aliasing_outputs_before_analysis() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("capture.pftrace");
+        let output = directory.path().join("capture.profile.html");
+        std::fs::write(&input, "unchanged trace")?;
+        let scope = OperationCaptureScope::allocate()
+            .ok_or_else(|| io::Error::other("operation scope should be available"))?;
+
+        let error =
+            generate_operation_ranked_profile_outputs(&input, &output, Some(&output), &scope)
+                .expect_err("HTML and artifact outputs must not alias");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(error.kind(), "profile_outputs_alias");
+        assert!(!output.exists());
         assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
         Ok(())
     }

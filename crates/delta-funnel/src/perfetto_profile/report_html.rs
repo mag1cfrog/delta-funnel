@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use super::ExistingOutputPolicy;
 use super::ranked_report::{
     CompactFunctionTree, RankedFunction, RankedProfileDocument, RankedProfileMetadata,
     RankedSemantic,
@@ -191,12 +192,6 @@ pub(super) fn write_ranked_profile_html(
     persisted
         .map_err(|_| output_failure("persist_failed", "completed report could not be persisted"))?;
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ExistingOutputPolicy {
-    Replace,
-    Preserve,
 }
 
 fn output_failure(kind: &'static str, message: &'static str) -> RankedReportFailure {

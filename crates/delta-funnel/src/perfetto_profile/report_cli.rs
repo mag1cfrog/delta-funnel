@@ -1,7 +1,9 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -34,7 +36,7 @@ struct PerfettoCli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum PerfettoCommand {
-    /// Generate a ranked HTML report from a raw trace.
+    /// Generate a ranked HTML report from a trace or ranked artifact.
     Report(RankedReportArgs),
 
     /// Inspect ranked profiling data in the terminal.
@@ -43,8 +45,8 @@ enum PerfettoCommand {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 struct RankedReportArgs {
-    /// Raw Perfetto trace to analyze.
-    #[arg(value_name = "INPUT.pftrace")]
+    /// Perfetto trace or ranked profile artifact to analyze.
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
 
     /// Report destination. Defaults to INPUT.profile.html.
@@ -58,8 +60,8 @@ struct RankedReportArgs {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 struct InspectArgs {
-    /// Raw Perfetto trace to inspect.
-    #[arg(value_name = "INPUT.pftrace")]
+    /// Perfetto trace or ranked profile artifact to inspect.
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
 
     /// Maximum number of rows to display.
@@ -199,10 +201,10 @@ impl fmt::Display for CliArgumentError {
         let message = match self {
             Self::MissingCommand => "a diagnostics command is required",
             Self::UnknownCommand => "unknown diagnostics command",
-            Self::MissingInput => "an input trace path is required",
+            Self::MissingInput => "a profile input path is required",
             Self::MissingOutputValue => "--output requires a path",
             Self::DuplicateOutput => "--output may be specified only once",
-            Self::MultipleInputs => "only one input trace path may be provided",
+            Self::MultipleInputs => "only one profile input path may be provided",
             Self::InvalidLimit => "limit must be between 1 and 200",
             Self::InvalidDepth => "depth must be between 0 and 32",
             Self::InvalidSemanticId => "semantic ID must be a signed integer",
@@ -250,7 +252,7 @@ impl CliArgumentError {
 pub enum RankedReportFailurePhase {
     /// Command arguments were invalid.
     Argument,
-    /// The input trace could not be read.
+    /// The profile input could not be read.
     Input,
     /// Capture completeness checks failed.
     Health,
@@ -367,9 +369,9 @@ impl fmt::Display for RankedReportPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputUnreadable(error) => {
-                write!(formatter, "input trace is not readable: {error}")
+                write!(formatter, "profile input is not readable: {error}")
             }
-            Self::InputNotFile => formatter.write_str("input trace is not a file"),
+            Self::InputNotFile => formatter.write_str("profile input is not a file"),
             Self::OutputHasNoFileName => formatter.write_str("output path has no file name"),
             Self::OutputNotFile => formatter.write_str("existing output is not a file"),
             Self::OutputParentNotDirectory => {
@@ -379,7 +381,7 @@ impl fmt::Display for RankedReportPathError {
                 write!(formatter, "output path could not be inspected: {error}")
             }
             Self::InputOutputAlias => {
-                formatter.write_str("input trace and output resolve to the same file")
+                formatter.write_str("profile input and output resolve to the same file")
             }
         }
     }
@@ -490,7 +492,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
-    match super::load_ranked_profile(&input, None) {
+    match super::load_ranked_profile_input(&input) {
         Ok(document) if args.interactive => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -997,8 +999,19 @@ pub(super) fn preflight_ranked_report_paths(
     input: &Path,
     output: &Path,
 ) -> Result<RankedReportPaths, RankedReportPathError> {
-    let input = preflight_ranked_profile_input(input)?;
-    let output = absolute_path(output).map_err(RankedReportPathError::OutputInspection)?;
+    let current_dir = if input.is_relative() || output.is_relative() {
+        Some(std::env::current_dir().map_err(|error| {
+            if input.is_relative() {
+                RankedReportPathError::InputUnreadable(error)
+            } else {
+                RankedReportPathError::OutputInspection(error)
+            }
+        })?)
+    } else {
+        None
+    };
+    let input = preflight_ranked_profile_input(&absolute_path_from(input, current_dir.as_deref()))?;
+    let output = absolute_path_from(output, current_dir.as_deref());
     if output.file_name().is_none() {
         return Err(RankedReportPathError::OutputHasNoFileName);
     }
@@ -1015,7 +1028,9 @@ pub(super) fn preflight_ranked_report_paths(
 pub(super) fn preflight_ranked_profile_input(
     input: &Path,
 ) -> Result<PathBuf, RankedReportPathError> {
-    let input_file = File::open(input).map_err(RankedReportPathError::InputUnreadable)?;
+    let input = absolute_path(input).map_err(RankedReportPathError::InputUnreadable)?;
+    let input_file =
+        super::open_profile_input(&input).map_err(RankedReportPathError::InputUnreadable)?;
     if !input_file
         .metadata()
         .map_err(RankedReportPathError::InputUnreadable)?
@@ -1030,11 +1045,12 @@ pub(super) fn preflight_ranked_profile_input(
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_owned())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
+    let current_dir = path.is_relative().then(std::env::current_dir).transpose()?;
+    Ok(absolute_path_from(path, current_dir.as_deref()))
+}
+
+fn absolute_path_from(path: &Path, current_dir: Option<&Path>) -> PathBuf {
+    current_dir.map_or_else(|| path.to_owned(), |current_dir| current_dir.join(path))
 }
 
 fn inspect_output_path(output: &Path) -> Result<(), RankedReportPathError> {
@@ -1229,7 +1245,8 @@ mod tests {
                 .ok_or("report help should stop parsing")?;
         assert_eq!(report_help.kind(), ErrorKind::DisplayHelp);
         let report_help = report_help.to_string();
-        assert!(report_help.contains("INPUT.pftrace"));
+        assert!(report_help.contains("<INPUT>"));
+        assert!(report_help.contains("Perfetto trace or ranked profile artifact"));
         assert!(report_help.contains("--output <OUTPUT.profile.html>"));
         assert!(report_help.contains("--no-clobber"));
         let bare_report_help =
@@ -1298,7 +1315,8 @@ mod tests {
             .ok_or("inspect help should stop parsing")?;
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         let help = help.to_string();
-        assert!(help.contains("INPUT.pftrace"));
+        assert!(help.contains("<INPUT>"));
+        assert!(help.contains("Perfetto trace or ranked profile artifact"));
         assert!(help.contains("--limit <LIMIT>"));
         assert!(help.contains("--semantic <ID>"));
         assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
@@ -1999,6 +2017,26 @@ mod tests {
         assert_eq!(paths.input, input.canonicalize()?);
         assert_eq!(paths.output, output);
         assert!(!missing_parent.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_relative_report_paths_against_one_directory() -> io::Result<()> {
+        let current_dir = std::env::current_dir()?;
+        let directory = tempfile::tempdir_in(&current_dir)?;
+        let relative_directory = directory
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("temporary directory should be under the current directory");
+        let input = relative_directory.join("capture.pftrace");
+        File::create(current_dir.join(&input))?.write_all(b"trace")?;
+        let output = relative_directory.join("capture.profile.html");
+
+        let paths = preflight_ranked_report_paths(&input, &output)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        assert_eq!(paths.input, current_dir.join(&input).canonicalize()?);
+        assert_eq!(paths.output, current_dir.join(output));
         Ok(())
     }
 

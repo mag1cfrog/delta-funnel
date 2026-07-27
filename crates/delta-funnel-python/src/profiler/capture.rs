@@ -47,8 +47,9 @@ impl ProfilerFailure {
 
 pub(super) struct OperationCapture {
     output: PathBuf,
+    artifact_output: Option<PathBuf>,
     trace: PathBuf,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     symbolize: bool,
     child: Option<Child>,
     reservation: Option<ProfileReservation>,
@@ -58,6 +59,7 @@ pub(super) struct OperationCapture {
 impl OperationCapture {
     pub(super) fn start(
         output: PathBuf,
+        artifact_output: Option<PathBuf>,
         sample_hz: u16,
         tracebox: PathBuf,
     ) -> Result<Self, ProfilerFailure> {
@@ -70,6 +72,10 @@ impl OperationCapture {
                 )
             })?;
         let output = prepare_output_path(&output)?;
+        let artifact_output = artifact_output
+            .as_deref()
+            .map(prepare_output_path)
+            .transpose()?;
         let parent = output.parent().ok_or_else(|| {
             ProfilerFailure::new(
                 "output_unavailable",
@@ -110,8 +116,9 @@ impl OperationCapture {
         crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         Ok(Self {
             output,
+            artifact_output,
             trace,
-            _directory: directory,
+            directory,
             symbolize: sample_hz == 1000,
             child: Some(child),
             reservation: Some(reservation),
@@ -135,13 +142,14 @@ impl OperationCapture {
         drop(self.reservation.take());
         stop_result?;
         let report_trace = if self.symbolize {
-            symbolize_trace(&self.trace, self._directory.path())?
+            symbolize_trace(&self.trace, self.directory.path())?
         } else {
             self.trace.clone()
         };
-        delta_funnel::perfetto_profile::generate_operation_ranked_profile_report(
+        delta_funnel::perfetto_profile::generate_operation_ranked_profile_outputs(
             &report_trace,
             &self.output,
+            self.artifact_output.as_deref(),
             &self.scope,
         )
         .map(|_| ())
@@ -859,8 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn output_path_is_frozen_before_the_profiled_operation_can_change_directory() -> io::Result<()>
-    {
+    fn prepares_relative_output_as_an_absolute_path() -> io::Result<()> {
         let directory = tempfile::tempdir_in(".")?;
         let directory_name = directory
             .path()

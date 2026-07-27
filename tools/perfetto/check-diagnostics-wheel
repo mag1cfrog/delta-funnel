@@ -82,7 +82,16 @@ venv_python="$work_dir/venv/bin/python"
 "$venv_python" -m pip install --disable-pip-version-check --no-cache-dir \
   --no-deps "$wheel" >/dev/null
 
-native_module=$("$venv_python" - <<'PY'
+artifact_fixture_dir=$(dirname -- "$0")
+artifact_fixture=$artifact_fixture_dir/../../crates/delta-funnel/src/perfetto_profile/testdata/ranked_profile_v1.dfprofile
+if [[ ! -r $artifact_fixture ]]; then
+  printf 'check-diagnostics-wheel: artifact fixture is not readable: %s\n' \
+    "$artifact_fixture" >&2
+  exit 66
+fi
+artifact_fixture=$(realpath -- "$artifact_fixture")
+
+native_module=$(DELTA_FUNNEL_TEST_ARTIFACT="$artifact_fixture" "$venv_python" - <<'PY'
 import json
 import os
 import shlex
@@ -184,6 +193,97 @@ invalid_command = subprocess.run(
 )
 if invalid_command.returncode != 64:
     raise SystemExit("delta-funnel-perfetto did not reject an invalid command")
+
+with tempfile.TemporaryDirectory() as artifact_temp_dir:
+    artifact = Path(os.environ["DELTA_FUNNEL_TEST_ARTIFACT"])
+    artifact_temp = Path(artifact_temp_dir)
+    artifact_report = artifact_temp.joinpath("artifact.profile.html")
+    unavailable_trace_processor = artifact_temp.joinpath("unavailable")
+    artifact_environment = {
+        **os.environ,
+        "TRACE_PROCESSOR_SHELL": str(unavailable_trace_processor),
+    }
+
+    aliased_output = artifact_temp.joinpath("aliased.profile.html")
+    profiler = deltafunnel.ProfilerConfig(
+        aliased_output,
+        artifact_output=aliased_output,
+    )
+    session = deltafunnel.Session()
+    table = session.table_from_sql("select 1 as value")
+    for operation_name, operation in [
+        (
+            "preview",
+            lambda: table.preview(progress=False, profiler=profiler),
+        ),
+        (
+            "write_all",
+            lambda: session.write_all([], progress=False, profiler=profiler),
+        ),
+    ]:
+        try:
+            operation()
+        except deltafunnel.DeltaFunnelError as error:
+            if (error.phase, error.kind) != ("config", "invalid_option_value"):
+                raise SystemExit(
+                    f"{operation_name} returned the wrong profile alias error: "
+                    f"{error.phase}/{error.kind}"
+                ) from error
+        else:
+            raise SystemExit(f"{operation_name} accepted aliased profile outputs")
+        if aliased_output.exists():
+            raise SystemExit(f"{operation_name} created an aliased profile output")
+
+    subprocess.run(
+        [perfetto_cli, "report", artifact, "--output", artifact_report],
+        env=artifact_environment,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    if "Delta Funnel preview" not in artifact_report.read_text():
+        raise SystemExit("artifact report did not contain its operation")
+    inspected = subprocess.run(
+        [perfetto_cli, "inspect", artifact],
+        env=artifact_environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if "Delta Funnel preview" not in inspected.stdout:
+        raise SystemExit("artifact inspection did not contain its operation")
+
+    unsupported = artifact_temp.joinpath("unsupported.dfprofile")
+    unsupported_bytes = bytearray(artifact.read_bytes())
+    unsupported_bytes[8:10] = (2).to_bytes(2, "little")
+    unsupported.write_bytes(unsupported_bytes)
+    for command in ["inspect", "report"]:
+        unsupported_report = artifact_temp.joinpath(
+            f"unsupported-{command}.profile.html"
+        )
+        arguments = [perfetto_cli, command, unsupported]
+        if command == "report":
+            arguments.extend(["--output", unsupported_report])
+        rejected = subprocess.run(
+            arguments,
+            env=artifact_environment,
+            capture_output=True,
+            text=True,
+        )
+        if rejected.returncode != 66:
+            raise SystemExit(
+                f"installed {command} accepted an unsupported artifact: "
+                f"{rejected.returncode}, {rejected.stderr!r}"
+            )
+        failure = json.loads(rejected.stderr)
+        if (
+            failure.get("phase") != "input"
+            or failure.get("kind") != "unsupported_artifact_version"
+        ):
+            raise SystemExit(
+                f"installed {command} returned the wrong artifact error: {failure!r}"
+            )
+        if unsupported_report.exists():
+            raise SystemExit(f"installed {command} created output after rejection")
 
 def write_fake_trace_processor(path):
     path.write_text(

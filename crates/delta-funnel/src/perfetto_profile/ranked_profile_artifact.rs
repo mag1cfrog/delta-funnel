@@ -1,0 +1,878 @@
+use std::io::{Read, Write};
+use std::mem;
+use std::ops::Range;
+use std::path::Path;
+
+use rkyv::rancor::Error as RkyvError;
+use rkyv::util::AlignedVec;
+
+use super::ExistingOutputPolicy;
+use super::ranked_report::{
+    ArchivedRankedProfileDocument, RANKED_PROFILE_SCHEMA_VERSION, RankedProfileDocument,
+};
+use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
+
+const MAGIC: [u8; 8] = *b"DFPROF\0\0";
+const ARTIFACT_VERSION: u16 = 1;
+const HEADER_LENGTH: usize = 64;
+// Version 1 means rkyv 0.8, aligned little-endian primitives, and 32-bit
+// relative pointers. Cargo features pin each format-affecting choice.
+const RKYV_FORMAT_CONFIG: u32 = 1;
+// The largest production fixture is 51 MiB. This leaves ten times that
+// measured headroom while bounding allocation before parsing untrusted data.
+const MAX_ARTIFACT_BYTES: usize = 512 * 1024 * 1024;
+
+const ARTIFACT_VERSION_RANGE: Range<usize> = 8..10;
+const HEADER_LENGTH_RANGE: Range<usize> = 10..12;
+const SCHEMA_VERSION_RANGE: Range<usize> = 12..16;
+const RKYV_CONFIG_RANGE: Range<usize> = 16..20;
+const RESERVED_WORD_RANGE: Range<usize> = 20..24;
+const PAYLOAD_OFFSET_RANGE: Range<usize> = 24..32;
+const PAYLOAD_LENGTH_RANGE: Range<usize> = 32..40;
+const RESERVED_TAIL_RANGE: Range<usize> = 40..HEADER_LENGTH;
+
+pub(super) fn has_ranked_profile_artifact_magic(input: &Path) -> Result<bool, RankedReportFailure> {
+    let mut file = super::open_profile_input(input)
+        .map_err(|_| input_failure("input_unreadable", "profile input could not be read"))?;
+    let mut magic = [0_u8; MAGIC.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(_) => Err(input_failure(
+            "input_unreadable",
+            "profile input could not be read",
+        )),
+    }
+}
+
+pub(super) fn read_ranked_profile_artifact(
+    input: &Path,
+) -> Result<RankedProfileDocument, RankedReportFailure> {
+    let mut file = super::open_profile_input(input)
+        .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
+    let file_length = file
+        .metadata()
+        .map_err(|_| input_failure("artifact_unreadable", "artifact could not be inspected"))?
+        .len();
+    let file_length = usize::try_from(file_length).map_err(|_| artifact_too_large())?;
+    if file_length > MAX_ARTIFACT_BYTES {
+        return Err(artifact_too_large());
+    }
+    if file_length < HEADER_LENGTH {
+        return Err(input_failure(
+            "truncated_artifact",
+            "artifact is shorter than its fixed header",
+        ));
+    }
+
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)
+        .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
+    let payload = parse_header(&header, file_length)?;
+
+    let mut bytes = AlignedVec::<16>::with_capacity(file_length);
+    bytes.resize(file_length, 0);
+    bytes[..HEADER_LENGTH].copy_from_slice(&header);
+    file.read_exact(&mut bytes[HEADER_LENGTH..])
+        .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
+    let mut trailing_byte = [0_u8; 1];
+    if file
+        .read(&mut trailing_byte)
+        .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?
+        != 0
+    {
+        return Err(input_failure(
+            "artifact_changed_while_reading",
+            "artifact changed while it was being read",
+        ));
+    }
+    let archived = rkyv::access::<ArchivedRankedProfileDocument, RkyvError>(&bytes[payload])
+        .map_err(|_| input_failure("invalid_archive", "artifact payload is not a valid archive"))?;
+    archived
+        .validate()
+        .map_err(|error| input_failure("invalid_ranked_profile", error.to_string()))?;
+    rkyv::deserialize::<RankedProfileDocument, RkyvError>(archived).map_err(|_| {
+        input_failure(
+            "artifact_deserialize_failed",
+            "artifact payload could not be materialized",
+        )
+    })
+}
+
+pub(super) fn write_ranked_profile_artifact(
+    output: &Path,
+    document: &RankedProfileDocument,
+    existing_output: ExistingOutputPolicy,
+) -> Result<(), RankedReportFailure> {
+    document.validate().map_err(|error| {
+        RankedReportFailure::new(
+            RankedReportFailurePhase::AggregateValidation,
+            "invalid_ranked_profile",
+            error.to_string(),
+        )
+    })?;
+    let payload = rkyv::to_bytes::<RkyvError>(document).map_err(|_| {
+        RankedReportFailure::new(
+            RankedReportFailurePhase::Serialization,
+            "artifact_serialize_failed",
+            "ranked profile artifact could not be serialized",
+        )
+    })?;
+    HEADER_LENGTH
+        .checked_add(payload.len())
+        .filter(|length| *length <= MAX_ARTIFACT_BYTES)
+        .ok_or_else(serialized_artifact_too_large)?;
+    let payload_length =
+        u64::try_from(payload.len()).map_err(|_| serialized_artifact_too_large())?;
+    let header = encode_header(payload_length);
+
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|_| {
+        output_failure(
+            "create_parent_failed",
+            "artifact output directory could not be created",
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| {
+        output_failure(
+            "create_temporary_failed",
+            "temporary artifact file could not be created",
+        )
+    })?;
+    temporary
+        .write_all(&header)
+        .and_then(|()| temporary.write_all(&payload))
+        .map_err(|_| {
+            output_failure(
+                "write_failed",
+                "temporary artifact file could not be written",
+            )
+        })?;
+    let persisted = match existing_output {
+        ExistingOutputPolicy::Replace => temporary.persist(output),
+        ExistingOutputPolicy::Preserve => temporary.persist_noclobber(output),
+    };
+    persisted.map_err(|_| {
+        output_failure(
+            "persist_failed",
+            "completed artifact could not be persisted",
+        )
+    })?;
+    Ok(())
+}
+
+fn encode_header(payload_length: u64) -> [u8; HEADER_LENGTH] {
+    let mut header = [0_u8; HEADER_LENGTH];
+    header[..MAGIC.len()].copy_from_slice(&MAGIC);
+    header[ARTIFACT_VERSION_RANGE].copy_from_slice(&ARTIFACT_VERSION.to_le_bytes());
+    header[HEADER_LENGTH_RANGE].copy_from_slice(&(HEADER_LENGTH as u16).to_le_bytes());
+    header[SCHEMA_VERSION_RANGE].copy_from_slice(&RANKED_PROFILE_SCHEMA_VERSION.to_le_bytes());
+    header[RKYV_CONFIG_RANGE].copy_from_slice(&RKYV_FORMAT_CONFIG.to_le_bytes());
+    header[PAYLOAD_OFFSET_RANGE].copy_from_slice(&(HEADER_LENGTH as u64).to_le_bytes());
+    header[PAYLOAD_LENGTH_RANGE].copy_from_slice(&payload_length.to_le_bytes());
+    header
+}
+
+fn parse_header(
+    bytes: &[u8; HEADER_LENGTH],
+    file_length: usize,
+) -> Result<Range<usize>, RankedReportFailure> {
+    if bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
+        return Err(input_failure(
+            "invalid_artifact_magic",
+            "input is not a Delta Funnel ranked profile artifact",
+        ));
+    }
+    let artifact_version = read_u16(bytes, ARTIFACT_VERSION_RANGE.clone());
+    if artifact_version != ARTIFACT_VERSION {
+        return Err(input_failure(
+            "unsupported_artifact_version",
+            "artifact format version is not supported",
+        ));
+    }
+    if usize::from(read_u16(bytes, HEADER_LENGTH_RANGE.clone())) != HEADER_LENGTH {
+        return Err(input_failure(
+            "invalid_artifact_header",
+            "artifact header length is invalid",
+        ));
+    }
+    if read_u32(bytes, SCHEMA_VERSION_RANGE.clone()) != RANKED_PROFILE_SCHEMA_VERSION {
+        return Err(input_failure(
+            "unsupported_ranked_schema",
+            "ranked profile schema version is not supported",
+        ));
+    }
+    if read_u32(bytes, RKYV_CONFIG_RANGE.clone()) != RKYV_FORMAT_CONFIG {
+        return Err(input_failure(
+            "unsupported_rkyv_config",
+            "artifact rkyv format configuration is not supported",
+        ));
+    }
+    if bytes[RESERVED_WORD_RANGE]
+        .iter()
+        .chain(bytes[RESERVED_TAIL_RANGE].iter())
+        .any(|byte| *byte != 0)
+    {
+        return Err(input_failure(
+            "invalid_artifact_header",
+            "artifact header has nonzero reserved bytes",
+        ));
+    }
+
+    let payload_offset =
+        usize::try_from(read_u64(bytes, PAYLOAD_OFFSET_RANGE.clone())).map_err(|_| {
+            input_failure(
+                "artifact_length_overflow",
+                "artifact payload offset does not fit this platform",
+            )
+        })?;
+    if payload_offset % mem::align_of::<ArchivedRankedProfileDocument>() != 0 {
+        return Err(input_failure(
+            "invalid_payload_alignment",
+            "artifact payload is not correctly aligned",
+        ));
+    }
+    if payload_offset != HEADER_LENGTH {
+        return Err(input_failure(
+            "invalid_payload_offset",
+            "artifact payload offset is invalid",
+        ));
+    }
+    let payload_length =
+        usize::try_from(read_u64(bytes, PAYLOAD_LENGTH_RANGE.clone())).map_err(|_| {
+            input_failure(
+                "artifact_length_overflow",
+                "artifact payload length does not fit this platform",
+            )
+        })?;
+    let expected_length = payload_offset.checked_add(payload_length).ok_or_else(|| {
+        input_failure(
+            "artifact_length_overflow",
+            "artifact payload range overflows",
+        )
+    })?;
+    if expected_length > MAX_ARTIFACT_BYTES {
+        return Err(artifact_too_large());
+    }
+    if expected_length > file_length {
+        return Err(input_failure(
+            "truncated_artifact",
+            "artifact payload is truncated",
+        ));
+    }
+    if expected_length < file_length {
+        return Err(input_failure(
+            "trailing_artifact_bytes",
+            "artifact has bytes after its declared payload",
+        ));
+    }
+    Ok(payload_offset..expected_length)
+}
+
+fn read_u16(bytes: &[u8], range: Range<usize>) -> u16 {
+    u16::from_le_bytes([bytes[range.start], bytes[range.start + 1]])
+}
+
+fn read_u32(bytes: &[u8], range: Range<usize>) -> u32 {
+    u32::from_le_bytes([
+        bytes[range.start],
+        bytes[range.start + 1],
+        bytes[range.start + 2],
+        bytes[range.start + 3],
+    ])
+}
+
+fn read_u64(bytes: &[u8], range: Range<usize>) -> u64 {
+    u64::from_le_bytes([
+        bytes[range.start],
+        bytes[range.start + 1],
+        bytes[range.start + 2],
+        bytes[range.start + 3],
+        bytes[range.start + 4],
+        bytes[range.start + 5],
+        bytes[range.start + 6],
+        bytes[range.start + 7],
+    ])
+}
+
+fn artifact_too_large() -> RankedReportFailure {
+    input_failure(
+        "artifact_too_large",
+        "artifact exceeds the 512 MiB safety limit",
+    )
+}
+
+fn serialized_artifact_too_large() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Serialization,
+        "artifact_too_large",
+        "serialized artifact exceeds the 512 MiB safety limit",
+    )
+}
+
+fn input_failure(kind: &'static str, message: impl Into<String>) -> RankedReportFailure {
+    RankedReportFailure::new(RankedReportFailurePhase::Input, kind, message)
+}
+
+fn output_failure(kind: &'static str, message: &'static str) -> RankedReportFailure {
+    RankedReportFailure::new(RankedReportFailurePhase::Output, kind, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use super::*;
+    use crate::perfetto_profile::ranked_report::{
+        RankedFunction, RankedProfileMetadata, RankedSemantic,
+    };
+    use crate::perfetto_profile::report_html::render_ranked_profile_html;
+    use crate::perfetto_profile::report_terminal::{
+        InspectSelection, InspectSort, render_terminal_view,
+    };
+
+    fn document() -> RankedProfileDocument {
+        RankedProfileDocument {
+            metadata: RankedProfileMetadata {
+                capture_complete: true,
+                semantic_complete: true,
+                finalization_observed: true,
+                incomplete_operation_root_count: 0,
+                truncation_marker_count: 0,
+                missing_identity_field_count: 0,
+                missing_terminal_result_count: 0,
+                crossing_worker_slice_count: 0,
+                crossing_planning_activity_slice_count: 0,
+                crossing_execution_activity_slice_count: 0,
+                invalid_planning_activity_hierarchy_count: 0,
+                invalid_execution_activity_hierarchy_count: 0,
+                perf_sample_without_callsite_count: 0,
+                perf_samples_skipped: 0,
+                buffer_loss_count: 0,
+                data_source_loss_count: 0,
+                flush_failure_count: 0,
+                schema_version: RANKED_PROFILE_SCHEMA_VERSION,
+                sample_frequency_hz: 1_000,
+                sampled_cpu_count: 1,
+                exact_time_unit: "nanoseconds".to_owned(),
+                sample_unit: "samples".to_owned(),
+                eligible_sample_count: 0,
+                direct_sample_count: 0,
+                ambiguous_sample_count: 0,
+                unattributed_sample_count: 0,
+                resolved_function_sample_count: 0,
+                unresolved_function_sample_count: 0,
+                unwind_error_sample_count: 0,
+                missing_callstack_sample_count: 0,
+                trace_profiler_dropped_sample_count: 0,
+            },
+            semantics: vec![RankedSemantic {
+                semantic_id: 1,
+                parent_semantic_id: None,
+                operation_id: 1,
+                name: "Delta Funnel preview".to_owned(),
+                semantic_kind: "operation".to_owned(),
+                operation_kind: Some("preview".to_owned()),
+                stage_category: None,
+                stage_name: None,
+                activity: None,
+                start_ns: 10,
+                end_ns: Some(20),
+                duration_ns: Some(10),
+                time_semantics: "wall_clock".to_owned(),
+                result: Some("ok".to_owned()),
+                is_complete: true,
+                query_execution_id: None,
+                query_scope: None,
+                query_owner: None,
+                worker_lane_id: None,
+                worker_kind: None,
+                node_id: None,
+                parent_node_id: None,
+                operator_partition: None,
+                execution_stream_id: None,
+                stage_owner_id: None,
+                direct_sample_count: 0,
+                inclusive_sample_count: 0,
+                resolved_function_sample_count: 0,
+                unresolved_function_sample_count: 0,
+                unwind_error_sample_count: 0,
+                missing_callstack_sample_count: 0,
+            }],
+            functions: Vec::new(),
+        }
+    }
+
+    fn artifact_bytes(document: &RankedProfileDocument) -> Vec<u8> {
+        let payload =
+            rkyv::to_bytes::<RkyvError>(document).expect("test document should serialize");
+        let mut bytes = encode_header(payload.len() as u64).to_vec();
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    fn round_trip(document: &RankedProfileDocument) -> RankedProfileDocument {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = directory.path().join("profile.dfprofile");
+        write_ranked_profile_artifact(&output, document, ExistingOutputPolicy::Replace)
+            .expect("artifact should be written");
+        read_ranked_profile_artifact(&output).expect("artifact should be read")
+    }
+
+    fn incomplete_document() -> RankedProfileDocument {
+        let mut document = document();
+        document.metadata.capture_complete = false;
+        document.metadata.semantic_complete = false;
+        document.metadata.finalization_observed = false;
+        document.metadata.incomplete_operation_root_count = 1;
+        document.metadata.missing_terminal_result_count = 1;
+        document.semantics[0].end_ns = None;
+        document.semantics[0].duration_ns = None;
+        document.semantics[0].result = None;
+        document.semantics[0].is_complete = false;
+        document
+    }
+
+    fn sampled_document() -> RankedProfileDocument {
+        let mut document = document();
+        document.metadata.eligible_sample_count = 2;
+        document.metadata.direct_sample_count = 2;
+        document.metadata.resolved_function_sample_count = 1;
+        document.metadata.unresolved_function_sample_count = 1;
+        document.semantics[0].direct_sample_count = 2;
+        document.semantics[0].inclusive_sample_count = 2;
+        document.semantics[0].resolved_function_sample_count = 1;
+        document.semantics[0].unresolved_function_sample_count = 1;
+        document.functions = vec![
+            RankedFunction {
+                semantic_id: 1,
+                function_id: 1,
+                parent_function_id: None,
+                name: "delta_funnel::preview::collect".to_owned(),
+                module_name: Some("deltafunnel.abi3.so".to_owned()),
+                source_file: Some("src/preview.rs".to_owned()),
+                line_number: Some(42),
+                self_sample_count: 1,
+                inclusive_sample_count: 1,
+            },
+            RankedFunction {
+                semantic_id: 1,
+                function_id: 2,
+                parent_function_id: None,
+                name: "[unresolved]".to_owned(),
+                module_name: Some("libc.so.6".to_owned()),
+                source_file: None,
+                line_number: None,
+                self_sample_count: 1,
+                inclusive_sample_count: 1,
+            },
+        ];
+        document
+    }
+
+    fn failure_kind(bytes: &[u8]) -> &'static str {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("profile.dfprofile");
+        fs::write(&input, bytes).expect("test artifact should be written");
+        read_ranked_profile_artifact(&input)
+            .expect_err("test artifact should be rejected")
+            .kind()
+    }
+
+    #[test]
+    fn round_trips_validated_artifact_with_atomic_output_policies() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = directory.path().join("nested/profile.dfprofile");
+        let document = document();
+
+        write_ranked_profile_artifact(&output, &document, ExistingOutputPolicy::Replace)
+            .expect("artifact should be written");
+        let artifact = read_ranked_profile_artifact(&output).expect("artifact should be read");
+        assert_eq!(artifact.metadata.sample_frequency_hz, 1_000);
+        assert_eq!(artifact.semantics[0].name, "Delta Funnel preview");
+        assert_eq!(
+            read_ranked_profile_artifact(&output).expect("artifact should be read"),
+            document
+        );
+
+        let original = fs::read(&output).expect("artifact should be readable");
+        let error =
+            write_ranked_profile_artifact(&output, &document, ExistingOutputPolicy::Preserve)
+                .expect_err("preserve policy should reject an existing artifact");
+        assert_eq!(error.kind(), "persist_failed");
+        assert_eq!(
+            fs::read(&output).expect("artifact should remain readable"),
+            original
+        );
+        assert_eq!(
+            fs::read_dir(output.parent().expect("output should have a parent"))
+                .expect("output directory should be readable")
+                .count(),
+            1
+        );
+
+        let blocked_output = directory.path().join("existing-directory");
+        fs::create_dir(&blocked_output).expect("blocking directory should be created");
+        fs::write(blocked_output.join("keep-me"), "unchanged").expect("sentinel should be written");
+        let error = write_ranked_profile_artifact(
+            &blocked_output,
+            &document,
+            ExistingOutputPolicy::Replace,
+        )
+        .expect_err("an artifact cannot replace an existing directory");
+        assert_eq!(error.kind(), "persist_failed");
+        assert_eq!(
+            fs::read_to_string(blocked_output.join("keep-me"))
+                .expect("sentinel should remain readable"),
+            "unchanged"
+        );
+
+        let mut invalid = document;
+        invalid.semantics[0].semantic_kind = "phase".to_owned();
+        let error = write_ranked_profile_artifact(&output, &invalid, ExistingOutputPolicy::Replace)
+            .expect_err("invalid document should be rejected before output");
+        assert_eq!(error.kind(), "invalid_ranked_profile");
+        assert_eq!(
+            fs::read(&output).expect("artifact should remain readable"),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_does_not_follow_existing_output_links() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let target = directory.path().join("target");
+        fs::write(&target, "unchanged").expect("target should be written");
+        let replace_link = |output: &Path| {
+            write_ranked_profile_artifact(output, &document(), ExistingOutputPolicy::Replace)
+                .expect("artifact should replace the link itself");
+            assert_eq!(
+                fs::read_to_string(&target).expect("target should remain readable"),
+                "unchanged"
+            );
+            read_ranked_profile_artifact(output).expect("replacement should be a valid artifact");
+        };
+
+        let hard_link = directory.path().join("hard-link.dfprofile");
+        fs::hard_link(&target, &hard_link).expect("hard link should be created");
+        replace_link(&hard_link);
+
+        let symbolic_link = directory.path().join("symbolic-link.dfprofile");
+        symlink(&target, &symbolic_link).expect("symbolic link should be created");
+        replace_link(&symbolic_link);
+    }
+
+    #[test]
+    fn concurrent_replacements_never_expose_a_torn_artifact() {
+        const WRITER_COUNT: usize = 4;
+        const WRITES_PER_THREAD: usize = 25;
+
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = Arc::new(directory.path().join("concurrent.dfprofile"));
+        let documents = Arc::new(
+            (0..WRITER_COUNT)
+                .map(|writer| {
+                    let mut document = document();
+                    document.semantics[0].name = format!("writer {writer}");
+                    document
+                })
+                .collect::<Vec<_>>(),
+        );
+        write_ranked_profile_artifact(&output, &documents[0], ExistingOutputPolicy::Replace)
+            .expect("initial artifact should be written");
+
+        let barrier = Arc::new(Barrier::new(WRITER_COUNT + 1));
+        let writers = (0..WRITER_COUNT)
+            .map(|writer| {
+                let barrier = Arc::clone(&barrier);
+                let documents = Arc::clone(&documents);
+                let output = Arc::clone(&output);
+                thread::spawn(move || {
+                    barrier.wait();
+                    (0..WRITES_PER_THREAD).try_for_each(|_| {
+                        write_ranked_profile_artifact(
+                            &output,
+                            &documents[writer],
+                            ExistingOutputPolicy::Replace,
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        loop {
+            let loaded = read_ranked_profile_artifact(&output)
+                .expect("concurrent artifact should remain readable");
+            assert!(documents.contains(&loaded));
+            if writers.iter().all(std::thread::JoinHandle::is_finished) {
+                break;
+            }
+        }
+        for writer in writers {
+            writer
+                .join()
+                .expect("writer should not panic")
+                .expect("concurrent replacement should succeed");
+        }
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("test directory should be readable")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_preserve_writers_allow_exactly_one_winner() {
+        const WRITER_COUNT: usize = 8;
+
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = Arc::new(directory.path().join("preserved.dfprofile"));
+        let barrier = Arc::new(Barrier::new(WRITER_COUNT));
+        let writers = (0..WRITER_COUNT)
+            .map(|writer| {
+                let barrier = Arc::clone(&barrier);
+                let output = Arc::clone(&output);
+                thread::spawn(move || {
+                    let mut document = document();
+                    document.semantics[0].name = format!("writer {writer}");
+                    barrier.wait();
+                    write_ranked_profile_artifact(
+                        &output,
+                        &document,
+                        ExistingOutputPolicy::Preserve,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("writer should not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| error.kind() == "persist_failed")
+        );
+        read_ranked_profile_artifact(&output).expect("winning artifact should be valid");
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("test directory should be readable")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn round_trips_representative_documents_and_preserves_renderer_output() {
+        let mut maximum_bound = sampled_document();
+        maximum_bound.semantics[0].name = "x".repeat(512);
+        maximum_bound.functions[0].module_name = Some("m".repeat(512));
+        maximum_bound.functions[0].source_file = Some("s".repeat(512));
+
+        for document in [
+            document(),
+            incomplete_document(),
+            sampled_document(),
+            maximum_bound,
+        ] {
+            document
+                .validate()
+                .expect("representative document should be valid");
+            assert_eq!(round_trip(&document), document);
+        }
+
+        let document = sampled_document();
+        let loaded = round_trip(&document);
+        assert_eq!(
+            render_ranked_profile_html(&loaded).expect("loaded HTML should render"),
+            render_ranked_profile_html(&document).expect("in-memory HTML should render")
+        );
+        for selection in [
+            InspectSelection::Root,
+            InspectSelection::Semantic(1),
+            InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 1,
+            },
+        ] {
+            assert_eq!(
+                render_terminal_view(&loaded, selection, InspectSort::InclusiveCpu, None, 20, 8,)
+                    .expect("loaded terminal view should render"),
+                render_terminal_view(&document, selection, InspectSort::InclusiveCpu, None, 20, 8,)
+                    .expect("in-memory terminal view should render")
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_version_one_golden_fixture_with_every_record_kind() {
+        let expected = sampled_document();
+        if std::env::var_os("DELTA_FUNNEL_UPDATE_RANKED_PROFILE_FIXTURE").is_some() {
+            fs::write(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/perfetto_profile/testdata/ranked_profile_v1.dfprofile"),
+                artifact_bytes(&expected),
+            )
+            .expect("golden fixture should be updated");
+            return;
+        }
+
+        let fixture = include_bytes!("testdata/ranked_profile_v1.dfprofile");
+        assert_eq!(artifact_bytes(&expected), fixture);
+
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("golden.dfprofile");
+        fs::write(&input, fixture).expect("golden fixture should be copied");
+        assert_eq!(
+            read_ranked_profile_artifact(&input).expect("golden fixture should load"),
+            expected
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_artifact_envelopes_before_archived_access() {
+        let valid = artifact_bytes(&document());
+        let mut cases = Vec::new();
+
+        let mut invalid_magic = valid.clone();
+        invalid_magic[0] ^= 1;
+        cases.push((invalid_magic, "invalid_artifact_magic"));
+
+        let mut unsupported_artifact = valid.clone();
+        unsupported_artifact[ARTIFACT_VERSION_RANGE]
+            .copy_from_slice(&(ARTIFACT_VERSION + 1).to_le_bytes());
+        cases.push((unsupported_artifact, "unsupported_artifact_version"));
+
+        let mut invalid_header_length = valid.clone();
+        invalid_header_length[HEADER_LENGTH_RANGE].copy_from_slice(&32_u16.to_le_bytes());
+        cases.push((invalid_header_length, "invalid_artifact_header"));
+
+        let mut unsupported_schema = valid.clone();
+        unsupported_schema[SCHEMA_VERSION_RANGE]
+            .copy_from_slice(&(RANKED_PROFILE_SCHEMA_VERSION + 1).to_le_bytes());
+        cases.push((unsupported_schema, "unsupported_ranked_schema"));
+
+        let mut unsupported_config = valid.clone();
+        unsupported_config[RKYV_CONFIG_RANGE]
+            .copy_from_slice(&(RKYV_FORMAT_CONFIG + 1).to_le_bytes());
+        cases.push((unsupported_config, "unsupported_rkyv_config"));
+
+        let mut reserved = valid.clone();
+        reserved[RESERVED_TAIL_RANGE.start] = 1;
+        cases.push((reserved, "invalid_artifact_header"));
+
+        let mut unaligned = valid.clone();
+        unaligned[PAYLOAD_OFFSET_RANGE].copy_from_slice(&65_u64.to_le_bytes());
+        cases.push((unaligned, "invalid_payload_alignment"));
+
+        let mut invalid_offset = valid.clone();
+        invalid_offset[PAYLOAD_OFFSET_RANGE].copy_from_slice(&80_u64.to_le_bytes());
+        cases.push((invalid_offset, "invalid_payload_offset"));
+
+        let mut truncated = valid.clone();
+        let payload_length = read_u64(&truncated, PAYLOAD_LENGTH_RANGE.clone());
+        truncated[PAYLOAD_LENGTH_RANGE].copy_from_slice(&(payload_length + 1).to_le_bytes());
+        cases.push((truncated, "truncated_artifact"));
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        cases.push((trailing, "trailing_artifact_bytes"));
+
+        let mut too_large = valid;
+        too_large[PAYLOAD_LENGTH_RANGE].copy_from_slice(&(MAX_ARTIFACT_BYTES as u64).to_le_bytes());
+        cases.push((too_large, "artifact_too_large"));
+
+        cases.push((vec![0; HEADER_LENGTH - 1], "truncated_artifact"));
+
+        for (bytes, expected_kind) in cases {
+            assert_eq!(failure_kind(&bytes), expected_kind);
+        }
+    }
+
+    #[test]
+    fn bytechecks_and_semantically_validates_archived_documents() {
+        let mut invalid_archive = artifact_bytes(&document());
+        invalid_archive.truncate(invalid_archive.len() - 1);
+        let payload_length = (invalid_archive.len() - HEADER_LENGTH) as u64;
+        invalid_archive[PAYLOAD_LENGTH_RANGE].copy_from_slice(&payload_length.to_le_bytes());
+        assert_eq!(failure_kind(&invalid_archive), "invalid_archive");
+
+        let mut invalid_document = document();
+        invalid_document.semantics[0].semantic_kind = "phase".to_owned();
+        let expected = invalid_document
+            .validate()
+            .expect_err("test document should be invalid")
+            .to_string();
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("invalid.dfprofile");
+        fs::write(&input, artifact_bytes(&invalid_document))
+            .expect("invalid test artifact should be written");
+        let error = read_ranked_profile_artifact(&input)
+            .expect_err("invalid semantic document should be rejected");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Input);
+        assert_eq!(error.kind(), "invalid_ranked_profile");
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[test]
+    fn rejects_oversized_sparse_artifacts_before_allocation() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("oversized.dfprofile");
+        File::create(&input)
+            .and_then(|file| file.set_len(MAX_ARTIFACT_BYTES as u64 + 1))
+            .expect("sparse artifact should be created");
+
+        let error = read_ranked_profile_artifact(&input)
+            .expect_err("oversized artifact should be rejected");
+        assert_eq!(error.kind(), "artifact_too_large");
+    }
+
+    #[test]
+    fn rejects_a_maximum_length_invalid_header_before_reading_its_payload() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("invalid-sparse.dfprofile");
+        File::create(&input)
+            .and_then(|file| file.set_len(MAX_ARTIFACT_BYTES as u64))
+            .expect("sparse artifact should be created");
+
+        let error = read_ranked_profile_artifact(&input)
+            .expect_err("invalid header should be rejected without reading its payload");
+
+        assert_eq!(error.kind(), "invalid_artifact_magic");
+    }
+
+    #[test]
+    fn handles_every_single_bit_artifact_mutation_without_panicking() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("mutated.dfprofile");
+        let mut bytes = artifact_bytes(&sampled_document());
+
+        for index in 0..bytes.len() {
+            for bit in 0..u8::BITS {
+                bytes[index] ^= 1 << bit;
+                fs::write(&input, &bytes).expect("mutated artifact should be written");
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| read_ranked_profile_artifact(&input)));
+                assert!(
+                    outcome.is_ok(),
+                    "artifact reader panicked after flipping bit {bit} of byte {index}"
+                );
+                bytes[index] ^= 1 << bit;
+            }
+        }
+    }
+}

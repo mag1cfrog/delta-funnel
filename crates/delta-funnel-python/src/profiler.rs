@@ -19,6 +19,7 @@ const PROFILER_PHASE: &str = "profiler";
 pub(crate) struct PyProfilerConfig {
     output: PathBuf,
     sample_hz: u16,
+    artifact_output: Option<PathBuf>,
 }
 
 impl PyProfilerConfig {
@@ -31,16 +32,22 @@ impl PyProfilerConfig {
     const fn sampling_frequency(&self) -> u16 {
         self.sample_hz
     }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    fn artifact_output_path(&self) -> Option<&Path> {
+        self.artifact_output.as_deref()
+    }
 }
 
 #[pymethods]
 impl PyProfilerConfig {
     #[new]
-    #[pyo3(signature = (output, *, sample_hz=1000))]
+    #[pyo3(signature = (output, *, sample_hz=1000, artifact_output=None))]
     fn new(
         py: Python<'_>,
         output: PathBuf,
         #[pyo3(from_py_with = parse_sample_hz)] sample_hz: u16,
+        artifact_output: Option<PathBuf>,
     ) -> PyResult<Self> {
         if output.file_name().is_none() {
             return Err(config_py_error(
@@ -49,7 +56,21 @@ impl PyProfilerConfig {
                 "`output` must name a file".to_owned(),
             ));
         }
-        Ok(Self { output, sample_hz })
+        if artifact_output
+            .as_deref()
+            .is_some_and(|output| output.file_name().is_none())
+        {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`artifact_output` must name a file".to_owned(),
+            ));
+        }
+        Ok(Self {
+            output,
+            sample_hz,
+            artifact_output,
+        })
     }
 
     #[getter]
@@ -62,10 +83,19 @@ impl PyProfilerConfig {
         self.sample_hz
     }
 
+    #[getter]
+    fn artifact_output(&self) -> Option<&Path> {
+        self.artifact_output.as_deref()
+    }
+
     fn __repr__(&self) -> String {
+        let artifact_output = self
+            .artifact_output
+            .as_ref()
+            .map_or_else(|| "None".to_owned(), |output| format!("{output:?}"));
         format!(
-            "deltafunnel.ProfilerConfig(output={:?}, sample_hz={})",
-            self.output, self.sample_hz
+            "deltafunnel.ProfilerConfig(output={:?}, sample_hz={}, artifact_output={})",
+            self.output, self.sample_hz, artifact_output
         )
     }
 }
@@ -110,30 +140,80 @@ pub(crate) fn start_operation_profile(
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     {
-        if let Some(trace_path) = trace_path
-            && delta_funnel::perfetto_profile::output_paths_alias(config.output_path(), trace_path)
-                .map_err(|_| {
-                    profiler_py_error(
-                        py,
-                        "output_unavailable",
-                        "profile output paths could not be inspected".to_owned(),
-                    )
-                })?
-        {
+        let output = resolve_output_path(py, config.output_path())?;
+        let artifact_output = config
+            .artifact_output_path()
+            .map(|output| resolve_output_path(py, output))
+            .transpose()?;
+        validate_output_paths(py, &output, artifact_output.as_deref(), trace_path)?;
+        crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
+        let sample_hz = config.sampling_frequency();
+        let tracebox = tracebox_launcher(py)?;
+        py.detach(move || {
+            capture::OperationCapture::start(output, artifact_output, sample_hz, tracebox)
+        })
+        .map(|capture| Some(OperationProfile { capture }))
+        .map_err(|error| profiler_failure_py_error(py, error))
+    }
+}
+
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+fn validate_output_paths(
+    py: Python<'_>,
+    output: &Path,
+    artifact_output: Option<&Path>,
+    trace_path: Option<&Path>,
+) -> PyResult<()> {
+    let paths_alias = |left: &Path, right: &Path| {
+        delta_funnel::perfetto_profile::output_paths_alias(left, right).map_err(|_| {
+            profiler_py_error(
+                py,
+                "output_unavailable",
+                "profile output paths could not be inspected".to_owned(),
+            )
+        })
+    };
+    if let Some(artifact_output) = artifact_output
+        && paths_alias(output, artifact_output)?
+    {
+        return Err(config_py_error(
+            py,
+            "invalid_option_value",
+            "`ProfilerConfig.output` and `ProfilerConfig.artifact_output` must name different files"
+                .to_owned(),
+        ));
+    }
+    if let Some(trace_path) = trace_path {
+        if paths_alias(output, trace_path)? {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
                 "`trace_path` and `ProfilerConfig.output` must name different files".to_owned(),
             ));
         }
-        crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
-        let output = config.output_path().to_owned();
-        let sample_hz = config.sampling_frequency();
-        let tracebox = tracebox_launcher(py)?;
-        py.detach(move || capture::OperationCapture::start(output, sample_hz, tracebox))
-            .map(|capture| Some(OperationProfile { capture }))
-            .map_err(|error| profiler_failure_py_error(py, error))
+        if let Some(artifact_output) = artifact_output
+            && paths_alias(artifact_output, trace_path)?
+        {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`trace_path` and `ProfilerConfig.artifact_output` must name different files"
+                    .to_owned(),
+            ));
+        }
     }
+    Ok(())
+}
+
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+fn resolve_output_path(py: Python<'_>, output: &Path) -> PyResult<PathBuf> {
+    std::path::absolute(output).map_err(|_| {
+        profiler_py_error(
+            py,
+            "output_unavailable",
+            "profile output path could not be resolved".to_owned(),
+        )
+    })
 }
 
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
@@ -236,6 +316,7 @@ mod tests {
         let stub = include_str!("../deltafunnel.pyi");
         assert!(stub.contains("class ProfilerConfig:"));
         assert!(stub.contains("sample_hz: Literal[100, 1000] = 1000"));
+        assert!(stub.contains("artifact_output: str | PathLike[str] | None = None"));
 
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
@@ -249,8 +330,14 @@ mod tests {
             );
             assert_eq!(default.getattr("sample_hz")?.extract::<u16>()?, 1000);
             assert_eq!(
+                default
+                    .getattr("artifact_output")?
+                    .extract::<Option<PathBuf>>()?,
+                None
+            );
+            assert_eq!(
                 default.repr()?.to_str()?,
-                "deltafunnel.ProfilerConfig(output=\"query.profile.html\", sample_hz=1000)"
+                "deltafunnel.ProfilerConfig(output=\"query.profile.html\", sample_hz=1000, artifact_output=None)"
             );
             assert!(
                 default
@@ -265,12 +352,19 @@ mod tests {
                 .call1(("lower-volume.profile.html",))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("sample_hz", 100)?;
+            kwargs.set_item("artifact_output", "lower-volume.dfprofile")?;
             let lower_volume = profiler.call((pathlib_path,), Some(&kwargs))?;
             assert_eq!(
                 lower_volume.getattr("output")?.extract::<PathBuf>()?,
                 PathBuf::from("lower-volume.profile.html")
             );
             assert_eq!(lower_volume.getattr("sample_hz")?.extract::<u16>()?, 100);
+            assert_eq!(
+                lower_volume
+                    .getattr("artifact_output")?
+                    .extract::<PathBuf>()?,
+                PathBuf::from("lower-volume.dfprofile")
+            );
 
             let invalid_values = [
                 99_i32.into_bound_py_any(py)?,
@@ -300,6 +394,66 @@ mod tests {
                     .value(py)
                     .getattr("kind")?
                     .extract::<String>()?,
+                "invalid_option_value"
+            );
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("artifact_output", "")?;
+            let empty_artifact = profiler
+                .call(("query.profile.html",), Some(&kwargs))
+                .expect_err("an empty artifact output path must be rejected");
+            assert_eq!(
+                empty_artifact
+                    .value(py)
+                    .getattr("kind")?
+                    .extract::<String>()?,
+                "invalid_option_value"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    #[test]
+    fn profiler_outputs_must_resolve_to_distinct_files() -> PyResult<()> {
+        Python::attach(|py| {
+            let config = PyProfilerConfig {
+                output: PathBuf::from("profile.html"),
+                sample_hz: 1_000,
+                artifact_output: Some(PathBuf::from("./profile.html")),
+            };
+            let output = resolve_output_path(py, config.output_path())?;
+            let artifact_output = config
+                .artifact_output_path()
+                .map(|output| resolve_output_path(py, output))
+                .transpose()?;
+            assert!(output.is_absolute());
+            assert!(artifact_output.as_deref().is_some_and(Path::is_absolute));
+            let error = validate_output_paths(py, &output, artifact_output.as_deref(), None)
+                .expect_err("HTML and artifact outputs must not alias");
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+
+            let config = PyProfilerConfig {
+                output: PathBuf::from("profile.html"),
+                sample_hz: 1_000,
+                artifact_output: Some(PathBuf::from("profile.dfprofile")),
+            };
+            let output = resolve_output_path(py, config.output_path())?;
+            let artifact_output = config
+                .artifact_output_path()
+                .map(|output| resolve_output_path(py, output))
+                .transpose()?;
+            let trace_path = resolve_output_path(py, Path::new("./profile.dfprofile"))?;
+            assert!(output.is_absolute());
+            assert!(artifact_output.as_deref().is_some_and(Path::is_absolute));
+            assert!(trace_path.is_absolute());
+            let error =
+                validate_output_paths(py, &output, artifact_output.as_deref(), Some(&trace_path))
+                    .expect_err("trace and artifact outputs must not alias");
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
                 "invalid_option_value"
             );
             Ok(())

@@ -155,8 +155,8 @@ impl PyTable {
     /// query execution profile and full operation timeline. Pass `trace_path`
     /// with `profile=True` to export Chrome Trace Event JSON after success.
     /// Pass `profiler=ProfilerConfig(...)` to record this write and export an
-    /// interactive ranked HTML report. Profiling and trace export are not
-    /// available for dry runs.
+    /// interactive ranked HTML report plus an optional reusable ranked artifact.
+    /// Profiling and trace export are not available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -231,6 +231,10 @@ impl PyTable {
         } else {
             delta_funnel::ExecutionProfileMode::Disabled
         };
+        let trace_path = trace_path
+            .map(std::path::absolute)
+            .transpose()
+            .map_err(PyOSError::new_err)?;
         let operation_profile =
             start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
         drop(profiler);
@@ -268,7 +272,8 @@ impl PyTable {
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass `profile=True` to also attach the
     /// detailed execution profile. Pass `profiler=ProfilerConfig(...)` to
-    /// record this preview and write an interactive ranked HTML report.
+    /// record this preview and write an interactive ranked HTML report plus an
+    /// optional reusable ranked artifact.
     #[pyo3(signature = (limit=20, *, progress=None, profile=false, profiler=None))]
     fn preview(
         &self,
@@ -499,6 +504,74 @@ mod tests {
         assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
         assert!(stub.contains("trace_path: str | PathLike[str] | None = None"));
         assert!(stub.contains("profiler: ProfilerConfig | None = None"));
+    }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    #[test]
+    fn preview_and_write_reject_artifact_output_collisions_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+            let profiler_type = module.getattr("ProfilerConfig")?;
+
+            let preview_output = temp_trace_path("preview-artifact-alias")?.with_extension("html");
+            let config_kwargs = PyDict::new(py);
+            config_kwargs.set_item("artifact_output", preview_output.to_string_lossy().as_ref())?;
+            let profiler = profiler_type.call(
+                (preview_output.to_string_lossy().as_ref(),),
+                Some(&config_kwargs),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profiler", profiler)?;
+            let error = table
+                .call_method("preview", (), Some(&kwargs))
+                .expect_err("preview outputs must not alias");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(!preview_output.exists());
+
+            let write_output = temp_trace_path("write-profile")?.with_extension("html");
+            let artifact_output = temp_trace_path("write-artifact")?.with_extension("dfprofile");
+            let config_kwargs = PyDict::new(py);
+            config_kwargs.set_item(
+                "artifact_output",
+                artifact_output.to_string_lossy().as_ref(),
+            )?;
+            let profiler = profiler_type.call(
+                (write_output.to_string_lossy().as_ref(),),
+                Some(&config_kwargs),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", "dbo")?;
+            kwargs.set_item("table", "orders")?;
+            kwargs.set_item("load_mode", "append_existing")?;
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("trace_path", artifact_output.to_string_lossy().as_ref())?;
+            kwargs.set_item("profiler", profiler)?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .expect_err("write trace and artifact outputs must not alias");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(!write_output.exists());
+            assert!(!artifact_output.exists());
+            Ok(())
+        })
     }
 
     #[test]

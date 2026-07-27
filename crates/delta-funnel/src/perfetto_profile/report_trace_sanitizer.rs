@@ -4,7 +4,6 @@
 //! skip and sequence-control fields below. Trace Processor remains the
 //! authoritative semantic event, sample, and callstack parser.
 
-use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
@@ -62,7 +61,7 @@ fn sanitize_failure(error: io::Error) -> RankedReportFailure {
 fn sanitize_trace_inner(input: &Path) -> io::Result<NamedTempFile> {
     let mut sanitized = NamedTempFile::new()?;
     {
-        let input = BufReader::new(File::open(input)?);
+        let input = BufReader::new(super::open_profile_input(input)?);
         let output = BufWriter::new(sanitized.as_file_mut());
         let mut writer = SanitizedTraceWriter::new(output);
         sanitize_packets(input, &mut writer, false)?;

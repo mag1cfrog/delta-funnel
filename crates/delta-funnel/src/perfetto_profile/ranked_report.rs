@@ -8,9 +8,20 @@ use serde::{Deserialize, Serialize};
 // This covers the 246,095-node production fixture while bounding
 // report memory. Raise it only with production and browser evidence.
 pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
+pub(super) const RANKED_PROFILE_SCHEMA_VERSION: u32 = 3;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(
+    Clone,
+    Debug,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+    Serialize,
+)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RankedProfileMetadata {
     pub capture_complete: bool,
@@ -46,7 +57,17 @@ pub(super) struct RankedProfileMetadata {
     pub trace_profiler_dropped_sample_count: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(
+    Clone,
+    Debug,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+    Serialize,
+)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RankedSemantic {
     pub semantic_id: i64,
@@ -123,7 +144,9 @@ fn semantic_requires_terminal_result(semantic_kind: &str) -> bool {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Serialize,
+)]
 pub(super) struct RankedFunction {
     pub semantic_id: i64,
     pub function_id: i64,
@@ -387,7 +410,9 @@ fn is_directional_arrow(value: &[u8], index: usize) -> bool {
     index > 0 && matches!(value[index - 1], b'-' | b'=')
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Serialize,
+)]
 pub(super) struct RankedProfileDocument {
     pub metadata: RankedProfileMetadata,
     pub semantics: Vec<RankedSemantic>,
@@ -519,6 +544,14 @@ pub(super) enum RankedProfileValidationError {
         declared_sample_count: i64,
         computed_sample_count: i64,
     },
+}
+
+#[derive(Default)]
+struct OperationRootState {
+    root_count: usize,
+    first_root_id: Option<i64>,
+    first_root_is_operation: bool,
+    first_non_root_operation_id: Option<i64>,
 }
 
 impl fmt::Display for RankedProfileValidationError {
@@ -744,7 +777,39 @@ impl RankedProfileDocument {
                 .and_then(normalize_source_file);
         }
     }
+}
 
+macro_rules! native_number {
+    ($value:expr) => {
+        $value
+    };
+}
+
+macro_rules! archived_number {
+    ($value:expr) => {
+        $value.to_native()
+    };
+}
+
+macro_rules! native_optional_number {
+    ($value:expr) => {
+        $value
+    };
+}
+
+macro_rules! archived_optional_number {
+    ($value:expr) => {
+        $value.as_ref().map(|value| value.to_native())
+    };
+}
+
+// Keep every domain invariant in one implementation. The archived rkyv types
+// expose the same collections and strings, while the adapters turn
+// archived numeric fields back into native values for checked arithmetic.
+#[rustfmt::skip]
+macro_rules! impl_ranked_profile_validation {
+    ($document:ty, $number:ident, $optional_number:ident) => {
+        impl $document {
     pub fn validate(&self) -> Result<(), RankedProfileValidationError> {
         self.validate_bounds()?;
         self.validate_metadata_and_intervals()?;
@@ -756,7 +821,7 @@ impl RankedProfileDocument {
         require_collection_bound("semantic", self.semantics.len())?;
         require_collection_bound("function", self.functions.len())?;
 
-        for semantic in &self.semantics {
+        for semantic in self.semantics.iter() {
             for (field, value) in [
                 ("name", Some(semantic.name.as_str())),
                 ("semantic_kind", Some(semantic.semantic_kind.as_str())),
@@ -771,17 +836,27 @@ impl RankedProfileDocument {
                 ("worker_kind", semantic.worker_kind.as_deref()),
             ] {
                 if let Some(value) = value {
-                    require_display_string("semantic", semantic.semantic_id, field, value)?;
+                    require_display_string(
+                        "semantic",
+                        $number!(semantic.semantic_id),
+                        field,
+                        value,
+                    )?;
                 }
             }
         }
-        for function in &self.functions {
+        for function in self.functions.iter() {
             for (field, value) in [
                 ("module_name", function.module_name.as_deref()),
                 ("source_file", function.source_file.as_deref()),
             ] {
                 if let Some(value) = value {
-                    require_display_string("function", function.function_id, field, value)?;
+                    require_display_string(
+                        "function",
+                        $number!(function.function_id),
+                        field,
+                        value,
+                    )?;
                 }
             }
             for (field, value, normalized) in [
@@ -804,8 +879,8 @@ impl RankedProfileDocument {
             ] {
                 if value.is_some() && normalized.as_deref() != value {
                     return Err(RankedProfileValidationError::UnsafeFunctionMetadata {
-                        semantic_id: function.semantic_id,
-                        function_id: function.function_id,
+                        semantic_id: $number!(function.semantic_id),
+                        function_id: $number!(function.function_id),
                         field,
                     });
                 }
@@ -815,12 +890,12 @@ impl RankedProfileDocument {
     }
 
     fn validate_metadata_and_intervals(&self) -> Result<(), RankedProfileValidationError> {
-        if self.metadata.schema_version != 3 {
+        if $number!(self.metadata.schema_version) != RANKED_PROFILE_SCHEMA_VERSION {
             return Err(RankedProfileValidationError::UnsupportedSchemaVersion {
-                schema_version: self.metadata.schema_version,
+                schema_version: $number!(self.metadata.schema_version),
             });
         }
-        if self.metadata.sample_frequency_hz == 0 {
+        if $number!(self.metadata.sample_frequency_hz) == 0 {
             return Err(RankedProfileValidationError::InvalidSampleFrequency);
         }
         for (field, actual, expected) in [
@@ -838,7 +913,9 @@ impl RankedProfileDocument {
         let retained_incomplete_operation_root_count = self
             .semantics
             .iter()
-            .filter(|semantic| semantic.semantic_kind == "operation" && !semantic.is_complete)
+            .filter(|semantic| {
+                semantic.semantic_kind == "operation" && !semantic.is_complete
+            })
             .fold(0_i64, |count, _| count + 1);
         let retained_missing_terminal_result_count = self
             .semantics
@@ -848,24 +925,26 @@ impl RankedProfileDocument {
                     && semantic_requires_terminal_result(&semantic.semantic_kind)
             })
             .fold(0_i64, |count, _| count + 1);
-        if self.metadata.incomplete_operation_root_count != retained_incomplete_operation_root_count
-            || self.metadata.missing_terminal_result_count != retained_missing_terminal_result_count
+        if $number!(self.metadata.incomplete_operation_root_count)
+            != retained_incomplete_operation_root_count
+            || $number!(self.metadata.missing_terminal_result_count)
+                != retained_missing_terminal_result_count
         {
             return Err(RankedProfileValidationError::InconsistentCaptureHealth {
                 reason: "semantic health counts do not match retained records",
             });
         }
-        if self.metadata.missing_identity_field_count > 0 {
+        if $number!(self.metadata.missing_identity_field_count) > 0 {
             return Err(RankedProfileValidationError::InconsistentCaptureHealth {
                 reason: "ownership identity is incomplete",
             });
         }
         if [
-            self.metadata.crossing_worker_slice_count,
-            self.metadata.crossing_planning_activity_slice_count,
-            self.metadata.crossing_execution_activity_slice_count,
-            self.metadata.invalid_planning_activity_hierarchy_count,
-            self.metadata.invalid_execution_activity_hierarchy_count,
+            $number!(self.metadata.crossing_worker_slice_count),
+            $number!(self.metadata.crossing_planning_activity_slice_count),
+            $number!(self.metadata.crossing_execution_activity_slice_count),
+            $number!(self.metadata.invalid_planning_activity_hierarchy_count),
+            $number!(self.metadata.invalid_execution_activity_hierarchy_count),
         ]
         .into_iter()
         .any(|count| count > 0)
@@ -875,9 +954,9 @@ impl RankedProfileDocument {
             });
         }
         let semantic_degraded = [
-            self.metadata.incomplete_operation_root_count,
-            self.metadata.truncation_marker_count,
-            self.metadata.missing_terminal_result_count,
+            $number!(self.metadata.incomplete_operation_root_count),
+            $number!(self.metadata.truncation_marker_count),
+            $number!(self.metadata.missing_terminal_result_count),
         ]
         .into_iter()
         .any(|count| count > 0);
@@ -888,56 +967,64 @@ impl RankedProfileDocument {
         }
         let capture_degraded = !self.metadata.semantic_complete
             || !self.metadata.finalization_observed
-            || self.metadata.buffer_loss_count > 0
-            || self.metadata.data_source_loss_count > 0
-            || self.metadata.flush_failure_count > 0
-            || self.metadata.trace_profiler_dropped_sample_count > 0;
+            || $number!(self.metadata.buffer_loss_count) > 0
+            || $number!(self.metadata.data_source_loss_count) > 0
+            || $number!(self.metadata.flush_failure_count) > 0
+            || $number!(self.metadata.trace_profiler_dropped_sample_count) > 0;
         if self.metadata.capture_complete && capture_degraded {
             return Err(RankedProfileValidationError::InconsistentCaptureHealth {
                 reason: "capture is complete despite capture degradation",
             });
         }
 
-        for semantic in &self.semantics {
+        for semantic in self.semantics.iter() {
             if !matches!(semantic.time_semantics.as_str(), "wall_clock" | "lifecycle") {
                 return Err(RankedProfileValidationError::InvalidSemanticTimeSemantics {
-                    semantic_id: semantic.semantic_id,
+                    semantic_id: $number!(semantic.semantic_id),
                 });
             }
-            match (semantic.is_complete, semantic.end_ns, semantic.duration_ns) {
+            match (
+                semantic.is_complete,
+                $optional_number!(semantic.end_ns),
+                $optional_number!(semantic.duration_ns),
+            ) {
                 (false, None, None) if semantic.result.is_none() => {}
                 (false, None, None) => {
                     return Err(RankedProfileValidationError::InvalidSemanticInterval {
-                        semantic_id: semantic.semantic_id,
+                        semantic_id: $number!(semantic.semantic_id),
                         reason: "incomplete interval has a terminal result",
                     });
                 }
                 (false, _, _) => {
                     return Err(RankedProfileValidationError::InvalidSemanticInterval {
-                        semantic_id: semantic.semantic_id,
+                        semantic_id: $number!(semantic.semantic_id),
                         reason: "incomplete interval has an end or duration",
                     });
                 }
                 (true, Some(end_ns), Some(duration_ns)) => {
-                    let actual_duration = end_ns.checked_sub(semantic.start_ns);
+                    let actual_duration = end_ns.checked_sub($number!(semantic.start_ns));
                     if duration_ns < 0 || actual_duration != Some(duration_ns) {
-                        return Err(RankedProfileValidationError::InvalidSemanticInterval {
-                            semantic_id: semantic.semantic_id,
-                            reason: "complete interval has inconsistent bounds",
-                        });
+                        return Err(
+                            RankedProfileValidationError::InvalidSemanticInterval {
+                                semantic_id: $number!(semantic.semantic_id),
+                                reason: "complete interval has inconsistent bounds",
+                            },
+                        );
                     }
                     if semantic_requires_terminal_result(&semantic.semantic_kind)
                         && semantic.result.is_none()
                     {
-                        return Err(RankedProfileValidationError::InvalidSemanticInterval {
-                            semantic_id: semantic.semantic_id,
-                            reason: "complete interval is missing a terminal result",
-                        });
+                        return Err(
+                            RankedProfileValidationError::InvalidSemanticInterval {
+                                semantic_id: $number!(semantic.semantic_id),
+                                reason: "complete interval is missing a terminal result",
+                            },
+                        );
                     }
                 }
                 (true, _, _) => {
                     return Err(RankedProfileValidationError::InvalidSemanticInterval {
-                        semantic_id: semantic.semantic_id,
+                        semantic_id: $number!(semantic.semantic_id),
                         reason: "complete interval is missing an end or duration",
                     });
                 }
@@ -952,10 +1039,11 @@ impl RankedProfileDocument {
         }
 
         let mut semantics = HashMap::with_capacity(self.semantics.len());
-        for semantic in &self.semantics {
-            if semantics.insert(semantic.semantic_id, semantic).is_some() {
+        for semantic in self.semantics.iter() {
+            let semantic_id = $number!(semantic.semantic_id);
+            if semantics.insert(semantic_id, semantic).is_some() {
                 return Err(RankedProfileValidationError::DuplicateSemanticId {
-                    semantic_id: semantic.semantic_id,
+                    semantic_id,
                 });
             }
         }
@@ -963,103 +1051,124 @@ impl RankedProfileDocument {
         let semantic_parents = self
             .semantics
             .iter()
-            .map(|semantic| (semantic.semantic_id, semantic.parent_semantic_id))
+            .map(|semantic| {
+                (
+                    $number!(semantic.semantic_id),
+                    $optional_number!(semantic.parent_semantic_id),
+                )
+            })
             .collect::<HashMap<_, _>>();
-        for semantic in &self.semantics {
-            let Some(parent_id) = semantic.parent_semantic_id else {
+        for semantic in self.semantics.iter() {
+            let semantic_id = $number!(semantic.semantic_id);
+            let Some(parent_id) = $optional_number!(semantic.parent_semantic_id) else {
                 continue;
             };
             let Some(parent) = semantics.get(&parent_id) else {
                 return Err(RankedProfileValidationError::MissingSemanticParent {
-                    semantic_id: semantic.semantic_id,
+                    semantic_id,
                     parent_semantic_id: parent_id,
                 });
             };
-            if parent.operation_id != semantic.operation_id {
+            if $number!(parent.operation_id) != $number!(semantic.operation_id) {
                 return Err(RankedProfileValidationError::CrossOperationSemanticParent {
-                    semantic_id: semantic.semantic_id,
+                    semantic_id,
                     parent_semantic_id: parent_id,
                 });
             }
         }
         if let Some(semantic_id) = first_cycle(
             &semantic_parents,
-            self.semantics.iter().map(|semantic| semantic.semantic_id),
+            self.semantics
+                .iter()
+                .map(|semantic| $number!(semantic.semantic_id)),
         ) {
             return Err(RankedProfileValidationError::SemanticCycle { semantic_id });
         }
 
-        let mut checked_operations = HashSet::new();
-        for operation_id in self.semantics.iter().map(|semantic| semantic.operation_id) {
-            if !checked_operations.insert(operation_id) {
-                continue;
+        let mut operation_order = Vec::new();
+        let mut operations = HashMap::<i64, OperationRootState>::new();
+        for semantic in self.semantics.iter() {
+            let operation_id = $number!(semantic.operation_id);
+            if !operations.contains_key(&operation_id) {
+                operation_order.push(operation_id);
             }
-            let roots = self
-                .semantics
-                .iter()
-                .filter(|semantic| {
-                    semantic.operation_id == operation_id && semantic.parent_semantic_id.is_none()
-                })
-                .collect::<Vec<_>>();
-            if roots.len() != 1 {
+            let state = operations.entry(operation_id).or_default();
+            let semantic_id = $number!(semantic.semantic_id);
+            if semantic.parent_semantic_id.is_none() {
+                state.root_count += 1;
+                if state.first_root_id.is_none() {
+                    state.first_root_id = Some(semantic_id);
+                    state.first_root_is_operation = semantic.semantic_kind == "operation";
+                }
+            } else if semantic.semantic_kind == "operation"
+                && state.first_non_root_operation_id.is_none()
+            {
+                state.first_non_root_operation_id = Some(semantic_id);
+            }
+        }
+        for operation_id in operation_order {
+            let state = &operations[&operation_id];
+            if state.root_count != 1 {
                 return Err(RankedProfileValidationError::InvalidOperationRootCount {
                     operation_id,
-                    root_count: roots.len(),
+                    root_count: state.root_count,
                 });
             }
-            let invalid_operation_node = self.semantics.iter().find(|semantic| {
-                semantic.operation_id == operation_id
-                    && semantic.semantic_kind == "operation"
-                    && semantic.semantic_id != roots[0].semantic_id
-            });
-            if roots[0].semantic_kind != "operation" || invalid_operation_node.is_some() {
+            if !state.first_root_is_operation || state.first_non_root_operation_id.is_some() {
                 return Err(RankedProfileValidationError::InvalidOperationRootKind {
                     operation_id,
-                    semantic_id: invalid_operation_node
-                        .map_or(roots[0].semantic_id, |semantic| semantic.semantic_id),
+                    semantic_id: state
+                        .first_non_root_operation_id
+                        .or(state.first_root_id)
+                        .expect("an operation with one root has a root ID"),
                 });
             }
         }
 
         let mut functions = HashMap::with_capacity(self.functions.len());
         let mut function_owners = HashMap::<i64, HashSet<i64>>::new();
-        for function in &self.functions {
-            if !semantics.contains_key(&function.semantic_id) {
+        for function in self.functions.iter() {
+            let semantic_id = $number!(function.semantic_id);
+            let function_id = $number!(function.function_id);
+            if !semantics.contains_key(&semantic_id) {
                 return Err(RankedProfileValidationError::MissingFunctionOwner {
-                    semantic_id: function.semantic_id,
-                    function_id: function.function_id,
+                    semantic_id,
+                    function_id,
                 });
             }
-            let identity = (function.semantic_id, function.function_id);
+            let identity = (semantic_id, function_id);
             if functions.insert(identity, function).is_some() {
                 return Err(RankedProfileValidationError::DuplicateFunctionId {
-                    semantic_id: function.semantic_id,
-                    function_id: function.function_id,
+                    semantic_id,
+                    function_id,
                 });
             }
             function_owners
-                .entry(function.function_id)
+                .entry(function_id)
                 .or_default()
-                .insert(function.semantic_id);
+                .insert(semantic_id);
         }
 
         let function_parents = self
             .functions
             .iter()
             .map(|function| {
+                let semantic_id = $number!(function.semantic_id);
                 (
-                    (function.semantic_id, function.function_id),
-                    function
-                        .parent_function_id
-                        .map(|parent_id| (function.semantic_id, parent_id)),
+                    (semantic_id, $number!(function.function_id)),
+                    $optional_number!(function.parent_function_id)
+                        .map(|parent_id| (semantic_id, parent_id)),
                 )
             })
             .collect::<HashMap<_, _>>();
-        for function in &self.functions {
-            let Some(parent_function_id) = function.parent_function_id else {
+        for function in self.functions.iter() {
+            let semantic_id = $number!(function.semantic_id);
+            let function_id = $number!(function.function_id);
+            let Some(parent_function_id) = $optional_number!(function.parent_function_id)
+            else {
                 continue;
             };
-            if functions.contains_key(&(function.semantic_id, parent_function_id)) {
+            if functions.contains_key(&(semantic_id, parent_function_id)) {
                 continue;
             }
             let error = if function_owners
@@ -1067,14 +1176,14 @@ impl RankedProfileDocument {
                 .is_some_and(|owners| !owners.is_empty())
             {
                 RankedProfileValidationError::CrossSemanticFunctionParent {
-                    semantic_id: function.semantic_id,
-                    function_id: function.function_id,
+                    semantic_id,
+                    function_id,
                     parent_function_id,
                 }
             } else {
                 RankedProfileValidationError::MissingFunctionParent {
-                    semantic_id: function.semantic_id,
-                    function_id: function.function_id,
+                    semantic_id,
+                    function_id,
                     parent_function_id,
                 }
             };
@@ -1082,9 +1191,12 @@ impl RankedProfileDocument {
         }
         if let Some((semantic_id, function_id)) = first_cycle(
             &function_parents,
-            self.functions
-                .iter()
-                .map(|function| (function.semantic_id, function.function_id)),
+            self.functions.iter().map(|function| {
+                (
+                    $number!(function.semantic_id),
+                    $number!(function.function_id),
+                )
+            }),
         ) {
             return Err(RankedProfileValidationError::FunctionCycle {
                 semantic_id,
@@ -1098,165 +1210,190 @@ impl RankedProfileDocument {
         for (field, value) in [
             (
                 "incomplete_operation_root_count",
-                self.metadata.incomplete_operation_root_count,
+                $number!(self.metadata.incomplete_operation_root_count),
             ),
             (
                 "truncation_marker_count",
-                self.metadata.truncation_marker_count,
+                $number!(self.metadata.truncation_marker_count),
             ),
             (
                 "missing_identity_field_count",
-                self.metadata.missing_identity_field_count,
+                $number!(self.metadata.missing_identity_field_count),
             ),
             (
                 "missing_terminal_result_count",
-                self.metadata.missing_terminal_result_count,
+                $number!(self.metadata.missing_terminal_result_count),
             ),
             (
                 "crossing_worker_slice_count",
-                self.metadata.crossing_worker_slice_count,
+                $number!(self.metadata.crossing_worker_slice_count),
             ),
             (
                 "crossing_planning_activity_slice_count",
-                self.metadata.crossing_planning_activity_slice_count,
+                $number!(self.metadata.crossing_planning_activity_slice_count),
             ),
             (
                 "crossing_execution_activity_slice_count",
-                self.metadata.crossing_execution_activity_slice_count,
+                $number!(self.metadata.crossing_execution_activity_slice_count),
             ),
             (
                 "invalid_planning_activity_hierarchy_count",
-                self.metadata.invalid_planning_activity_hierarchy_count,
+                $number!(self.metadata.invalid_planning_activity_hierarchy_count),
             ),
             (
                 "invalid_execution_activity_hierarchy_count",
-                self.metadata.invalid_execution_activity_hierarchy_count,
+                $number!(self.metadata.invalid_execution_activity_hierarchy_count),
             ),
             (
                 "perf_sample_without_callsite_count",
-                self.metadata.perf_sample_without_callsite_count,
+                $number!(self.metadata.perf_sample_without_callsite_count),
             ),
-            ("perf_samples_skipped", self.metadata.perf_samples_skipped),
-            ("buffer_loss_count", self.metadata.buffer_loss_count),
+            (
+                "perf_samples_skipped",
+                $number!(self.metadata.perf_samples_skipped),
+            ),
+            (
+                "buffer_loss_count",
+                $number!(self.metadata.buffer_loss_count),
+            ),
             (
                 "data_source_loss_count",
-                self.metadata.data_source_loss_count,
+                $number!(self.metadata.data_source_loss_count),
             ),
-            ("flush_failure_count", self.metadata.flush_failure_count),
-            ("eligible_sample_count", self.metadata.eligible_sample_count),
-            ("direct_sample_count", self.metadata.direct_sample_count),
+            (
+                "flush_failure_count",
+                $number!(self.metadata.flush_failure_count),
+            ),
+            (
+                "eligible_sample_count",
+                $number!(self.metadata.eligible_sample_count),
+            ),
+            (
+                "direct_sample_count",
+                $number!(self.metadata.direct_sample_count),
+            ),
             (
                 "ambiguous_sample_count",
-                self.metadata.ambiguous_sample_count,
+                $number!(self.metadata.ambiguous_sample_count),
             ),
             (
                 "unattributed_sample_count",
-                self.metadata.unattributed_sample_count,
+                $number!(self.metadata.unattributed_sample_count),
             ),
             (
                 "resolved_function_sample_count",
-                self.metadata.resolved_function_sample_count,
+                $number!(self.metadata.resolved_function_sample_count),
             ),
             (
                 "unresolved_function_sample_count",
-                self.metadata.unresolved_function_sample_count,
+                $number!(self.metadata.unresolved_function_sample_count),
             ),
             (
                 "unwind_error_sample_count",
-                self.metadata.unwind_error_sample_count,
+                $number!(self.metadata.unwind_error_sample_count),
             ),
             (
                 "missing_callstack_sample_count",
-                self.metadata.missing_callstack_sample_count,
+                $number!(self.metadata.missing_callstack_sample_count),
             ),
             (
                 "trace_profiler_dropped_sample_count",
-                self.metadata.trace_profiler_dropped_sample_count,
+                $number!(self.metadata.trace_profiler_dropped_sample_count),
             ),
         ] {
             require_nonnegative("profile", 0, field, value)?;
         }
-        let classified_sample_count = self
-            .metadata
-            .direct_sample_count
-            .checked_add(self.metadata.ambiguous_sample_count)
-            .and_then(|count| count.checked_add(self.metadata.unattributed_sample_count))
-            .ok_or(RankedProfileValidationError::SampleCountOverflow { scope: "coverage" })?;
-        if classified_sample_count != self.metadata.eligible_sample_count {
+        let direct_sample_count = $number!(self.metadata.direct_sample_count);
+        let classified_sample_count = direct_sample_count
+            .checked_add($number!(self.metadata.ambiguous_sample_count))
+            .and_then(|count| {
+                count.checked_add($number!(self.metadata.unattributed_sample_count))
+            })
+            .ok_or(RankedProfileValidationError::SampleCountOverflow {
+                scope: "coverage",
+            })?;
+        if classified_sample_count != $number!(self.metadata.eligible_sample_count) {
             return Err(RankedProfileValidationError::CoverageMismatch {
-                eligible_sample_count: self.metadata.eligible_sample_count,
+                eligible_sample_count: $number!(self.metadata.eligible_sample_count),
                 classified_sample_count,
             });
         }
         validate_function_coverage(
             None,
-            self.metadata.direct_sample_count,
-            self.metadata.resolved_function_sample_count,
-            self.metadata.unresolved_function_sample_count,
-            self.metadata.unwind_error_sample_count,
-            self.metadata.missing_callstack_sample_count,
+            direct_sample_count,
+            $number!(self.metadata.resolved_function_sample_count),
+            $number!(self.metadata.unresolved_function_sample_count),
+            $number!(self.metadata.unwind_error_sample_count),
+            $number!(self.metadata.missing_callstack_sample_count),
         )?;
 
         let semantic_parents = self
             .semantics
             .iter()
-            .map(|semantic| (semantic.semantic_id, semantic.parent_semantic_id))
+            .map(|semantic| {
+                (
+                    $number!(semantic.semantic_id),
+                    $optional_number!(semantic.parent_semantic_id),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut semantic_direct = HashMap::with_capacity(self.semantics.len());
         let mut semantic_direct_total = 0_i64;
         let mut semantic_function_totals = [0_i64; 4];
-        for semantic in &self.semantics {
+        for semantic in self.semantics.iter() {
+            let semantic_id = $number!(semantic.semantic_id);
+            let semantic_direct_sample_count = $number!(semantic.direct_sample_count);
             require_nonnegative(
                 "semantic",
-                semantic.semantic_id,
+                semantic_id,
                 "direct_sample_count",
-                semantic.direct_sample_count,
+                semantic_direct_sample_count,
             )?;
             require_nonnegative(
                 "semantic",
-                semantic.semantic_id,
+                semantic_id,
                 "inclusive_sample_count",
-                semantic.inclusive_sample_count,
+                $number!(semantic.inclusive_sample_count),
             )?;
             for (field, value) in [
                 (
                     "resolved_function_sample_count",
-                    semantic.resolved_function_sample_count,
+                    $number!(semantic.resolved_function_sample_count),
                 ),
                 (
                     "unresolved_function_sample_count",
-                    semantic.unresolved_function_sample_count,
+                    $number!(semantic.unresolved_function_sample_count),
                 ),
                 (
                     "unwind_error_sample_count",
-                    semantic.unwind_error_sample_count,
+                    $number!(semantic.unwind_error_sample_count),
                 ),
                 (
                     "missing_callstack_sample_count",
-                    semantic.missing_callstack_sample_count,
+                    $number!(semantic.missing_callstack_sample_count),
                 ),
             ] {
-                require_nonnegative("semantic", semantic.semantic_id, field, value)?;
+                require_nonnegative("semantic", semantic_id, field, value)?;
             }
             validate_function_coverage(
-                Some(semantic.semantic_id),
-                semantic.direct_sample_count,
-                semantic.resolved_function_sample_count,
-                semantic.unresolved_function_sample_count,
-                semantic.unwind_error_sample_count,
-                semantic.missing_callstack_sample_count,
+                Some(semantic_id),
+                semantic_direct_sample_count,
+                $number!(semantic.resolved_function_sample_count),
+                $number!(semantic.unresolved_function_sample_count),
+                $number!(semantic.unwind_error_sample_count),
+                $number!(semantic.missing_callstack_sample_count),
             )?;
-            semantic_direct.insert(semantic.semantic_id, semantic.direct_sample_count);
+            semantic_direct.insert(semantic_id, semantic_direct_sample_count);
             semantic_direct_total = semantic_direct_total
-                .checked_add(semantic.direct_sample_count)
+                .checked_add(semantic_direct_sample_count)
                 .ok_or(RankedProfileValidationError::SampleCountOverflow {
                     scope: "semantic direct",
                 })?;
             for (total, value) in semantic_function_totals.iter_mut().zip([
-                semantic.resolved_function_sample_count,
-                semantic.unresolved_function_sample_count,
-                semantic.unwind_error_sample_count,
-                semantic.missing_callstack_sample_count,
+                $number!(semantic.resolved_function_sample_count),
+                $number!(semantic.unresolved_function_sample_count),
+                $number!(semantic.unwind_error_sample_count),
+                $number!(semantic.missing_callstack_sample_count),
             ]) {
                 *total = total.checked_add(value).ok_or(
                     RankedProfileValidationError::SampleCountOverflow {
@@ -1265,31 +1402,31 @@ impl RankedProfileDocument {
                 )?;
             }
         }
-        if semantic_direct_total != self.metadata.direct_sample_count {
+        if semantic_direct_total != direct_sample_count {
             return Err(RankedProfileValidationError::DirectSampleMismatch {
-                declared_sample_count: self.metadata.direct_sample_count,
+                declared_sample_count: direct_sample_count,
                 semantic_sample_count: semantic_direct_total,
             });
         }
         for (field, declared_sample_count, semantic_sample_count) in [
             (
                 "resolved_function_sample_count",
-                self.metadata.resolved_function_sample_count,
+                $number!(self.metadata.resolved_function_sample_count),
                 semantic_function_totals[0],
             ),
             (
                 "unresolved_function_sample_count",
-                self.metadata.unresolved_function_sample_count,
+                $number!(self.metadata.unresolved_function_sample_count),
                 semantic_function_totals[1],
             ),
             (
                 "unwind_error_sample_count",
-                self.metadata.unwind_error_sample_count,
+                $number!(self.metadata.unwind_error_sample_count),
                 semantic_function_totals[2],
             ),
             (
                 "missing_callstack_sample_count",
-                self.metadata.missing_callstack_sample_count,
+                $number!(self.metadata.missing_callstack_sample_count),
                 semantic_function_totals[3],
             ),
         ] {
@@ -1303,22 +1440,22 @@ impl RankedProfileDocument {
                 );
             }
         }
-        let semantic_inclusive = fold_inclusive_counts(&semantic_parents, &semantic_direct).ok_or(
-            RankedProfileValidationError::SampleCountOverflow {
+        let semantic_inclusive = fold_inclusive_counts(&semantic_parents, &semantic_direct)
+            .ok_or(RankedProfileValidationError::SampleCountOverflow {
                 scope: "semantic inclusive",
-            },
-        )?;
-        for semantic in &self.semantics {
+            })?;
+        for semantic in self.semantics.iter() {
+            let semantic_id = $number!(semantic.semantic_id);
             let computed_sample_count = semantic_inclusive
-                .get(&semantic.semantic_id)
+                .get(&semantic_id)
                 .copied()
                 .ok_or(RankedProfileValidationError::SampleCountOverflow {
                     scope: "semantic inclusive",
                 })?;
-            if semantic.inclusive_sample_count != computed_sample_count {
+            if $number!(semantic.inclusive_sample_count) != computed_sample_count {
                 return Err(RankedProfileValidationError::SemanticInclusiveMismatch {
-                    semantic_id: semantic.semantic_id,
-                    declared_sample_count: semantic.inclusive_sample_count,
+                    semantic_id,
+                    declared_sample_count: $number!(semantic.inclusive_sample_count),
                     computed_sample_count,
                 });
             }
@@ -1328,85 +1465,95 @@ impl RankedProfileDocument {
             .functions
             .iter()
             .map(|function| {
+                let semantic_id = $number!(function.semantic_id);
                 (
-                    (function.semantic_id, function.function_id),
-                    function
-                        .parent_function_id
-                        .map(|parent_id| (function.semantic_id, parent_id)),
+                    (semantic_id, $number!(function.function_id)),
+                    $optional_number!(function.parent_function_id)
+                        .map(|parent_id| (semantic_id, parent_id)),
                 )
             })
             .collect::<HashMap<_, _>>();
         let mut function_self = HashMap::with_capacity(self.functions.len());
         let mut function_self_by_semantic = HashMap::<i64, i64>::new();
-        for function in &self.functions {
+        for function in self.functions.iter() {
+            let semantic_id = $number!(function.semantic_id);
+            let function_id = $number!(function.function_id);
+            let self_sample_count = $number!(function.self_sample_count);
             require_nonnegative(
                 "function",
-                function.function_id,
+                function_id,
                 "self_sample_count",
-                function.self_sample_count,
+                self_sample_count,
             )?;
             require_nonnegative(
                 "function",
-                function.function_id,
+                function_id,
                 "inclusive_sample_count",
-                function.inclusive_sample_count,
+                $number!(function.inclusive_sample_count),
             )?;
-            function_self.insert(
-                (function.semantic_id, function.function_id),
-                function.self_sample_count,
-            );
-            let semantic_total = function_self_by_semantic
-                .entry(function.semantic_id)
-                .or_default();
-            *semantic_total = semantic_total
-                .checked_add(function.self_sample_count)
-                .ok_or(RankedProfileValidationError::SampleCountOverflow {
+            function_self.insert((semantic_id, function_id), self_sample_count);
+            let semantic_total = function_self_by_semantic.entry(semantic_id).or_default();
+            *semantic_total = semantic_total.checked_add(self_sample_count).ok_or(
+                RankedProfileValidationError::SampleCountOverflow {
                     scope: "function self",
-                })?;
+                },
+            )?;
         }
-        for semantic in &self.semantics {
+        for semantic in self.semantics.iter() {
+            let semantic_id = $number!(semantic.semantic_id);
             let function_sample_count = function_self_by_semantic
-                .get(&semantic.semantic_id)
+                .get(&semantic_id)
                 .copied()
                 .unwrap_or_default();
-            let captured_sample_count = semantic
-                .resolved_function_sample_count
-                .checked_add(semantic.unresolved_function_sample_count)
+            let captured_sample_count = $number!(semantic.resolved_function_sample_count)
+                .checked_add($number!(semantic.unresolved_function_sample_count))
                 .ok_or(RankedProfileValidationError::SampleCountOverflow {
                     scope: "captured native stacks",
                 })?;
             if captured_sample_count != function_sample_count {
                 return Err(RankedProfileValidationError::FunctionSelfMismatch {
-                    semantic_id: semantic.semantic_id,
+                    semantic_id,
                     captured_sample_count,
                     function_sample_count,
                 });
             }
         }
-        let function_inclusive = fold_inclusive_counts(&function_parents, &function_self).ok_or(
+        let function_inclusive = fold_inclusive_counts(&function_parents, &function_self)
+            .ok_or(
             RankedProfileValidationError::SampleCountOverflow {
                 scope: "function inclusive",
             },
         )?;
-        for function in &self.functions {
+        for function in self.functions.iter() {
+            let semantic_id = $number!(function.semantic_id);
+            let function_id = $number!(function.function_id);
             let computed_sample_count = function_inclusive
-                .get(&(function.semantic_id, function.function_id))
+                .get(&(semantic_id, function_id))
                 .copied()
                 .ok_or(RankedProfileValidationError::SampleCountOverflow {
                     scope: "function inclusive",
                 })?;
-            if function.inclusive_sample_count != computed_sample_count {
+            if $number!(function.inclusive_sample_count) != computed_sample_count {
                 return Err(RankedProfileValidationError::FunctionInclusiveMismatch {
-                    semantic_id: function.semantic_id,
-                    function_id: function.function_id,
-                    declared_sample_count: function.inclusive_sample_count,
+                    semantic_id,
+                    function_id,
+                    declared_sample_count: $number!(function.inclusive_sample_count),
                     computed_sample_count,
                 });
             }
         }
         Ok(())
     }
+        }
+    };
 }
+
+impl_ranked_profile_validation!(RankedProfileDocument, native_number, native_optional_number);
+impl_ranked_profile_validation!(
+    ArchivedRankedProfileDocument,
+    archived_number,
+    archived_optional_number
+);
 
 fn normalize_module_name(value: &str) -> Option<String> {
     safe_basename(value).map(str::to_owned)
@@ -1999,6 +2146,20 @@ mod tests {
             invalid.validate_structure(),
             Err(RankedProfileValidationError::FunctionCycle { .. })
         ));
+    }
+
+    #[test]
+    fn validates_many_independent_operations() {
+        let semantics = (1..=4_096)
+            .map(|id| semantic(id, None, id, "operation"))
+            .collect::<Vec<_>>();
+        let profile = RankedProfileDocument {
+            metadata: document().metadata,
+            semantics,
+            functions: Vec::new(),
+        };
+
+        assert_eq!(profile.validate_structure(), Ok(()));
     }
 
     #[test]

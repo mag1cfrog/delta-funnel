@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
@@ -147,7 +148,8 @@ impl PySession {
     /// profiles are under `report["cache"]["aliases"]`, or under
     /// `error.context["aliases"]` for cache orchestration failures.
     /// Pass `profiler=ProfilerConfig(...)` to record the complete write-all
-    /// operation and export an interactive ranked HTML report.
+    /// operation and export an interactive ranked HTML report plus an optional
+    /// reusable ranked artifact.
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.
@@ -230,6 +232,10 @@ impl PySession {
                     .to_owned(),
             ));
         }
+        let trace_path = trace_path
+            .map(std::path::absolute)
+            .transpose()
+            .map_err(PyOSError::new_err)?;
         let operation_profile =
             start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
         drop(profiler);
@@ -1408,7 +1414,7 @@ mod tests {
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     #[test]
-    fn write_all_rejects_aliasing_trace_and_profiler_outputs_before_execution() -> PyResult<()> {
+    fn write_all_rejects_aliasing_profiler_destinations_before_execution() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
@@ -1425,6 +1431,19 @@ mod tests {
             let error = session
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .expect_err("one path cannot hold both profile formats");
+            assert_config_error(py, &error, "invalid_option_value")?;
+            assert!(!output.exists());
+
+            let profiler_kwargs = PyDict::new(py);
+            profiler_kwargs.set_item("artifact_output", output.to_string_lossy().as_ref())?;
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call((output.to_string_lossy().as_ref(),), Some(&profiler_kwargs))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("profiler", profiler)?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .expect_err("HTML and artifact outputs must not alias");
             assert_config_error(py, &error, "invalid_option_value")?;
             assert!(!output.exists());
 
