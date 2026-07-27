@@ -169,11 +169,49 @@ pub fn generate_operation_ranked_profile_report(
     output: &Path,
     capture_scope: &OperationCaptureScope,
 ) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_report_for_scope(
-        input,
-        output,
-        Some(capture_scope.id),
-        ExistingOutputPolicy::Replace,
+    generate_operation_ranked_profile_outputs(input, output, None, capture_scope)
+}
+
+/// Generates one operation-scoped HTML report and optional reusable artifact.
+///
+/// # Errors
+///
+/// Returns a structured failure when an output aliases another path, the
+/// selected operation is unavailable, or either output cannot be completed.
+#[doc(hidden)]
+pub fn generate_operation_ranked_profile_outputs(
+    input: &Path,
+    output: &Path,
+    artifact_output: Option<&Path>,
+    capture_scope: &OperationCaptureScope,
+) -> Result<PathBuf, RankedReportFailure> {
+    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
+    let artifact_output = artifact_output
+        .map(|artifact_output| {
+            preflight_ranked_report_paths(input, artifact_output).map_err(RankedReportFailure::from)
+        })
+        .transpose()?;
+    if let Some(artifact) = &artifact_output
+        && output_paths_alias(&paths.output, &artifact.output)
+            .map_err(|_| profile_outputs_alias_failure())?
+    {
+        return Err(profile_outputs_alias_failure());
+    }
+
+    let document = load_ranked_profile(&paths.input, Some(capture_scope.id))?;
+    let html = render_ranked_profile_html(&document)?;
+    if let Some(artifact) = artifact_output {
+        write_ranked_profile_artifact(&artifact.output, &document, ExistingOutputPolicy::Replace)?;
+    }
+    write_ranked_profile_html(&paths.output, &html, ExistingOutputPolicy::Replace)?;
+    Ok(paths.output)
+}
+
+fn profile_outputs_alias_failure() -> RankedReportFailure {
+    RankedReportFailure::new(
+        RankedReportFailurePhase::Output,
+        "profile_outputs_alias",
+        "ranked HTML and artifact outputs must name different files",
     )
 }
 
@@ -680,6 +718,25 @@ mod tests {
             .expect_err("the report must never replace its input trace");
         assert_eq!(error.phase(), RankedReportFailurePhase::Output);
         assert_eq!(error.kind(), "aliases_input");
+        assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
+        Ok(())
+    }
+
+    #[test]
+    fn operation_report_rejects_aliasing_outputs_before_analysis() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("capture.pftrace");
+        let output = directory.path().join("capture.profile.html");
+        std::fs::write(&input, "unchanged trace")?;
+        let scope = OperationCaptureScope::allocate()
+            .ok_or_else(|| io::Error::other("operation scope should be available"))?;
+
+        let error =
+            generate_operation_ranked_profile_outputs(&input, &output, Some(&output), &scope)
+                .expect_err("HTML and artifact outputs must not alias");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(error.kind(), "profile_outputs_alias");
+        assert!(!output.exists());
         assert_eq!(std::fs::read_to_string(input)?, "unchanged trace");
         Ok(())
     }

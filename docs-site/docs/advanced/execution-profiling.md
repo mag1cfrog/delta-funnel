@@ -111,8 +111,8 @@ This changes only the view; the complete captured tree remains in the report
 model. Select **Show all native frames** in HTML or pass `--all-frames` to
 `inspect` to restore every frame.
 By default, `ProfilerConfig` keeps only the requested HTML report after
-deleting its temporary capture and intermediate ranked artifact. Set
-`artifact_output` when an agent or later terminal session needs the same
+deleting its temporary capture. Set `artifact_output` to write the same
+in-memory ranked document when an agent or later terminal session needs the
 operation-scoped data. When you generate a report from your own `.pftrace`
 file, that input remains unchanged and retains the complete native call stack.
 

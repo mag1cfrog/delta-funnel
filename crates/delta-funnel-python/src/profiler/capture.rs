@@ -146,18 +146,12 @@ impl OperationCapture {
         } else {
             self.trace.clone()
         };
-        let artifact = self
-            .artifact_output
-            .clone()
-            .unwrap_or_else(|| self.directory.path().join("operation.dfprofile"));
-        delta_funnel::perfetto_profile::generate_operation_ranked_profile_artifact(
+        delta_funnel::perfetto_profile::generate_operation_ranked_profile_outputs(
             &report_trace,
-            &artifact,
+            &self.output,
+            self.artifact_output.as_deref(),
             &self.scope,
         )
-        .and_then(|_| {
-            delta_funnel::perfetto_profile::generate_ranked_profile_report(&artifact, &self.output)
-        })
         .map(|_| ())
         .map_err(|error| ProfilerFailure::new(error.kind(), error.to_string()))
     }
