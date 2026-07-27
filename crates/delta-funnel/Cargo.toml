@@ -29,6 +29,7 @@ perfetto-profile = [
     "dep:flate2",
     "dep:hyper-util",
     "dep:perfetto-sdk",
+    "dep:rkyv",
     "dep:same-file",
     "dep:serde",
     "dep:tempfile",
@@ -59,6 +60,7 @@ libc = "0.2"
 object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
 perfetto-sdk = { version = "1.0.3", optional = true }
+rkyv = { version = "0.8.17", default-features = false, features = ["aligned", "bytecheck", "little_endian", "pointer_width_32", "std"], optional = true }
 same-file = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 snafu = "0.9"

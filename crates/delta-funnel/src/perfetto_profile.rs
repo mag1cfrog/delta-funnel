@@ -23,6 +23,7 @@ use crate::profiling::{allocate_id, in_operation_capture_scope};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
+mod ranked_profile_artifact;
 mod ranked_report;
 mod report_aggregate;
 mod report_cli;
@@ -33,6 +34,7 @@ mod report_trace_processor;
 mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
+use ranked_profile_artifact::{read_ranked_profile_artifact, write_ranked_profile_artifact};
 use report_aggregate::load_ranked_profile;
 use report_cli::preflight_ranked_report_paths;
 pub use report_cli::{
@@ -92,6 +94,34 @@ pub fn generate_ranked_profile_report(
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
     generate_ranked_profile_report_for_scope(input, output, None, ExistingOutputPolicy::Replace)
+}
+
+/// Converts a completed Perfetto trace into a reusable ranked profile artifact.
+///
+/// # Errors
+///
+/// Returns a structured failure when the trace cannot be aggregated, validated,
+/// serialized, or atomically persisted.
+#[doc(hidden)]
+pub fn generate_ranked_profile_artifact(
+    input: &Path,
+    output: &Path,
+) -> Result<PathBuf, RankedReportFailure> {
+    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
+    let document = load_ranked_profile(&paths.input, None)?;
+    write_ranked_profile_artifact(&paths.output, &document, ExistingOutputPolicy::Replace)?;
+    Ok(paths.output)
+}
+
+/// Validates a ranked profile artifact without starting Trace Processor.
+///
+/// # Errors
+///
+/// Returns a structured failure when the artifact envelope, archive bytes, or
+/// ranked profile invariants are invalid.
+#[doc(hidden)]
+pub fn validate_ranked_profile_artifact(input: &Path) -> Result<(), RankedReportFailure> {
+    read_ranked_profile_artifact(input).map(|_| ())
 }
 
 fn generate_ranked_profile_report_without_clobber(
