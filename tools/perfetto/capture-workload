@@ -191,9 +191,16 @@ runtime_dir=$(mktemp -d "$capture_dir/.delta-funnel-perfetto.XXXXXX")
 ready_fifo=$runtime_dir/tracebox-ready
 trace_pid=
 workload_pid=
+diagnostics_pid=
+diagnostics_stage=
 interruption_status=
 interruption_signal=
 status_emitted=0
+workload_status=
+health_status=125
+report_status=125
+report_output=
+health_output_file=$runtime_dir/capture-health.out
 
 emit_status() {
   local workload_status=$1
@@ -231,17 +238,82 @@ stop_workload() {
   fi
   local signal=${interruption_signal:-TERM}
   kill "-$signal" "$workload_pid" 2>/dev/null || true
-  wait "$workload_pid" 2>/dev/null || true
+  if wait "$workload_pid" 2>/dev/null; then
+    workload_status=0
+  else
+    workload_status=$?
+  fi
   workload_pid=
+}
+
+finish_health() {
+  local status=$1
+  if (( status != 0 )); then
+    health_status=$status
+    return
+  fi
+
+  health_output=$(<"$health_output_file")
+  printf '%s\n' "$health_output"
+  health_row=$(sed -n '$p' <<<"$health_output")
+  capture_complete=${health_row%%,*}
+  if [[ $capture_complete == 1 ]]; then
+    health_status=0
+  else
+    health_status=65
+  fi
+}
+
+finish_report() {
+  report_status=$1
+  if (( report_status == 0 )); then
+    report_output=$report_path
+  fi
+}
+
+stop_diagnostics() {
+  if [[ -z $diagnostics_pid ]]; then
+    return
+  fi
+  local signal=${interruption_signal:-TERM}
+  local status
+  kill "-$signal" "$diagnostics_pid" 2>/dev/null || true
+  if wait "$diagnostics_pid" 2>/dev/null; then
+    status=0
+  else
+    status=$?
+  fi
+  case $diagnostics_stage in
+    health) finish_health "$status" ;;
+    report) finish_report "$status" ;;
+  esac
+  diagnostics_pid=
+  diagnostics_stage=
+}
+
+warn_if_completed_workload() {
+  if [[ $workload_status == 0 &&
+        (${tracebox_status:-125} != 0 ||
+         $health_status != 0 ||
+         $report_status != 0) ]]; then
+    printf '%s\n' \
+      'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2
+  fi
 }
 
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
   stop_workload
+  stop_diagnostics
   stop_tracebox
   if [[ -n $interruption_status && $status_emitted == 0 ]]; then
-    emit_status "$interruption_status" "${tracebox_status:-125}" 125 125
+    if [[ -z $workload_status ]]; then
+      workload_status=$interruption_status
+    fi
+    emit_status "$workload_status" "${tracebox_status:-125}" \
+      "$health_status" "$report_status" "$report_output"
+    warn_if_completed_workload
   fi
   rm -rf -- "$runtime_dir" || true
   exit "$status"
@@ -330,36 +402,34 @@ health_args=("$capture_path")
 if [[ -n $configured_file_cap_bytes ]]; then
   health_args+=("$configured_file_cap_bytes")
 fi
-if health_output=$(TRACE_PROCESSOR_SHELL=$trace_processor \
-  "$script_dir/capture-health" "${health_args[@]}"); then
-  printf '%s\n' "$health_output"
-  health_row=$(sed -n '$p' <<<"$health_output")
-  capture_complete=${health_row%%,*}
-  if [[ $capture_complete == 1 ]]; then
-    health_status=0
-  else
-    health_status=65
-  fi
+TRACE_PROCESSOR_SHELL=$trace_processor \
+  "$script_dir/capture-health" "${health_args[@]}" >"$health_output_file" &
+diagnostics_pid=$!
+diagnostics_stage=health
+if wait "$diagnostics_pid"; then
+  diagnostics_status=0
 else
-  health_status=$?
+  diagnostics_status=$?
 fi
+finish_health "$diagnostics_status"
+diagnostics_pid=
+diagnostics_stage=
 
-report_status=125
-report_output=
 if (( health_status == 0 )); then
-  if "$report_cli" report "$capture_path" --output "$report_path"; then
-    report_status=0
-    report_output=$report_path
+  "$report_cli" report "$capture_path" --output "$report_path" &
+  diagnostics_pid=$!
+  diagnostics_stage=report
+  if wait "$diagnostics_pid"; then
+    diagnostics_status=0
   else
-    report_status=$?
+    diagnostics_status=$?
   fi
+  finish_report "$diagnostics_status"
+  diagnostics_pid=
+  diagnostics_stage=
 fi
 
 emit_status "$workload_status" "${tracebox_status:-125}" "$health_status" \
   "$report_status" "$report_output"
-if (( workload_status == 0 &&
-      (tracebox_status != 0 || health_status != 0 || report_status != 0) )); then
-  printf '%s\n' \
-    'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2
-fi
+warn_if_completed_workload
 exit "$workload_status"

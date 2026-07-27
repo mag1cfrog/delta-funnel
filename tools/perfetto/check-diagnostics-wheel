@@ -378,12 +378,24 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "if [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
         "$query == *record_kind* ]]; then\n"
+        "  if [[ -n ${DELTA_FUNNEL_TEST_REPORT_BLOCK_FILE:-} ]]; then\n"
+        "    : >\"$DELTA_FUNNEL_TEST_REPORT_BLOCK_FILE\"\n"
+        "    parent=$PPID\n"
+        "    while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done\n"
+        "    exit 143\n"
+        "  fi\n"
         "  if [[ ${DELTA_FUNNEL_TEST_REPORT_FAILURE:-0} == 1 ]]; then\n"
         "    exit 65\n"
         "  fi\n"
         "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
         "elif [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *selected_operations* ]]; then\n"
+        "  if [[ -n ${DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE:-} ]]; then\n"
+        "    : >\"$DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE\"\n"
+        "    parent=$PPID\n"
+        "    while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done\n"
+        "    exit 143\n"
+        "  fi\n"
         "  if [[ ${DELTA_FUNNEL_TEST_HEALTH_FAILURE:-0} == 1 ]]; then\n"
         "    exit 65\n"
         "  fi\n"
@@ -593,50 +605,97 @@ with tempfile.TemporaryDirectory() as temp_dir:
     ):
         raise SystemExit("capture artifact paths were not handled literally")
 
-    interrupted_trace, interrupted_report = capture_artifacts("interrupted")
+    def interrupt_capture(name, marker, workload="pass", **environment):
+        trace, report = capture_artifacts(name)
+        process = subprocess.Popen(
+            [
+                capture,
+                "--output",
+                trace,
+                "--",
+                sys.executable,
+                "-c",
+                workload,
+            ],
+            env=capture_environment(**environment),
+            cwd=temp,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        while not marker.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                raise SystemExit(f"{name} interruption fixture did not reach its stage")
+            time.sleep(0.01)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+        status = dict(
+            field.split("=", 1)
+            for field in shlex.split(stdout.splitlines()[-1])
+        )
+        return process, trace, report, status, stderr
+
     workload_started = temp.joinpath("workload-started")
-    interrupted = subprocess.Popen(
-        [
-            capture,
-            "--output",
-            interrupted_trace,
-            "--",
-            sys.executable,
-            "-c",
+    interrupted, interrupted_trace, interrupted_report, status, _ = (
+        interrupt_capture(
+            "interrupted-workload",
+            workload_started,
             (
                 "from pathlib import Path; import time; "
                 f"Path({str(workload_started)!r}).write_text('started'); "
                 "time.sleep(60)"
             ),
-        ],
-        env=capture_environment(),
-        cwd=temp,
-        start_new_session=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    deadline = time.monotonic() + 10
-    while not workload_started.exists() and interrupted.poll() is None:
-        if time.monotonic() >= deadline:
-            interrupted.kill()
-            raise SystemExit("interruption fixture did not start its workload")
-        time.sleep(0.01)
-    interrupted.send_signal(signal.SIGTERM)
-    stdout, _ = interrupted.communicate(timeout=10)
-    status = dict(
-        field.split("=", 1)
-        for field in shlex.split(stdout.splitlines()[-1])
+        )
     )
     if (
         interrupted.returncode != 143
         or status["workload_status"] != "143"
+        or status["tracebox_status"] != "0"
         or status["health_status"] != "125"
         or status["report_status"] != "125"
         or not interrupted_trace.is_file()
         or interrupted_report.exists()
     ):
         raise SystemExit("interrupted capture fabricated a completed report")
+
+    health_started = temp.joinpath("health-started")
+    interrupted, trace, report, status, stderr = interrupt_capture(
+        "interrupted-health",
+        health_started,
+        DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE=str(health_started),
+    )
+    if (
+        interrupted.returncode != 143
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "0"
+        or status["health_status"] != "143"
+        or status["report_status"] != "125"
+        or not trace.is_file()
+        or report.exists()
+        or "do not retry" not in stderr
+    ):
+        raise SystemExit("health interruption replaced the completed workload result")
+
+    report_started = temp.joinpath("report-started")
+    interrupted, trace, report, status, stderr = interrupt_capture(
+        "interrupted-report",
+        report_started,
+        DELTA_FUNNEL_TEST_REPORT_BLOCK_FILE=str(report_started),
+    )
+    if (
+        interrupted.returncode != 143
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "0"
+        or status["health_status"] != "0"
+        or status["report_status"] != "143"
+        or not trace.is_file()
+        or report.exists()
+        or "do not retry" not in stderr
+    ):
+        raise SystemExit("report interruption replaced completed capture outcomes")
 
 if not callable(deltafunnel.init_perfetto_diagnostics):
     raise SystemExit("Perfetto diagnostics initializer is not callable")
