@@ -155,8 +155,8 @@ impl PyTable {
     /// query execution profile and full operation timeline. Pass `trace_path`
     /// with `profile=True` to export Chrome Trace Event JSON after success.
     /// Pass `profiler=ProfilerConfig(...)` to record this write and export an
-    /// interactive ranked HTML report. Profiling and trace export are not
-    /// available for dry runs.
+    /// interactive ranked HTML report plus an optional reusable ranked artifact.
+    /// Profiling and trace export are not available for dry runs.
     ///
     /// By default, shows an indeterminate phase display in interactive
     /// terminals and Jupyter, and stays quiet elsewhere. Pass `progress=True`
@@ -268,7 +268,8 @@ impl PyTable {
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass `profile=True` to also attach the
     /// detailed execution profile. Pass `profiler=ProfilerConfig(...)` to
-    /// record this preview and write an interactive ranked HTML report.
+    /// record this preview and write an interactive ranked HTML report plus an
+    /// optional reusable ranked artifact.
     #[pyo3(signature = (limit=20, *, progress=None, profile=false, profiler=None))]
     fn preview(
         &self,

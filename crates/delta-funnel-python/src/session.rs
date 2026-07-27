@@ -147,7 +147,8 @@ impl PySession {
     /// profiles are under `report["cache"]["aliases"]`, or under
     /// `error.context["aliases"]` for cache orchestration failures.
     /// Pass `profiler=ProfilerConfig(...)` to record the complete write-all
-    /// operation and export an interactive ranked HTML report.
+    /// operation and export an interactive ranked HTML report plus an optional
+    /// reusable ranked artifact.
     /// Returns a plain Python `dict` report. One consolidated progress display
     /// follows output planning, shared cache work, and sequential writes. Pass
     /// `progress=False` to disable it for this call.

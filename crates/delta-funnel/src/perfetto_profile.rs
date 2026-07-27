@@ -110,8 +110,31 @@ pub fn generate_ranked_profile_artifact(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_artifact_for_scope(input, output, None)
+}
+
+/// Converts one host-selected operation capture into a reusable ranked profile artifact.
+///
+/// # Errors
+///
+/// Returns a structured failure when the selected operation is unavailable or
+/// the artifact cannot be validated, serialized, or atomically persisted.
+#[doc(hidden)]
+pub fn generate_operation_ranked_profile_artifact(
+    input: &Path,
+    output: &Path,
+    capture_scope: &OperationCaptureScope,
+) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_artifact_for_scope(input, output, Some(capture_scope.id))
+}
+
+fn generate_ranked_profile_artifact_for_scope(
+    input: &Path,
+    output: &Path,
+    capture_scope_id: Option<u64>,
+) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = load_ranked_profile(&paths.input, None)?;
+    let document = load_ranked_profile(&paths.input, capture_scope_id)?;
     write_ranked_profile_artifact(&paths.output, &document, ExistingOutputPolicy::Replace)?;
     Ok(paths.output)
 }

@@ -35,12 +35,14 @@ class DeltaFunnelError(Exception):
 class ProfilerConfig:
     output: Path
     sample_hz: Literal[100, 1000]
+    artifact_output: Path | None
 
     def __init__(
         self,
         output: str | PathLike[str],
         *,
         sample_hz: Literal[100, 1000] = 1000,
+        artifact_output: str | PathLike[str] | None = None,
     ) -> None: ...
 
 

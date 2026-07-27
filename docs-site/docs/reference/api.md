@@ -123,18 +123,23 @@ See [Troubleshoot a failed run](../advanced/tracing-and-diagnostics.md).
 class ProfilerConfig:
     output: Path
     sample_hz: Literal[100, 1000]
+    artifact_output: Path | None
 
     def __init__(
         self,
         output: str | PathLike[str],
         *,
         sample_hz: Literal[100, 1000] = 1000,
+        artifact_output: str | PathLike[str] | None = None,
     ) -> None
 ```
 
 Configures one operation-scoped ranked HTML report. The object is immutable.
 `output` names the report file. Delta Funnel creates missing parent directories
-and replaces an existing file only after the new report is complete.
+and replaces an existing file only after the new report is complete. Set
+`artifact_output` to retain the same operation-scoped ranked model as a
+`.dfprofile` file for later HTML or terminal inspection. The default `None`
+keeps only the HTML report.
 
 Use 1000 Hz for short operations and 100 Hz for lower-volume or longer
 captures. Only one operation profile can be active in a process. Passing this
