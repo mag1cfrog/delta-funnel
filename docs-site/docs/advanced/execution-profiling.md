@@ -119,12 +119,13 @@ report = table.write_to_mssql(
 )
 
 profile = report["execution_profile"]
-timeline = report["operation_timeline"]
+phase_timings = report["phase_timings"]
 ```
 
-The profile describes query execution. The timeline also covers SQL Server
-planning, stream consumption, writer finalization, validation, swap, and
-cleanup. A failed call can retain a completed query profile when the failure
+The profile describes DataFusion query execution. `phase_timings` describes
+the SQL Server planning, stream consumption, writer finalization, validation,
+swap, and cleanup phases. Each timing has an elapsed duration but no start
+offset. A failed call can retain a completed query profile when the failure
 happened later in the SQL Server lifecycle.
 
 ### Inspect write-all profiles
@@ -192,6 +193,6 @@ silently selecting a different profiling model.
 - [Execution profile reference](../reference/execution-profile.md) defines
   returned operator metrics and redaction.
 - [Diagnostics reference](../reference/diagnostics.md) defines operation
-  timelines and terminal events.
+  phase timings and terminal events.
 - [Perfetto diagnostics runbook](../contributing/profiling-perfetto.md) covers
   diagnostics-wheel setup, symbols, CLI inspection, and advanced raw capture.

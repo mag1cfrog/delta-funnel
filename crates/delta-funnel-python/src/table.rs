@@ -628,6 +628,7 @@ mod tests {
             );
 
             assert!(preview.getattr("export_trace").is_err());
+            assert!(preview.getattr("operation_timeline").is_err());
             Ok(())
         })
     }
@@ -681,11 +682,7 @@ mod tests {
                 "error"
             );
             assert!(required_item(&profile, "partial")?.extract::<bool>()?);
-            let timeline = required_item(&context, "operation_timeline")?.cast_into::<PyDict>()?;
-            assert_eq!(
-                required_item(&timeline, "status")?.extract::<String>()?,
-                "failed"
-            );
+            assert!(context.get_item("operation_timeline")?.is_none());
             Ok(())
         })
     }

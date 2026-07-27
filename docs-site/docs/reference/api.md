@@ -412,8 +412,7 @@ Plans or executes one SQL Server output and returns a report.
 
 - `dry_run=True` plans without writing and rejects `execution_profile` and
   `ranked_profile`.
-- `execution_profile=True` attaches `execution_profile` and `operation_timeline` to
-  an execute report.
+- `execution_profile=True` attaches `execution_profile` to an execute report.
 - `ranked_profile` writes an operation-scoped ranked HTML report.
 - `connection_string` overrides the session default for this call.
 
@@ -456,7 +455,7 @@ name, target, load mode, and optional connection override.
 - [Execution profile reference](execution-profile.md) defines the returned
   profile schema, metric mapping, labels, and redaction rules.
 - [Diagnostics reference](diagnostics.md) defines tracing events, operation
-  timelines, stream outcomes, and cache lifecycle fields.
+  phase timings, stream outcomes, and cache lifecycle fields.
 - [Progress displays](../progress.md) defines automatic, forced, and disabled
   progress behavior.
 

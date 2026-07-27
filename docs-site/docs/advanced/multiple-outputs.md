@@ -59,8 +59,8 @@ report = session.write_all(
 
 Profiling is optional and belongs to the Advanced path. See
 [Inspect write-all profiles](execution-profiling.md#inspect-write-all-profiles)
-to enable profiling, find each output's profile, and export the complete
-workflow timeline.
+to enable profiling, find each output's exact profile, or generate one ranked
+report for the complete operation.
 
 ## Interpret failures
 

@@ -1127,6 +1127,7 @@ mod tests {
         assert_eq!(value["write_stats"]["elapsed_ms"], 125);
         assert_eq!(report.execution_profile(), None);
         assert!(value["execution_profile"].is_null());
+        assert!(value.get("operation_timeline").is_none());
         assert_eq!(value["cleanup"], "not_applicable");
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
@@ -1205,6 +1206,7 @@ mod tests {
         assert_eq!(value["cleanup"], "failed");
         assert!(value.get("execution_profile").is_none());
         assert!(value["report"]["execution_profile"].is_null());
+        assert!(value["report"].get("operation_timeline").is_none());
         assert!(value["report"].get("status").is_none());
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);
@@ -1311,6 +1313,7 @@ mod tests {
         assert_eq!(value["aliases"][0]["alias"], "shared_orders");
         assert_eq!(value["aliases"][0]["status"], "materialized_and_restored");
         assert!(value["aliases"][0]["execution_profile"].is_null());
+        assert!(value["aliases"][0].get("operation_timeline").is_none());
         assert_eq!(
             value["aliases"][0]["phase_timings"][0]["phase_name"],
             "cache_alias_restore"

@@ -47,7 +47,7 @@ Follow these steps in order:
 - [Choose a profiling method](contributing/profiling.md): select a semantic
   trace, Samply, or Perfetto based on the question you need to answer.
 - [Export execution profiles](advanced/execution-profiling.md): inspect preview
-  and SQL Server operations on a shared wall-clock timeline.
+  and SQL Server operations with returned metrics or a ranked report.
 
 ## Reference
 
