@@ -874,7 +874,12 @@ mod tests {
                 "table_from_sql",
                 ("select cast(1 as bigint) / cast(0 as bigint) as value",),
             )?;
-            let execution_profile = module.getattr("ExecutionProfileConfig")?.call0()?;
+            let trace_path = temp_trace_path("failed-preview-trace")?;
+            let config_kwargs = PyDict::new(py);
+            config_kwargs.set_item("chrome_trace_path", trace_path.to_string_lossy().as_ref())?;
+            let execution_profile = module
+                .getattr("ExecutionProfileConfig")?
+                .call((), Some(&config_kwargs))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("progress", false)?;
             kwargs.set_item("execution_profile", execution_profile)?;
@@ -919,6 +924,7 @@ mod tests {
                 required_item(&timeline, "status")?.extract::<String>()?,
                 "failed"
             );
+            assert!(!trace_path.exists());
             Ok(())
         })
     }
