@@ -341,6 +341,11 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
 
     use super::*;
     use crate::perfetto_profile::ranked_report::{
@@ -591,6 +596,114 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_replacements_never_expose_a_torn_artifact() {
+        const WRITER_COUNT: usize = 4;
+        const WRITES_PER_THREAD: usize = 25;
+
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = Arc::new(directory.path().join("concurrent.dfprofile"));
+        let documents = Arc::new(
+            (0..WRITER_COUNT)
+                .map(|writer| {
+                    let mut document = document();
+                    document.semantics[0].name = format!("writer {writer}");
+                    document
+                })
+                .collect::<Vec<_>>(),
+        );
+        write_ranked_profile_artifact(&output, &documents[0], ExistingOutputPolicy::Replace)
+            .expect("initial artifact should be written");
+
+        let barrier = Arc::new(Barrier::new(WRITER_COUNT + 1));
+        let remaining = Arc::new(AtomicUsize::new(WRITER_COUNT));
+        let writers = (0..WRITER_COUNT)
+            .map(|writer| {
+                let barrier = Arc::clone(&barrier);
+                let documents = Arc::clone(&documents);
+                let output = Arc::clone(&output);
+                let remaining = Arc::clone(&remaining);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..WRITES_PER_THREAD {
+                        write_ranked_profile_artifact(
+                            &output,
+                            &documents[writer],
+                            ExistingOutputPolicy::Replace,
+                        )
+                        .expect("concurrent replacement should succeed");
+                    }
+                    remaining.fetch_sub(1, Ordering::Release);
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        loop {
+            let loaded = read_ranked_profile_artifact(&output)
+                .expect("concurrent artifact should remain readable")
+                .into_document()
+                .expect("concurrent artifact should remain valid");
+            assert!(documents.contains(&loaded));
+            if remaining.load(Ordering::Acquire) == 0 {
+                break;
+            }
+        }
+        for writer in writers {
+            writer.join().expect("writer should not panic");
+        }
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("test directory should be readable")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_preserve_writers_allow_exactly_one_winner() {
+        const WRITER_COUNT: usize = 8;
+
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = Arc::new(directory.path().join("preserved.dfprofile"));
+        let barrier = Arc::new(Barrier::new(WRITER_COUNT));
+        let writers = (0..WRITER_COUNT)
+            .map(|writer| {
+                let barrier = Arc::clone(&barrier);
+                let output = Arc::clone(&output);
+                thread::spawn(move || {
+                    let mut document = document();
+                    document.semantics[0].name = format!("writer {writer}");
+                    barrier.wait();
+                    write_ranked_profile_artifact(
+                        &output,
+                        &document,
+                        ExistingOutputPolicy::Preserve,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("writer should not panic"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| error.kind() == "persist_failed")
+        );
+        read_ranked_profile_artifact(&output).expect("winning artifact should be valid");
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("test directory should be readable")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn round_trips_representative_documents_and_preserves_renderer_output() {
         let mut maximum_bound = sampled_document();
         maximum_bound.semantics[0].name = "x".repeat(512);
@@ -746,12 +859,12 @@ mod tests {
     }
 
     #[test]
-    fn handles_every_single_bit_payload_mutation_without_panicking() {
+    fn handles_every_single_bit_artifact_mutation_without_panicking() {
         let directory = tempfile::tempdir().expect("test directory should be created");
         let input = directory.path().join("mutated.dfprofile");
         let mut bytes = artifact_bytes(&sampled_document());
 
-        for index in HEADER_LENGTH..bytes.len() {
+        for index in 0..bytes.len() {
             for bit in 0..u8::BITS {
                 bytes[index] ^= 1 << bit;
                 fs::write(&input, &bytes).expect("mutated artifact should be written");
