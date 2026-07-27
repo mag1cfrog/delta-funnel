@@ -275,10 +275,17 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "if [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
         "$query == *record_kind* ]]; then\n"
+        "  if [[ ${DELTA_FUNNEL_TEST_REPORT_FAILURE:-0} == 1 ]]; then\n"
+        "    exit 65\n"
+        "  fi\n"
         "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
         "elif [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *selected_operations* ]]; then\n"
-        "  printf '\"capture_complete\"\\n1\\n'\n"
+        "  if [[ ${DELTA_FUNNEL_TEST_HEALTH_FAILURE:-0} == 1 ]]; then\n"
+        "    exit 65\n"
+        "  fi\n"
+        "  printf '\"capture_complete\"\\n%s\\n' "
+        "\"${DELTA_FUNNEL_TEST_CAPTURE_COMPLETE:-1}\"\n"
         "else\n"
         "  exit 65\n"
         "fi\n"
@@ -368,10 +375,17 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "if [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
         "$query == *record_kind* ]]; then\n"
+        "  if [[ ${DELTA_FUNNEL_TEST_REPORT_FAILURE:-0} == 1 ]]; then\n"
+        "    exit 65\n"
+        "  fi\n"
         "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
         "elif [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *selected_operations* ]]; then\n"
-        "  printf '\"capture_complete\"\\n1\\n'\n"
+        "  if [[ ${DELTA_FUNNEL_TEST_HEALTH_FAILURE:-0} == 1 ]]; then\n"
+        "    exit 65\n"
+        "  fi\n"
+        "  printf '\"capture_complete\"\\n%s\\n' "
+        "\"${DELTA_FUNNEL_TEST_CAPTURE_COMPLETE:-1}\"\n"
         "else\n"
         "  exit 65\n"
         "fi\n"
@@ -395,41 +409,100 @@ with tempfile.TemporaryDirectory() as temp_dir:
     fake_perf = temp.joinpath("perf")
     fake_perf.write_text("#!/usr/bin/env bash\nexit 0\n")
     fake_perf.chmod(0o700)
-    trace = temp.joinpath("captures", "successful.pftrace")
-    report = temp.joinpath("captures", "successful.profile.html")
-    captured = subprocess.run(
-        [
-            capture,
-            "--output",
-            trace,
-            "--",
-            sys.executable,
-            "-c",
-            "pass",
-        ],
-        env={
-            **os.environ,
-            "TRACEBOX": str(fake_tracebox),
-            "PERF": str(fake_perf),
-            "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
-            "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
-        },
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    status = captured.stdout.splitlines()[-1]
+
+    def run_capture(name, workload="pass", **environment):
+        trace = temp.joinpath("captures", f"{name}.pftrace")
+        report = temp.joinpath("captures", f"{name}.profile.html")
+        result = subprocess.run(
+            [
+                capture,
+                "--output",
+                trace,
+                "--",
+                sys.executable,
+                "-c",
+                workload,
+            ],
+            env={
+                **os.environ,
+                "TRACEBOX": str(fake_tracebox),
+                "PERF": str(fake_perf),
+                "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
+                "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
+                **environment,
+            },
+            capture_output=True,
+            text=True,
+        )
+        status = result.stdout.splitlines()[-1]
+        fields = dict(field.split("=", 1) for field in status.split())
+        return result, trace, report, fields
+
+    captured, trace, report, status = run_capture("successful")
     expected_status = (
         "workload_status=0 tracebox_status=0 health_status=0 "
         "report_status=0 sample_hz=1000 "
         f"trace={trace} report={report}"
     )
-    if status != expected_status:
+    if captured.returncode != 0 or captured.stdout.splitlines()[-1] != expected_status:
         raise SystemExit(f"capture-workload returned an invalid status: {status}")
     if trace.read_bytes() != trace_bytes:
         raise SystemExit("automatic report generation modified the raw trace")
     if not report.is_file() or "Delta Funnel preview" not in report.read_text():
         raise SystemExit("capture-workload did not generate the ranked report")
+
+    failed, trace, report, status = run_capture(
+        "workload-failure",
+        "raise SystemExit(42)",
+    )
+    if failed.returncode != 42:
+        raise SystemExit("capture-workload did not preserve the workload failure")
+    if (
+        status["workload_status"] != "42"
+        or status["tracebox_status"] != "0"
+        or status["health_status"] != "0"
+        or status["report_status"] != "0"
+        or not trace.is_file()
+        or not report.is_file()
+    ):
+        raise SystemExit("workload failure did not preserve independent diagnostics")
+
+    unhealthy, trace, report, status = run_capture(
+        "unhealthy-capture",
+        DELTA_FUNNEL_TEST_CAPTURE_COMPLETE="0",
+    )
+    if unhealthy.returncode != 0:
+        raise SystemExit("capture health failure replaced the workload result")
+    if (
+        status["health_status"] != "65"
+        or status["report_status"] != "125"
+        or not trace.is_file()
+        or report.exists()
+    ):
+        raise SystemExit("unhealthy raw capture did not skip report generation")
+    if "do not retry" not in unhealthy.stderr:
+        raise SystemExit("capture health failure did not protect a completed workload")
+
+    preserved_report = temp.joinpath(
+        "captures",
+        "report-failure.profile.html",
+    )
+    preserved_report.write_text("previous complete report")
+    report_failure, trace, report, status = run_capture(
+        "report-failure",
+        DELTA_FUNNEL_TEST_REPORT_FAILURE="1",
+    )
+    if report_failure.returncode != 0:
+        raise SystemExit("report failure replaced the workload result")
+    if (
+        status["health_status"] != "0"
+        or status["report_status"] == "0"
+        or not trace.is_file()
+        or report.read_text() != "previous complete report"
+    ):
+        raise SystemExit("report failure did not preserve completed artifacts")
+    if "do not retry" not in report_failure.stderr:
+        raise SystemExit("report failure did not protect a completed workload")
 
 if not callable(deltafunnel.init_perfetto_diagnostics):
     raise SystemExit("Perfetto diagnostics initializer is not callable")
