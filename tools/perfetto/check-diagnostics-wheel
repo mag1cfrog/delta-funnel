@@ -649,6 +649,17 @@ with tempfile.TemporaryDirectory() as temp_dir:
     ):
         raise SystemExit("existing report did not stop capture before the workload")
 
+    dangling_trace, dangling_report = capture_artifacts("dangling-trace")
+    dangling_trace.symlink_to(dangling_report)
+    dangling, trace, report, status = run_capture("dangling-trace")
+    if (
+        dangling.returncode != 73
+        or status
+        or not trace.is_symlink()
+        or report.exists()
+    ):
+        raise SystemExit("dangling trace destination bypassed capture preflight")
+
     tracebox_failure, trace, report, status = run_capture(
         "tracebox-failure",
         DELTA_FUNNEL_TEST_TRACEBOX_STOP_STATUS="74",

@@ -132,7 +132,7 @@ if [[ ! -w $capture_dir ]]; then
     "$capture_dir" >&2
   exit 73
 fi
-if [[ -e $capture_path ]]; then
+if [[ -e $capture_path || -L $capture_path ]]; then
   printf 'capture-workload: output already exists: %s\n' "$capture_path" >&2
   exit 73
 fi
@@ -225,7 +225,8 @@ stop_tracebox() {
   if [[ -z $trace_pid ]]; then
     return
   fi
-  if stop_process_group "$trace_pid" TERM "$tracebox_stop_grace_polls"; then
+  if stop_process_group \
+    "$trace_pid" TERM "$tracebox_stop_grace_polls" leader; then
     tracebox_status=0
   else
     tracebox_status=$?
@@ -248,13 +249,18 @@ stop_process_group() {
   local pid=$1
   local signal=$2
   local grace_polls=${3:-$stop_grace_polls}
+  local initial_signal_scope=${4:-group}
   local status=0
   local waited=0
   local poll
 
-  kill "-$signal" -- "-$pid" 2>/dev/null ||
-    kill "-$signal" "$pid" 2>/dev/null ||
-    true
+  if [[ $initial_signal_scope == group ]]; then
+    kill "-$signal" -- "-$pid" 2>/dev/null ||
+      kill "-$signal" "$pid" 2>/dev/null ||
+      true
+  else
+    kill "-$signal" "$pid" 2>/dev/null || true
+  fi
   for (( poll = 0; poll < grace_polls; poll++ )); do
     if (( waited == 0 )) && process_finished "$pid"; then
       if wait "$pid" 2>/dev/null; then
