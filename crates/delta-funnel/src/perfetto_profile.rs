@@ -101,7 +101,7 @@ fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns a structured failure when the trace, Trace Processor query, aggregate,
+/// Returns a structured failure when the input, analysis, aggregate,
 /// serialization, or output write fails.
 pub fn generate_ranked_profile_report(
     input: &Path,
@@ -197,7 +197,7 @@ fn load_ranked_profile_input(input: &Path) -> Result<RankedProfileDocument, Rank
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("dfprofile"));
     if artifact_extension || has_ranked_profile_artifact_magic(input)? {
-        read_ranked_profile_artifact(input)?.into_document()
+        read_ranked_profile_artifact(input)
     } else {
         load_ranked_profile(input, None)
     }

@@ -31,30 +31,6 @@ const PAYLOAD_OFFSET_RANGE: Range<usize> = 24..32;
 const PAYLOAD_LENGTH_RANGE: Range<usize> = 32..40;
 const RESERVED_TAIL_RANGE: Range<usize> = 40..HEADER_LENGTH;
 
-#[derive(Debug)]
-pub(super) struct RankedProfileArtifact {
-    bytes: AlignedVec<16>,
-    payload: Range<usize>,
-}
-
-impl RankedProfileArtifact {
-    pub(super) fn document(&self) -> Result<&ArchivedRankedProfileDocument, RankedReportFailure> {
-        rkyv::access::<ArchivedRankedProfileDocument, RkyvError>(&self.bytes[self.payload.clone()])
-            .map_err(|_| {
-                input_failure("invalid_archive", "artifact payload is not a valid archive")
-            })
-    }
-
-    pub(super) fn into_document(self) -> Result<RankedProfileDocument, RankedReportFailure> {
-        rkyv::deserialize::<RankedProfileDocument, RkyvError>(self.document()?).map_err(|_| {
-            input_failure(
-                "artifact_deserialize_failed",
-                "artifact payload could not be materialized",
-            )
-        })
-    }
-}
-
 pub(super) fn has_ranked_profile_artifact_magic(input: &Path) -> Result<bool, RankedReportFailure> {
     let mut file = super::open_profile_input(input)
         .map_err(|_| input_failure("input_unreadable", "profile input could not be read"))?;
@@ -71,7 +47,7 @@ pub(super) fn has_ranked_profile_artifact_magic(input: &Path) -> Result<bool, Ra
 
 pub(super) fn read_ranked_profile_artifact(
     input: &Path,
-) -> Result<RankedProfileArtifact, RankedReportFailure> {
+) -> Result<RankedProfileDocument, RankedReportFailure> {
     let mut file = super::open_profile_input(input)
         .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
     let file_length = file
@@ -105,15 +81,21 @@ pub(super) fn read_ranked_profile_artifact(
         ));
     }
     let payload = parse_header(&bytes)?;
-    let artifact = RankedProfileArtifact { bytes, payload };
-    artifact.document()?.validate().map_err(|error| {
+    let archived = rkyv::access::<ArchivedRankedProfileDocument, RkyvError>(&bytes[payload])
+        .map_err(|_| input_failure("invalid_archive", "artifact payload is not a valid archive"))?;
+    archived.validate().map_err(|error| {
         RankedReportFailure::new(
             RankedReportFailurePhase::AggregateValidation,
             "invalid_ranked_profile",
             error.to_string(),
         )
     })?;
-    Ok(artifact)
+    rkyv::deserialize::<RankedProfileDocument, RkyvError>(archived).map_err(|_| {
+        input_failure(
+            "artifact_deserialize_failed",
+            "artifact payload could not be materialized",
+        )
+    })
 }
 
 pub(super) fn write_ranked_profile_artifact(
@@ -341,10 +323,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{
-        Arc, Barrier,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
@@ -441,10 +420,7 @@ mod tests {
         let output = directory.path().join("profile.dfprofile");
         write_ranked_profile_artifact(&output, document, ExistingOutputPolicy::Replace)
             .expect("artifact should be written");
-        read_ranked_profile_artifact(&output)
-            .expect("artifact should be read")
-            .into_document()
-            .expect("artifact should deserialize")
+        read_ranked_profile_artifact(&output).expect("artifact should be read")
     }
 
     fn incomplete_document() -> RankedProfileDocument {
@@ -516,14 +492,10 @@ mod tests {
         write_ranked_profile_artifact(&output, &document, ExistingOutputPolicy::Replace)
             .expect("artifact should be written");
         let artifact = read_ranked_profile_artifact(&output).expect("artifact should be read");
-        let archived = artifact.document().expect("artifact should remain valid");
-        assert_eq!(archived.metadata.sample_frequency_hz.to_native(), 1_000);
-        assert_eq!(archived.semantics[0].name.as_str(), "Delta Funnel preview");
+        assert_eq!(artifact.metadata.sample_frequency_hz, 1_000);
+        assert_eq!(artifact.semantics[0].name, "Delta Funnel preview");
         assert_eq!(
-            read_ranked_profile_artifact(&output)
-                .expect("artifact should be read")
-                .into_document()
-                .expect("artifact should deserialize"),
+            read_ranked_profile_artifact(&output).expect("artifact should be read"),
             document
         );
 
@@ -615,24 +587,20 @@ mod tests {
             .expect("initial artifact should be written");
 
         let barrier = Arc::new(Barrier::new(WRITER_COUNT + 1));
-        let remaining = Arc::new(AtomicUsize::new(WRITER_COUNT));
         let writers = (0..WRITER_COUNT)
             .map(|writer| {
                 let barrier = Arc::clone(&barrier);
                 let documents = Arc::clone(&documents);
                 let output = Arc::clone(&output);
-                let remaining = Arc::clone(&remaining);
                 thread::spawn(move || {
                     barrier.wait();
-                    for _ in 0..WRITES_PER_THREAD {
+                    (0..WRITES_PER_THREAD).try_for_each(|_| {
                         write_ranked_profile_artifact(
                             &output,
                             &documents[writer],
                             ExistingOutputPolicy::Replace,
                         )
-                        .expect("concurrent replacement should succeed");
-                    }
-                    remaining.fetch_sub(1, Ordering::Release);
+                    })
                 })
             })
             .collect::<Vec<_>>();
@@ -640,16 +608,17 @@ mod tests {
         barrier.wait();
         loop {
             let loaded = read_ranked_profile_artifact(&output)
-                .expect("concurrent artifact should remain readable")
-                .into_document()
-                .expect("concurrent artifact should remain valid");
+                .expect("concurrent artifact should remain readable");
             assert!(documents.contains(&loaded));
-            if remaining.load(Ordering::Acquire) == 0 {
+            if writers.iter().all(std::thread::JoinHandle::is_finished) {
                 break;
             }
         }
         for writer in writers {
-            writer.join().expect("writer should not panic");
+            writer
+                .join()
+                .expect("writer should not panic")
+                .expect("concurrent replacement should succeed");
         }
         assert_eq!(
             fs::read_dir(directory.path())
@@ -753,10 +722,7 @@ mod tests {
         fs::write(&input, fixture).expect("golden fixture should be copied");
 
         let expected = document();
-        let loaded = read_ranked_profile_artifact(&input)
-            .expect("golden fixture should load")
-            .into_document()
-            .expect("golden fixture should deserialize");
+        let loaded = read_ranked_profile_artifact(&input).expect("golden fixture should load");
         assert_eq!(loaded, expected);
         assert_eq!(artifact_bytes(&expected), fixture);
     }
@@ -868,10 +834,8 @@ mod tests {
             for bit in 0..u8::BITS {
                 bytes[index] ^= 1 << bit;
                 fs::write(&input, &bytes).expect("mutated artifact should be written");
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    read_ranked_profile_artifact(&input)
-                        .and_then(RankedProfileArtifact::into_document)
-                }));
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| read_ranked_profile_artifact(&input)));
                 assert!(
                     outcome.is_ok(),
                     "artifact reader panicked after flipping bit {bit} of byte {index}"

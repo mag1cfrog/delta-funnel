@@ -201,10 +201,10 @@ impl fmt::Display for CliArgumentError {
         let message = match self {
             Self::MissingCommand => "a diagnostics command is required",
             Self::UnknownCommand => "unknown diagnostics command",
-            Self::MissingInput => "an input trace path is required",
+            Self::MissingInput => "a profile input path is required",
             Self::MissingOutputValue => "--output requires a path",
             Self::DuplicateOutput => "--output may be specified only once",
-            Self::MultipleInputs => "only one input trace path may be provided",
+            Self::MultipleInputs => "only one profile input path may be provided",
             Self::InvalidLimit => "limit must be between 1 and 200",
             Self::InvalidDepth => "depth must be between 0 and 32",
             Self::InvalidSemanticId => "semantic ID must be a signed integer",
@@ -252,7 +252,7 @@ impl CliArgumentError {
 pub enum RankedReportFailurePhase {
     /// Command arguments were invalid.
     Argument,
-    /// The input trace could not be read.
+    /// The profile input could not be read.
     Input,
     /// Capture completeness checks failed.
     Health,
@@ -369,9 +369,9 @@ impl fmt::Display for RankedReportPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputUnreadable(error) => {
-                write!(formatter, "input trace is not readable: {error}")
+                write!(formatter, "profile input is not readable: {error}")
             }
-            Self::InputNotFile => formatter.write_str("input trace is not a file"),
+            Self::InputNotFile => formatter.write_str("profile input is not a file"),
             Self::OutputHasNoFileName => formatter.write_str("output path has no file name"),
             Self::OutputNotFile => formatter.write_str("existing output is not a file"),
             Self::OutputParentNotDirectory => {
@@ -381,7 +381,7 @@ impl fmt::Display for RankedReportPathError {
                 write!(formatter, "output path could not be inspected: {error}")
             }
             Self::InputOutputAlias => {
-                formatter.write_str("input trace and output resolve to the same file")
+                formatter.write_str("profile input and output resolve to the same file")
             }
         }
     }

@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 
@@ -231,6 +232,10 @@ impl PySession {
                     .to_owned(),
             ));
         }
+        let trace_path = trace_path
+            .map(std::path::absolute)
+            .transpose()
+            .map_err(PyOSError::new_err)?;
         let operation_profile =
             start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
         drop(profiler);

@@ -231,6 +231,10 @@ impl PyTable {
         } else {
             delta_funnel::ExecutionProfileMode::Disabled
         };
+        let trace_path = trace_path
+            .map(std::path::absolute)
+            .transpose()
+            .map_err(PyOSError::new_err)?;
         let operation_profile =
             start_operation_profile(py, profiler.as_deref(), trace_path.as_deref())?;
         drop(profiler);

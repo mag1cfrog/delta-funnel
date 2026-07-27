@@ -140,10 +140,13 @@ pub(crate) fn start_operation_profile(
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     {
-        validate_output_paths(py, config, trace_path)?;
+        let output = resolve_output_path(py, config.output_path())?;
+        let artifact_output = config
+            .artifact_output_path()
+            .map(|output| resolve_output_path(py, output))
+            .transpose()?;
+        validate_output_paths(py, &output, artifact_output.as_deref(), trace_path)?;
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
-        let output = config.output_path().to_owned();
-        let artifact_output = config.artifact_output_path().map(Path::to_owned);
         let sample_hz = config.sampling_frequency();
         let tracebox = tracebox_launcher(py)?;
         py.detach(move || {
@@ -157,7 +160,8 @@ pub(crate) fn start_operation_profile(
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
 fn validate_output_paths(
     py: Python<'_>,
-    config: &PyProfilerConfig,
+    output: &Path,
+    artifact_output: Option<&Path>,
     trace_path: Option<&Path>,
 ) -> PyResult<()> {
     let paths_alias = |left: &Path, right: &Path| {
@@ -169,8 +173,8 @@ fn validate_output_paths(
             )
         })
     };
-    if let Some(artifact_output) = config.artifact_output_path()
-        && paths_alias(config.output_path(), artifact_output)?
+    if let Some(artifact_output) = artifact_output
+        && paths_alias(output, artifact_output)?
     {
         return Err(config_py_error(
             py,
@@ -180,14 +184,14 @@ fn validate_output_paths(
         ));
     }
     if let Some(trace_path) = trace_path {
-        if paths_alias(config.output_path(), trace_path)? {
+        if paths_alias(output, trace_path)? {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
                 "`trace_path` and `ProfilerConfig.output` must name different files".to_owned(),
             ));
         }
-        if let Some(artifact_output) = config.artifact_output_path()
+        if let Some(artifact_output) = artifact_output
             && paths_alias(artifact_output, trace_path)?
         {
             return Err(config_py_error(
@@ -199,6 +203,17 @@ fn validate_output_paths(
         }
     }
     Ok(())
+}
+
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+fn resolve_output_path(py: Python<'_>, output: &Path) -> PyResult<PathBuf> {
+    std::path::absolute(output).map_err(|_| {
+        profiler_py_error(
+            py,
+            "output_unavailable",
+            "profile output path could not be resolved".to_owned(),
+        )
+    })
 }
 
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
@@ -406,7 +421,12 @@ mod tests {
                 sample_hz: 1_000,
                 artifact_output: Some(PathBuf::from("./profile.html")),
             };
-            let error = validate_output_paths(py, &config, None)
+            let output = resolve_output_path(py, config.output_path())?;
+            let artifact_output = config
+                .artifact_output_path()
+                .map(|output| resolve_output_path(py, output))
+                .transpose()?;
+            let error = validate_output_paths(py, &output, artifact_output.as_deref(), None)
                 .expect_err("HTML and artifact outputs must not alias");
             assert_eq!(
                 error.value(py).getattr("kind")?.extract::<String>()?,
@@ -418,8 +438,15 @@ mod tests {
                 sample_hz: 1_000,
                 artifact_output: Some(PathBuf::from("profile.dfprofile")),
             };
-            let error = validate_output_paths(py, &config, Some(Path::new("./profile.dfprofile")))
-                .expect_err("trace and artifact outputs must not alias");
+            let output = resolve_output_path(py, config.output_path())?;
+            let artifact_output = config
+                .artifact_output_path()
+                .map(|output| resolve_output_path(py, output))
+                .transpose()?;
+            let trace_path = resolve_output_path(py, Path::new("./profile.dfprofile"))?;
+            let error =
+                validate_output_paths(py, &output, artifact_output.as_deref(), Some(&trace_path))
+                    .expect_err("trace and artifact outputs must not alias");
             assert_eq!(
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "invalid_option_value"

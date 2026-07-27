@@ -12,10 +12,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(target_os = "linux")]
-use std::process::{Output, Stdio};
-#[cfg(target_os = "linux")]
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use delta_funnel::perfetto_profile::{
@@ -123,7 +120,8 @@ fn generates_operation_html_and_artifact_from_one_aggregate()
          cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n",
     )?;
 
-    let child = Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .args([
             "--exact",
             "generates_operation_html_and_artifact_from_one_aggregate",
@@ -133,8 +131,8 @@ fn generates_operation_html_and_artifact_from_one_aggregate()
         .env("DELTA_FUNNEL_TEST_OPERATION_HTML", &output)
         .env("DELTA_FUNNEL_TEST_OPERATION_ARTIFACT", &artifact)
         .env("TRACE_PROCESSOR_SHELL", &trace_processor)
-        .env("DELTA_FUNNEL_TEST_AGGREGATE", &aggregate)
-        .output()?;
+        .env("DELTA_FUNNEL_TEST_AGGREGATE", &aggregate);
+    let child = output_with_timeout(command, Duration::from_secs(10))?;
     assert!(
         child.status.success(),
         "operation output child failed: {}",
@@ -144,7 +142,8 @@ fn generates_operation_html_and_artifact_from_one_aggregate()
     assert!(output.is_file());
     assert!(artifact.is_file());
 
-    let report = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"));
+    command
         .arg("report")
         .arg(&artifact)
         .arg("--output")
@@ -152,8 +151,8 @@ fn generates_operation_html_and_artifact_from_one_aggregate()
         .env(
             "TRACE_PROCESSOR_SHELL",
             directory.path().join("unavailable"),
-        )
-        .output()?;
+        );
+    let report = output_with_timeout(command, Duration::from_secs(10))?;
     assert!(
         report.status.success(),
         "artifact rerender failed: {}",
@@ -342,7 +341,6 @@ fn reports_help_output_failures_with_stable_diagnostics() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn output_with_timeout(
     mut command: Command,
     timeout: Duration,
