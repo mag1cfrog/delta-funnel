@@ -70,10 +70,11 @@ CPU, syscall, scheduler, stack, or kernel profiling.
 ## Inspect terminal execution profiles
 
 `query_execution_profile_terminal` is one bounded `DEBUG` summary on the
-`delta_funnel` tracing target for an execution that registered a detailed
-profile consumer. Profiling is opt-in. When `ExecutionProfileMode` remains at
-its default `Disabled` value, Delta Funnel does not allocate a profile result,
-retain a plan for profiling, collect DataFusion metrics, or emit this event.
+`delta_funnel` tracing target for an execution that registered an exact
+execution profile consumer. Profiling is opt-in. When `ExecutionProfileMode`
+remains at its default `Disabled` value, Delta Funnel does not allocate a
+profile result, retain a plan for profiling, collect DataFusion metrics, or
+emit this event.
 
 The event fields are:
 
@@ -122,10 +123,10 @@ must admit DEBUG records.
 
 ## Inspect returned write-all cache diagnostics
 
-Auto-cached `write_all` calls record cache lifecycle timings whether detailed
-operator profiling is enabled or disabled. On success, read the executed alias
-reports under `report["cache"]["aliases"]`. Each attempted alias has one of
-these statuses:
+Auto-cached `write_all` calls record cache lifecycle timings whether exact
+execution operator profiling is enabled or disabled. On success, read the
+executed alias reports under `report["cache"]["aliases"]`. Each attempted alias
+has one of these statuses:
 
 - `materialized_and_restored` means cache setup, installation, and required
   restoration completed. Outputs may still contain failures.
@@ -203,13 +204,13 @@ completed output reports are not lost.
 Rust callers match `DeltaFunnelError::WriteAllCache { failure, source }` and
 read `WriteAllCacheFailure::aliases()`,
 `primary_failed_alias_table_id()`, `workflow()`, and `operation_timeline()`.
-The partial timeline is present when detailed profiling was enabled and uses a
-failed root status. `source` retains the original primary error and its source
-chain.
+The partial timeline is present when exact execution profiling was enabled and
+uses a failed root status. `source` retains the original primary error and its
+source chain.
 
-These lifecycle timings describe cache orchestration boundaries. A detailed
-operator profile is separately opt-in and describes work inside one cache
-physical plan. On a normal Python result, read it from
+These lifecycle timings describe cache orchestration boundaries. An exact
+execution operator profile is separately opt-in and describes work inside one
+cache physical plan. On a normal Python result, read it from
 `report["cache"]["aliases"][i]["execution_profile"]`. On a cache failure, read
 the same alias-owned field from `error.context["aliases"][i]`. Rust callers use
 `WriteAllCacheAliasReport::execution_profile()` on aliases from either

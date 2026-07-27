@@ -143,7 +143,7 @@ impl PySession {
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept the
     /// `cache_mode` option. Pass
-    /// `execution_profile=ExecutionProfileConfig(...)` to attach a detailed
+    /// `execution_profile=ExecutionProfileConfig(...)` to attach an exact
     /// execution profile to each attempted output and executed cache alias and
     /// optionally export one Chrome Trace Event JSON file for the complete
     /// write-all wall clock. Cache profiles are under
@@ -364,7 +364,7 @@ impl PySession {
                 py,
                 trace_destination,
                 report.to_trace_event_json_value(),
-                "write trace export requires detailed profiling",
+                "write trace export requires exact execution profiling",
                 "completed",
                 &report_value,
             )?;
@@ -467,7 +467,7 @@ impl PySession {
                 py,
                 trace_destination,
                 report.to_trace_event_json_value(),
-                "write-all trace export requires detailed profiling",
+                "write-all trace export requires exact execution profiling",
                 status,
                 &report_value,
             )?;
@@ -1449,7 +1449,7 @@ mod tests {
 
             let error = session
                 .call_method("write_all", (&outputs,), Some(&kwargs))
-                .expect_err("a standard wheel must reject operation profiling");
+                .expect_err("a standard wheel must reject ranked profiling");
             assert_eq!(
                 error.value(py).getattr("phase")?.extract::<String>()?,
                 "ranked_profile"
@@ -1462,7 +1462,7 @@ mod tests {
             kwargs.set_item("dry_run", true)?;
             let error = session
                 .call_method("write_all", (&outputs,), Some(&kwargs))
-                .expect_err("dry-run operation profiling must be rejected");
+                .expect_err("dry-run ranked profiling must be rejected");
             assert_config_error(py, &error, "invalid_option_value")?;
             assert!(!output.exists());
             Ok(())

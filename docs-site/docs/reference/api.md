@@ -389,7 +389,7 @@ def show(
 ```
 
 Executes the same bounded query as `preview` and prints its text form to Python
-stdout. It does not retain the `Preview` or enable detailed profiling.
+stdout. It does not retain the `Preview` or enable exact execution profiling.
 
 <a id="table-to-mssql"></a>
 ##### `Table.to_mssql`

@@ -140,7 +140,7 @@ impl PyTable {
     ///
     /// Pass `dry_run=True` to plan without writing. Returns a plain Python
     /// `dict` report. Pass `execution_profile=ExecutionProfileConfig(...)` to
-    /// attach a detailed query execution profile and optionally export Chrome
+    /// attach an exact query execution profile and optionally export Chrome
     /// Trace Event JSON. Pass `ranked_profile=RankedProfileConfig(...)` to
     /// record this write and export an interactive ranked HTML report plus an
     /// optional reusable ranked artifact. Profiling is not available for dry
@@ -247,7 +247,7 @@ impl PyTable {
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass
     /// `execution_profile=ExecutionProfileConfig(...)` to also attach the
-    /// detailed execution profile and optionally export Chrome Trace Event
+    /// exact execution profile and optionally export Chrome Trace Event
     /// JSON. Pass `ranked_profile=RankedProfileConfig(...)` to record this
     /// preview and write an interactive ranked HTML report plus an optional
     /// reusable ranked artifact.
@@ -704,7 +704,7 @@ mod tests {
 
             let error = table
                 .call_method("preview", (), Some(&kwargs))
-                .expect_err("a standard wheel must reject operation profiling");
+                .expect_err("a standard wheel must reject ranked profiling");
 
             assert!(error.is_instance_of::<DeltaFunnelError>(py));
             assert_eq!(
@@ -743,7 +743,7 @@ mod tests {
 
             let error = table
                 .call_method("write_to_mssql", (), Some(&kwargs))
-                .expect_err("a standard wheel must reject operation profiling");
+                .expect_err("a standard wheel must reject ranked profiling");
 
             assert!(error.is_instance_of::<DeltaFunnelError>(py));
             assert_eq!(
@@ -758,7 +758,7 @@ mod tests {
             kwargs.set_item("dry_run", true)?;
             let error = table
                 .call_method("write_to_mssql", (), Some(&kwargs))
-                .expect_err("dry-run operation profiling must be rejected");
+                .expect_err("dry-run ranked profiling must be rejected");
             assert_eq!(
                 error.value(py).getattr("phase")?.extract::<String>()?,
                 "config"

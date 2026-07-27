@@ -42,7 +42,7 @@ benchmark_args=(
 ```
 
 The complete feature-off, stable semantic JSON, and Samply command matrix is in
-[Run Delta Scan Benchmarks](scan-benchmarks.md#compare-samply-with-detailed-profiling).
+[Run Delta Scan Benchmarks](scan-benchmarks.md#compare-samply-with-exact-execution-profiling).
 It brackets the profiled runs with feature-off controls and records command
 wall time with GNU `time`. When following it after the builds above, replace
 each `target/profiling/delta_scan_partition_bench` path in that matrix with the

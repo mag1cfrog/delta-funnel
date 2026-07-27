@@ -189,7 +189,7 @@ pub(crate) fn start_ranked_profile(
         Err(ranked_profile_py_error(
             py,
             "not_available",
-            "operation profiling requires a diagnostics-enabled Linux build".to_owned(),
+            "ranked profiling requires a diagnostics-enabled Linux build".to_owned(),
         ))
     }
 
@@ -320,7 +320,7 @@ impl RankedProfileCapture {
             Err(ranked_profile_py_error(
                 py,
                 "not_available",
-                "operation profiling requires a diagnostics-enabled Linux build".to_owned(),
+                "ranked profiling requires a diagnostics-enabled Linux build".to_owned(),
             ))
         }
     }

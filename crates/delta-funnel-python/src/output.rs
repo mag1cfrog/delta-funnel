@@ -520,7 +520,8 @@ union all select cast(103 as bigint) as order_id",),
                 table.table().as_str(),
                 "create_and_load",
             )?;
-            kwargs.set_item("profile", true)?;
+            let execution_profile = module.getattr("ExecutionProfileConfig")?.call0()?;
+            kwargs.set_item("execution_profile", execution_profile)?;
 
             let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
             let report_repr = report.repr()?.extract::<String>()?;
