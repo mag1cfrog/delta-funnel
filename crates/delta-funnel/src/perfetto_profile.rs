@@ -39,7 +39,7 @@ pub use report_cli::{
     RankedReportFailure, RankedReportFailurePhase, run_perfetto_diagnostics_cli,
     run_perfetto_diagnostics_cli_with_args,
 };
-use report_html::{render_ranked_profile_html, write_ranked_profile_html};
+use report_html::{ExistingOutputPolicy, render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;
 
@@ -91,7 +91,14 @@ pub fn generate_ranked_profile_report(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_report_for_scope(input, output, None)
+    generate_ranked_profile_report_for_scope(input, output, None, ExistingOutputPolicy::Replace)
+}
+
+fn generate_ranked_profile_report_without_clobber(
+    input: &Path,
+    output: &Path,
+) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_report_for_scope(input, output, None, ExistingOutputPolicy::Preserve)
 }
 
 /// Generates one ranked HTML report for a host-selected operation capture.
@@ -106,18 +113,24 @@ pub fn generate_operation_ranked_profile_report(
     output: &Path,
     capture_scope: &OperationCaptureScope,
 ) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_report_for_scope(input, output, Some(capture_scope.id))
+    generate_ranked_profile_report_for_scope(
+        input,
+        output,
+        Some(capture_scope.id),
+        ExistingOutputPolicy::Replace,
+    )
 }
 
 fn generate_ranked_profile_report_for_scope(
     input: &Path,
     output: &Path,
     capture_scope_id: Option<u64>,
+    existing_output: ExistingOutputPolicy,
 ) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
     let document = load_ranked_profile(&paths.input, capture_scope_id)?;
     let html = render_ranked_profile_html(&document)?;
-    write_ranked_profile_html(&paths.output, &html)?;
+    write_ranked_profile_html(&paths.output, &html, existing_output)?;
     Ok(paths.output)
 }
 

@@ -133,6 +133,19 @@ jobs:
         if: matrix.host_sccache == 'true'
         uses: mozilla-actions/sccache-action@v0.0.10
 
+      - name: Pull manylinux image
+        if: matrix.manylinux != 'off'
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull quay.io/pypa/manylinux_2_28_x86_64:latest; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              exit 1
+            fi
+            sleep "$((attempt * 10))"
+          done
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:

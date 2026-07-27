@@ -176,6 +176,27 @@ agent needs the terminal inspector, or when you need the raw Perfetto timeline
 or scheduler context. A whole-process capture includes every enabled Delta
 Funnel operation between activation and process exit.
 
+The whole-process command also requires `perf` and the util-linux `setsid`
+command. Install the packages for the host distribution:
+
+```sh
+# Fedora
+sudo dnf install perf util-linux-core
+
+# Ubuntu
+sudo apt install linux-tools-generic util-linux
+
+# Debian
+sudo apt install linux-perf util-linux
+```
+
+Run only the matching install command, then verify both executables:
+
+```sh
+perf --version
+setsid --help >/dev/null
+```
+
 Locate the packaged capture command and verify the diagnostics CLI:
 
 ```sh
@@ -206,7 +227,7 @@ process can appear in the trace.
 ### Record the workload
 
 Run one command from the workload project root. Use a new output name for each
-capture because existing trace files are never overwritten:
+capture because existing trace and report files are never overwritten:
 
 ```sh
 "$capture_workload" \
@@ -215,17 +236,35 @@ capture because existing trace files are never overwritten:
 ```
 
 The command starts Perfetto, waits until all data sources are ready, runs the
-workload, stops Perfetto, and checks the saved trace. A successful run ends
-with output like:
+workload, finalizes and checks the saved trace, then generates the sibling
+ranked report. A successful run creates:
 
 ```text
-workload_status=0 tracebox_status=0 health_status=0 sample_hz=1000 trace=target/perfetto-captures/query.pftrace
+target/perfetto-captures/query.pftrace
+target/perfetto-captures/query.profile.html
 ```
 
-`health_status=0` means the printed health row reported
-`capture_complete=1`. The command always exits with the workload's own status.
-A later capture or health failure cannot turn a successful database write into
-a failed workload. Never retry a write only because diagnostics failed.
+It ends with one machine-readable status line:
+
+```text
+workload_status=0 tracebox_status=0 health_status=0 report_status=0 sample_hz=1000 trace=target/perfetto-captures/query.pftrace report=target/perfetto-captures/query.profile.html
+```
+
+`workload_status` is the workload's actual result. `tracebox_status`,
+`health_status`, and `report_status` independently describe capture
+finalization, raw-trace health, and report generation. Status `0` means that
+stage succeeded, while `125` means it did not run. The `report` field appears
+only after a complete non-empty report is present.
+
+On ordinary completion, the command exits with `workload_status`, even when
+later diagnostics fail. Argument and setup failures return before the workload,
+while an interrupted wrapper returns its signal status. The machine-readable
+fields are authoritative once capture starts.
+
+A capture, health, or report failure cannot turn a successful database write
+into a failed workload. The warning tells automated callers not to retry a
+completed write. Keep the raw trace for diagnosis and inspect the nonzero
+diagnostics status instead.
 
 Short mode defaults to 1000 Hz. Pass `--sample-hz 100` when lower capture
 volume matters more than resolving short native work. The explicit override
@@ -314,24 +353,22 @@ This prevents a short identity from accidentally selecting another node.
 Every interactive response ends with `-- end --`, so an agent can consume the
 session without terminal-screen parsing.
 
-### Generate a ranked HTML report
+### Regenerate a ranked HTML report
 
-Generate a self-contained interactive report beside the trace:
-
-```sh
-uv run delta-funnel-perfetto report \
-  target/perfetto-captures/query.pftrace
-```
-
-The default output is
-`target/perfetto-captures/query.profile.html`. Choose another destination with
-`--output`:
+Normal whole-process capture already generates the sibling HTML report. Use
+the standalone command only to regenerate an older raw trace or create another
+report destination:
 
 ```sh
 uv run delta-funnel-perfetto report \
   target/perfetto-captures/query.pftrace \
-  --output target/perfetto-captures/query-report.html
+  --output target/perfetto-captures/query-rerun.profile.html \
+  --no-clobber
 ```
+
+Without `--output`, the destination is
+`target/perfetto-captures/query.profile.html`. The standalone command replaces
+its output by default. Pass `--no-clobber` to preserve an existing report.
 
 Open the HTML file in a browser. It uses the same ranked semantic and function
 data model as the terminal inspector. The raw trace is not embedded in the

@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: capture-workload [--mode short|streaming|deep-system] [--sample-hz 100|1000] --output TRACE -- COMMAND [ARG...]
 
-Record one diagnostics-enabled Python workload and check the saved trace.
+Record one diagnostics-enabled Python workload, check the saved trace, and
+generate a sibling ranked HTML report.
 The default mode is short. Short mode defaults to 1000 Hz; other modes default
 to 100 Hz.
 EOF
@@ -104,7 +105,7 @@ fi
 tracebox=${TRACEBOX:-$script_dir/delta-funnel-tracebox}
 trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
 perf=${PERF:-perf}
-for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od; do
+for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od setsid; do
   if ! command -v "$executable" >/dev/null 2>&1; then
     printf 'capture-workload: required command is unavailable: %s\n' \
       "$executable" >&2
@@ -131,8 +132,20 @@ if [[ ! -w $capture_dir ]]; then
     "$capture_dir" >&2
   exit 73
 fi
-if [[ -e $capture_path ]]; then
+if [[ -e $capture_path || -L $capture_path ]]; then
   printf 'capture-workload: output already exists: %s\n' "$capture_path" >&2
+  exit 73
+fi
+case $capture_path in
+  *.pftrace)
+    report_path=${capture_path%.pftrace}.profile.html
+    ;;
+  *)
+    report_path=$capture_path.profile.html
+    ;;
+esac
+if [[ -e $report_path || -L $report_path ]]; then
+  printf 'capture-workload: report output already exists: %s\n' "$report_path" >&2
   exit 73
 fi
 
@@ -151,6 +164,19 @@ shift
 
 target_dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd -P)
 target_name=$(basename -- "$target")
+report_cli=$target_dir/delta-funnel-perfetto
+if [[ ! -x $report_cli ]]; then
+  report_cli=$(command -v delta-funnel-perfetto) || {
+    printf '%s\n' \
+      'capture-workload: required command is unavailable: delta-funnel-perfetto' >&2
+    exit 127
+  }
+fi
+if ! "$report_cli" report --help >/dev/null; then
+  printf '%s\n' \
+    'capture-workload: ranked report command is unavailable' >&2
+  exit 69
+fi
 launcher=$target_dir/delta-funnel-perfetto-preview
 if [[ -e $launcher || -L $launcher ]]; then
   if [[ ! -x $launcher ]] || [[ ! $launcher -ef $target ]]; then
@@ -164,13 +190,43 @@ fi
 runtime_dir=$(mktemp -d "$capture_dir/.delta-funnel-perfetto.XXXXXX")
 ready_fifo=$runtime_dir/tracebox-ready
 trace_pid=
+workload_pid=
+diagnostics_pid=
+diagnostics_stage=
+interruption_status=
+interruption_signal=
+status_emitted=0
+workload_status=
+health_status=125
+report_status=125
+report_output=
+health_output_file=$runtime_dir/capture-health.out
+stop_grace_polls=100
+tracebox_stop_grace_polls=1000
+
+emit_status() {
+  local workload_status=$1
+  local tracebox_status=$2
+  local health_status=$3
+  local report_status=$4
+  local report_output=${5:-}
+
+  printf 'workload_status=%s tracebox_status=%s health_status=%s report_status=%s sample_hz=%s trace=%q' \
+    "$workload_status" "$tracebox_status" "$health_status" "$report_status" \
+    "$sample_hz" "$capture_path"
+  if [[ -n $report_output ]]; then
+    printf ' report=%q' "$report_output"
+  fi
+  printf '\n'
+  status_emitted=1
+}
 
 stop_tracebox() {
   if [[ -z $trace_pid ]]; then
-    return
+    return 0
   fi
-  kill -TERM "$trace_pid" 2>/dev/null || true
-  if wait "$trace_pid"; then
+  if stop_process_group \
+    "$trace_pid" TERM "$tracebox_stop_grace_polls" leader; then
     tracebox_status=0
   else
     tracebox_status=$?
@@ -178,17 +234,156 @@ stop_tracebox() {
   trace_pid=
 }
 
+process_finished() {
+  local pid=$1
+  local process_stat
+  if [[ ! -r /proc/$pid/stat ]]; then
+    return 0
+  fi
+  process_stat=$(<"/proc/$pid/stat") || return 0
+  process_stat=${process_stat##*) }
+  [[ ${process_stat%% *} == Z ]]
+}
+
+stop_process_group() {
+  local pid=$1
+  local signal=$2
+  local grace_polls=${3:-$stop_grace_polls}
+  local initial_signal_scope=${4:-group}
+  local status=0
+  local waited=0
+  local poll
+
+  if [[ $initial_signal_scope == group ]]; then
+    kill "-$signal" -- "-$pid" 2>/dev/null ||
+      kill "-$signal" "$pid" 2>/dev/null ||
+      true
+  else
+    kill "-$signal" "$pid" 2>/dev/null || true
+  fi
+  for (( poll = 0; poll < grace_polls; poll++ )); do
+    if (( waited == 0 )) && process_finished "$pid"; then
+      if wait "$pid" 2>/dev/null; then
+        status=0
+      else
+        status=$?
+      fi
+      waited=1
+    fi
+    if (( waited == 1 )) && ! kill -0 -- "-$pid" 2>/dev/null; then
+      return "$status"
+    fi
+    sleep 0.01
+  done
+
+  kill -KILL -- "-$pid" 2>/dev/null ||
+    kill -KILL "$pid" 2>/dev/null ||
+    true
+  if (( waited == 0 )); then
+    if wait "$pid" 2>/dev/null; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  return "$status"
+}
+
+stop_workload() {
+  if [[ -z $workload_pid ]]; then
+    return 0
+  fi
+  local signal=${interruption_signal:-TERM}
+  if stop_process_group "$workload_pid" "$signal"; then
+    workload_status=0
+  else
+    workload_status=$?
+  fi
+  workload_pid=
+}
+
+finish_health() {
+  local status=$1
+  if (( status != 0 )); then
+    health_status=$status
+    return 0
+  fi
+
+  health_output=$(<"$health_output_file")
+  printf '%s\n' "$health_output"
+  health_row=$(sed -n '$p' <<<"$health_output")
+  capture_complete=${health_row%%,*}
+  if [[ $capture_complete == 1 ]]; then
+    health_status=0
+  else
+    health_status=65
+  fi
+}
+
+finish_report() {
+  report_status=$1
+  if (( report_status == 0 )); then
+    if [[ -f $report_path && ! -L $report_path && -r $report_path &&
+          -s $report_path ]]; then
+      report_output=$report_path
+    else
+      report_status=73
+      printf '%s\n' \
+        'capture-workload: report command produced no complete report' >&2
+    fi
+  fi
+}
+
+stop_diagnostics() {
+  if [[ -z $diagnostics_pid ]]; then
+    return 0
+  fi
+  local signal=${interruption_signal:-TERM}
+  local status
+  if stop_process_group "$diagnostics_pid" "$signal"; then
+    status=0
+  else
+    status=$?
+  fi
+  case $diagnostics_stage in
+    health) finish_health "$status" ;;
+    report) finish_report "$status" ;;
+  esac
+  diagnostics_pid=
+  diagnostics_stage=
+}
+
+warn_if_completed_workload() {
+  if [[ $workload_status == 0 &&
+        (${tracebox_status:-125} != 0 ||
+         $health_status != 0 ||
+         $report_status != 0) ]]; then
+    printf '%s\n' \
+      'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2
+  fi
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
+  stop_workload
+  stop_diagnostics
   stop_tracebox
-  rm -rf -- "$runtime_dir"
+  if [[ $status_emitted == 0 ]]; then
+    if [[ -z $workload_status ]]; then
+      workload_status=${interruption_status:-125}
+    fi
+    emit_status "$workload_status" "${tracebox_status:-125}" \
+      "$health_status" "$report_status" "$report_output"
+    warn_if_completed_workload
+  fi
+  rm -rf -- "$runtime_dir" || true
   exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'interruption_status=130; interruption_signal=INT; exit 130' INT
+trap 'interruption_status=143; interruption_signal=TERM; exit 143' TERM
+trap 'interruption_status=129; interruption_signal=HUP; exit 129' HUP
 
 capture_config=$runtime_dir/capture.pbtx
 if ! awk -v sample_hz="$sample_hz" '
@@ -224,17 +419,20 @@ if ! awk -v sample_hz="$sample_hz" '
   exit 69
 fi
 
-"$tracebox" --system-sockets --query >/dev/null || {
+if "$tracebox" --system-sockets --query >/dev/null; then
+  :
+else
+  tracebox_status=$?
   printf 'capture-workload: Perfetto system service is unavailable\n' >&2
   exit 69
-}
+fi
 "$perf" stat --all-cpus --event cpu-clock -- sleep 0.1 >/dev/null 2>&1 || {
   printf 'capture-workload: Linux performance events are unavailable\n' >&2
   exit 77
 }
 
 mkfifo "$ready_fifo"
-"$tracebox" --txt --system-sockets --no-clobber \
+setsid --wait "$tracebox" --txt --system-sockets --no-clobber \
   --notify-fd 3 \
   --config "$capture_config" \
   --out "$capture_path" \
@@ -249,41 +447,56 @@ fi
 rm -f -- "$ready_fifo"
 if [[ $readiness != 0 ]]; then
   stop_tracebox
+  emit_status 125 "${tracebox_status:-125}" 125 125
   printf 'capture-workload: tracebox readiness failed: status=%s\n' \
     "${tracebox_status:-125}" >&2
   exit 69
 fi
 
-if "$launcher" "$@"; then
+setsid --wait "$launcher" "$@" &
+workload_pid=$!
+if wait "$workload_pid"; then
   workload_status=0
 else
   workload_status=$?
 fi
+workload_pid=
 stop_tracebox
 
 health_args=("$capture_path")
 if [[ -n $configured_file_cap_bytes ]]; then
   health_args+=("$configured_file_cap_bytes")
 fi
-if health_output=$(TRACE_PROCESSOR_SHELL=$trace_processor \
-  "$script_dir/capture-health" "${health_args[@]}"); then
-  printf '%s\n' "$health_output"
-  health_row=$(sed -n '$p' <<<"$health_output")
-  capture_complete=${health_row%%,*}
-  if [[ $capture_complete == 1 ]]; then
-    health_status=0
-  else
-    health_status=65
-  fi
+TRACE_PROCESSOR_SHELL=$trace_processor \
+  setsid --wait "$script_dir/capture-health" "${health_args[@]}" \
+  >"$health_output_file" &
+diagnostics_pid=$!
+diagnostics_stage=health
+if wait "$diagnostics_pid"; then
+  diagnostics_status=0
 else
-  health_status=$?
+  diagnostics_status=$?
+fi
+finish_health "$diagnostics_status"
+diagnostics_pid=
+diagnostics_stage=
+
+if (( health_status == 0 )); then
+  setsid --wait "$report_cli" report "$capture_path" \
+    --output "$report_path" --no-clobber &
+  diagnostics_pid=$!
+  diagnostics_stage=report
+  if wait "$diagnostics_pid"; then
+    diagnostics_status=0
+  else
+    diagnostics_status=$?
+  fi
+  finish_report "$diagnostics_status"
+  diagnostics_pid=
+  diagnostics_stage=
 fi
 
-printf 'workload_status=%s tracebox_status=%s health_status=%s sample_hz=%s trace=%s\n' \
-  "$workload_status" "${tracebox_status:-125}" "$health_status" "$sample_hz" \
-  "$capture_path"
-if (( workload_status == 0 && (tracebox_status != 0 || health_status != 0) )); then
-  printf '%s\n' \
-    'capture-workload: workload succeeded; do not retry it because diagnostics failed' >&2
-fi
+emit_status "$workload_status" "${tracebox_status:-125}" "$health_status" \
+  "$report_status" "$report_output"
+warn_if_completed_workload
 exit "$workload_status"
