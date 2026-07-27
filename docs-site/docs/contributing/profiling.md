@@ -37,9 +37,19 @@ Open `target/profiles/preview.profile.html` in a browser. The report is
 self-contained and stays on the local machine. `artifact_output` is optional;
 it preserves the same validated ranked model for later terminal inspection.
 
+[![Ranked profiling report showing capture quality, controls, and the top-level operation](../assets/ranked-profile-overview.png)](../assets/ranked-profile-overview.png)
+
+The overview keeps capture quality, filtering, sorting, and the operation
+ranking in one viewport. Click either screenshot to open it at full resolution.
+
 Start with the operation row. Expand its longest semantic phase, then continue
 into native function rows. Function children are ranked by inclusive CPU
 samples by default. Self CPU samples show where samples ended directly.
+
+[![Ranked profiling report filtered to show exact semantic phases leading into sampled native functions](../assets/ranked-profile-native-functions.png)](../assets/ranked-profile-native-functions.png)
+
+The expanded view follows exact operation and phase rows into sampled
+functions while keeping exact duration, self CPU, and inclusive CPU separate.
 
 Use 1000 Hz for short investigations that need more native-stack detail. Use
 100 Hz to reduce capture volume. Both values are statistical sampling

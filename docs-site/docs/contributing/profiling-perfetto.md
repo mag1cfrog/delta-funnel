@@ -397,13 +397,8 @@ from matching a longer one. Use the same technique with a worker token such as
 `w-00000000000000000001]` when a query contains many parallel workers. Expand
 the remaining parent tracks to keep the relevant ancestry in view.
 
-[![Full Perfetto timeline filtered to one SQL Server write_all operation](../assets/perfetto-semantic-hierarchy.png)](../assets/perfetto-semantic-hierarchy.png)
-
-The full viewport above shows a real SQL Server `write_all` operation. Each
-output owner contains an end-to-end `Execute output` parent. Its children show
-query setup and the actual SQL Server lifecycle, including connection, target
-preparation, streaming writes, writer finalization, and validation, on the
-same wall-clock ruler.
+Each output owner contains an end-to-end `Execute output` parent. Its children
+show query setup and the SQL Server lifecycle on the same wall-clock ruler.
 
 Drag across an output owner or worker track to select the time range you want
 to investigate. Temporarily clear the name filter, check
@@ -412,16 +407,6 @@ filter. Open `Current Selection`, choose `Perf sample flamegraph`, and keep
 `Top Down` selected. The semantic tracks show exact wall-clock intervals; the
 flame graph shows statistical on-CPU native samples from the same selected
 interval.
-
-[![Perfetto Top Down native flame graph](../assets/perfetto-native-flamegraph.png)](../assets/perfetto-native-flamegraph.png)
-
-The blue markers and shaded region above delimit the selected 3.26-second
-interval. The lower panel follows the native stack from the runtime into Delta
-Funnel and DataFusion. Click either screenshot to open the complete UI at full
-size.
-
-The repository example takes about 6 seconds and produced about 12 MB during
-validation. Hardware, workload, and symbols change both values.
 
 ## Whole-process capture options
 
