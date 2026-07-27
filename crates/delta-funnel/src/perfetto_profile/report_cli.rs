@@ -999,8 +999,19 @@ pub(super) fn preflight_ranked_report_paths(
     input: &Path,
     output: &Path,
 ) -> Result<RankedReportPaths, RankedReportPathError> {
-    let input = preflight_ranked_profile_input(input)?;
-    let output = absolute_path(output).map_err(RankedReportPathError::OutputInspection)?;
+    let current_dir = if input.is_relative() || output.is_relative() {
+        Some(std::env::current_dir().map_err(|error| {
+            if input.is_relative() {
+                RankedReportPathError::InputUnreadable(error)
+            } else {
+                RankedReportPathError::OutputInspection(error)
+            }
+        })?)
+    } else {
+        None
+    };
+    let input = preflight_ranked_profile_input(&absolute_path_from(input, current_dir.as_deref()))?;
+    let output = absolute_path_from(output, current_dir.as_deref());
     if output.file_name().is_none() {
         return Err(RankedReportPathError::OutputHasNoFileName);
     }
@@ -1017,8 +1028,9 @@ pub(super) fn preflight_ranked_report_paths(
 pub(super) fn preflight_ranked_profile_input(
     input: &Path,
 ) -> Result<PathBuf, RankedReportPathError> {
+    let input = absolute_path(input).map_err(RankedReportPathError::InputUnreadable)?;
     let input_file =
-        super::open_profile_input(input).map_err(RankedReportPathError::InputUnreadable)?;
+        super::open_profile_input(&input).map_err(RankedReportPathError::InputUnreadable)?;
     if !input_file
         .metadata()
         .map_err(RankedReportPathError::InputUnreadable)?
@@ -1033,11 +1045,12 @@ pub(super) fn preflight_ranked_profile_input(
 }
 
 fn absolute_path(path: &Path) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_owned())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
+    let current_dir = path.is_relative().then(std::env::current_dir).transpose()?;
+    Ok(absolute_path_from(path, current_dir.as_deref()))
+}
+
+fn absolute_path_from(path: &Path, current_dir: Option<&Path>) -> PathBuf {
+    current_dir.map_or_else(|| path.to_owned(), |current_dir| current_dir.join(path))
 }
 
 fn inspect_output_path(output: &Path) -> Result<(), RankedReportPathError> {
@@ -2004,6 +2017,26 @@ mod tests {
         assert_eq!(paths.input, input.canonicalize()?);
         assert_eq!(paths.output, output);
         assert!(!missing_parent.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_relative_report_paths_against_one_directory() -> io::Result<()> {
+        let current_dir = std::env::current_dir()?;
+        let directory = tempfile::tempdir_in(&current_dir)?;
+        let relative_directory = directory
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("temporary directory should be under the current directory");
+        let input = relative_directory.join("capture.pftrace");
+        File::create(current_dir.join(&input))?.write_all(b"trace")?;
+        let output = relative_directory.join("capture.profile.html");
+
+        let paths = preflight_ranked_report_paths(&input, &output)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        assert_eq!(paths.input, current_dir.join(&input).canonicalize()?);
+        assert_eq!(paths.output, current_dir.join(output));
         Ok(())
     }
 
