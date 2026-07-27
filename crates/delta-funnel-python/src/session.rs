@@ -1409,7 +1409,7 @@ mod tests {
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     #[test]
-    fn write_all_rejects_aliasing_trace_and_profiler_outputs_before_execution() -> PyResult<()> {
+    fn write_all_rejects_aliasing_profiler_destinations_before_execution() -> PyResult<()> {
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
@@ -1426,6 +1426,19 @@ mod tests {
             let error = session
                 .call_method("write_all", (&outputs,), Some(&kwargs))
                 .expect_err("one path cannot hold both profile formats");
+            assert_config_error(py, &error, "invalid_option_value")?;
+            assert!(!output.exists());
+
+            let profiler_kwargs = PyDict::new(py);
+            profiler_kwargs.set_item("artifact_output", output.to_string_lossy().as_ref())?;
+            let profiler = module
+                .getattr("ProfilerConfig")?
+                .call((output.to_string_lossy().as_ref(),), Some(&profiler_kwargs))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("profiler", profiler)?;
+            let error = session
+                .call_method("write_all", (&outputs,), Some(&kwargs))
+                .expect_err("HTML and artifact outputs must not alias");
             assert_config_error(py, &error, "invalid_option_value")?;
             assert!(!output.exists());
 

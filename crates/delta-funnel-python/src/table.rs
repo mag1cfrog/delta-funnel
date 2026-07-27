@@ -502,6 +502,74 @@ mod tests {
         assert!(stub.contains("profiler: ProfilerConfig | None = None"));
     }
 
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    #[test]
+    fn preview_and_write_reject_artifact_output_collisions_before_execution() -> PyResult<()> {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
+            let profiler_type = module.getattr("ProfilerConfig")?;
+
+            let preview_output = temp_trace_path("preview-artifact-alias")?.with_extension("html");
+            let config_kwargs = PyDict::new(py);
+            config_kwargs.set_item("artifact_output", preview_output.to_string_lossy().as_ref())?;
+            let profiler = profiler_type.call(
+                (preview_output.to_string_lossy().as_ref(),),
+                Some(&config_kwargs),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("profiler", profiler)?;
+            let error = table
+                .call_method("preview", (), Some(&kwargs))
+                .expect_err("preview outputs must not alias");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(!preview_output.exists());
+
+            let write_output = temp_trace_path("write-profile")?.with_extension("html");
+            let artifact_output = temp_trace_path("write-artifact")?.with_extension("dfprofile");
+            let config_kwargs = PyDict::new(py);
+            config_kwargs.set_item(
+                "artifact_output",
+                artifact_output.to_string_lossy().as_ref(),
+            )?;
+            let profiler = profiler_type.call(
+                (write_output.to_string_lossy().as_ref(),),
+                Some(&config_kwargs),
+            )?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("schema", "dbo")?;
+            kwargs.set_item("table", "orders")?;
+            kwargs.set_item("load_mode", "append_existing")?;
+            kwargs.set_item("progress", false)?;
+            kwargs.set_item("trace_path", artifact_output.to_string_lossy().as_ref())?;
+            kwargs.set_item("profiler", profiler)?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .expect_err("write trace and artifact outputs must not alias");
+            assert_eq!(
+                error.value(py).getattr("phase")?.extract::<String>()?,
+                "config"
+            );
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert!(!write_output.exists());
+            assert!(!artifact_output.exists());
+            Ok(())
+        })
+    }
+
     #[test]
     fn write_trace_path_is_keyword_only_and_requires_detailed_profile() -> PyResult<()> {
         Python::attach(|py| {
