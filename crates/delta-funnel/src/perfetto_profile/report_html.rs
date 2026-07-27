@@ -875,6 +875,29 @@ mod tests {
       operationsBody.querySelectorAll(".semantic-row")
     ).find(row => row.textContent.includes("Distributed cases"));
     check(distributedCasesRow !== undefined, "wide semantic owner was not rendered");
+    const distributedCells = distributedCasesRow.querySelectorAll("td");
+    const coverageDetail = distributedCells[4].querySelector(".detail");
+    check(
+      coverageDetail.title === coverageDetail.textContent,
+      "full numeric detail was not available on hover"
+    );
+    check(
+      getComputedStyle(coverageDetail).overflow === "hidden" &&
+        getComputedStyle(coverageDetail).textOverflow === "ellipsis" &&
+        getComputedStyle(coverageDetail).whiteSpace === "nowrap",
+      "numeric detail was not constrained to one line"
+    );
+    check(
+      coverageDetail.scrollWidth > coverageDetail.clientWidth,
+      "long numeric detail did not actually overflow"
+    );
+    check(
+      coverageDetail.getBoundingClientRect().right <=
+        distributedCells[4].getBoundingClientRect().right &&
+        distributedCells[4].getBoundingClientRect().right <=
+          distributedCells[5].getBoundingClientRect().left,
+      "numeric detail overlapped the adjacent cell"
+    );
     distributedCasesRow.querySelector(".disclosure").click();
     const wideOwnerFunction = Array.from(
       operationsBody.querySelectorAll(".function-row")

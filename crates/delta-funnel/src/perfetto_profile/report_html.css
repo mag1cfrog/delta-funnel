@@ -84,6 +84,7 @@ tbody tr:focus-visible { outline: 3px solid Highlight; outline-offset: -3px; }
 }
 .detail { display: block; font-size: .8rem; margin-top: .2rem; }
 .number { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.number .detail { overflow: hidden; text-overflow: ellipsis; }
 .disclosure, .leaf {
   align-items: center;
   display: inline-flex;
