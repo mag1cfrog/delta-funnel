@@ -12,7 +12,6 @@ Options: TypeAlias = Mapping[str, object]
 
 class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
-    profile: bool | None
 
 
 def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...
@@ -99,8 +98,8 @@ class Session:
         options: WriteAllExecutionOptions | None = None,
         dry_run: bool | None = None,
         progress: bool | None = None,
-        trace_path: str | PathLike[str] | None = None,
-        profiler: RankedProfileConfig | None = None,
+        execution_profile: ExecutionProfileConfig | None = None,
+        ranked_profile: RankedProfileConfig | None = None,
     ) -> Report: ...
 
 
@@ -113,8 +112,6 @@ class Preview:
     html: str
     phase_timings: list[dict[str, object]]
     execution_profile: dict[str, object] | None
-
-    def export_trace(self, path: str | PathLike[str]) -> None: ...
 
     def __str__(self) -> str: ...
 
@@ -129,8 +126,8 @@ class Table:
         limit: int = 20,
         *,
         progress: bool | None = None,
-        profile: bool | None = False,
-        profiler: RankedProfileConfig | None = None,
+        execution_profile: ExecutionProfileConfig | None = None,
+        ranked_profile: RankedProfileConfig | None = None,
     ) -> Preview: ...
 
     def show(self, limit: int = 20, *, progress: bool | None = None) -> None: ...
@@ -155,9 +152,8 @@ class Table:
         name: str | None = None,
         connection_string: str | None = None,
         progress: bool | None = None,
-        profile: bool | None = False,
-        trace_path: str | PathLike[str] | None = None,
-        profiler: RankedProfileConfig | None = None,
+        execution_profile: ExecutionProfileConfig | None = None,
+        ranked_profile: RankedProfileConfig | None = None,
     ) -> Report: ...
 
 

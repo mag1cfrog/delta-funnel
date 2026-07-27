@@ -10,7 +10,7 @@ use crate::{exception::delta_funnel_py_error, session::config_py_error};
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
 mod capture;
 
-const PROFILER_PHASE: &str = "profiler";
+const RANKED_PROFILE_PHASE: &str = "ranked_profile";
 
 /// Immutable configuration for exact execution profiling.
 #[pyclass(frozen, name = "ExecutionProfileConfig", module = "deltafunnel")]
@@ -21,6 +21,16 @@ pub(crate) struct PyExecutionProfileConfig {
 impl PyExecutionProfileConfig {
     pub(crate) fn chrome_trace_path(&self) -> Option<&Path> {
         self.chrome_trace_path.as_deref()
+    }
+}
+
+pub(crate) fn execution_profile_mode(
+    config: Option<&PyExecutionProfileConfig>,
+) -> delta_funnel::ExecutionProfileMode {
+    if config.is_some() {
+        delta_funnel::ExecutionProfileMode::Detailed
+    } else {
+        delta_funnel::ExecutionProfileMode::Disabled
     }
 }
 
@@ -149,13 +159,13 @@ pub(crate) fn add_profiler(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRankedProfileConfig>()
 }
 
-pub(crate) struct OperationProfile {
+pub(crate) struct RankedProfileCapture {
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     capture: capture::OperationCapture,
 }
 
-pub(crate) fn in_operation_profile_scope<T>(
-    profile: Option<&OperationProfile>,
+pub(crate) fn in_ranked_profile_scope<T>(
+    profile: Option<&RankedProfileCapture>,
     operation: impl FnOnce() -> T,
 ) -> T {
     match profile {
@@ -164,19 +174,19 @@ pub(crate) fn in_operation_profile_scope<T>(
     }
 }
 
-pub(crate) fn start_operation_profile(
+pub(crate) fn start_ranked_profile(
     py: Python<'_>,
     config: Option<&PyRankedProfileConfig>,
-    trace_path: Option<&Path>,
-) -> PyResult<Option<OperationProfile>> {
+    chrome_trace_path: Option<&Path>,
+) -> PyResult<Option<RankedProfileCapture>> {
     let Some(config) = config else {
         return Ok(None);
     };
 
     #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
     {
-        let _ = (config, trace_path);
-        Err(profiler_py_error(
+        let _ = (config, chrome_trace_path);
+        Err(ranked_profile_py_error(
             py,
             "not_available",
             "operation profiling requires a diagnostics-enabled Linux build".to_owned(),
@@ -190,15 +200,15 @@ pub(crate) fn start_operation_profile(
             .artifact_path()
             .map(|path| resolve_output_path(py, path))
             .transpose()?;
-        validate_output_paths(py, &output, artifact_output.as_deref(), trace_path)?;
+        validate_output_paths(py, &output, artifact_output.as_deref(), chrome_trace_path)?;
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
         let sample_hz = config.sampling_frequency();
         let tracebox = tracebox_launcher(py)?;
         py.detach(move || {
             capture::OperationCapture::start(output, artifact_output, sample_hz, tracebox)
         })
-        .map(|capture| Some(OperationProfile { capture }))
-        .map_err(|error| profiler_failure_py_error(py, error))
+        .map(|capture| Some(RankedProfileCapture { capture }))
+        .map_err(|error| ranked_profile_failure_py_error(py, error))
     }
 }
 
@@ -207,11 +217,11 @@ fn validate_output_paths(
     py: Python<'_>,
     output: &Path,
     artifact_output: Option<&Path>,
-    trace_path: Option<&Path>,
+    chrome_trace_path: Option<&Path>,
 ) -> PyResult<()> {
     let paths_alias = |left: &Path, right: &Path| {
         delta_funnel::perfetto_profile::output_paths_alias(left, right).map_err(|_| {
-            profiler_py_error(
+            ranked_profile_py_error(
                 py,
                 "output_unavailable",
                 "profile output paths could not be inspected".to_owned(),
@@ -228,23 +238,21 @@ fn validate_output_paths(
                 .to_owned(),
         ));
     }
-    if let Some(trace_path) = trace_path {
-        if paths_alias(output, trace_path)? {
+    if let Some(chrome_trace_path) = chrome_trace_path {
+        if paths_alias(output, chrome_trace_path)? {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` and `RankedProfileConfig.report_path` must name different files"
-                    .to_owned(),
+                "`ExecutionProfileConfig.chrome_trace_path` and `RankedProfileConfig.report_path` must name different files".to_owned(),
             ));
         }
         if let Some(artifact_output) = artifact_output
-            && paths_alias(artifact_output, trace_path)?
+            && paths_alias(artifact_output, chrome_trace_path)?
         {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` and `RankedProfileConfig.artifact_path` must name different files"
-                    .to_owned(),
+                "`ExecutionProfileConfig.chrome_trace_path` and `RankedProfileConfig.artifact_path` must name different files".to_owned(),
             ));
         }
     }
@@ -254,7 +262,7 @@ fn validate_output_paths(
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
 fn resolve_output_path(py: Python<'_>, output: &Path) -> PyResult<PathBuf> {
     std::path::absolute(output).map_err(|_| {
-        profiler_py_error(
+        ranked_profile_py_error(
             py,
             "output_unavailable",
             "profile output path could not be resolved".to_owned(),
@@ -272,14 +280,14 @@ fn tracebox_launcher(py: Python<'_>) -> PyResult<PathBuf> {
         .and_then(|module| module.getattr("__file__"))
         .and_then(|path| path.extract::<PathBuf>())
         .map_err(|_| {
-            profiler_py_error(
+            ranked_profile_py_error(
                 py,
                 "tracebox_unavailable",
                 "packaged Perfetto tracebox launcher could not be located".to_owned(),
             )
         })?;
     let package = extension.parent().ok_or_else(|| {
-        profiler_py_error(
+        ranked_profile_py_error(
             py,
             "tracebox_unavailable",
             "packaged Perfetto tracebox launcher could not be located".to_owned(),
@@ -288,7 +296,7 @@ fn tracebox_launcher(py: Python<'_>) -> PyResult<PathBuf> {
     Ok(package.join("perfetto/delta-funnel-tracebox"))
 }
 
-impl OperationProfile {
+impl RankedProfileCapture {
     fn in_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
         #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
         {
@@ -303,13 +311,13 @@ impl OperationProfile {
         #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
         {
             py.detach(move || self.capture.finish())
-                .map_err(|error| profiler_failure_py_error(py, error))
+                .map_err(|error| ranked_profile_failure_py_error(py, error))
         }
 
         #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
         {
             let _ = self;
-            Err(profiler_py_error(
+            Err(ranked_profile_py_error(
                 py,
                 "not_available",
                 "operation profiling requires a diagnostics-enabled Linux build".to_owned(),
@@ -318,16 +326,16 @@ impl OperationProfile {
     }
 }
 
-fn profiler_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
-    match delta_funnel_py_error(py, PROFILER_PHASE, kind, message, None) {
+fn ranked_profile_py_error(py: Python<'_>, kind: &'static str, message: String) -> PyErr {
+    match delta_funnel_py_error(py, RANKED_PROFILE_PHASE, kind, message, None) {
         Ok(error) => error,
         Err(error) => error,
     }
 }
 
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
-fn profiler_failure_py_error(py: Python<'_>, error: capture::ProfilerFailure) -> PyErr {
-    profiler_py_error(py, error.kind, error.message)
+fn ranked_profile_failure_py_error(py: Python<'_>, error: capture::ProfilerFailure) -> PyErr {
+    ranked_profile_py_error(py, error.kind, error.message)
 }
 
 fn parse_sample_hz(value: &Bound<'_, PyAny>) -> PyResult<u16> {
@@ -366,6 +374,17 @@ mod tests {
         assert!(stub.contains("report_path: str | PathLike[str]"));
         assert!(stub.contains("sample_hz: Literal[100, 1000] = 1000"));
         assert!(stub.contains("artifact_path: str | PathLike[str] | None = None"));
+        assert_eq!(
+            execution_profile_mode(None),
+            delta_funnel::ExecutionProfileMode::Disabled
+        );
+        let exact_config = PyExecutionProfileConfig {
+            chrome_trace_path: None,
+        };
+        assert_eq!(
+            execution_profile_mode(Some(&exact_config)),
+            delta_funnel::ExecutionProfileMode::Detailed
+        );
 
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
@@ -506,7 +525,7 @@ mod tests {
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     #[test]
-    fn profiler_outputs_must_resolve_to_distinct_files() -> PyResult<()> {
+    fn profile_outputs_must_resolve_to_distinct_files() -> PyResult<()> {
         Python::attach(|py| {
             let config = PyRankedProfileConfig {
                 report_path: PathBuf::from("profile.html"),
