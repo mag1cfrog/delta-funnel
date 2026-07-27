@@ -196,12 +196,44 @@ if invalid_command.returncode != 64:
 
 with tempfile.TemporaryDirectory() as artifact_temp_dir:
     artifact = Path(os.environ["DELTA_FUNNEL_TEST_ARTIFACT"])
-    artifact_report = Path(artifact_temp_dir).joinpath("artifact.profile.html")
-    unavailable_trace_processor = Path(artifact_temp_dir).joinpath("unavailable")
+    artifact_temp = Path(artifact_temp_dir)
+    artifact_report = artifact_temp.joinpath("artifact.profile.html")
+    unavailable_trace_processor = artifact_temp.joinpath("unavailable")
     artifact_environment = {
         **os.environ,
         "TRACE_PROCESSOR_SHELL": str(unavailable_trace_processor),
     }
+
+    aliased_output = artifact_temp.joinpath("aliased.profile.html")
+    profiler = deltafunnel.ProfilerConfig(
+        aliased_output,
+        artifact_output=aliased_output,
+    )
+    session = deltafunnel.Session()
+    table = session.table_from_sql("select 1 as value")
+    for operation_name, operation in [
+        (
+            "preview",
+            lambda: table.preview(progress=False, profiler=profiler),
+        ),
+        (
+            "write_all",
+            lambda: session.write_all([], progress=False, profiler=profiler),
+        ),
+    ]:
+        try:
+            operation()
+        except deltafunnel.DeltaFunnelError as error:
+            if (error.phase, error.kind) != ("config", "invalid_option_value"):
+                raise SystemExit(
+                    f"{operation_name} returned the wrong profile alias error: "
+                    f"{error.phase}/{error.kind}"
+                ) from error
+        else:
+            raise SystemExit(f"{operation_name} accepted aliased profile outputs")
+        if aliased_output.exists():
+            raise SystemExit(f"{operation_name} created an aliased profile output")
+
     subprocess.run(
         [perfetto_cli, "report", artifact, "--output", artifact_report],
         env=artifact_environment,
@@ -219,6 +251,39 @@ with tempfile.TemporaryDirectory() as artifact_temp_dir:
     )
     if "Delta Funnel preview" not in inspected.stdout:
         raise SystemExit("artifact inspection did not contain its operation")
+
+    unsupported = artifact_temp.joinpath("unsupported.dfprofile")
+    unsupported_bytes = bytearray(artifact.read_bytes())
+    unsupported_bytes[8:10] = (2).to_bytes(2, "little")
+    unsupported.write_bytes(unsupported_bytes)
+    for command in ["inspect", "report"]:
+        unsupported_report = artifact_temp.joinpath(
+            f"unsupported-{command}.profile.html"
+        )
+        arguments = [perfetto_cli, command, unsupported]
+        if command == "report":
+            arguments.extend(["--output", unsupported_report])
+        rejected = subprocess.run(
+            arguments,
+            env=artifact_environment,
+            capture_output=True,
+            text=True,
+        )
+        if rejected.returncode != 66:
+            raise SystemExit(
+                f"installed {command} accepted an unsupported artifact: "
+                f"{rejected.returncode}, {rejected.stderr!r}"
+            )
+        failure = json.loads(rejected.stderr)
+        if (
+            failure.get("phase") != "input"
+            or failure.get("kind") != "unsupported_artifact_version"
+        ):
+            raise SystemExit(
+                f"installed {command} returned the wrong artifact error: {failure!r}"
+            )
+        if unsupported_report.exists():
+            raise SystemExit(f"installed {command} created output after rejection")
 
 def write_fake_trace_processor(path):
     path.write_text(
