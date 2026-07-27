@@ -117,20 +117,84 @@ fn reads_artifacts_without_trace_processor() -> Result<(), Box<dyn std::error::E
     );
     assert!(String::from_utf8(inspect.stdout)?.contains("Delta Funnel preview"));
 
-    let malformed = directory.path().join("malformed.dfprofile");
-    fs::write(&malformed, [0_u8; 64])?;
-    let inspect = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
-        .arg("inspect")
-        .arg(&malformed)
-        .env(
-            "TRACE_PROCESSOR_SHELL",
-            directory.path().join("must-not-start"),
-        )
-        .output()?;
-    assert_eq!(inspect.status.code(), Some(66));
-    let failure: serde_json::Value = serde_json::from_slice(&inspect.stderr)?;
-    assert_eq!(failure["phase"], "input");
-    assert_eq!(failure["kind"], "invalid_artifact_magic");
+    Ok(())
+}
+
+#[test]
+fn rejects_malicious_artifacts_without_trace_processor() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let fixture =
+        include_bytes!("../src/perfetto_profile/testdata/ranked_profile_v1.dfprofile").to_vec();
+    let mut cases = Vec::new();
+
+    let mut invalid_magic = fixture.clone();
+    invalid_magic[0] ^= 1;
+    cases.push(("invalid-magic", invalid_magic, "invalid_artifact_magic"));
+
+    cases.push((
+        "truncated-header",
+        fixture[..32].to_vec(),
+        "truncated_artifact",
+    ));
+
+    let mut unsupported_version = fixture.clone();
+    unsupported_version[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    cases.push((
+        "unsupported-version",
+        unsupported_version,
+        "unsupported_artifact_version",
+    ));
+
+    let mut trailing = fixture.clone();
+    trailing.push(0);
+    cases.push(("trailing-byte", trailing, "trailing_artifact_bytes"));
+
+    let mut invalid_archive = fixture;
+    invalid_archive.pop();
+    let payload_length = u64::try_from(invalid_archive.len() - 64)?;
+    invalid_archive[32..40].copy_from_slice(&payload_length.to_le_bytes());
+    cases.push(("invalid-archive", invalid_archive, "invalid_archive"));
+
+    let marker = directory.path().join("trace-processor-started");
+    let trace_processor = directory.path().join("trace_processor_shell");
+    write_executable(
+        &trace_processor,
+        "#!/bin/sh\n\
+         set -eu\n\
+         : >\"$DELTA_FUNNEL_TRACE_PROCESSOR_MARKER\"\n\
+         exit 99\n",
+    )?;
+
+    for (name, bytes, expected_kind) in cases {
+        let input = directory.path().join(format!("{name}.dfprofile"));
+        fs::write(&input, bytes)?;
+        for command in ["inspect", "report"] {
+            let report = directory.path().join(format!("{name}.profile.html"));
+            let mut process = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"));
+            process.arg(command).arg(&input);
+            if command == "report" {
+                process.arg("--output").arg(&report);
+            }
+            let result = process
+                .env("TRACE_PROCESSOR_SHELL", &trace_processor)
+                .env("DELTA_FUNNEL_TRACE_PROCESSOR_MARKER", &marker)
+                .output()?;
+            assert_eq!(
+                result.status.code(),
+                Some(66),
+                "{command} accepted malicious case {name}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let failure: serde_json::Value = serde_json::from_slice(&result.stderr)?;
+            assert_eq!(failure["phase"], "input", "{command} case {name}");
+            assert_eq!(failure["kind"], expected_kind, "{command} case {name}");
+            assert!(!report.exists(), "{command} case {name} created output");
+            assert!(
+                !marker.exists(),
+                "{command} case {name} started Trace Processor"
+            );
+        }
+    }
     Ok(())
 }
 

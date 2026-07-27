@@ -338,7 +338,8 @@ fn output_failure(kind: &'static str, message: &'static str) -> RankedReportFail
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
     use crate::perfetto_profile::ranked_report::{
@@ -687,5 +688,41 @@ mod tests {
             .expect_err("invalid semantic document should be rejected");
         assert_eq!(error.kind(), "invalid_ranked_profile");
         assert_eq!(error.to_string(), expected);
+    }
+
+    #[test]
+    fn rejects_oversized_sparse_artifacts_before_allocation() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("oversized.dfprofile");
+        File::create(&input)
+            .and_then(|file| file.set_len(MAX_ARTIFACT_BYTES as u64 + 1))
+            .expect("sparse artifact should be created");
+
+        let error = read_ranked_profile_artifact(&input)
+            .expect_err("oversized artifact should be rejected");
+        assert_eq!(error.kind(), "artifact_too_large");
+    }
+
+    #[test]
+    fn handles_every_single_bit_payload_mutation_without_panicking() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("mutated.dfprofile");
+        let mut bytes = artifact_bytes(&sampled_document());
+
+        for index in HEADER_LENGTH..bytes.len() {
+            for bit in 0..u8::BITS {
+                bytes[index] ^= 1 << bit;
+                fs::write(&input, &bytes).expect("mutated artifact should be written");
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    read_ranked_profile_artifact(&input)
+                        .and_then(RankedProfileArtifact::into_document)
+                }));
+                assert!(
+                    outcome.is_ok(),
+                    "artifact reader panicked after flipping bit {bit} of byte {index}"
+                );
+                bytes[index] ^= 1 << bit;
+            }
+        }
     }
 }
