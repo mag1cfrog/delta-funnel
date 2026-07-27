@@ -19,6 +19,10 @@ required-features = ["perfetto-profile"]
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+# This direct dependency activates tracing on the transitive hyper-util instance.
+ignored = ["hyper-util"]
+
 [features]
 perfetto-profile = [
     "dep:clap",
