@@ -213,7 +213,7 @@ fabricated wall-clock span. The top-level `delta_funnel_timeline` field
 preserves the relative timeline data, while `delta_funnel_profile` preserves
 the complete redacted operator profile.
 
-Distinct phases and operator lifecycle partitions use separate synthetic tracks
+Distinct phases and operator lifecycle partitions use separate tracks
 because they can overlap without forming a call stack. Operator activity events
 instead reuse the executor worker that synchronously ran each call. Activity
 spans on one worker lane are sequential or properly nested, even when that
