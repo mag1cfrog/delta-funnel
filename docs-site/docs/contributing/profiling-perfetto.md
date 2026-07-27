@@ -535,7 +535,3 @@ function names, timing, and system activity. Store it in a private local
 directory. Perfetto UI processes a local file locally unless the user chooses
 its upload or share action. Review the trace and follow the workload's data
 handling policy before any upload.
-
-See the [profiling validation report](profiling-validation-report.md) for the
-correctness matrix, performance measurements, buffer sizes, and production
-decision evidence behind this workflow.

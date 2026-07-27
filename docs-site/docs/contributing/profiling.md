@@ -12,6 +12,10 @@ Perfetto diagnostics currently require a diagnostics-enabled build on Linux
 x86_64. Follow [Set up Perfetto diagnostics for Python](profiling-perfetto.md)
 once before using either view.
 
+The existing `profile=True` and `trace_path` APIs remain a separate,
+diagnostics-free path for semantic and operator data. They do not collect
+native CPU stacks.
+
 ## Explore one operation in HTML
 
 Create a profiler configuration and pass it directly to the operation:
@@ -107,12 +111,6 @@ trace when scheduler context is needed.
 The raw `.pftrace` remains the advanced source for chronology, scheduler, I/O,
 and event-level investigation. Use ranked HTML for interactive exploration and
 the terminal inspector for deterministic scripted or agent-assisted analysis.
-
-See the [profiling validation report](profiling-validation-report.md) for
-measured overhead, memory use, artifact sizes, sample coverage, and
-production-scale results. Use the
-[reproduction instructions](profiling-validation-reproduction.md) only to
-repeat those measurements.
 
 ## Keep reports private
 

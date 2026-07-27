@@ -1,9 +1,9 @@
 # Reproduce the Profiling Validation
 
-This appendix contains the commands and repository checks behind the
-[profiling validation report](profiling-validation-report.md). Use it when
-reproducing or updating that evidence. It is not required for ordinary
-workload profiling.
+This appendix contains the commands and repository checks used to reproduce or
+update the maintainer validation evidence in
+[GitHub issue #549](https://github.com/mag1cfrog/delta-funnel/issues/549). It
+is not required for ordinary workload profiling.
 
 ## Reproduce the canonical workload
 
@@ -156,11 +156,10 @@ python -m zensical build --strict -f docs-site/mkdocs.yml
 git diff --check
 ```
 
-The default dependency-tree checks shown in the validation report found no
-Perfetto dependency in the core or Python package. The normal Python package
-check built an abi3 wheel, verified its contents and metadata, installed it
-into a clean environment, and passed terminal, minimum-Rich, and Jupyter
-progress smoke tests.
+The default dependency-tree checks found no Perfetto dependency in the core or
+Python package. The normal Python package check built an abi3 wheel, verified
+its contents and metadata, installed it into a clean environment, and passed
+terminal, minimum-Rich, and Jupyter progress smoke tests.
 
 The diagnostic wheel passed a separate optimized build and clean-environment
 import check:
