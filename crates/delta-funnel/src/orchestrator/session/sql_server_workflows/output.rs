@@ -8,14 +8,14 @@ use crate::{
     MssqlOutputQueryFuture, MssqlTargetCleanupStatus, MssqlTargetOutputPlan, MssqlWriteBackend,
     MssqlWriteFailureContext, MssqlWritePhase, MssqlWriteReport, PhaseTimingReport,
     QueryExecutionProfile, QueryExecutionScope, ReportReasonCode, ResolvedMssqlTarget,
-    TimelineSpanStatus, ValidationOptions, observability, plan_mssql_target_for_resolved_output,
+    ValidationOptions, observability, plan_mssql_target_for_resolved_output,
     profiling::{
         OperationStageContext, OperationStageTrace, OperationTraceContext, OperationTraceKind,
         OperationTracePhase, ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{QueryTraceIdentity, with_query_planning_activity},
-    report::{OperationTimelineRecorder, PhaseTimer},
+    report::PhaseTimer,
 };
 
 use super::super::{
@@ -78,14 +78,7 @@ impl DeltaFunnelSession {
             stage_context,
             "Plan output schema",
             "delta_funnel.write.planning",
-            "Output schema planning",
-        )
-        .map(|span| {
-            span.with_attribute(
-                "output_name",
-                request.target().output_name().to_owned().into(),
-            )
-        });
+        );
         let schema = match self.schema_for_lazy_table(request.table()) {
             Ok(schema) => {
                 phase_timings.push(schema_timer.completed());
@@ -104,14 +97,7 @@ impl DeltaFunnelSession {
             stage_context,
             "Plan SQL Server target",
             "delta_funnel.write.planning",
-            "SQL Server target planning",
-        )
-        .map(|span| {
-            span.with_attribute(
-                "output_name",
-                request.target().output_name().to_owned().into(),
-            )
-        });
+        );
         let resolved_target =
             match request
                 .target()
@@ -392,13 +378,7 @@ impl DeltaFunnelSession {
     where
         W: OrchestratorMssqlOutputWriter,
     {
-        let trace_context = OperationTraceContext::start(
-            OperationTraceKind::MssqlWrite,
-            (profile_mode == ExecutionProfileMode::Detailed).then(OperationTimelineRecorder::start),
-        );
-        let timeline = trace_context
-            .as_ref()
-            .and_then(OperationTraceContext::timeline);
+        let trace_context = OperationTraceContext::start(OperationTraceKind::MssqlWrite);
         let mut process_phases = ProcessOperationPhaseTracker::start(
             trace_context.as_ref(),
             OperationTracePhase::Planning,
@@ -442,13 +422,7 @@ impl DeltaFunnelSession {
                 Some(&mut process_phases),
             )
             .await
-            .map_err(|failure| {
-                finish_mssql_write_error_timeline(
-                    failure.error,
-                    timeline,
-                    request.target().output_name(),
-                )
-            })?;
+            .map_err(|failure| failure.error)?;
 
             let mut phase_timings = planned.phase_timings().to_vec();
             phase_timings.extend(query_phase_timings);
@@ -483,8 +457,6 @@ impl DeltaFunnelSession {
                     Err(error)
                 }
             };
-            let result =
-                finish_mssql_write_timeline(result, timeline, request.target().output_name());
             process_phases.finish("ok");
             result
         }
@@ -522,14 +494,7 @@ pub(super) async fn create_mssql_output_query_execution_with_trace_context(
         stage_context,
         "Build query DataFrame",
         "delta_funnel.write.query",
-        "Query DataFrame planning",
-    )
-    .map(|span| {
-        span.with_attribute(
-            "output_name",
-            planned.resolved_target().output_name().to_owned().into(),
-        )
-    });
+    );
     let dataframe = match dataframe_for_lazy_table_from_session_parts(
         context,
         planned.table(),
@@ -599,14 +564,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
         stage_context,
         "Build physical plan",
         "delta_funnel.write.query",
-        "Query physical planning",
-    )
-    .map(|span| {
-        span.with_attribute(
-            "output_name",
-            planned.resolved_target().output_name().to_owned().into(),
-        )
-    });
+    );
     let physical_plan_result = match &trace_identity {
         Some(trace_identity) => {
             with_query_planning_activity(trace_identity.clone(), dataframe.create_physical_plan())
@@ -639,14 +597,7 @@ pub(super) async fn create_mssql_output_query_execution_from_dataframe_with_trac
         stage_context,
         "Set up query stream",
         "delta_funnel.write.query",
-        "Query stream setup",
-    )
-    .map(|span| {
-        span.with_attribute(
-            "output_name",
-            planned.resolved_target().output_name().to_owned().into(),
-        )
-    });
+    );
     let profile_scope = match profile_mode {
         ExecutionProfileMode::Disabled => None,
         ExecutionProfileMode::Detailed => Some(QueryExecutionScope::MssqlOutput),
@@ -787,104 +738,12 @@ fn with_mssql_write_execution_profile(
     }
 }
 
-fn finish_mssql_write_timeline(
-    result: Result<MssqlWriteReport, DeltaFunnelError>,
-    timeline: Option<&OperationTimelineRecorder>,
-    output_name: &str,
-) -> Result<MssqlWriteReport, DeltaFunnelError> {
-    let Some(timeline) = timeline else {
-        return result;
-    };
-    if let Some(profile) = mssql_write_execution_profile(&result) {
-        timeline.append_operator_lifecycles(profile);
-    }
-    let status = if result.is_ok() {
-        TimelineSpanStatus::Completed
-    } else {
-        TimelineSpanStatus::Failed
-    };
-    let operation_timeline = timeline.finish(format!("SQL Server write: {output_name}"), status);
-    match result {
-        Ok(report) => Ok(report.with_operation_timeline(Some(operation_timeline))),
-        Err(error) => Err(with_mssql_write_operation_timeline(
-            error,
-            operation_timeline,
-        )),
-    }
-}
-
-fn finish_mssql_write_error_timeline(
-    error: DeltaFunnelError,
-    timeline: Option<&OperationTimelineRecorder>,
-    output_name: &str,
-) -> DeltaFunnelError {
-    let Some(timeline) = timeline else {
-        return error;
-    };
-    if let Some(profile) = mssql_write_error_execution_profile(&error) {
-        timeline.append_operator_lifecycles(profile);
-    }
-    let operation_timeline = timeline.finish(
-        format!("SQL Server write: {output_name}"),
-        TimelineSpanStatus::Failed,
-    );
-    with_mssql_write_operation_timeline(error, operation_timeline)
-}
-
-fn mssql_write_execution_profile(
-    result: &Result<MssqlWriteReport, DeltaFunnelError>,
-) -> Option<&QueryExecutionProfile> {
-    match result {
-        Ok(report) => report.execution_profile(),
-        Err(error) => mssql_write_error_execution_profile(error),
-    }
-}
-
-fn mssql_write_error_execution_profile(error: &DeltaFunnelError) -> Option<&QueryExecutionProfile> {
-    match error {
-        DeltaFunnelError::MssqlWritePhase { context, .. }
-        | DeltaFunnelError::MssqlQueryPhase { context, .. }
-        | DeltaFunnelError::MssqlBatchSchemaValidation { context, .. } => {
-            context.report().execution_profile()
-        }
-        _ => None,
-    }
-}
-
-fn with_mssql_write_operation_timeline(
-    error: DeltaFunnelError,
-    operation_timeline: crate::OperationTimeline,
-) -> DeltaFunnelError {
-    match error {
-        DeltaFunnelError::MssqlWritePhase { context, message } => {
-            DeltaFunnelError::MssqlWritePhase {
-                context: Box::new((*context).with_operation_timeline(Some(operation_timeline))),
-                message,
-            }
-        }
-        DeltaFunnelError::MssqlQueryPhase { context, source } => {
-            DeltaFunnelError::MssqlQueryPhase {
-                context: Box::new((*context).with_operation_timeline(Some(operation_timeline))),
-                source,
-            }
-        }
-        DeltaFunnelError::MssqlBatchSchemaValidation { context, source } => {
-            DeltaFunnelError::MssqlBatchSchemaValidation {
-                context: Box::new((*context).with_operation_timeline(Some(operation_timeline))),
-                source,
-            }
-        }
-        other => other,
-    }
-}
-
 fn start_write_span(
     stage_context: OperationStageContext<'_>,
     name: &'static str,
     category: &'static str,
-    track_name: &str,
 ) -> Option<OperationStageTrace> {
-    stage_context.start(name, category, track_name)
+    stage_context.start(name, category)
 }
 
 fn complete_write_span(span: Option<OperationStageTrace>) {
@@ -1901,46 +1760,9 @@ mod tests {
         assert!(!profile.partial());
         assert_eq!(profile.delta_funnel_row_limit(), None);
         assert!(!profile.operators().is_empty());
-        let timeline = report.operation_timeline().ok_or("expected timeline")?;
-        crate::report::trace_contract::validate_operation_trace(timeline)?;
-        assert_eq!(timeline.status(), crate::TimelineSpanStatus::Completed);
-        assert!(timeline.total_duration_micros() > 0);
-        assert!(timeline.spans().iter().any(|span| {
-            span.name() == "Build query DataFrame" && span.category() == "delta_funnel.write.query"
-        }));
-        assert!(
-            timeline
-                .spans()
-                .iter()
-                .any(|span| span.category() == "datafusion.operator.lifecycle")
-        );
-        let activity_spans = timeline
-            .spans()
-            .iter()
-            .filter(|span| span.category() == "datafusion.operator.activity")
-            .collect::<Vec<_>>();
-        assert!(!activity_spans.is_empty());
-        assert!(activity_spans.iter().all(|span| {
-            span.attributes()["query_execution_id"].is_u64()
-                && span.attributes()["worker_lane_id"].is_u64()
-                && span.attributes()["worker_kind"].is_string()
-                && span.track_name().starts_with("DataFusion query ")
-        }));
-        assert!(timeline.spans().iter().all(|span| {
-            span.start_offset_micros()
-                .saturating_add(span.duration_micros())
-                <= timeline.total_duration_micros()
-        }));
         let value = report.to_json_value();
         assert_eq!(value["execution_profile"]["scope"], "mssql_output");
         assert_eq!(value["execution_profile"]["outcome"], "success");
-        assert_eq!(value["operation_timeline"]["status"], "completed");
-        let trace = report.to_trace_event_json_value().ok_or("expected trace")?;
-        assert_eq!(
-            trace["delta_funnel_timeline"]["total_duration_micros"],
-            timeline.total_duration_micros()
-        );
-        assert_eq!(trace["delta_funnel_profile"]["scope"], "mssql_output");
         assert_eq!(
             value
                 .as_object()
@@ -2060,15 +1882,9 @@ mod tests {
             assert_eq!(profile.scope(), QueryExecutionScope::MssqlOutput);
             assert_eq!(profile.outcome(), QueryExecutionOutcome::Cancelled);
             assert!(profile.partial());
-            let timeline = context
-                .operation_timeline()
-                .ok_or("expected failure timeline")?;
-            crate::report::trace_contract::validate_operation_trace(timeline)?;
-            assert_eq!(timeline.status(), crate::TimelineSpanStatus::Failed);
             let value = context.to_json_value();
             assert!(value.get("execution_profile").is_none());
             assert_eq!(value["report"]["execution_profile"]["outcome"], "cancelled");
-            assert_eq!(value["report"]["operation_timeline"]["status"], "failed");
             let events = execution_profile_events(&capture);
             assert_eq!(events.len(), 1);
             assert_eq!(
@@ -2695,21 +2511,12 @@ mod tests {
         assert_eq!(call.schema_fields, 2);
         assert_eq!(report.stats().rows_written(), u64::try_from(table.rows())?);
         assert_eq!(report.stats().batches_written(), call.batches);
-        let timeline = report.operation_timeline().ok_or("expected timeline")?;
-        let planning_spans = timeline
-            .spans()
-            .iter()
-            .filter(|span| span.category() == "datafusion.planning.activity")
-            .collect::<Vec<_>>();
-        assert!(
-            planning_spans
-                .iter()
-                .any(|span| span.name() == "Delta scan planning")
-        );
-        assert!(planning_spans.iter().all(|span| {
-            span.track_name() == "DataFusion query planning / SQL output: orders_output"
-                && span.attributes()["query_scope"] == "mssql_output"
-                && span.attributes()["query_owner"] == "orders_output"
+        let profile = report.execution_profile().ok_or("expected profile")?;
+        assert!(!profile.operators().is_empty());
+        assert!(profile.operators().iter().any(|operator| {
+            operator
+                .delta_provider_read_stats()
+                .is_some_and(|stats| stats.source_name == "orders")
         }));
         Ok(())
     }

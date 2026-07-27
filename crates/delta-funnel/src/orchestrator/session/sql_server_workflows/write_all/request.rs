@@ -1,17 +1,14 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use crate::{
-    DeltaFunnelError, ExecutionProfileMode, MssqlStreamBenchmarkOutputWriter,
-    MssqlWorkflowOutputWriter, MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode,
-    observability,
+    DeltaFunnelError, MssqlStreamBenchmarkOutputWriter, MssqlWorkflowOutputWriter,
+    MssqlWorkflowSinkWriter, PhaseTimingReport, ReportReasonCode, observability,
     profiling::{
         OperationStageContext, OperationStageTrace, OperationTraceContext, OperationTraceKind,
         OperationTracePhase, ProcessOperationPhaseTracker,
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
-    report::{
-        OperationTimelineRecorder, PhaseTimer, TimelineSpanStatus, sql_server::WriteAllReport,
-    },
+    report::{PhaseTimer, sql_server::WriteAllReport},
     support::sanitize_text_for_display,
     usize_to_u64_saturating,
 };
@@ -98,14 +95,7 @@ impl DeltaFunnelSession {
     {
         validate_write_all_requests(requests)?;
         let active_reporter = if requests.is_empty() { None } else { reporter };
-        let trace_context = OperationTraceContext::start(
-            OperationTraceKind::WriteAll,
-            (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
-                .then(OperationTimelineRecorder::start),
-        );
-        let timeline = trace_context
-            .as_ref()
-            .and_then(OperationTraceContext::timeline);
+        let trace_context = OperationTraceContext::start(OperationTraceKind::WriteAll);
         let stage_context = OperationStageContext::new(trace_context.as_ref(), None);
         let mut process_phases = ProcessOperationPhaseTracker::start(
             trace_context.as_ref(),
@@ -119,11 +109,8 @@ impl DeltaFunnelSession {
         let result = async {
             // Resolve every output before cache planning or execution starts.
             let planning_timer = PhaseTimer::start(OUTPUT_PLANNING_PHASE);
-            let planning_span = stage_context.start(
-                "Plan outputs",
-                "delta_funnel.write_all.planning",
-                "Write-all phases",
-            );
+            let planning_span =
+                stage_context.start("Plan outputs", "delta_funnel.write_all.planning");
             let planned_outputs =
                 match self.plan_write_outputs(requests, active_reporter, trace_context.as_ref()) {
                     Ok(outputs) => {
@@ -142,11 +129,8 @@ impl DeltaFunnelSession {
             let automatic_cache_plan = match options.cache_mode() {
                 WriteAllCacheMode::Auto => {
                     let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
-                    let cache_span = stage_context.start(
-                        "Plan caches",
-                        "delta_funnel.write_all.planning",
-                        "Write-all phases",
-                    );
+                    let cache_span =
+                        stage_context.start("Plan caches", "delta_funnel.write_all.planning");
                     let cache_plan = self.plan_mssql_output_cache(requests);
                     complete_write_all_span(cache_span);
                     phase_timings.push(cache_timer.completed());
@@ -169,7 +153,6 @@ impl DeltaFunnelSession {
             let workflow_span = stage_context.start(
                 "Execute output workflow",
                 "delta_funnel.write_all.execution",
-                "Write-all phases",
             );
             let workflow_result = match automatic_cache_plan.as_ref() {
                 Some(cache_plan) => match cache_plan.decision() {
@@ -243,11 +226,8 @@ impl DeltaFunnelSession {
                 ));
             }
             let source_timer = PhaseTimer::start(SOURCE_REPORTING_PHASE);
-            let source_span = stage_context.start(
-                "Report sources",
-                "delta_funnel.write_all.reporting",
-                "Write-all phases",
-            );
+            let source_span =
+                stage_context.start("Report sources", "delta_funnel.write_all.reporting");
             let sources = match self.source_reports_for_planned_outputs_with_provider_stats(
                 &planned_outputs,
                 provider_stats_snapshots(&shared_provider_stats),
@@ -267,22 +247,6 @@ impl DeltaFunnelSession {
         }
         .await;
 
-        let result = match (result, timeline) {
-            (Ok(report), Some(timeline)) => {
-                let status = if report.all_succeeded() {
-                    TimelineSpanStatus::Completed
-                } else {
-                    TimelineSpanStatus::Failed
-                };
-                let timeline = timeline.finish("SQL Server write_all", status);
-                Ok(report.with_operation_timeline(Some(timeline)))
-            }
-            (Err(error), Some(timeline)) => {
-                let timeline = timeline.finish("SQL Server write_all", TimelineSpanStatus::Failed);
-                Err(with_write_all_cache_operation_timeline(error, timeline))
-            }
-            (result, _) => result,
-        };
         process_phases.finish(if result.is_ok() { "ok" } else { "error" });
         let process_result = match &result {
             Ok(report) if report.all_succeeded() => "ok",
@@ -455,19 +419,6 @@ fn complete_write_all_span(span: Option<OperationStageTrace>) {
 fn fail_write_all_span(span: Option<OperationStageTrace>) {
     if let Some(span) = span {
         span.failed();
-    }
-}
-
-fn with_write_all_cache_operation_timeline(
-    error: DeltaFunnelError,
-    operation_timeline: crate::OperationTimeline,
-) -> DeltaFunnelError {
-    match error {
-        DeltaFunnelError::WriteAllCache { failure, source } => DeltaFunnelError::WriteAllCache {
-            failure: Box::new((*failure).with_operation_timeline(Some(operation_timeline))),
-            source,
-        },
-        other => other,
     }
 }
 
@@ -902,11 +853,6 @@ mod tests {
         assert_eq!(profile.outcome(), outcome);
         assert!(profile.partial());
         assert!(skipped.is_skipped());
-        crate::report::trace_contract::validate_operation_trace(
-            report
-                .operation_timeline()
-                .ok_or("expected failed write-all timeline")?,
-        )?;
         Ok(())
     }
 
@@ -1499,59 +1445,6 @@ mod tests {
                 execution_profile_event_count(&profile_events, "write_all_cache_alias"),
                 1
             );
-            let timeline = report
-                .operation_timeline()
-                .ok_or("expected write-all operation timeline")?;
-            for expected_name in [
-                "Resolve cache DataFrame",
-                "Build cache physical plan",
-                "Set up cache streams",
-                "Execute and collect cache",
-                "Build cache MemTable",
-                "Install cache alias",
-                "Restore cache alias",
-            ] {
-                assert!(
-                    timeline
-                        .spans()
-                        .iter()
-                        .any(|span| span.name() == expected_name),
-                    "missing cache timeline span {expected_name}"
-                );
-            }
-            let install = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Install cache alias")
-                .ok_or("missing cache install span")?;
-            let first_output = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Execute output: big_output")
-                .ok_or("missing first output span")?;
-            assert!(
-                install
-                    .start_offset_micros()
-                    .saturating_add(install.duration_micros())
-                    <= first_output.start_offset_micros()
-            );
-            let second_output = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Execute output: selected_output")
-                .ok_or("missing second output span")?;
-            let restore = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Restore cache alias")
-                .ok_or("missing cache restore span")?;
-            assert!(
-                second_output
-                    .start_offset_micros()
-                    .saturating_add(second_output.duration_micros())
-                    <= restore.start_offset_micros()
-            );
-
             let events = events.lock().map_err(|_| "progress event lock poisoned")?;
             let cache_events = events
                 .iter()
@@ -1838,89 +1731,6 @@ mod tests {
                     )?;
                 }
             }
-            let timeline = report
-                .operation_timeline()
-                .ok_or("expected write-all operation timeline")?;
-            crate::report::trace_contract::validate_operation_trace(timeline)?;
-            assert_eq!(timeline.name(), "SQL Server write_all");
-            assert_eq!(timeline.status().as_str(), "completed");
-            for expected_name in [
-                "Plan outputs",
-                "Execute output workflow",
-                "Execute output: first_output",
-                "Execute output: second_output",
-                "Report sources",
-            ] {
-                assert!(
-                    timeline
-                        .spans()
-                        .iter()
-                        .any(|span| span.name() == expected_name),
-                    "missing timeline span {expected_name}"
-                );
-            }
-            let first_span = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Execute output: first_output")
-                .ok_or("missing first output span")?;
-            let second_span = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Execute output: second_output")
-                .ok_or("missing second output span")?;
-            assert!(
-                first_span
-                    .start_offset_micros()
-                    .saturating_add(first_span.duration_micros())
-                    <= second_span.start_offset_micros()
-            );
-            let operator_spans = timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "datafusion.operator.lifecycle")
-                .collect::<Vec<_>>();
-            assert!(!operator_spans.is_empty());
-            for output_name in ["first_output", "second_output"] {
-                assert!(operator_spans.iter().any(|span| {
-                    span.attributes()["output_name"].as_str() == Some(output_name)
-                }));
-            }
-            assert!(operator_spans.iter().all(|span| {
-                let output_name = span.attributes()["output_name"]
-                    .as_str()
-                    .expect("operator span output name");
-                span.track_name()
-                    .starts_with(&format!("Output: {output_name} / "))
-            }));
-            let activity_spans = timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "datafusion.operator.activity")
-                .collect::<Vec<_>>();
-            assert!(!activity_spans.is_empty());
-            let mut query_execution_ids = activity_spans
-                .iter()
-                .filter_map(|span| span.attributes()["query_execution_id"].as_u64())
-                .collect::<Vec<_>>();
-            query_execution_ids.sort_unstable();
-            query_execution_ids.dedup();
-            assert_eq!(query_execution_ids, [1, 2]);
-            assert!(activity_spans.iter().all(|span| {
-                span.attributes()["worker_lane_id"].is_u64()
-                    && span.attributes()["worker_kind"].is_string()
-                    && span.track_name().starts_with("DataFusion query ")
-            }));
-            assert!(timeline.spans().iter().all(|span| {
-                span.start_offset_micros()
-                    .saturating_add(span.duration_micros())
-                    <= timeline.total_duration_micros()
-            }));
-            let trace = report
-                .to_trace_event_json_value()
-                .ok_or("expected write-all trace export")?;
-            assert!(trace.get("traceEvents").is_some());
-            assert!(trace.get("delta_funnel_write_all_report").is_some());
             let events = execution_profile_events(&capture);
             assert_eq!(events.len(), 2);
             assert!(events.iter().all(|event| {
@@ -1963,36 +1773,17 @@ mod tests {
                 )
                 .await?;
 
-            let timeline = report
-                .operation_timeline()
-                .ok_or("expected write-all operation timeline")?;
-            let planning_spans = timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "datafusion.planning.activity")
-                .collect::<Vec<_>>();
-            let activity_spans = timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "datafusion.operator.activity")
-                .collect::<Vec<_>>();
-            for output_name in ["first_output", "second_output"] {
-                let expected_track =
-                    format!("DataFusion query planning / SQL output: {output_name}");
-                let planning = planning_spans
-                    .iter()
-                    .find(|span| {
-                        span.name() == "Delta scan planning"
-                            && span.track_name() == expected_track
-                            && span.attributes()["query_scope"] == "mssql_output"
-                            && span.attributes()["query_owner"] == output_name
-                    })
-                    .ok_or("expected output planning span")?;
-                assert!(activity_spans.iter().any(|span| {
-                    span.attributes()["query_execution_id"]
-                        == planning.attributes()["query_execution_id"]
-                        && span.attributes()["query_scope"] == "mssql_output"
-                        && span.attributes()["query_owner"] == output_name
+            for status in report.outputs() {
+                let crate::MssqlOutputWriteStatus::Succeeded(output) = status else {
+                    return Err("expected successful output".into());
+                };
+                let profile = output
+                    .execution_profile()
+                    .ok_or("expected output profile")?;
+                assert!(profile.operators().iter().any(|operator| {
+                    operator
+                        .delta_provider_read_stats()
+                        .is_some_and(|stats| stats.source_name == "orders")
                 }));
             }
             Ok(())
@@ -2061,24 +1852,6 @@ mod tests {
             assert!(skipped.is_skipped());
             assert_eq!(execution_profile_events(&capture).len(), 2);
 
-            let timeline = report
-                .operation_timeline()
-                .ok_or("expected failed write-all timeline")?;
-            assert_eq!(timeline.status().as_str(), "failed");
-            let failed_output_span = timeline
-                .spans()
-                .iter()
-                .find(|span| span.name() == "Execute output: second_output")
-                .ok_or("missing failed output span")?;
-            assert_eq!(failed_output_span.status().as_str(), "failed");
-            assert!(
-                timeline
-                    .spans()
-                    .iter()
-                    .all(|span| span.name() != "Execute output: third_output")
-            );
-            assert!(report.to_trace_event_json_value().is_some());
-
             let value = report.to_json_value();
             let failed = &value["workflow"]["outputs"][1];
             assert!(value.get("execution_profile").is_none());
@@ -2131,8 +1904,6 @@ mod tests {
                 )
                 .await?;
 
-            assert!(report.operation_timeline().is_none());
-            assert!(report.to_trace_event_json_value().is_none());
             assert_eq!(report.outputs().len(), 1);
             assert_eq!(report.outputs()[0].output_name(), "orders_output");
             assert_eq!(report.sources().len(), 1);
@@ -2393,7 +2164,6 @@ mod tests {
             assert_eq!(aliases[0].execution_profile(), None);
             assert!(report.to_json_value()["cache"]["aliases"][0]["execution_profile"].is_null());
             assert!(execution_profile_events(&capture).is_empty());
-            assert_eq!(report.operation_timeline(), None);
             let stages = process_write_all_stages(&capture);
             for expected_name in [
                 "Resolve cache DataFrame",
@@ -2938,26 +2708,6 @@ mod tests {
             let DeltaFunnelError::WriteAllCache { failure, source } = error else {
                 return Err("expected structured write_all cache failure".into());
             };
-            let timeline = failure
-                .operation_timeline()
-                .ok_or("expected partial cache failure timeline")?;
-            assert_eq!(timeline.status().as_str(), "failed");
-            assert!(timeline.spans().iter().any(|span| {
-                span.name() == "Resolve cache DataFrame" && span.status().as_str() == "completed"
-            }));
-            assert!(timeline.spans().iter().any(|span| {
-                span.name() == "Build cache physical plan" && span.status().as_str() == "failed"
-            }));
-            assert!(
-                timeline
-                    .spans()
-                    .iter()
-                    .all(|span| !span.name().starts_with("Execute output:"))
-            );
-            assert_eq!(
-                failure.to_json_value()["operation_timeline"]["status"],
-                "failed"
-            );
             assert_eq!(failure.primary_failed_alias_table_id(), Some(big.id()));
             assert_eq!(failure.workflow(), None);
             assert_eq!(failure.aliases().len(), 1);

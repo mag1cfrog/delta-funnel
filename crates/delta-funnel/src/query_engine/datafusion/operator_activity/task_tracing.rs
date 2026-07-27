@@ -80,7 +80,6 @@ impl DataFusionTaskTraceContext {
             query_execution_id: self.activity.query_execution_id,
             worker_lane: context.worker_lane,
             owns_worker_lane,
-            timeline_span_id: None,
             process_span_active: true,
             task_trace_context: Some(self.clone()),
         };

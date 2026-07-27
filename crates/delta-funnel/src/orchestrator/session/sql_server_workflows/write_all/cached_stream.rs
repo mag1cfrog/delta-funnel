@@ -57,13 +57,7 @@ async fn create_cached_output_query_execution_from_retained_sql(
     let stage_context = OperationStageContext::new(trace_context.as_ref(), stage_owner_id);
     let output_name = planned.resolved_target().output_name();
     let dataframe_timer = PhaseTimer::start(QUERY_DATAFRAME_PLANNING_PHASE);
-    let dataframe_span = stage_context
-        .start(
-            "Build query DataFrame",
-            "delta_funnel.write.query",
-            "Query DataFrame planning",
-        )
-        .map(|span| span.with_attribute("output_name", output_name.to_owned().into()));
+    let dataframe_span = stage_context.start("Build query DataFrame", "delta_funnel.write.query");
     let dataframe = match context
         .sql_with_options(sql_text.as_str(), read_only_sql_options())
         .await

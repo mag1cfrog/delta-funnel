@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
 
-use crate::{
-    QueryExecutionScope, profiling::OperationTraceContext, report::OperationTimelineRecorder,
-};
+use crate::{QueryExecutionScope, profiling::OperationTraceContext};
 
 use super::{
     DFQueryExecution, DFQueryExecutionSetupError, execute_datafusion_query_output,
@@ -29,7 +27,7 @@ impl QueryTraceIdentity {
         query_owner: Option<&str>,
     ) -> Option<Self> {
         debug_assert_ne!(context.operation_id(), 0);
-        debug_assert!(context.timeline().is_some() || context.process_spans_enabled());
+        debug_assert!(context.process_spans_enabled());
         let query_execution_id = context.next_query_execution_id()?;
         Some(Self {
             context,
@@ -37,10 +35,6 @@ impl QueryTraceIdentity {
             query_scope,
             query_owner: query_owner.map(Arc::<str>::from),
         })
-    }
-
-    pub(super) const fn timeline(&self) -> Option<&OperationTimelineRecorder> {
-        self.context.timeline()
     }
 
     pub(super) const fn operation_id(&self) -> u64 {

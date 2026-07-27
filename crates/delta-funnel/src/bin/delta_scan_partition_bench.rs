@@ -219,7 +219,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 77] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 71] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -291,12 +291,6 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 77] = [
     "min_total_micros",
     "max_total_micros",
     "execution_profile_mode",
-    "operation_timeline_span_count_max",
-    "trace_event_count_max",
-    "trace_json_bytes_max",
-    "trace_export_micros_p50",
-    "trace_export_micros_p95",
-    "trace_export_micros_p99",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1018,10 +1012,6 @@ struct ProviderExecRunMeasurement {
     produced_batches: usize,
     process_peak_rss_bytes: Option<u64>,
     process_peak_rss_delta_bytes: Option<u64>,
-    operation_timeline_span_count: usize,
-    trace_event_count: usize,
-    trace_json_bytes: usize,
-    trace_export_micros: u64,
     batch_latency_micros: Vec<u64>,
     read_stats: ProviderExecReadStatsMeasurement,
 }
@@ -1065,10 +1055,6 @@ struct ProviderExecSummary {
     batch_latency_micros: PercentileSummary,
     process_peak_rss_bytes: Option<u64>,
     process_peak_rss_delta_bytes: Option<u64>,
-    operation_timeline_span_count_max: usize,
-    trace_event_count_max: usize,
-    trace_json_bytes_max: usize,
-    trace_export_micros: PercentileSummary,
     min_total_micros: u64,
     max_total_micros: u64,
     read_stats: ProviderExecReadStatsSummary,
@@ -2533,54 +2519,6 @@ async fn run_provider_exec_write_workflow_once(
     let source_rows_per_second = u128_to_u64_saturating(
         (table.row_count as u128).saturating_mul(1_000_000) / u128::from(total_micros),
     );
-    let operation_timeline_span_count = match (execution_profile_mode, report.operation_timeline())
-    {
-        (ExecutionProfileMode::Disabled, None) => 0,
-        (ExecutionProfileMode::Detailed, Some(timeline)) => timeline.spans().len(),
-        (ExecutionProfileMode::Disabled, Some(_)) => {
-            return Err(io::Error::other(
-                "disabled profiling unexpectedly produced an operation timeline",
-            )
-            .into());
-        }
-        (ExecutionProfileMode::Detailed, None) => {
-            return Err(io::Error::other(
-                "detailed profiling did not produce an operation timeline",
-            )
-            .into());
-        }
-    };
-    let trace_export_started = Instant::now();
-    let (trace_event_count, trace_json_bytes, trace_export_micros) =
-        match (execution_profile_mode, report.to_trace_event_json_value()) {
-            (ExecutionProfileMode::Disabled, None) => (0, 0, 0),
-            (ExecutionProfileMode::Detailed, Some(trace)) => {
-                let trace_event_count = trace
-                    .get("traceEvents")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| {
-                        io::Error::other(
-                            "detailed profiling produced trace JSON without a traceEvents array",
-                        )
-                    })?
-                    .len();
-                let trace_json_bytes = serde_json::to_vec(&trace)?.len();
-                let trace_export_micros =
-                    u128_to_u64_saturating(trace_export_started.elapsed().as_micros()).max(1);
-                (trace_event_count, trace_json_bytes, trace_export_micros)
-            }
-            (ExecutionProfileMode::Disabled, Some(_)) => {
-                return Err(io::Error::other(
-                    "disabled profiling unexpectedly produced trace JSON",
-                )
-                .into());
-            }
-            (ExecutionProfileMode::Detailed, None) => {
-                return Err(
-                    io::Error::other("detailed profiling did not produce trace JSON").into(),
-                );
-            }
-        };
     let process_peak_rss_bytes = process_peak_rss_bytes();
     let process_peak_rss_delta_bytes = match (process_peak_rss_before_bytes, process_peak_rss_bytes)
     {
@@ -2597,10 +2535,6 @@ async fn run_provider_exec_write_workflow_once(
         produced_batches,
         process_peak_rss_bytes,
         process_peak_rss_delta_bytes,
-        operation_timeline_span_count,
-        trace_event_count,
-        trace_json_bytes,
-        trace_export_micros,
         batch_latency_micros,
         read_stats: provider_exec_read_stats_measurement(&provider_stats),
     })
@@ -2769,10 +2703,6 @@ async fn run_provider_exec_once(
         produced_batches,
         process_peak_rss_bytes,
         process_peak_rss_delta_bytes,
-        operation_timeline_span_count: 0,
-        trace_event_count: 0,
-        trace_json_bytes: 0,
-        trace_export_micros: 0,
         batch_latency_micros,
         read_stats,
     })
@@ -2861,27 +2791,6 @@ fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> Provide
             .iter()
             .filter_map(|measurement| measurement.process_peak_rss_delta_bytes)
             .max(),
-        operation_timeline_span_count_max: measurements
-            .iter()
-            .map(|measurement| measurement.operation_timeline_span_count)
-            .max()
-            .unwrap_or(0),
-        trace_event_count_max: measurements
-            .iter()
-            .map(|measurement| measurement.trace_event_count)
-            .max()
-            .unwrap_or(0),
-        trace_json_bytes_max: measurements
-            .iter()
-            .map(|measurement| measurement.trace_json_bytes)
-            .max()
-            .unwrap_or(0),
-        trace_export_micros: percentile_summary(
-            &measurements
-                .iter()
-                .map(|measurement| measurement.trace_export_micros)
-                .collect::<Vec<_>>(),
-        ),
         min_total_micros: total_micros.iter().copied().min().unwrap_or(0),
         max_total_micros: total_micros.iter().copied().max().unwrap_or(0),
         read_stats: provider_exec_read_stats_summary(measurements),
@@ -3267,12 +3176,6 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         summary.min_total_micros.to_string(),
         summary.max_total_micros.to_string(),
         execution_profile_mode_name(input.execution_profile_mode).to_owned(),
-        summary.operation_timeline_span_count_max.to_string(),
-        summary.trace_event_count_max.to_string(),
-        summary.trace_json_bytes_max.to_string(),
-        summary.trace_export_micros.p50.to_string(),
-        summary.trace_export_micros.p95.to_string(),
-        summary.trace_export_micros.p99.to_string(),
     ]
 }
 
@@ -8226,10 +8129,6 @@ mod tests {
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"source_rows_per_second_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"batch_latency_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"execution_profile_mode"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"operation_timeline_span_count_max"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_event_count_max"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_json_bytes_max"));
-        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"trace_export_micros_p99"));
     }
 
     #[test]
@@ -8791,14 +8690,6 @@ mod tests {
             },
             process_peak_rss_bytes: Some(4096),
             process_peak_rss_delta_bytes: Some(1024),
-            operation_timeline_span_count_max: 100,
-            trace_event_count_max: 110,
-            trace_json_bytes_max: 32_768,
-            trace_export_micros: PercentileSummary {
-                p50: 60,
-                p95: 61,
-                p99: 62,
-            },
             min_total_micros: 29,
             max_total_micros: 33,
             read_stats: ProviderExecReadStatsSummary {
@@ -8889,12 +8780,6 @@ mod tests {
         assert_eq!(row[51], "4096");
         assert_eq!(row[52], "1024");
         assert_eq!(row[70], "detailed");
-        assert_eq!(row[71], "100");
-        assert_eq!(row[72], "110");
-        assert_eq!(row[73], "32768");
-        assert_eq!(row[74], "60");
-        assert_eq!(row[75], "61");
-        assert_eq!(row[76], "62");
     }
 
     #[test]
