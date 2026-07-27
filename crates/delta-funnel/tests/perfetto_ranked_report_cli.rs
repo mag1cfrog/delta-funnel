@@ -78,6 +78,48 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
 }
 
 #[test]
+fn reads_artifacts_without_trace_processor() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory
+        .path()
+        .join("artifact-with-trace-extension.pftrace");
+    let output = directory.path().join("artifact.profile.html");
+    fs::write(
+        &input,
+        include_bytes!("../src/perfetto_profile/testdata/ranked_profile_v1.dfprofile"),
+    )?;
+    let missing_trace_processor = directory.path().join("does-not-exist");
+
+    let report = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("report")
+        .arg(&input)
+        .arg("--output")
+        .arg(&output)
+        .env("TRACE_PROCESSOR_SHELL", &missing_trace_processor)
+        .output()?;
+    assert!(
+        report.status.success(),
+        "artifact report failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let html = fs::read_to_string(output)?;
+    assert!(html.contains("Delta Funnel preview"));
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("inspect")
+        .arg(&input)
+        .env("TRACE_PROCESSOR_SHELL", missing_trace_processor)
+        .output()?;
+    assert!(
+        inspect.status.success(),
+        "artifact inspection failed: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    assert!(String::from_utf8(inspect.stdout)?.contains("Delta Funnel preview"));
+    Ok(())
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn reports_help_output_failures_with_stable_diagnostics() -> Result<(), Box<dyn std::error::Error>>
 {

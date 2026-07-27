@@ -45,6 +45,29 @@ impl RankedProfileArtifact {
                 input_failure("invalid_archive", "artifact payload is not a valid archive")
             })
     }
+
+    pub(super) fn into_document(self) -> Result<RankedProfileDocument, RankedReportFailure> {
+        rkyv::deserialize::<RankedProfileDocument, RkyvError>(self.document()?).map_err(|_| {
+            input_failure(
+                "artifact_deserialize_failed",
+                "artifact payload could not be materialized",
+            )
+        })
+    }
+}
+
+pub(super) fn has_ranked_profile_artifact_magic(input: &Path) -> Result<bool, RankedReportFailure> {
+    let mut file = File::open(input)
+        .map_err(|_| input_failure("input_unreadable", "profile input could not be read"))?;
+    let mut magic = [0_u8; MAGIC.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(_) => Err(input_failure(
+            "input_unreadable",
+            "profile input could not be read",
+        )),
+    }
 }
 
 pub(super) fn read_ranked_profile_artifact(
@@ -421,6 +444,13 @@ mod tests {
         let archived = artifact.document().expect("artifact should remain valid");
         assert_eq!(archived.metadata.sample_frequency_hz.to_native(), 1_000);
         assert_eq!(archived.semantics[0].name.as_str(), "Delta Funnel preview");
+        assert_eq!(
+            read_ranked_profile_artifact(&output)
+                .expect("artifact should be read")
+                .into_document()
+                .expect("artifact should deserialize"),
+            document
+        );
 
         let original = fs::read(&output).expect("artifact should be readable");
         let error =

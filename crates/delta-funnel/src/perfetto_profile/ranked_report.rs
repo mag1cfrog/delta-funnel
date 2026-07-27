@@ -11,7 +11,17 @@ pub(super) const MAX_RECORDS_PER_COLLECTION: usize = 500_000;
 pub(super) const RANKED_PROFILE_SCHEMA_VERSION: u32 = 3;
 const MAX_DISPLAY_STRING_CHARS: usize = 512;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, Serialize)]
+#[derive(
+    Clone,
+    Debug,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+    Serialize,
+)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RankedProfileMetadata {
     pub capture_complete: bool,
@@ -47,7 +57,17 @@ pub(super) struct RankedProfileMetadata {
     pub trace_profiler_dropped_sample_count: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, Serialize)]
+#[derive(
+    Clone,
+    Debug,
+    Deserialize,
+    PartialEq,
+    Eq,
+    rkyv::Archive,
+    rkyv::Deserialize,
+    rkyv::Serialize,
+    Serialize,
+)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RankedSemantic {
     pub semantic_id: i64,
@@ -124,7 +144,9 @@ fn semantic_requires_terminal_result(semantic_kind: &str) -> bool {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, Serialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Serialize,
+)]
 pub(super) struct RankedFunction {
     pub semantic_id: i64,
     pub function_id: i64,
@@ -388,7 +410,9 @@ fn is_directional_arrow(value: &[u8], index: usize) -> bool {
     index > 0 && matches!(value[index - 1], b'-' | b'=')
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, Serialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Serialize,
+)]
 pub(super) struct RankedProfileDocument {
     pub metadata: RankedProfileMetadata,
     pub semantics: Vec<RankedSemantic>,

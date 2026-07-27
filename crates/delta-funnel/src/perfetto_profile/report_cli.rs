@@ -34,7 +34,7 @@ struct PerfettoCli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum PerfettoCommand {
-    /// Generate a ranked HTML report from a raw trace.
+    /// Generate a ranked HTML report from a trace or ranked artifact.
     Report(RankedReportArgs),
 
     /// Inspect ranked profiling data in the terminal.
@@ -43,8 +43,8 @@ enum PerfettoCommand {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 struct RankedReportArgs {
-    /// Raw Perfetto trace to analyze.
-    #[arg(value_name = "INPUT.pftrace")]
+    /// Perfetto trace or ranked profile artifact to analyze.
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
 
     /// Report destination. Defaults to INPUT.profile.html.
@@ -58,8 +58,8 @@ struct RankedReportArgs {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 struct InspectArgs {
-    /// Raw Perfetto trace to inspect.
-    #[arg(value_name = "INPUT.pftrace")]
+    /// Perfetto trace or ranked profile artifact to inspect.
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
 
     /// Maximum number of rows to display.
@@ -490,7 +490,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
-    match super::load_ranked_profile(&input, None) {
+    match super::load_ranked_profile_input(&input) {
         Ok(document) if args.interactive => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -1229,7 +1229,8 @@ mod tests {
                 .ok_or("report help should stop parsing")?;
         assert_eq!(report_help.kind(), ErrorKind::DisplayHelp);
         let report_help = report_help.to_string();
-        assert!(report_help.contains("INPUT.pftrace"));
+        assert!(report_help.contains("<INPUT>"));
+        assert!(report_help.contains("Perfetto trace or ranked profile artifact"));
         assert!(report_help.contains("--output <OUTPUT.profile.html>"));
         assert!(report_help.contains("--no-clobber"));
         let bare_report_help =
@@ -1298,7 +1299,8 @@ mod tests {
             .ok_or("inspect help should stop parsing")?;
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         let help = help.to_string();
-        assert!(help.contains("INPUT.pftrace"));
+        assert!(help.contains("<INPUT>"));
+        assert!(help.contains("Perfetto trace or ranked profile artifact"));
         assert!(help.contains("--limit <LIMIT>"));
         assert!(help.contains("--semantic <ID>"));
         assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));

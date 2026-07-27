@@ -34,7 +34,10 @@ mod report_trace_processor;
 mod report_trace_sanitizer;
 
 pub use profile_layer::{PROFILE_TARGET, PerfettoProfileLayer, is_profile_target};
-use ranked_profile_artifact::{read_ranked_profile_artifact, write_ranked_profile_artifact};
+use ranked_profile_artifact::{
+    has_ranked_profile_artifact_magic, read_ranked_profile_artifact, write_ranked_profile_artifact,
+};
+use ranked_report::RankedProfileDocument;
 use report_aggregate::load_ranked_profile;
 use report_cli::preflight_ranked_report_paths;
 pub use report_cli::{
@@ -83,7 +86,7 @@ fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Generates one self-contained ranked HTML report from a completed Perfetto trace.
+/// Generates one self-contained ranked HTML report from a completed Perfetto trace or artifact.
 ///
 /// # Errors
 ///
@@ -158,10 +161,21 @@ fn generate_ranked_profile_report_for_scope(
     existing_output: ExistingOutputPolicy,
 ) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = load_ranked_profile(&paths.input, capture_scope_id)?;
+    let document = match capture_scope_id {
+        Some(capture_scope_id) => load_ranked_profile(&paths.input, Some(capture_scope_id))?,
+        None => load_ranked_profile_input(&paths.input)?,
+    };
     let html = render_ranked_profile_html(&document)?;
     write_ranked_profile_html(&paths.output, &html, existing_output)?;
     Ok(paths.output)
+}
+
+fn load_ranked_profile_input(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {
+    if has_ranked_profile_artifact_magic(input)? {
+        read_ranked_profile_artifact(input)?.into_document()
+    } else {
+        load_ranked_profile(input, None)
+    }
 }
 
 const CATEGORY: &str = "delta_funnel.profile";
