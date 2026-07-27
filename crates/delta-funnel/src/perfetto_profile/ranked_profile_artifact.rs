@@ -341,7 +341,13 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::perfetto_profile::ranked_report::{RankedProfileMetadata, RankedSemantic};
+    use crate::perfetto_profile::ranked_report::{
+        RankedFunction, RankedProfileMetadata, RankedSemantic,
+    };
+    use crate::perfetto_profile::report_html::render_ranked_profile_html;
+    use crate::perfetto_profile::report_terminal::{
+        InspectSelection, InspectSort, render_terminal_view,
+    };
 
     fn document() -> RankedProfileDocument {
         RankedProfileDocument {
@@ -423,6 +429,68 @@ mod tests {
         bytes
     }
 
+    fn round_trip(document: &RankedProfileDocument) -> RankedProfileDocument {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let output = directory.path().join("profile.dfprofile");
+        write_ranked_profile_artifact(&output, document, ExistingOutputPolicy::Replace)
+            .expect("artifact should be written");
+        read_ranked_profile_artifact(&output)
+            .expect("artifact should be read")
+            .into_document()
+            .expect("artifact should deserialize")
+    }
+
+    fn incomplete_document() -> RankedProfileDocument {
+        let mut document = document();
+        document.metadata.capture_complete = false;
+        document.metadata.semantic_complete = false;
+        document.metadata.finalization_observed = false;
+        document.metadata.incomplete_operation_root_count = 1;
+        document.metadata.missing_terminal_result_count = 1;
+        document.semantics[0].end_ns = None;
+        document.semantics[0].duration_ns = None;
+        document.semantics[0].result = None;
+        document.semantics[0].is_complete = false;
+        document
+    }
+
+    fn sampled_document() -> RankedProfileDocument {
+        let mut document = document();
+        document.metadata.eligible_sample_count = 2;
+        document.metadata.direct_sample_count = 2;
+        document.metadata.resolved_function_sample_count = 1;
+        document.metadata.unresolved_function_sample_count = 1;
+        document.semantics[0].direct_sample_count = 2;
+        document.semantics[0].inclusive_sample_count = 2;
+        document.semantics[0].resolved_function_sample_count = 1;
+        document.semantics[0].unresolved_function_sample_count = 1;
+        document.functions = vec![
+            RankedFunction {
+                semantic_id: 1,
+                function_id: 1,
+                parent_function_id: None,
+                name: "delta_funnel::preview::collect".to_owned(),
+                module_name: Some("deltafunnel.abi3.so".to_owned()),
+                source_file: Some("src/preview.rs".to_owned()),
+                line_number: Some(42),
+                self_sample_count: 1,
+                inclusive_sample_count: 1,
+            },
+            RankedFunction {
+                semantic_id: 1,
+                function_id: 2,
+                parent_function_id: None,
+                name: "[unresolved]".to_owned(),
+                module_name: Some("libc.so.6".to_owned()),
+                source_file: None,
+                line_number: None,
+                self_sample_count: 1,
+                inclusive_sample_count: 1,
+            },
+        ];
+        document
+    }
+
     fn failure_kind(bytes: &[u8]) -> &'static str {
         let directory = tempfile::tempdir().expect("test directory should be created");
         let input = directory.path().join("profile.dfprofile");
@@ -477,6 +545,48 @@ mod tests {
             fs::read(&output).expect("artifact should remain readable"),
             original
         );
+    }
+
+    #[test]
+    fn round_trips_representative_documents_and_preserves_renderer_output() {
+        let mut maximum_bound = sampled_document();
+        maximum_bound.semantics[0].name = "x".repeat(512);
+        maximum_bound.functions[0].module_name = Some("m".repeat(512));
+        maximum_bound.functions[0].source_file = Some("s".repeat(512));
+
+        for document in [
+            document(),
+            incomplete_document(),
+            sampled_document(),
+            maximum_bound,
+        ] {
+            document
+                .validate()
+                .expect("representative document should be valid");
+            assert_eq!(round_trip(&document), document);
+        }
+
+        let document = sampled_document();
+        let loaded = round_trip(&document);
+        assert_eq!(
+            render_ranked_profile_html(&loaded).expect("loaded HTML should render"),
+            render_ranked_profile_html(&document).expect("in-memory HTML should render")
+        );
+        for selection in [
+            InspectSelection::Root,
+            InspectSelection::Semantic(1),
+            InspectSelection::Function {
+                semantic_id: 1,
+                function_id: 1,
+            },
+        ] {
+            assert_eq!(
+                render_terminal_view(&loaded, selection, InspectSort::InclusiveCpu, None, 20, 8,)
+                    .expect("loaded terminal view should render"),
+                render_terminal_view(&document, selection, InspectSort::InclusiveCpu, None, 20, 8,)
+                    .expect("in-memory terminal view should render")
+            );
+        }
     }
 
     #[test]
