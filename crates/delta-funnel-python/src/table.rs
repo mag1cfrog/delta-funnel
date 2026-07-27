@@ -13,7 +13,7 @@ use pyo3::types::{PyAnyMethods, PyBool};
 use crate::exception::attach_operation_result;
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
-use crate::profiler::{PyProfilerConfig, in_operation_profile_scope, start_operation_profile};
+use crate::profiler::{PyRankedProfileConfig, in_operation_profile_scope, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::session::{PySession, borrow_session_mut, config_py_error};
 
@@ -154,7 +154,7 @@ impl PyTable {
     /// `dict` report. Pass `profile=True` on execute calls to attach a detailed
     /// query execution profile and full operation timeline. Pass `trace_path`
     /// with `profile=True` to export Chrome Trace Event JSON after success.
-    /// Pass `profiler=ProfilerConfig(...)` to record this write and export an
+    /// Pass `profiler=RankedProfileConfig(...)` to record this write and export an
     /// interactive ranked HTML report plus an optional reusable ranked artifact.
     /// Profiling and trace export are not available for dry runs.
     ///
@@ -184,7 +184,7 @@ impl PyTable {
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
         trace_path: Option<PathBuf>,
-        profiler: Option<PyRef<'_, PyProfilerConfig>>,
+        profiler: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<Py<PyAny>> {
         if dry_run == Some(true) && (profile || profiler.is_some()) {
             return Err(config_py_error(
@@ -204,7 +204,8 @@ impl PyTable {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` requires `profile=True` or `profiler=ProfilerConfig(...)`".to_owned(),
+                "`trace_path` requires `profile=True` or `profiler=RankedProfileConfig(...)`"
+                    .to_owned(),
             ));
         }
         let spec = PyMssqlOutputSpec::new(
@@ -271,7 +272,7 @@ impl PyTable {
     /// Pass `progress=True` to force it or `progress=False` to disable it. The
     /// progress display closes before the `Preview` object is returned. Phase
     /// timings are always attached. Pass `profile=True` to also attach the
-    /// detailed execution profile. Pass `profiler=ProfilerConfig(...)` to
+    /// detailed execution profile. Pass `profiler=RankedProfileConfig(...)` to
     /// record this preview and write an interactive ranked HTML report plus an
     /// optional reusable ranked artifact.
     #[pyo3(signature = (limit=20, *, progress=None, profile=false, profiler=None))]
@@ -281,7 +282,7 @@ impl PyTable {
         limit: usize,
         progress: Option<bool>,
         #[pyo3(from_py_with = parse_profile_arg)] profile: bool,
-        profiler: Option<PyRef<'_, PyProfilerConfig>>,
+        profiler: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<PyPreview> {
         let profile_mode = if profile || profiler.is_some() {
             delta_funnel::ExecutionProfileMode::Detailed
@@ -503,7 +504,7 @@ mod tests {
 
         assert!(stub.contains("def export_trace(self, path: str | PathLike[str]) -> None: ..."));
         assert!(stub.contains("trace_path: str | PathLike[str] | None = None"));
-        assert!(stub.contains("profiler: ProfilerConfig | None = None"));
+        assert!(stub.contains("profiler: RankedProfileConfig | None = None"));
     }
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
@@ -514,11 +515,11 @@ mod tests {
             deltafunnel(&module)?;
             let session = module.getattr("Session")?.call0()?;
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
-            let profiler_type = module.getattr("ProfilerConfig")?;
+            let profiler_type = module.getattr("RankedProfileConfig")?;
 
             let preview_output = temp_trace_path("preview-artifact-alias")?.with_extension("html");
             let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item("artifact_output", preview_output.to_string_lossy().as_ref())?;
+            config_kwargs.set_item("artifact_path", preview_output.to_string_lossy().as_ref())?;
             let profiler = profiler_type.call(
                 (preview_output.to_string_lossy().as_ref(),),
                 Some(&config_kwargs),
@@ -542,10 +543,7 @@ mod tests {
             let write_output = temp_trace_path("write-profile")?.with_extension("html");
             let artifact_output = temp_trace_path("write-artifact")?.with_extension("dfprofile");
             let config_kwargs = PyDict::new(py);
-            config_kwargs.set_item(
-                "artifact_output",
-                artifact_output.to_string_lossy().as_ref(),
-            )?;
+            config_kwargs.set_item("artifact_path", artifact_output.to_string_lossy().as_ref())?;
             let profiler = profiler_type.call(
                 (write_output.to_string_lossy().as_ref(),),
                 Some(&config_kwargs),
@@ -709,7 +707,7 @@ mod tests {
             )?;
             let output = temp_trace_path("profiler-unavailable")?.with_extension("html");
             let profiler = module
-                .getattr("ProfilerConfig")?
+                .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("progress", false)?;
@@ -744,7 +742,7 @@ mod tests {
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let output = temp_trace_path("write-profiler-unavailable")?.with_extension("html");
             let profiler = module
-                .getattr("ProfilerConfig")?
+                .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("schema", "dbo")?;

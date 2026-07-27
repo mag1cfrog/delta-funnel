@@ -32,17 +32,27 @@ class DeltaFunnelError(Exception):
     context: object | None
 
 
-class ProfilerConfig:
-    output: Path
-    sample_hz: Literal[100, 1000]
-    artifact_output: Path | None
+class ExecutionProfileConfig:
+    chrome_trace_path: Path | None
 
     def __init__(
         self,
-        output: str | PathLike[str],
+        *,
+        chrome_trace_path: str | PathLike[str] | None = None,
+    ) -> None: ...
+
+
+class RankedProfileConfig:
+    report_path: Path
+    sample_hz: Literal[100, 1000]
+    artifact_path: Path | None
+
+    def __init__(
+        self,
+        report_path: str | PathLike[str],
         *,
         sample_hz: Literal[100, 1000] = 1000,
-        artifact_output: str | PathLike[str] | None = None,
+        artifact_path: str | PathLike[str] | None = None,
     ) -> None: ...
 
 
@@ -90,7 +100,7 @@ class Session:
         dry_run: bool | None = None,
         progress: bool | None = None,
         trace_path: str | PathLike[str] | None = None,
-        profiler: ProfilerConfig | None = None,
+        profiler: RankedProfileConfig | None = None,
     ) -> Report: ...
 
 
@@ -120,7 +130,7 @@ class Table:
         *,
         progress: bool | None = None,
         profile: bool | None = False,
-        profiler: ProfilerConfig | None = None,
+        profiler: RankedProfileConfig | None = None,
     ) -> Preview: ...
 
     def show(self, limit: int = 20, *, progress: bool | None = None) -> None: ...
@@ -147,7 +157,7 @@ class Table:
         progress: bool | None = None,
         profile: bool | None = False,
         trace_path: str | PathLike[str] | None = None,
-        profiler: ProfilerConfig | None = None,
+        profiler: RankedProfileConfig | None = None,
     ) -> Report: ...
 
 

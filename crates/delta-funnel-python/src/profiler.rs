@@ -1,4 +1,4 @@
-//! Python operation profiler configuration and lifecycle entry points.
+//! Python profiling configuration and ranked-profile lifecycle entry points.
 
 use std::path::{Path, PathBuf};
 
@@ -12,20 +12,64 @@ mod capture;
 
 const PROFILER_PHASE: &str = "profiler";
 
-/// Immutable configuration for one operation-scoped profiling report.
-///
-/// Use 1000 Hz for short operations and 100 Hz for longer, bounded-volume captures.
-#[pyclass(frozen, name = "ProfilerConfig", module = "deltafunnel")]
-pub(crate) struct PyProfilerConfig {
-    output: PathBuf,
-    sample_hz: u16,
-    artifact_output: Option<PathBuf>,
+/// Immutable configuration for exact execution profiling.
+#[pyclass(frozen, name = "ExecutionProfileConfig", module = "deltafunnel")]
+pub(crate) struct PyExecutionProfileConfig {
+    chrome_trace_path: Option<PathBuf>,
 }
 
-impl PyProfilerConfig {
+impl PyExecutionProfileConfig {
+    pub(crate) fn chrome_trace_path(&self) -> Option<&Path> {
+        self.chrome_trace_path.as_deref()
+    }
+}
+
+#[pymethods]
+impl PyExecutionProfileConfig {
+    #[new]
+    #[pyo3(signature = (*, chrome_trace_path=None))]
+    fn new(py: Python<'_>, chrome_trace_path: Option<PathBuf>) -> PyResult<Self> {
+        if chrome_trace_path
+            .as_deref()
+            .is_some_and(|path| path.file_name().is_none())
+        {
+            return Err(config_py_error(
+                py,
+                "invalid_option_value",
+                "`chrome_trace_path` must name a file".to_owned(),
+            ));
+        }
+        Ok(Self { chrome_trace_path })
+    }
+
+    #[getter]
+    fn get_chrome_trace_path(&self) -> Option<&Path> {
+        self.chrome_trace_path()
+    }
+
+    fn __repr__(&self) -> String {
+        let chrome_trace_path = self
+            .chrome_trace_path
+            .as_ref()
+            .map_or_else(|| "None".to_owned(), |path| format!("{path:?}"));
+        format!("deltafunnel.ExecutionProfileConfig(chrome_trace_path={chrome_trace_path})")
+    }
+}
+
+/// Immutable configuration for one operation-scoped ranked profiling report.
+///
+/// Use 1000 Hz for short operations and 100 Hz for longer, bounded-volume captures.
+#[pyclass(frozen, name = "RankedProfileConfig", module = "deltafunnel")]
+pub(crate) struct PyRankedProfileConfig {
+    report_path: PathBuf,
+    sample_hz: u16,
+    artifact_path: Option<PathBuf>,
+}
+
+impl PyRankedProfileConfig {
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
-    fn output_path(&self) -> &Path {
-        &self.output
+    fn report_path(&self) -> &Path {
+        &self.report_path
     }
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
@@ -34,48 +78,48 @@ impl PyProfilerConfig {
     }
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
-    fn artifact_output_path(&self) -> Option<&Path> {
-        self.artifact_output.as_deref()
+    fn artifact_path(&self) -> Option<&Path> {
+        self.artifact_path.as_deref()
     }
 }
 
 #[pymethods]
-impl PyProfilerConfig {
+impl PyRankedProfileConfig {
     #[new]
-    #[pyo3(signature = (output, *, sample_hz=1000, artifact_output=None))]
+    #[pyo3(signature = (report_path, *, sample_hz=1000, artifact_path=None))]
     fn new(
         py: Python<'_>,
-        output: PathBuf,
+        report_path: PathBuf,
         #[pyo3(from_py_with = parse_sample_hz)] sample_hz: u16,
-        artifact_output: Option<PathBuf>,
+        artifact_path: Option<PathBuf>,
     ) -> PyResult<Self> {
-        if output.file_name().is_none() {
+        if report_path.file_name().is_none() {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`output` must name a file".to_owned(),
+                "`report_path` must name a file".to_owned(),
             ));
         }
-        if artifact_output
+        if artifact_path
             .as_deref()
-            .is_some_and(|output| output.file_name().is_none())
+            .is_some_and(|path| path.file_name().is_none())
         {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`artifact_output` must name a file".to_owned(),
+                "`artifact_path` must name a file".to_owned(),
             ));
         }
         Ok(Self {
-            output,
+            report_path,
             sample_hz,
-            artifact_output,
+            artifact_path,
         })
     }
 
     #[getter]
-    fn output(&self) -> &Path {
-        &self.output
+    fn get_report_path(&self) -> &Path {
+        &self.report_path
     }
 
     #[getter]
@@ -84,24 +128,25 @@ impl PyProfilerConfig {
     }
 
     #[getter]
-    fn artifact_output(&self) -> Option<&Path> {
-        self.artifact_output.as_deref()
+    fn get_artifact_path(&self) -> Option<&Path> {
+        self.artifact_path.as_deref()
     }
 
     fn __repr__(&self) -> String {
-        let artifact_output = self
-            .artifact_output
+        let artifact_path = self
+            .artifact_path
             .as_ref()
-            .map_or_else(|| "None".to_owned(), |output| format!("{output:?}"));
+            .map_or_else(|| "None".to_owned(), |path| format!("{path:?}"));
         format!(
-            "deltafunnel.ProfilerConfig(output={:?}, sample_hz={}, artifact_output={})",
-            self.output, self.sample_hz, artifact_output
+            "deltafunnel.RankedProfileConfig(report_path={:?}, sample_hz={}, artifact_path={})",
+            self.report_path, self.sample_hz, artifact_path
         )
     }
 }
 
 pub(crate) fn add_profiler(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyProfilerConfig>()
+    module.add_class::<PyExecutionProfileConfig>()?;
+    module.add_class::<PyRankedProfileConfig>()
 }
 
 pub(crate) struct OperationProfile {
@@ -121,7 +166,7 @@ pub(crate) fn in_operation_profile_scope<T>(
 
 pub(crate) fn start_operation_profile(
     py: Python<'_>,
-    config: Option<&PyProfilerConfig>,
+    config: Option<&PyRankedProfileConfig>,
     trace_path: Option<&Path>,
 ) -> PyResult<Option<OperationProfile>> {
     let Some(config) = config else {
@@ -140,10 +185,10 @@ pub(crate) fn start_operation_profile(
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
     {
-        let output = resolve_output_path(py, config.output_path())?;
+        let output = resolve_output_path(py, config.report_path())?;
         let artifact_output = config
-            .artifact_output_path()
-            .map(|output| resolve_output_path(py, output))
+            .artifact_path()
+            .map(|path| resolve_output_path(py, path))
             .transpose()?;
         validate_output_paths(py, &output, artifact_output.as_deref(), trace_path)?;
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
@@ -179,7 +224,7 @@ fn validate_output_paths(
         return Err(config_py_error(
             py,
             "invalid_option_value",
-            "`ProfilerConfig.output` and `ProfilerConfig.artifact_output` must name different files"
+            "`RankedProfileConfig.report_path` and `RankedProfileConfig.artifact_path` must name different files"
                 .to_owned(),
         ));
     }
@@ -188,7 +233,8 @@ fn validate_output_paths(
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` and `ProfilerConfig.output` must name different files".to_owned(),
+                "`trace_path` and `RankedProfileConfig.report_path` must name different files"
+                    .to_owned(),
             ));
         }
         if let Some(artifact_output) = artifact_output
@@ -197,7 +243,7 @@ fn validate_output_paths(
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` and `ProfilerConfig.artifact_output` must name different files"
+                "`trace_path` and `RankedProfileConfig.artifact_path` must name different files"
                     .to_owned(),
             ));
         }
@@ -312,32 +358,78 @@ mod tests {
     use crate::deltafunnel;
 
     #[test]
-    fn profiler_config_exposes_one_immutable_validated_python_contract() -> PyResult<()> {
+    fn profile_configs_expose_distinct_immutable_python_contracts() -> PyResult<()> {
         let stub = include_str!("../deltafunnel.pyi");
-        assert!(stub.contains("class ProfilerConfig:"));
+        assert!(stub.contains("class ExecutionProfileConfig:"));
+        assert!(stub.contains("chrome_trace_path: str | PathLike[str] | None = None"));
+        assert!(stub.contains("class RankedProfileConfig:"));
+        assert!(stub.contains("report_path: str | PathLike[str]"));
         assert!(stub.contains("sample_hz: Literal[100, 1000] = 1000"));
-        assert!(stub.contains("artifact_output: str | PathLike[str] | None = None"));
+        assert!(stub.contains("artifact_path: str | PathLike[str] | None = None"));
 
         Python::attach(|py| {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
-            let profiler = module.getattr("ProfilerConfig")?;
+            assert!(module.getattr("ProfilerConfig").is_err());
 
-            let default = profiler.call1(("query.profile.html",))?;
+            let execution_profile = module.getattr("ExecutionProfileConfig")?;
+            let default_execution = execution_profile.call0()?;
             assert_eq!(
-                default.getattr("output")?.extract::<PathBuf>()?,
+                default_execution
+                    .getattr("chrome_trace_path")?
+                    .extract::<Option<PathBuf>>()?,
+                None
+            );
+            assert_eq!(
+                default_execution.repr()?.to_str()?,
+                "deltafunnel.ExecutionProfileConfig(chrome_trace_path=None)"
+            );
+
+            let pathlib_path = py
+                .import("pathlib")?
+                .getattr("Path")?
+                .call1(("query.trace.json",))?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("chrome_trace_path", pathlib_path)?;
+            let execution_with_trace = execution_profile.call((), Some(&kwargs))?;
+            assert_eq!(
+                execution_with_trace
+                    .getattr("chrome_trace_path")?
+                    .extract::<PathBuf>()?,
+                PathBuf::from("query.trace.json")
+            );
+            assert!(
+                execution_with_trace
+                    .setattr("chrome_trace_path", "other.trace.json")
+                    .expect_err("the config must be immutable")
+                    .is_instance_of::<PyAttributeError>(py)
+            );
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("chrome_trace_path", "")?;
+            let empty_trace = execution_profile
+                .call((), Some(&kwargs))
+                .expect_err("an empty Chrome trace path must be rejected");
+            assert_eq!(
+                empty_trace.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+
+            let ranked_profile = module.getattr("RankedProfileConfig")?;
+            let default = ranked_profile.call1(("query.profile.html",))?;
+            assert_eq!(
+                default.getattr("report_path")?.extract::<PathBuf>()?,
                 PathBuf::from("query.profile.html")
             );
             assert_eq!(default.getattr("sample_hz")?.extract::<u16>()?, 1000);
             assert_eq!(
                 default
-                    .getattr("artifact_output")?
+                    .getattr("artifact_path")?
                     .extract::<Option<PathBuf>>()?,
                 None
             );
             assert_eq!(
                 default.repr()?.to_str()?,
-                "deltafunnel.ProfilerConfig(output=\"query.profile.html\", sample_hz=1000, artifact_output=None)"
+                "deltafunnel.RankedProfileConfig(report_path=\"query.profile.html\", sample_hz=1000, artifact_path=None)"
             );
             assert!(
                 default
@@ -352,16 +444,16 @@ mod tests {
                 .call1(("lower-volume.profile.html",))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("sample_hz", 100)?;
-            kwargs.set_item("artifact_output", "lower-volume.dfprofile")?;
-            let lower_volume = profiler.call((pathlib_path,), Some(&kwargs))?;
+            kwargs.set_item("artifact_path", "lower-volume.dfprofile")?;
+            let lower_volume = ranked_profile.call((pathlib_path,), Some(&kwargs))?;
             assert_eq!(
-                lower_volume.getattr("output")?.extract::<PathBuf>()?,
+                lower_volume.getattr("report_path")?.extract::<PathBuf>()?,
                 PathBuf::from("lower-volume.profile.html")
             );
             assert_eq!(lower_volume.getattr("sample_hz")?.extract::<u16>()?, 100);
             assert_eq!(
                 lower_volume
-                    .getattr("artifact_output")?
+                    .getattr("artifact_path")?
                     .extract::<PathBuf>()?,
                 PathBuf::from("lower-volume.dfprofile")
             );
@@ -375,7 +467,7 @@ mod tests {
             for invalid in invalid_values {
                 let kwargs = PyDict::new(py);
                 kwargs.set_item("sample_hz", invalid)?;
-                let error = profiler
+                let error = ranked_profile
                     .call(("query.profile.html",), Some(&kwargs))
                     .expect_err("invalid sample frequency must be rejected");
                 let value = error.value(py);
@@ -386,7 +478,7 @@ mod tests {
                 );
             }
 
-            let empty_output = profiler
+            let empty_output = ranked_profile
                 .call1(("",))
                 .expect_err("an empty output path must be rejected");
             assert_eq!(
@@ -397,8 +489,8 @@ mod tests {
                 "invalid_option_value"
             );
             let kwargs = PyDict::new(py);
-            kwargs.set_item("artifact_output", "")?;
-            let empty_artifact = profiler
+            kwargs.set_item("artifact_path", "")?;
+            let empty_artifact = ranked_profile
                 .call(("query.profile.html",), Some(&kwargs))
                 .expect_err("an empty artifact output path must be rejected");
             assert_eq!(
@@ -416,14 +508,14 @@ mod tests {
     #[test]
     fn profiler_outputs_must_resolve_to_distinct_files() -> PyResult<()> {
         Python::attach(|py| {
-            let config = PyProfilerConfig {
-                output: PathBuf::from("profile.html"),
+            let config = PyRankedProfileConfig {
+                report_path: PathBuf::from("profile.html"),
                 sample_hz: 1_000,
-                artifact_output: Some(PathBuf::from("./profile.html")),
+                artifact_path: Some(PathBuf::from("./profile.html")),
             };
-            let output = resolve_output_path(py, config.output_path())?;
+            let output = resolve_output_path(py, config.report_path())?;
             let artifact_output = config
-                .artifact_output_path()
+                .artifact_path()
                 .map(|output| resolve_output_path(py, output))
                 .transpose()?;
             assert!(output.is_absolute());
@@ -435,14 +527,14 @@ mod tests {
                 "invalid_option_value"
             );
 
-            let config = PyProfilerConfig {
-                output: PathBuf::from("profile.html"),
+            let config = PyRankedProfileConfig {
+                report_path: PathBuf::from("profile.html"),
                 sample_hz: 1_000,
-                artifact_output: Some(PathBuf::from("profile.dfprofile")),
+                artifact_path: Some(PathBuf::from("profile.dfprofile")),
             };
-            let output = resolve_output_path(py, config.output_path())?;
+            let output = resolve_output_path(py, config.report_path())?;
             let artifact_output = config
-                .artifact_output_path()
+                .artifact_path()
                 .map(|output| resolve_output_path(py, output))
                 .transpose()?;
             let trace_path = resolve_output_path(py, Path::new("./profile.dfprofile"))?;

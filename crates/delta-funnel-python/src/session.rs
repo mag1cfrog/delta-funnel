@@ -9,7 +9,7 @@ use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
 use crate::exception::{attach_operation_result, delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
 use crate::output::PyMssqlOutputSpec;
-use crate::profiler::{PyProfilerConfig, in_operation_profile_scope, start_operation_profile};
+use crate::profiler::{PyRankedProfileConfig, in_operation_profile_scope, start_operation_profile};
 use crate::progress::PythonProgress;
 use crate::table::{PyTable, TraceDestination};
 
@@ -147,7 +147,7 @@ impl PySession {
     /// Trace Event JSON file for the complete write-all wall clock. Cache
     /// profiles are under `report["cache"]["aliases"]`, or under
     /// `error.context["aliases"]` for cache orchestration failures.
-    /// Pass `profiler=ProfilerConfig(...)` to record the complete write-all
+    /// Pass `profiler=RankedProfileConfig(...)` to record the complete write-all
     /// operation and export an interactive ranked HTML report plus an optional
     /// reusable ranked artifact.
     /// Returns a plain Python `dict` report. One consolidated progress display
@@ -163,7 +163,7 @@ impl PySession {
         dry_run: Option<bool>,
         progress: Option<bool>,
         trace_path: Option<PathBuf>,
-        profiler: Option<PyRef<'_, PyProfilerConfig>>,
+        profiler: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<Py<PyAny>> {
         for output in &outputs {
             if !output.belongs_to_session(py, &slf) {
@@ -228,7 +228,7 @@ impl PySession {
             return Err(config_py_error(
                 py,
                 "invalid_option_value",
-                "`trace_path` requires `options={'profile': True}` or `profiler=ProfilerConfig(...)`"
+                "`trace_path` requires `options={'profile': True}` or `profiler=RankedProfileConfig(...)`"
                     .to_owned(),
             ));
         }
@@ -1367,7 +1367,7 @@ mod tests {
             .map_or("", |(signature, _)| signature);
         assert!(signature.contains("options: WriteAllExecutionOptions | None = None"));
         assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
-        assert!(signature.contains("profiler: ProfilerConfig | None = None"));
+        assert!(signature.contains("profiler: RankedProfileConfig | None = None"));
         assert!(!signature.contains("options: Options"));
     }
 
@@ -1423,7 +1423,7 @@ mod tests {
             let output = env_unique_path("write-all-output-alias")?.with_extension("html");
 
             let profiler = module
-                .getattr("ProfilerConfig")?
+                .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("trace_path", output.to_string_lossy().as_ref())?;
@@ -1435,9 +1435,9 @@ mod tests {
             assert!(!output.exists());
 
             let profiler_kwargs = PyDict::new(py);
-            profiler_kwargs.set_item("artifact_output", output.to_string_lossy().as_ref())?;
+            profiler_kwargs.set_item("artifact_path", output.to_string_lossy().as_ref())?;
             let profiler = module
-                .getattr("ProfilerConfig")?
+                .getattr("RankedProfileConfig")?
                 .call((output.to_string_lossy().as_ref(),), Some(&profiler_kwargs))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("profiler", profiler)?;
@@ -1451,7 +1451,7 @@ mod tests {
             let hard_link = output.with_extension("json");
             fs::hard_link(&output, &hard_link).map_err(io_py_error)?;
             let profiler = module
-                .getattr("ProfilerConfig")?
+                .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("trace_path", hard_link.to_string_lossy().as_ref())?;
@@ -1478,7 +1478,7 @@ mod tests {
             let outputs = PyList::empty(py);
             let output = env_unique_path("write-all-profiler-unavailable")?.with_extension("html");
             let profiler = module
-                .getattr("ProfilerConfig")?
+                .getattr("RankedProfileConfig")?
                 .call1((output.to_string_lossy().as_ref(),))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("profiler", profiler)?;

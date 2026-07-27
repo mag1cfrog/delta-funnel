@@ -192,7 +192,7 @@ mod tests {
 
         assert!(signature.contains("profile: bool | None = False"));
         assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
-        assert!(signature.contains("profiler: ProfilerConfig | None = None"));
+        assert!(signature.contains("profiler: RankedProfileConfig | None = None"));
     }
 
     #[test]
