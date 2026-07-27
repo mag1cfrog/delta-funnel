@@ -194,10 +194,9 @@ def write_fake_trace_processor(path):
         "$query == *'CREATE PERFETTO TABLE delta_funnel_capture_health AS'* && "
         "$query == *record_kind* ]]; then\n"
         "  if [[ -n ${DELTA_FUNNEL_TEST_REPORT_BLOCK_FILE:-} ]]; then\n"
-        "    : >\"$DELTA_FUNNEL_TEST_REPORT_BLOCK_FILE\"\n"
-        "    parent=$PPID\n"
-        "    while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done\n"
-        "    exit 143\n"
+        "    printf '%s\\n' \"$$\" >\"$DELTA_FUNNEL_TEST_REPORT_BLOCK_FILE\"\n"
+        "    trap 'exit 143' TERM INT HUP\n"
+        "    while :; do sleep 1; done\n"
         "  fi\n"
         "  if [[ ${DELTA_FUNNEL_TEST_REPORT_FAILURE:-0} == 1 ]]; then\n"
         "    exit 65\n"
@@ -206,10 +205,9 @@ def write_fake_trace_processor(path):
         "elif [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *selected_operations* ]]; then\n"
         "  if [[ -n ${DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE:-} ]]; then\n"
-        "    : >\"$DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE\"\n"
-        "    parent=$PPID\n"
-        "    while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done\n"
-        "    exit 143\n"
+        "    printf '%s\\n' \"$$\" >\"$DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE\"\n"
+        "    trap 'exit 143' TERM INT HUP\n"
+        "    while :; do sleep 1; done\n"
         "  fi\n"
         "  if [[ ${DELTA_FUNNEL_TEST_HEALTH_FAILURE:-0} == 1 ]]; then\n"
         "    exit 65\n"
@@ -696,6 +694,19 @@ with tempfile.TemporaryDirectory() as temp_dir:
         )
         return process, trace, report, status, stderr
 
+    def assert_process_stopped(marker, stage):
+        pid = int(marker.read_text())
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                os.kill(pid, signal.SIGKILL)
+                raise SystemExit(f"interrupted {stage} left process {pid} running")
+            time.sleep(0.01)
+
     workload_started = temp.joinpath("workload-started")
     interrupted, interrupted_trace, interrupted_report, status, _ = (
         interrupt_capture(
@@ -736,6 +747,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         or "do not retry" not in stderr
     ):
         raise SystemExit("health interruption replaced the completed workload result")
+    assert_process_stopped(health_started, "health check")
 
     report_started = temp.joinpath("report-started")
     interrupted, trace, report, status, stderr = interrupt_capture(
@@ -754,6 +766,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         or "do not retry" not in stderr
     ):
         raise SystemExit("report interruption replaced completed capture outcomes")
+    assert_process_stopped(report_started, "report generation")
 
 if not callable(deltafunnel.init_perfetto_diagnostics):
     raise SystemExit("Perfetto diagnostics initializer is not callable")

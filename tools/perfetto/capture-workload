@@ -105,7 +105,7 @@ fi
 tracebox=${TRACEBOX:-$script_dir/delta-funnel-tracebox}
 trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
 perf=${PERF:-perf}
-for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od; do
+for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od setsid; do
   if ! command -v "$executable" >/dev/null 2>&1; then
     printf 'capture-workload: required command is unavailable: %s\n' \
       "$executable" >&2
@@ -278,6 +278,7 @@ stop_diagnostics() {
   local signal=${interruption_signal:-TERM}
   local status
   kill "-$signal" "$diagnostics_pid" 2>/dev/null || true
+  kill "-$signal" -- "-$diagnostics_pid" 2>/dev/null || true
   if wait "$diagnostics_pid" 2>/dev/null; then
     status=0
   else
@@ -406,7 +407,8 @@ if [[ -n $configured_file_cap_bytes ]]; then
   health_args+=("$configured_file_cap_bytes")
 fi
 TRACE_PROCESSOR_SHELL=$trace_processor \
-  "$script_dir/capture-health" "${health_args[@]}" >"$health_output_file" &
+  setsid --wait "$script_dir/capture-health" "${health_args[@]}" \
+  >"$health_output_file" &
 diagnostics_pid=$!
 diagnostics_stage=health
 if wait "$diagnostics_pid"; then
@@ -419,7 +421,8 @@ diagnostics_pid=
 diagnostics_stage=
 
 if (( health_status == 0 )); then
-  "$report_cli" report "$capture_path" --output "$report_path" --no-clobber &
+  setsid --wait "$report_cli" report "$capture_path" \
+    --output "$report_path" --no-clobber &
   diagnostics_pid=$!
   diagnostics_stage=report
   if wait "$diagnostics_pid"; then
