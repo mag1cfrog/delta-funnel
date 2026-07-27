@@ -371,7 +371,10 @@ fn preflight_llvm_symbolizer_with(program: &OsStr) -> Result<(), ProfilerFailure
             } else {
                 "llvm_symbolizer_start_failed"
             };
-            ProfilerFailure::new(kind, "llvm-symbolizer could not be started")
+            ProfilerFailure::new(
+                kind,
+                format!("llvm-symbolizer could not be started: {error}"),
+            )
         })
         .and_then(|status| {
             status.success().then_some(()).ok_or_else(|| {
@@ -762,6 +765,16 @@ mod tests {
     #[test]
     fn llvm_symbolizer_preflight_requires_json_output() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
+        let missing = directory.path().join("missing-symbolizer");
+        let error = preflight_llvm_symbolizer_with(missing.as_os_str())
+            .expect_err("a missing executable must fail preflight");
+        assert_eq!(error.kind, "llvm_symbolizer_unavailable");
+        assert!(
+            error
+                .message
+                .starts_with("llvm-symbolizer could not be started: ")
+        );
+
         let version_only = directory.path().join("version-only-symbolizer");
         fs::write(&version_only, "#!/bin/sh\n[ \"${1:-}\" = --version ]\n")?;
         let mut permissions = fs::metadata(&version_only)?.permissions();
