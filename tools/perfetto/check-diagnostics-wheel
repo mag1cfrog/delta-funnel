@@ -433,7 +433,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
             **environment,
         }
 
-    def run_capture(name, workload="pass", suffix=".pftrace", **environment):
+    def run_capture(
+        name,
+        workload="pass",
+        suffix=".pftrace",
+        target=sys.executable,
+        **environment,
+    ):
         trace, report = capture_artifacts(name, suffix)
         result = subprocess.run(
             [
@@ -441,7 +447,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
                 "--output",
                 trace,
                 "--",
-                sys.executable,
+                target,
                 "-c",
                 workload,
             ],
@@ -521,6 +527,30 @@ with tempfile.TemporaryDirectory() as temp_dir:
         raise SystemExit("automatic report generation modified the raw trace")
     if not report.is_file() or "Delta Funnel preview" not in report.read_text():
         raise SystemExit("capture-workload did not generate the ranked report")
+
+    incomplete_bin = temp.joinpath("incomplete-report-bin")
+    incomplete_bin.mkdir()
+    incomplete_python = incomplete_bin.joinpath("python")
+    incomplete_python.symlink_to(sys.executable)
+    incomplete_report_cli = incomplete_bin.joinpath("delta-funnel-perfetto")
+    incomplete_report_cli.write_text("#!/usr/bin/env bash\nexit 0\n")
+    incomplete_report_cli.chmod(0o700)
+    missing_report, trace, report, status = run_capture(
+        "missing-report",
+        target=incomplete_python,
+    )
+    if (
+        missing_report.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "0"
+        or status["health_status"] != "0"
+        or status["report_status"] != "73"
+        or "report" in status
+        or not trace.is_file()
+        or report.exists()
+        or "do not retry" not in missing_report.stderr
+    ):
+        raise SystemExit("successful report command fabricated a missing artifact")
 
     failed, trace, report, status = run_capture(
         "workload-failure",

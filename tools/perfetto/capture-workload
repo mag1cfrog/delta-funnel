@@ -267,7 +267,14 @@ finish_health() {
 finish_report() {
   report_status=$1
   if (( report_status == 0 )); then
-    report_output=$report_path
+    if [[ -f $report_path && ! -L $report_path && -r $report_path &&
+          -s $report_path ]]; then
+      report_output=$report_path
+    else
+      report_status=73
+      printf '%s\n' \
+        'capture-workload: report command produced no complete report' >&2
+    fi
   fi
 }
 
