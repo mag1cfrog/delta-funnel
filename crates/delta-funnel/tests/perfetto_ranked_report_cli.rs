@@ -240,6 +240,15 @@ fn rejects_malicious_artifacts_without_trace_processor() -> Result<(), Box<dyn s
     invalid_archive[32..40].copy_from_slice(&payload_length.to_le_bytes());
     cases.push(("invalid-archive", invalid_archive, "invalid_archive"));
 
+    let mut invalid_profile =
+        include_bytes!("../src/perfetto_profile/testdata/ranked_profile_v1.dfprofile").to_vec();
+    let semantic_kind = invalid_profile
+        .windows(b"operation".len())
+        .position(|window| window == b"operation")
+        .ok_or("fixture does not contain its semantic kind")?;
+    invalid_profile[semantic_kind + b"operation".len() - 1] = b'x';
+    cases.push(("invalid-profile", invalid_profile, "invalid_ranked_profile"));
+
     let marker = directory.path().join("trace-processor-started");
     let trace_processor = directory.path().join("trace_processor_shell");
     write_executable(

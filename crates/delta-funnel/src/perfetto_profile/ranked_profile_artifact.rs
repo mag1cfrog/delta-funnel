@@ -83,13 +83,9 @@ pub(super) fn read_ranked_profile_artifact(
     let payload = parse_header(&bytes)?;
     let archived = rkyv::access::<ArchivedRankedProfileDocument, RkyvError>(&bytes[payload])
         .map_err(|_| input_failure("invalid_archive", "artifact payload is not a valid archive"))?;
-    archived.validate().map_err(|error| {
-        RankedReportFailure::new(
-            RankedReportFailurePhase::AggregateValidation,
-            "invalid_ranked_profile",
-            error.to_string(),
-        )
-    })?;
+    archived
+        .validate()
+        .map_err(|error| input_failure("invalid_ranked_profile", error.to_string()))?;
     rkyv::deserialize::<RankedProfileDocument, RkyvError>(archived).map_err(|_| {
         input_failure(
             "artifact_deserialize_failed",
@@ -807,6 +803,7 @@ mod tests {
             .expect("invalid test artifact should be written");
         let error = read_ranked_profile_artifact(&input)
             .expect_err("invalid semantic document should be rejected");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Input);
         assert_eq!(error.kind(), "invalid_ranked_profile");
         assert_eq!(error.to_string(), expected);
     }
