@@ -63,6 +63,17 @@ pub fn output_paths_alias(left: &Path, right: &Path) -> io::Result<bool> {
     }
 }
 
+fn open_profile_input(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
 fn resolve_output_identity(path: &Path) -> io::Result<PathBuf> {
     let mut resolved = PathBuf::new();
     for component in std::path::absolute(path)?.components() {

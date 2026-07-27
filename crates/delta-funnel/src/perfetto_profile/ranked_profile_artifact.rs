@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{Read, Write};
 use std::mem;
 use std::ops::Range;
@@ -57,7 +56,7 @@ impl RankedProfileArtifact {
 }
 
 pub(super) fn has_ranked_profile_artifact_magic(input: &Path) -> Result<bool, RankedReportFailure> {
-    let mut file = File::open(input)
+    let mut file = super::open_profile_input(input)
         .map_err(|_| input_failure("input_unreadable", "profile input could not be read"))?;
     let mut magic = [0_u8; MAGIC.len()];
     match file.read_exact(&mut magic) {
@@ -73,7 +72,7 @@ pub(super) fn has_ranked_profile_artifact_magic(input: &Path) -> Result<bool, Ra
 pub(super) fn read_ranked_profile_artifact(
     input: &Path,
 ) -> Result<RankedProfileArtifact, RankedReportFailure> {
-    let mut file = File::open(input)
+    let mut file = super::open_profile_input(input)
         .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
     let file_length = file
         .metadata()
@@ -339,6 +338,8 @@ fn output_failure(kind: &'static str, message: &'static str) -> RankedReportFail
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use super::*;
@@ -537,6 +538,22 @@ mod tests {
             1
         );
 
+        let blocked_output = directory.path().join("existing-directory");
+        fs::create_dir(&blocked_output).expect("blocking directory should be created");
+        fs::write(blocked_output.join("keep-me"), "unchanged").expect("sentinel should be written");
+        let error = write_ranked_profile_artifact(
+            &blocked_output,
+            &document,
+            ExistingOutputPolicy::Replace,
+        )
+        .expect_err("an artifact cannot replace an existing directory");
+        assert_eq!(error.kind(), "persist_failed");
+        assert_eq!(
+            fs::read_to_string(blocked_output.join("keep-me"))
+                .expect("sentinel should remain readable"),
+            "unchanged"
+        );
+
         let mut invalid = document;
         invalid.semantics[0].semantic_kind = "phase".to_owned();
         let error = write_ranked_profile_artifact(&output, &invalid, ExistingOutputPolicy::Replace)
@@ -546,6 +563,31 @@ mod tests {
             fs::read(&output).expect("artifact should remain readable"),
             original
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_does_not_follow_existing_output_links() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let target = directory.path().join("target");
+        fs::write(&target, "unchanged").expect("target should be written");
+        let replace_link = |output: &Path| {
+            write_ranked_profile_artifact(output, &document(), ExistingOutputPolicy::Replace)
+                .expect("artifact should replace the link itself");
+            assert_eq!(
+                fs::read_to_string(&target).expect("target should remain readable"),
+                "unchanged"
+            );
+            read_ranked_profile_artifact(output).expect("replacement should be a valid artifact");
+        };
+
+        let hard_link = directory.path().join("hard-link.dfprofile");
+        fs::hard_link(&target, &hard_link).expect("hard link should be created");
+        replace_link(&hard_link);
+
+        let symbolic_link = directory.path().join("symbolic-link.dfprofile");
+        symlink(&target, &symbolic_link).expect("symbolic link should be created");
+        replace_link(&symbolic_link);
     }
 
     #[test]

@@ -2,15 +2,21 @@
 
 #![cfg(all(feature = "perfetto-profile", unix))]
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 #[cfg(target_os = "linux")]
-use std::process::Stdio;
+use std::process::{Output, Stdio};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[test]
 fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dyn std::error::Error>>
@@ -200,6 +206,49 @@ fn rejects_malicious_artifacts_without_trace_processor() -> Result<(), Box<dyn s
 
 #[test]
 #[cfg(target_os = "linux")]
+fn rejects_named_pipe_inputs_without_hanging() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("blocking.dfprofile");
+    let input_c = CString::new(input.as_os_str().as_bytes())?;
+    if unsafe { libc::mkfifo(input_c.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+
+    let marker = directory.path().join("trace-processor-started");
+    let trace_processor = directory.path().join("trace_processor_shell");
+    write_executable(
+        &trace_processor,
+        "#!/bin/sh\n\
+         set -eu\n\
+         : >\"$DELTA_FUNNEL_TRACE_PROCESSOR_MARKER\"\n\
+         exit 99\n",
+    )?;
+
+    for command_name in ["inspect", "report"] {
+        let report = directory
+            .path()
+            .join(format!("{command_name}.profile.html"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"));
+        command.arg(command_name).arg(&input);
+        if command_name == "report" {
+            command.arg("--output").arg(&report);
+        }
+        command
+            .env("TRACE_PROCESSOR_SHELL", &trace_processor)
+            .env("DELTA_FUNNEL_TRACE_PROCESSOR_MARKER", &marker);
+        let result = output_with_timeout(command, Duration::from_secs(2))?;
+        assert_eq!(result.status.code(), Some(66));
+        let failure: serde_json::Value = serde_json::from_slice(&result.stderr)?;
+        assert_eq!(failure["phase"], "input");
+        assert_eq!(failure["kind"], "not_file");
+        assert!(!report.exists());
+        assert!(!marker.exists());
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn reports_help_output_failures_with_stable_diagnostics() -> Result<(), Box<dyn std::error::Error>>
 {
     let result = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
@@ -211,6 +260,25 @@ fn reports_help_output_failures_with_stable_diagnostics() -> Result<(), Box<dyn 
     assert_eq!(failure["phase"], "output");
     assert_eq!(failure["kind"], "terminal_write_failed");
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<Output, Box<dyn std::error::Error>> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "command did not exit").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(child.wait_with_output()?)
 }
 
 fn write_executable(path: &Path, contents: &str) -> io::Result<()> {

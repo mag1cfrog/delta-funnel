@@ -1,7 +1,9 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -1015,7 +1017,8 @@ pub(super) fn preflight_ranked_report_paths(
 pub(super) fn preflight_ranked_profile_input(
     input: &Path,
 ) -> Result<PathBuf, RankedReportPathError> {
-    let input_file = File::open(input).map_err(RankedReportPathError::InputUnreadable)?;
+    let input_file =
+        super::open_profile_input(input).map_err(RankedReportPathError::InputUnreadable)?;
     if !input_file
         .metadata()
         .map_err(RankedReportPathError::InputUnreadable)?
