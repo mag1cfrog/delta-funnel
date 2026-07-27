@@ -223,7 +223,7 @@ emit_status() {
 
 stop_tracebox() {
   if [[ -z $trace_pid ]]; then
-    return
+    return 0
   fi
   if stop_process_group \
     "$trace_pid" TERM "$tracebox_stop_grace_polls" leader; then
@@ -291,7 +291,7 @@ stop_process_group() {
 
 stop_workload() {
   if [[ -z $workload_pid ]]; then
-    return
+    return 0
   fi
   local signal=${interruption_signal:-TERM}
   if stop_process_group "$workload_pid" "$signal"; then
@@ -306,7 +306,7 @@ finish_health() {
   local status=$1
   if (( status != 0 )); then
     health_status=$status
-    return
+    return 0
   fi
 
   health_output=$(<"$health_output_file")
@@ -336,7 +336,7 @@ finish_report() {
 
 stop_diagnostics() {
   if [[ -z $diagnostics_pid ]]; then
-    return
+    return 0
   fi
   local signal=${interruption_signal:-TERM}
   local status
