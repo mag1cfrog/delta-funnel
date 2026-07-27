@@ -100,7 +100,7 @@ jobs:
       - name: Cache Cargo and diagnostics target
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: testpypi-diagnostics-linux-x86-64
+          shared-key: testpypi-diagnostics-linux-x86-64-assets-v1
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build diagnostics wheel
@@ -115,6 +115,7 @@ jobs:
             ) }}
         with:
           command: build
+          docker-options: -e DELTA_FUNNEL_PERFETTO_ASSET_HASH
           maturin-version: v1.13.3
           rust-toolchain: ${{ steps.rust-version.outputs.version }}
           manylinux: "2_28"
