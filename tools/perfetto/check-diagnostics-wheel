@@ -410,7 +410,9 @@ with tempfile.TemporaryDirectory() as temp_dir:
     fake_tracebox.write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        "if [[ \" $* \" == *' --query '* ]]; then exit 0; fi\n"
+        "if [[ \" $* \" == *' --query '* ]]; then\n"
+        "  exit \"${DELTA_FUNNEL_TEST_TRACEBOX_QUERY_STATUS:-0}\"\n"
+        "fi\n"
         "output=\n"
         "while (( $# > 0 )); do\n"
         "  if [[ $1 == --out ]]; then output=$2; shift 2; else shift; fi\n"
@@ -426,7 +428,10 @@ with tempfile.TemporaryDirectory() as temp_dir:
     )
     fake_tracebox.chmod(0o700)
     fake_perf = temp.joinpath("perf")
-    fake_perf.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_perf.write_text(
+        "#!/usr/bin/env bash\n"
+        "exit \"${DELTA_FUNNEL_TEST_PERF_STATUS:-0}\"\n"
+    )
     fake_perf.chmod(0o700)
 
     def capture_artifacts(name, suffix=".pftrace"):
@@ -472,6 +477,57 @@ with tempfile.TemporaryDirectory() as temp_dir:
             else {}
         )
         return result, trace, report, fields
+
+    fake_bin = temp.joinpath("fake-bin")
+    fake_bin.mkdir()
+    fake_awk = fake_bin.joinpath("awk")
+    fake_awk.write_text("#!/usr/bin/env bash\nexit 74\n")
+    fake_awk.chmod(0o700)
+
+    config_failure, trace, report, status = run_capture(
+        "config-failure",
+        PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+    )
+    if (
+        config_failure.returncode != 69
+        or status["workload_status"] != "125"
+        or status["tracebox_status"] != "125"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or trace.exists()
+        or report.exists()
+    ):
+        raise SystemExit("capture config failure omitted terminal outcomes")
+
+    service_failure, trace, report, status = run_capture(
+        "service-failure",
+        DELTA_FUNNEL_TEST_TRACEBOX_QUERY_STATUS="74",
+    )
+    if (
+        service_failure.returncode != 69
+        or status["workload_status"] != "125"
+        or status["tracebox_status"] != "74"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or trace.exists()
+        or report.exists()
+    ):
+        raise SystemExit("tracebox service failure omitted terminal outcomes")
+
+    perf_failure, trace, report, status = run_capture(
+        "perf-failure",
+        DELTA_FUNNEL_TEST_PERF_STATUS="77",
+    )
+    if (
+        perf_failure.returncode != 77
+        or status["workload_status"] != "125"
+        or status["tracebox_status"] != "125"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or trace.exists()
+        or report.exists()
+    ):
+        raise SystemExit("perf capability failure omitted terminal outcomes")
 
     captured, trace, report, status = run_capture("successful")
     expected_status = (

@@ -307,9 +307,9 @@ cleanup() {
   stop_workload
   stop_diagnostics
   stop_tracebox
-  if [[ -n $interruption_status && $status_emitted == 0 ]]; then
+  if [[ $status_emitted == 0 ]]; then
     if [[ -z $workload_status ]]; then
-      workload_status=$interruption_status
+      workload_status=${interruption_status:-125}
     fi
     emit_status "$workload_status" "${tracebox_status:-125}" \
       "$health_status" "$report_status" "$report_output"
@@ -357,10 +357,13 @@ if ! awk -v sample_hz="$sample_hz" '
   exit 69
 fi
 
-"$tracebox" --system-sockets --query >/dev/null || {
+if "$tracebox" --system-sockets --query >/dev/null; then
+  :
+else
+  tracebox_status=$?
   printf 'capture-workload: Perfetto system service is unavailable\n' >&2
   exit 69
-}
+fi
 "$perf" stat --all-cpus --event cpu-clock -- sleep 0.1 >/dev/null 2>&1 || {
   printf 'capture-workload: Linux performance events are unavailable\n' >&2
   exit 77
