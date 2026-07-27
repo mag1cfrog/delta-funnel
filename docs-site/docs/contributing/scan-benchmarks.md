@@ -75,9 +75,9 @@ cargo run --release -p delta-funnel --bin delta_scan_partition_bench -- \
   --trace-output target/delta-provider-default.jsonl
 ```
 
-## Measure detailed profiling overhead
+## Measure exact execution profiling overhead
 
-Use the phase-aligned workflow to compare detailed operation profiling with
+Use the phase-aligned workflow to compare exact execution profiling with
 profiling disabled. This case generates a 13,394,789-row synthetic Delta table
 and executes the production DataFusion provider and `write_all` stream paths.
 It does not open SQL Server or write target rows.
@@ -104,7 +104,7 @@ cargo run --release -p delta-funnel --bin delta_scan_partition_bench -- \
   --output target/operation-profile-baseline-disabled.csv
 ```
 
-Run the same workflow with detailed profiling enabled:
+Run the same workflow with exact execution profiling enabled:
 
 ```bash
 cargo run --release -p delta-funnel --bin delta_scan_partition_bench -- \
@@ -123,12 +123,12 @@ cargo run --release -p delta-funnel --bin delta_scan_partition_bench -- \
 
 Run both commands on an otherwise idle host. Keep their workload, seed,
 backend, scheduling profile, storage profile, repetition count, release build,
-and CSV schema version identical. Compare detailed profiling against both of
-these references:
+and CSV schema version identical. Compare exact execution profiling against
+both of these references:
 
 - Profiling disabled measures the total cost added by profiling.
-- The current detailed mode measures whether a replacement profiler improves
-  or regresses the existing implementation.
+- The current exact execution mode measures whether a replacement profiler
+  improves or regresses the existing implementation.
 
 `total_micros` includes the measured workflow but excludes Chrome trace
 serialization. `trace_export_micros` records trace construction and compact
@@ -159,10 +159,10 @@ Three repetitions are enough for a reproducible development baseline, but not
 for a hard performance threshold. Repeat the comparison and investigate host
 noise before attributing a small difference to a code change.
 
-### Compare Samply with detailed profiling
+### Compare Samply with exact execution profiling
 
-Use the same symbolized optimized binary for the disabled, Samply, and detailed
-cases so that the build profile is not another variable:
+Use the same symbolized optimized binary for the disabled, Samply, and exact
+execution profiling cases so that the build profile is not another variable:
 
 ```bash
 cargo build --locked --profile profiling \
@@ -225,8 +225,8 @@ This directional comparison was collected at commit `c60857d41673` on Fedora
 Linux 43 x86-64 with an AMD Ryzen 7 8845HS, 8 cores, 16 hardware threads, 16
 available parallelism slots, Samply 0.13.1 at its default 1000 Hz rate, and
 Rust 1.97.0. Every case used the same `profiling` binary and three repetitions.
-The execution order was disabled control, detailed, Samply, then disabled
-control.
+The execution order was disabled control, exact execution profiling, Samply,
+then disabled control.
 
 | Metric | Disabled before | Detailed | Samply | Disabled after |
 | --- | ---: | ---: | ---: | ---: |

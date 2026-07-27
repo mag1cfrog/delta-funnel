@@ -98,7 +98,7 @@ Sync the environment and verify the installed package:
 uv sync --upgrade-package deltafunnel
 
 uv run python -c \
-  'from deltafunnel import ProfilerConfig; print(ProfilerConfig("profile.html"))'
+  'from deltafunnel import RankedProfileConfig; print(RankedProfileConfig("profile.html"))'
 
 perfetto_assets="$(uv run python -c \
   'from importlib.resources import files; print(files("deltafunnel") / "perfetto")')"
@@ -171,10 +171,12 @@ command or `init_perfetto_diagnostics()` call is needed.
 
 ## Advanced: capture a whole Python process
 
-Use the manual path only when one operation scope is insufficient, when an
-agent needs the terminal inspector, or when you need the raw Perfetto timeline
-or scheduler context. A whole-process capture includes every enabled Delta
-Funnel operation between activation and process exit.
+Use the manual path only when one operation scope is insufficient, when
+several operations must be correlated, or when you need the raw Perfetto
+timeline or scheduler context. For one operation, retain a `.dfprofile`
+artifact and use the terminal inspector without a whole-process capture. A
+whole-process capture includes every enabled Delta Funnel operation between
+activation and process exit.
 
 The whole-process command also requires `perf` and the util-linux `setsid`
 command. Install the packages for the host distribution:

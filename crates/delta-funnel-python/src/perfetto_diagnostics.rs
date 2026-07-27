@@ -164,7 +164,7 @@ pub(super) fn ensure_perfetto_subscriber(py: Python<'_>) -> PyResult<()> {
         return Err(perfetto_diagnostics_py_error(
             py,
             "subscriber_unavailable",
-            "operation profiling cannot attach to the installed tracing subscriber".to_owned(),
+            "ranked profiling cannot attach to the installed tracing subscriber".to_owned(),
         ));
     }
     let filter = parse_logging_filter(py, None, env::var(LOG_FILTER_ENV).ok())?;
@@ -176,7 +176,7 @@ pub(super) fn ensure_perfetto_subscriber(py: Python<'_>) -> PyResult<()> {
         Err(perfetto_diagnostics_py_error(
             py,
             "subscriber_unavailable",
-            "operation profiling could not install its tracing subscriber".to_owned(),
+            "ranked profiling could not install its tracing subscriber".to_owned(),
         ))
     }
 }

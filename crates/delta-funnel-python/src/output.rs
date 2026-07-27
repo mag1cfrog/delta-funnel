@@ -150,7 +150,7 @@ mod tests {
         test_support::python_state,
     };
     use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
-    use pyo3::exceptions::{PyAssertionError, PyKeyError};
+    use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule};
     use std::{
@@ -183,16 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn pyi_stub_exposes_table_write_profile_option() {
+    fn pyi_stub_exposes_explicit_table_write_profile_configs() {
         let stub = include_str!("../deltafunnel.pyi");
         let signature = stub
             .split_once("def write_to_mssql(")
             .and_then(|(_, tail)| tail.split_once(") -> Report:"))
             .map_or("", |(signature, _)| signature);
 
-        assert!(signature.contains("profile: bool | None = False"));
-        assert!(signature.contains("trace_path: str | PathLike[str] | None = None"));
-        assert!(signature.contains("profiler: ProfilerConfig | None = None"));
+        assert!(signature.contains("execution_profile: ExecutionProfileConfig | None = None"));
+        assert!(signature.contains("ranked_profile: RankedProfileConfig | None = None"));
+        for retired in [
+            "profile: bool",
+            "trace_path: str",
+            "profiler: RankedProfileConfig",
+        ] {
+            assert!(!signature.contains(retired));
+        }
     }
 
     #[test]
@@ -373,71 +379,48 @@ mod tests {
     }
 
     #[test]
-    fn table_write_profile_validation_precedes_progress_and_dry_run() -> PyResult<()> {
+    fn table_write_profile_configs_validate_before_progress_and_dry_run() -> PyResult<()> {
         let _state = python_state();
         Python::attach(|py| {
-            let table = sql_table(py)?;
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let session = module.getattr("Session")?.call0()?;
+            let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let initial_adapter_count = adapter_creation_count();
-            let invalid_profiles = PyList::empty(py);
-            invalid_profiles.append(0)?;
-            invalid_profiles.append(1)?;
-            invalid_profiles.append("detailed")?;
-            invalid_profiles.append(PyList::new(py, [true])?)?;
-            let truthy_dict = PyDict::new(py);
-            truthy_dict.set_item("enabled", true)?;
-            invalid_profiles.append(truthy_dict)?;
-
-            for profile in invalid_profiles.iter() {
+            for retired in ["profile", "trace_path", "profiler"] {
                 let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
                 kwargs.set_item("progress", true)?;
-                kwargs.set_item("profile", profile)?;
+                kwargs.set_item(retired, true)?;
+                let error = table
+                    .call_method("write_to_mssql", (), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+
+            for (argument, config) in [
+                (
+                    "execution_profile",
+                    module.getattr("ExecutionProfileConfig")?.call0()?,
+                ),
+                (
+                    "ranked_profile",
+                    module
+                        .getattr("RankedProfileConfig")?
+                        .call1(("dry-run.profile.html",))?,
+                ),
+            ] {
+                let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+                kwargs.set_item("dry_run", true)?;
+                kwargs.set_item("progress", true)?;
+                kwargs.set_item(argument, config)?;
                 let error = table
                     .call_method("write_to_mssql", (), Some(&kwargs))
                     .unwrap_err();
                 assert!(error.is_instance_of::<DeltaFunnelError>(py));
                 assert_eq!(
-                    error.value(py).getattr("phase")?.extract::<String>()?,
-                    "config"
-                );
-                assert_eq!(
                     error.value(py).getattr("kind")?.extract::<String>()?,
                     "invalid_option_value"
                 );
-            }
-
-            let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
-            kwargs.set_item("dry_run", true)?;
-            kwargs.set_item("progress", true)?;
-            kwargs.set_item("profile", true)?;
-            let error = table
-                .call_method("write_to_mssql", (), Some(&kwargs))
-                .unwrap_err();
-            assert!(error.is_instance_of::<DeltaFunnelError>(py));
-            assert_eq!(
-                error.value(py).getattr("phase")?.extract::<String>()?,
-                "config"
-            );
-            assert_eq!(
-                error.value(py).getattr("kind")?.extract::<String>()?,
-                "invalid_option_value"
-            );
-
-            for profile in [
-                py.None(),
-                false.into_pyobject(py)?.to_owned().unbind().into_any(),
-            ] {
-                let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
-                kwargs.set_item(
-                    "connection_string",
-                    "server=tcp:sql.example.com;password=secret-token",
-                )?;
-                kwargs.set_item("dry_run", true)?;
-                kwargs.set_item("progress", false)?;
-                kwargs.set_item("profile", profile)?;
-                let report = table
-                    .call_method("write_to_mssql", (), Some(&kwargs))?
-                    .cast_into::<PyDict>()?;
-                assert!(!report.contains("execution_profile")?);
             }
             assert_eq!(adapter_creation_count(), initial_adapter_count);
 
@@ -447,7 +430,7 @@ mod tests {
                 .to_string();
             assert_eq!(
                 signature,
-                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, profile=False, trace_path=None, profiler=None)"
+                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, execution_profile=None, ranked_profile=None)"
             );
             Ok(())
         })
@@ -537,7 +520,8 @@ union all select cast(103 as bigint) as order_id",),
                 table.table().as_str(),
                 "create_and_load",
             )?;
-            kwargs.set_item("profile", true)?;
+            let execution_profile = module.getattr("ExecutionProfileConfig")?.call0()?;
+            kwargs.set_item("execution_profile", execution_profile)?;
 
             let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
             let report_repr = report.repr()?.extract::<String>()?;

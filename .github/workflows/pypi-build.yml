@@ -270,6 +270,9 @@ jobs:
 
           session = deltafunnel.Session()
           assert repr(session).startswith("deltafunnel.Session(")
+          execution_profile = deltafunnel.ExecutionProfileConfig()
+          assert execution_profile.chrome_trace_path is None
+          assert not hasattr(deltafunnel, "ProfilerConfig")
           print(deltafunnel.__version__)
           PY
 

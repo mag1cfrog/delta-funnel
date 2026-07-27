@@ -93,7 +93,7 @@ The tracing targets are:
 
 ## Profiling and diagnostics reference
 
-Detailed operation profiling and field-level contracts now have separate owner
+Exact execution profiling and field-level contracts have separate owner
 pages:
 
 <a id="inspect-terminal-parquet-io"></a>
