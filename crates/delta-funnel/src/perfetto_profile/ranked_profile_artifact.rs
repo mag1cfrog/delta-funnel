@@ -593,18 +593,16 @@ mod tests {
     fn reads_the_version_one_golden_fixture() {
         let directory = tempfile::tempdir().expect("test directory should be created");
         let input = directory.path().join("golden.dfprofile");
-        fs::write(
-            &input,
-            include_bytes!("testdata/ranked_profile_v1.dfprofile"),
-        )
-        .expect("golden fixture should be copied");
+        let fixture = include_bytes!("testdata/ranked_profile_v1.dfprofile");
+        fs::write(&input, fixture).expect("golden fixture should be copied");
 
-        let artifact = read_ranked_profile_artifact(&input).expect("golden fixture should load");
-        let document = artifact
-            .document()
-            .expect("golden fixture should remain valid");
-        assert_eq!(document.metadata.schema_version.to_native(), 3);
-        assert_eq!(document.semantics[0].name.as_str(), "Delta Funnel preview");
+        let expected = document();
+        let loaded = read_ranked_profile_artifact(&input)
+            .expect("golden fixture should load")
+            .into_document()
+            .expect("golden fixture should deserialize");
+        assert_eq!(loaded, expected);
+        assert_eq!(artifact_bytes(&expected), fixture);
     }
 
     #[test]

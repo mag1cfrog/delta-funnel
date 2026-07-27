@@ -116,6 +116,21 @@ fn reads_artifacts_without_trace_processor() -> Result<(), Box<dyn std::error::E
         String::from_utf8_lossy(&inspect.stderr)
     );
     assert!(String::from_utf8(inspect.stdout)?.contains("Delta Funnel preview"));
+
+    let malformed = directory.path().join("malformed.dfprofile");
+    fs::write(&malformed, [0_u8; 64])?;
+    let inspect = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("inspect")
+        .arg(&malformed)
+        .env(
+            "TRACE_PROCESSOR_SHELL",
+            directory.path().join("must-not-start"),
+        )
+        .output()?;
+    assert_eq!(inspect.status.code(), Some(66));
+    let failure: serde_json::Value = serde_json::from_slice(&inspect.stderr)?;
+    assert_eq!(failure["phase"], "input");
+    assert_eq!(failure["kind"], "invalid_artifact_magic");
     Ok(())
 }
 

@@ -99,57 +99,6 @@ pub fn generate_ranked_profile_report(
     generate_ranked_profile_report_for_scope(input, output, None, ExistingOutputPolicy::Replace)
 }
 
-/// Converts a completed Perfetto trace into a reusable ranked profile artifact.
-///
-/// # Errors
-///
-/// Returns a structured failure when the trace cannot be aggregated, validated,
-/// serialized, or atomically persisted.
-#[doc(hidden)]
-pub fn generate_ranked_profile_artifact(
-    input: &Path,
-    output: &Path,
-) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_artifact_for_scope(input, output, None)
-}
-
-/// Converts one host-selected operation capture into a reusable ranked profile artifact.
-///
-/// # Errors
-///
-/// Returns a structured failure when the selected operation is unavailable or
-/// the artifact cannot be validated, serialized, or atomically persisted.
-#[doc(hidden)]
-pub fn generate_operation_ranked_profile_artifact(
-    input: &Path,
-    output: &Path,
-    capture_scope: &OperationCaptureScope,
-) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_artifact_for_scope(input, output, Some(capture_scope.id))
-}
-
-fn generate_ranked_profile_artifact_for_scope(
-    input: &Path,
-    output: &Path,
-    capture_scope_id: Option<u64>,
-) -> Result<PathBuf, RankedReportFailure> {
-    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = load_ranked_profile(&paths.input, capture_scope_id)?;
-    write_ranked_profile_artifact(&paths.output, &document, ExistingOutputPolicy::Replace)?;
-    Ok(paths.output)
-}
-
-/// Validates a ranked profile artifact without starting Trace Processor.
-///
-/// # Errors
-///
-/// Returns a structured failure when the artifact envelope, archive bytes, or
-/// ranked profile invariants are invalid.
-#[doc(hidden)]
-pub fn validate_ranked_profile_artifact(input: &Path) -> Result<(), RankedReportFailure> {
-    read_ranked_profile_artifact(input).map(|_| ())
-}
-
 fn generate_ranked_profile_report_without_clobber(
     input: &Path,
     output: &Path,
@@ -232,7 +181,11 @@ fn generate_ranked_profile_report_for_scope(
 }
 
 fn load_ranked_profile_input(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {
-    if has_ranked_profile_artifact_magic(input)? {
+    let artifact_extension = input
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfprofile"));
+    if artifact_extension || has_ranked_profile_artifact_magic(input)? {
         read_ranked_profile_artifact(input)?.into_document()
     } else {
         load_ranked_profile(input, None)
