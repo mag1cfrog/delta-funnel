@@ -546,6 +546,14 @@ pub(super) enum RankedProfileValidationError {
     },
 }
 
+#[derive(Default)]
+struct OperationRootState {
+    root_count: usize,
+    first_root_id: Option<i64>,
+    first_root_is_operation: bool,
+    first_non_root_operation_id: Option<i64>,
+}
+
 impl fmt::Display for RankedProfileValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1077,41 +1085,42 @@ macro_rules! impl_ranked_profile_validation {
             return Err(RankedProfileValidationError::SemanticCycle { semantic_id });
         }
 
-        let mut checked_operations = HashSet::new();
-        for operation_id in self
-            .semantics
-            .iter()
-            .map(|semantic| $number!(semantic.operation_id))
-        {
-            if !checked_operations.insert(operation_id) {
-                continue;
+        let mut operation_order = Vec::new();
+        let mut operations = HashMap::<i64, OperationRootState>::new();
+        for semantic in self.semantics.iter() {
+            let operation_id = $number!(semantic.operation_id);
+            if !operations.contains_key(&operation_id) {
+                operation_order.push(operation_id);
             }
-            let roots = self
-                .semantics
-                .iter()
-                .filter(|semantic| {
-                    $number!(semantic.operation_id) == operation_id
-                        && semantic.parent_semantic_id.is_none()
-                })
-                .collect::<Vec<_>>();
-            if roots.len() != 1 {
+            let state = operations.entry(operation_id).or_default();
+            let semantic_id = $number!(semantic.semantic_id);
+            if semantic.parent_semantic_id.is_none() {
+                state.root_count += 1;
+                if state.first_root_id.is_none() {
+                    state.first_root_id = Some(semantic_id);
+                    state.first_root_is_operation = semantic.semantic_kind == "operation";
+                }
+            } else if semantic.semantic_kind == "operation"
+                && state.first_non_root_operation_id.is_none()
+            {
+                state.first_non_root_operation_id = Some(semantic_id);
+            }
+        }
+        for operation_id in operation_order {
+            let state = &operations[&operation_id];
+            if state.root_count != 1 {
                 return Err(RankedProfileValidationError::InvalidOperationRootCount {
                     operation_id,
-                    root_count: roots.len(),
+                    root_count: state.root_count,
                 });
             }
-            let invalid_operation_node = self.semantics.iter().find(|semantic| {
-                $number!(semantic.operation_id) == operation_id
-                    && semantic.semantic_kind == "operation"
-                    && $number!(semantic.semantic_id) != $number!(roots[0].semantic_id)
-            });
-            if roots[0].semantic_kind != "operation" || invalid_operation_node.is_some() {
+            if !state.first_root_is_operation || state.first_non_root_operation_id.is_some() {
                 return Err(RankedProfileValidationError::InvalidOperationRootKind {
                     operation_id,
-                    semantic_id: invalid_operation_node.map_or_else(
-                        || $number!(roots[0].semantic_id),
-                        |semantic| $number!(semantic.semantic_id),
-                    ),
+                    semantic_id: state
+                        .first_non_root_operation_id
+                        .or(state.first_root_id)
+                        .expect("an operation with one root has a root ID"),
                 });
             }
         }
@@ -2137,6 +2146,20 @@ mod tests {
             invalid.validate_structure(),
             Err(RankedProfileValidationError::FunctionCycle { .. })
         ));
+    }
+
+    #[test]
+    fn validates_many_independent_operations() {
+        let semantics = (1..=4_096)
+            .map(|id| semantic(id, None, id, "operation"))
+            .collect::<Vec<_>>();
+        let profile = RankedProfileDocument {
+            metadata: document().metadata,
+            semantics,
+            functions: Vec::new(),
+        };
+
+        assert_eq!(profile.validate_structure(), Ok(()));
     }
 
     #[test]
