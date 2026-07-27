@@ -144,6 +144,10 @@ case $capture_path in
     report_path=$capture_path.profile.html
     ;;
 esac
+if [[ -e $report_path || -L $report_path ]]; then
+  printf 'capture-workload: report output already exists: %s\n' "$report_path" >&2
+  exit 73
+fi
 
 target=$1
 if [[ $target != */* ]]; then
@@ -186,6 +190,27 @@ fi
 runtime_dir=$(mktemp -d "$capture_dir/.delta-funnel-perfetto.XXXXXX")
 ready_fifo=$runtime_dir/tracebox-ready
 trace_pid=
+workload_pid=
+interruption_status=
+interruption_signal=
+status_emitted=0
+
+emit_status() {
+  local workload_status=$1
+  local tracebox_status=$2
+  local health_status=$3
+  local report_status=$4
+  local report_output=${5:-}
+
+  printf 'workload_status=%s tracebox_status=%s health_status=%s report_status=%s sample_hz=%s trace=%q' \
+    "$workload_status" "$tracebox_status" "$health_status" "$report_status" \
+    "$sample_hz" "$capture_path"
+  if [[ -n $report_output ]]; then
+    printf ' report=%q' "$report_output"
+  fi
+  printf '\n'
+  status_emitted=1
+}
 
 stop_tracebox() {
   if [[ -z $trace_pid ]]; then
@@ -200,17 +225,31 @@ stop_tracebox() {
   trace_pid=
 }
 
+stop_workload() {
+  if [[ -z $workload_pid ]]; then
+    return
+  fi
+  local signal=${interruption_signal:-TERM}
+  kill "-$signal" "$workload_pid" 2>/dev/null || true
+  wait "$workload_pid" 2>/dev/null || true
+  workload_pid=
+}
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
+  stop_workload
   stop_tracebox
-  rm -rf -- "$runtime_dir"
+  if [[ -n $interruption_status && $status_emitted == 0 ]]; then
+    emit_status "$interruption_status" "${tracebox_status:-125}" 125 125
+  fi
+  rm -rf -- "$runtime_dir" || true
   exit "$status"
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+trap 'interruption_status=130; interruption_signal=INT; exit 130' INT
+trap 'interruption_status=143; interruption_signal=TERM; exit 143' TERM
+trap 'interruption_status=129; interruption_signal=HUP; exit 129' HUP
 
 capture_config=$runtime_dir/capture.pbtx
 if ! awk -v sample_hz="$sample_hz" '
@@ -271,16 +310,20 @@ fi
 rm -f -- "$ready_fifo"
 if [[ $readiness != 0 ]]; then
   stop_tracebox
+  emit_status 125 "${tracebox_status:-125}" 125 125
   printf 'capture-workload: tracebox readiness failed: status=%s\n' \
     "${tracebox_status:-125}" >&2
   exit 69
 fi
 
-if "$launcher" "$@"; then
+"$launcher" "$@" &
+workload_pid=$!
+if wait "$workload_pid"; then
   workload_status=0
 else
   workload_status=$?
 fi
+workload_pid=
 stop_tracebox
 
 health_args=("$capture_path")
@@ -312,13 +355,8 @@ if (( health_status == 0 )); then
   fi
 fi
 
-printf 'workload_status=%s tracebox_status=%s health_status=%s report_status=%s sample_hz=%s trace=%s' \
-  "$workload_status" "${tracebox_status:-125}" "$health_status" "$report_status" \
-  "$sample_hz" "$capture_path"
-if [[ -n $report_output ]]; then
-  printf ' report=%s' "$report_output"
-fi
-printf '\n'
+emit_status "$workload_status" "${tracebox_status:-125}" "$health_status" \
+  "$report_status" "$report_output"
 if (( workload_status == 0 &&
       (tracebox_status != 0 || health_status != 0 || report_status != 0) )); then
   printf '%s\n' \

@@ -85,9 +85,12 @@ venv_python="$work_dir/venv/bin/python"
 native_module=$("$venv_python" - <<'PY'
 import json
 import os
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
@@ -401,8 +404,12 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "  if [[ $1 == --out ]]; then output=$2; shift 2; else shift; fi\n"
         "done\n"
         "printf '\\x0a\\x00' >\"$output\"\n"
+        "if [[ ${DELTA_FUNNEL_TEST_READINESS_FAILURE:-0} == 1 ]]; then\n"
+        "  printf '\\1' >&3\n"
+        "  exit 69\n"
+        "fi\n"
         "printf '\\0' >&3\n"
-        "trap 'exit 0' TERM\n"
+        "trap 'exit \"${DELTA_FUNNEL_TEST_TRACEBOX_STOP_STATUS:-0}\"' TERM\n"
         "while :; do sleep 1; done\n"
     )
     fake_tracebox.chmod(0o700)
@@ -410,9 +417,27 @@ with tempfile.TemporaryDirectory() as temp_dir:
     fake_perf.write_text("#!/usr/bin/env bash\nexit 0\n")
     fake_perf.chmod(0o700)
 
-    def run_capture(name, workload="pass", **environment):
-        trace = temp.joinpath("captures", f"{name}.pftrace")
-        report = temp.joinpath("captures", f"{name}.profile.html")
+    def capture_artifacts(name, suffix=".pftrace"):
+        trace = temp.joinpath("captures", f"{name}{suffix}")
+        report = (
+            trace.with_suffix(".profile.html")
+            if suffix == ".pftrace"
+            else Path(f"{trace}.profile.html")
+        )
+        return trace, report
+
+    def capture_environment(**environment):
+        return {
+            **os.environ,
+            "TRACEBOX": str(fake_tracebox),
+            "PERF": str(fake_perf),
+            "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
+            "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
+            **environment,
+        }
+
+    def run_capture(name, workload="pass", suffix=".pftrace", **environment):
+        trace, report = capture_artifacts(name, suffix)
         result = subprocess.run(
             [
                 capture,
@@ -423,19 +448,17 @@ with tempfile.TemporaryDirectory() as temp_dir:
                 "-c",
                 workload,
             ],
-            env={
-                **os.environ,
-                "TRACEBOX": str(fake_tracebox),
-                "PERF": str(fake_perf),
-                "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
-                "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
-                **environment,
-            },
+            env=capture_environment(**environment),
+            cwd=temp,
             capture_output=True,
             text=True,
         )
-        status = result.stdout.splitlines()[-1]
-        fields = dict(field.split("=", 1) for field in status.split())
+        lines = result.stdout.splitlines()
+        fields = (
+            dict(field.split("=", 1) for field in shlex.split(lines[-1]))
+            if lines
+            else {}
+        )
         return result, trace, report, fields
 
     captured, trace, report, status = run_capture("successful")
@@ -483,13 +506,14 @@ with tempfile.TemporaryDirectory() as temp_dir:
     if "do not retry" not in unhealthy.stderr:
         raise SystemExit("capture health failure did not protect a completed workload")
 
-    preserved_report = temp.joinpath(
-        "captures",
-        "report-failure.profile.html",
-    )
-    preserved_report.write_text("previous complete report")
+    _, preserved_report = capture_artifacts("report-failure")
     report_failure, trace, report, status = run_capture(
         "report-failure",
+        (
+            "from pathlib import Path; "
+            f"Path({str(preserved_report)!r}).write_text("
+            "'previous complete report')"
+        ),
         DELTA_FUNNEL_TEST_REPORT_FAILURE="1",
     )
     if report_failure.returncode != 0:
@@ -503,6 +527,116 @@ with tempfile.TemporaryDirectory() as temp_dir:
         raise SystemExit("report failure did not preserve completed artifacts")
     if "do not retry" not in report_failure.stderr:
         raise SystemExit("report failure did not protect a completed workload")
+
+    collision_marker = temp.joinpath("collision-workload-ran")
+    _, collision_report = capture_artifacts("report-collision")
+    collision_report.write_text("existing complete report")
+    collision, trace, report, status = run_capture(
+        "report-collision",
+        (
+            "from pathlib import Path; "
+            f"Path({str(collision_marker)!r}).write_text('ran')"
+        ),
+    )
+    if (
+        collision.returncode != 73
+        or status
+        or trace.exists()
+        or report.read_text() != "existing complete report"
+        or collision_marker.exists()
+    ):
+        raise SystemExit("existing report did not stop capture before the workload")
+
+    tracebox_failure, trace, report, status = run_capture(
+        "tracebox-failure",
+        DELTA_FUNNEL_TEST_TRACEBOX_STOP_STATUS="74",
+    )
+    if tracebox_failure.returncode != 0:
+        raise SystemExit("tracebox failure replaced the workload result")
+    if (
+        status["tracebox_status"] != "74"
+        or status["health_status"] != "0"
+        or status["report_status"] != "0"
+        or not trace.is_file()
+        or not report.is_file()
+    ):
+        raise SystemExit("tracebox failure did not preserve independent outcomes")
+
+    readiness, trace, report, status = run_capture(
+        "readiness-failure",
+        DELTA_FUNNEL_TEST_READINESS_FAILURE="1",
+    )
+    if readiness.returncode != 69:
+        raise SystemExit("tracebox readiness failure returned the wrong wrapper status")
+    if (
+        status["workload_status"] != "125"
+        or status["tracebox_status"] != "69"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or not trace.is_file()
+        or report.exists()
+    ):
+        raise SystemExit("tracebox readiness failure fabricated a completed outcome")
+
+    hostile_name = "space and Unicode 名称;touch injected"
+    hostile, trace, report, status = run_capture(
+        hostile_name,
+        suffix=".trace",
+    )
+    if (
+        hostile.returncode != 0
+        or status["trace"] != str(trace)
+        or status["report"] != str(report)
+        or not trace.is_file()
+        or not report.is_file()
+        or temp.joinpath("injected").exists()
+    ):
+        raise SystemExit("capture artifact paths were not handled literally")
+
+    interrupted_trace, interrupted_report = capture_artifacts("interrupted")
+    workload_started = temp.joinpath("workload-started")
+    interrupted = subprocess.Popen(
+        [
+            capture,
+            "--output",
+            interrupted_trace,
+            "--",
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; import time; "
+                f"Path({str(workload_started)!r}).write_text('started'); "
+                "time.sleep(60)"
+            ),
+        ],
+        env=capture_environment(),
+        cwd=temp,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while not workload_started.exists() and interrupted.poll() is None:
+        if time.monotonic() >= deadline:
+            interrupted.kill()
+            raise SystemExit("interruption fixture did not start its workload")
+        time.sleep(0.01)
+    interrupted.send_signal(signal.SIGTERM)
+    stdout, _ = interrupted.communicate(timeout=10)
+    status = dict(
+        field.split("=", 1)
+        for field in shlex.split(stdout.splitlines()[-1])
+    )
+    if (
+        interrupted.returncode != 143
+        or status["workload_status"] != "143"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or not interrupted_trace.is_file()
+        or interrupted_report.exists()
+    ):
+        raise SystemExit("interrupted capture fabricated a completed report")
 
 if not callable(deltafunnel.init_perfetto_diagnostics):
     raise SystemExit("Perfetto diagnostics initializer is not callable")
