@@ -44,9 +44,15 @@ pub use report_cli::{
     RankedReportFailure, RankedReportFailurePhase, run_perfetto_diagnostics_cli,
     run_perfetto_diagnostics_cli_with_args,
 };
-use report_html::{ExistingOutputPolicy, render_ranked_profile_html, write_ranked_profile_html};
+use report_html::{render_ranked_profile_html, write_ranked_profile_html};
 #[cfg(test)]
 use report_terminal::render_terminal_view;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingOutputPolicy {
+    Replace,
+    Preserve,
+}
 
 /// Reports whether two profile destinations resolve to the same file.
 #[doc(hidden)]

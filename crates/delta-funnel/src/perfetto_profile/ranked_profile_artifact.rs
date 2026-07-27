@@ -6,11 +6,11 @@ use std::path::Path;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
 
+use super::ExistingOutputPolicy;
 use super::ranked_report::{
     ArchivedRankedProfileDocument, RANKED_PROFILE_SCHEMA_VERSION, RankedProfileDocument,
 };
 use super::report_cli::{RankedReportFailure, RankedReportFailurePhase};
-use super::report_html::ExistingOutputPolicy;
 
 const MAGIC: [u8; 8] = *b"DFPROF\0\0";
 const ARTIFACT_VERSION: u16 = 1;
