@@ -760,6 +760,36 @@ with tempfile.TemporaryDirectory() as temp_dir:
     ):
         raise SystemExit("interrupted capture fabricated a completed report")
 
+    stubborn_child_started = temp.joinpath("stubborn-child-started")
+    stubborn_child = (
+        "from pathlib import Path; import os, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(stubborn_child_started)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    stubborn_workload = (
+        "import signal, subprocess, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"subprocess.Popen([sys.executable, '-c', {stubborn_child!r}]); "
+        "time.sleep(60)"
+    )
+    interrupted, trace, report, status, _ = interrupt_capture(
+        "interrupted-stubborn-workload",
+        stubborn_child_started,
+        stubborn_workload,
+    )
+    if (
+        interrupted.returncode != 143
+        or status["workload_status"] != "137"
+        or status["tracebox_status"] != "0"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or not trace.is_file()
+        or report.exists()
+    ):
+        raise SystemExit("stubborn workload escaped bounded interruption cleanup")
+    assert_process_stopped(stubborn_child_started, "workload child")
+
     health_started = temp.joinpath("health-started")
     interrupted, trace, report, status, stderr = interrupt_capture(
         "interrupted-health",

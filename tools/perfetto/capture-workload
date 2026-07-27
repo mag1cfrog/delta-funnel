@@ -201,6 +201,7 @@ health_status=125
 report_status=125
 report_output=
 health_output_file=$runtime_dir/capture-health.out
+stop_grace_polls=100
 
 emit_status() {
   local workload_status=$1
@@ -232,13 +233,59 @@ stop_tracebox() {
   trace_pid=
 }
 
+process_finished() {
+  local pid=$1
+  local process_stat
+  if [[ ! -r /proc/$pid/stat ]]; then
+    return 0
+  fi
+  process_stat=$(<"/proc/$pid/stat") || return 0
+  process_stat=${process_stat##*) }
+  [[ ${process_stat%% *} == Z ]]
+}
+
+stop_process_group() {
+  local pid=$1
+  local signal=$2
+  local status=0
+  local waited=0
+  local poll
+
+  kill "-$signal" "$pid" 2>/dev/null || true
+  kill "-$signal" -- "-$pid" 2>/dev/null || true
+  for (( poll = 0; poll < stop_grace_polls; poll++ )); do
+    if (( waited == 0 )) && process_finished "$pid"; then
+      if wait "$pid" 2>/dev/null; then
+        status=0
+      else
+        status=$?
+      fi
+      waited=1
+    fi
+    if (( waited == 1 )) && ! kill -0 -- "-$pid" 2>/dev/null; then
+      return "$status"
+    fi
+    sleep 0.01
+  done
+
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+  if (( waited == 0 )); then
+    if wait "$pid" 2>/dev/null; then
+      status=0
+    else
+      status=$?
+    fi
+  fi
+  return "$status"
+}
+
 stop_workload() {
   if [[ -z $workload_pid ]]; then
     return
   fi
   local signal=${interruption_signal:-TERM}
-  kill "-$signal" "$workload_pid" 2>/dev/null || true
-  if wait "$workload_pid" 2>/dev/null; then
+  if stop_process_group "$workload_pid" "$signal"; then
     workload_status=0
   else
     workload_status=$?
@@ -284,9 +331,7 @@ stop_diagnostics() {
   fi
   local signal=${interruption_signal:-TERM}
   local status
-  kill "-$signal" "$diagnostics_pid" 2>/dev/null || true
-  kill "-$signal" -- "-$diagnostics_pid" 2>/dev/null || true
-  if wait "$diagnostics_pid" 2>/dev/null; then
+  if stop_process_group "$diagnostics_pid" "$signal"; then
     status=0
   else
     status=$?
@@ -399,7 +444,7 @@ if [[ $readiness != 0 ]]; then
   exit 69
 fi
 
-"$launcher" "$@" &
+setsid --wait "$launcher" "$@" &
 workload_pid=$!
 if wait "$workload_pid"; then
   workload_status=0
