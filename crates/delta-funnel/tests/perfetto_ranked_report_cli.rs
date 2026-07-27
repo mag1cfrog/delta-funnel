@@ -11,12 +11,18 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::{Output, Stdio};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
+
+use delta_funnel::perfetto_profile::{
+    OperationCaptureScope, generate_operation_ranked_profile_outputs,
+};
+
+const OPERATION_OUTPUTS_CHILD: &str = "DELTA_FUNNEL_TEST_OPERATION_OUTPUTS_CHILD";
 
 #[test]
 fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dyn std::error::Error>>
@@ -80,6 +86,80 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
         assert_eq!(failure["kind"], "terminal_write_failed");
         assert!(failed_output.is_file());
     }
+    Ok(())
+}
+
+#[test]
+fn generates_operation_html_and_artifact_from_one_aggregate()
+-> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os(OPERATION_OUTPUTS_CHILD).is_some() {
+        let input = required_path("DELTA_FUNNEL_TEST_OPERATION_INPUT")?;
+        let output = required_path("DELTA_FUNNEL_TEST_OPERATION_HTML")?;
+        let artifact = required_path("DELTA_FUNNEL_TEST_OPERATION_ARTIFACT")?;
+        let scope = OperationCaptureScope::allocate().ok_or("operation scope unavailable")?;
+        generate_operation_ranked_profile_outputs(&input, &output, Some(&artifact), &scope)?;
+        return Ok(());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("operation.pftrace");
+    let output = directory.path().join("operation.profile.html");
+    let artifact = directory.path().join("operation.dfprofile");
+    let rerendered = directory.path().join("rerendered.profile.html");
+    let aggregate = directory.path().join("aggregate.csv");
+    let trace_processor = directory.path().join("trace_processor_shell");
+    let input_bytes = b"\x0a\x00";
+    fs::write(&input, input_bytes)?;
+    fs::write(&aggregate, aggregate_output())?;
+    write_executable(
+        &trace_processor,
+        "#!/bin/sh\n\
+         set -eu\n\
+         query=$(cat)\n\
+         case \"$query\" in\n\
+           *delta_funnel_capture_health_input*'CREATE PERFETTO TABLE delta_funnel_report_selection AS'*'CREATE PERFETTO TABLE delta_funnel_capture_health AS'*record_kind*) ;;\n\
+           *) exit 65 ;;\n\
+         esac\n\
+         cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n",
+    )?;
+
+    let child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "generates_operation_html_and_artifact_from_one_aggregate",
+        ])
+        .env(OPERATION_OUTPUTS_CHILD, "1")
+        .env("DELTA_FUNNEL_TEST_OPERATION_INPUT", &input)
+        .env("DELTA_FUNNEL_TEST_OPERATION_HTML", &output)
+        .env("DELTA_FUNNEL_TEST_OPERATION_ARTIFACT", &artifact)
+        .env("TRACE_PROCESSOR_SHELL", &trace_processor)
+        .env("DELTA_FUNNEL_TEST_AGGREGATE", &aggregate)
+        .output()?;
+    assert!(
+        child.status.success(),
+        "operation output child failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert_eq!(fs::read(&input)?, input_bytes);
+    assert!(output.is_file());
+    assert!(artifact.is_file());
+
+    let report = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("report")
+        .arg(&artifact)
+        .arg("--output")
+        .arg(&rerendered)
+        .env(
+            "TRACE_PROCESSOR_SHELL",
+            directory.path().join("unavailable"),
+        )
+        .output()?;
+    assert!(
+        report.status.success(),
+        "artifact rerender failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    assert_eq!(fs::read(output)?, fs::read(rerendered)?);
     Ok(())
 }
 
@@ -286,6 +366,12 @@ fn write_executable(path: &Path, contents: &str) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions)
+}
+
+fn required_path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{name} is not set").into())
 }
 
 fn aggregate_output() -> String {
