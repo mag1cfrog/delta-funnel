@@ -50,6 +50,10 @@ struct RankedReportArgs {
     /// Report destination. Defaults to INPUT.profile.html.
     #[arg(long, value_name = "OUTPUT.profile.html", allow_hyphen_values = true)]
     output: Option<PathBuf>,
+
+    /// Refuse to replace an existing report destination.
+    #[arg(long)]
+    no_clobber: bool,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -791,7 +795,12 @@ fn run_report_command(args: RankedReportArgs) -> i32 {
     let output = args
         .output
         .unwrap_or_else(|| default_report_path(&args.input));
-    match super::generate_ranked_profile_report(&args.input, &output) {
+    let generated = if args.no_clobber {
+        super::generate_ranked_profile_report_without_clobber(&args.input, &output)
+    } else {
+        super::generate_ranked_profile_report(&args.input, &output)
+    };
+    match generated {
         Ok(output) => {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "wrote {}", output.display())
@@ -897,6 +906,7 @@ fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
     let mut args = args.iter();
     let mut has_input = false;
     let mut has_output = false;
+    let mut has_no_clobber = false;
     while let Some(argument) = args.next() {
         if matches!(argument.to_str(), Some("-h" | "--help")) {
             return None;
@@ -909,6 +919,11 @@ fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
             if args.next().is_none() {
                 return Some(CliArgumentError::MissingOutputValue);
             }
+        } else if argument == "--no-clobber" {
+            if has_no_clobber {
+                return Some(CliArgumentError::DuplicateOption);
+            }
+            has_no_clobber = true;
         } else if argument.as_encoded_bytes().starts_with(b"-") {
             return Some(CliArgumentError::UnknownOption);
         } else if has_input {
@@ -1216,6 +1231,7 @@ mod tests {
         let report_help = report_help.to_string();
         assert!(report_help.contains("INPUT.pftrace"));
         assert!(report_help.contains("--output <OUTPUT.profile.html>"));
+        assert!(report_help.contains("--no-clobber"));
         let bare_report_help =
             PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "report"])
                 .err()
@@ -1230,6 +1246,7 @@ mod tests {
                 command: PerfettoCommand::Report(RankedReportArgs {
                     input: PathBuf::from("capture.pftrace"),
                     output: None,
+                    no_clobber: false,
                 }),
             }
         );
@@ -1247,6 +1264,23 @@ mod tests {
                 command: PerfettoCommand::Report(RankedReportArgs {
                     input: PathBuf::from("traces/capture"),
                     output: Some(PathBuf::from("reports/capture.html")),
+                    no_clobber: false,
+                }),
+            }
+        );
+        let no_clobber = PerfettoCli::try_parse_from([
+            "delta-funnel-perfetto",
+            "report",
+            "--no-clobber",
+            "capture.pftrace",
+        ])?;
+        assert_eq!(
+            no_clobber,
+            PerfettoCli {
+                command: PerfettoCommand::Report(RankedReportArgs {
+                    input: PathBuf::from("capture.pftrace"),
+                    output: None,
+                    no_clobber: true,
                 }),
             }
         );
@@ -1734,6 +1768,15 @@ mod tests {
             (
                 vec![OsString::from("report"), OsString::from("--unknown")],
                 CliArgumentError::UnknownOption,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("capture.pftrace"),
+                    OsString::from("--no-clobber"),
+                    OsString::from("--no-clobber"),
+                ],
+                CliArgumentError::DuplicateOption,
             ),
             (
                 vec![OsString::from("inspect")],

@@ -163,6 +163,7 @@ pub(super) fn render_ranked_profile_html(
 pub(super) fn write_ranked_profile_html(
     output: &Path,
     html: &str,
+    existing_output: ExistingOutputPolicy,
 ) -> Result<(), RankedReportFailure> {
     let parent = output
         .parent()
@@ -183,10 +184,19 @@ pub(super) fn write_ranked_profile_html(
     temporary.write_all(html.as_bytes()).map_err(|_| {
         output_failure("write_failed", "temporary report file could not be written")
     })?;
-    temporary
-        .persist(output)
+    let persisted = match existing_output {
+        ExistingOutputPolicy::Replace => temporary.persist(output),
+        ExistingOutputPolicy::Preserve => temporary.persist_noclobber(output),
+    };
+    persisted
         .map_err(|_| output_failure("persist_failed", "completed report could not be persisted"))?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExistingOutputPolicy {
+    Replace,
+    Preserve,
 }
 
 fn output_failure(kind: &'static str, message: &'static str) -> RankedReportFailure {
@@ -1205,10 +1215,14 @@ mod tests {
     fn atomically_replaces_output_and_preserves_it_on_failure() -> std::io::Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("nested/report.profile.html");
-        write_ranked_profile_html(&output, "first complete report")
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        write_ranked_profile_html(
+            &output,
+            "first complete report",
+            ExistingOutputPolicy::Replace,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
         assert_eq!(fs::read_to_string(&output)?, "first complete report");
-        write_ranked_profile_html(&output, "complete report")
+        write_ranked_profile_html(&output, "complete report", ExistingOutputPolicy::Replace)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         assert_eq!(fs::read_to_string(&output)?, "complete report");
         assert_eq!(
@@ -1219,14 +1233,25 @@ mod tests {
         let blocked_output = directory.path().join("existing-output");
         fs::create_dir(&blocked_output)?;
         fs::write(blocked_output.join("keep-me"), "unchanged")?;
-        let error = write_ranked_profile_html(&blocked_output, "partial report")
-            .expect_err("a report cannot replace an existing directory");
+        let error = write_ranked_profile_html(
+            &blocked_output,
+            "partial report",
+            ExistingOutputPolicy::Replace,
+        )
+        .expect_err("a report cannot replace an existing directory");
         assert_eq!(error.phase(), RankedReportFailurePhase::Output);
         assert_eq!(error.kind(), "persist_failed");
         assert_eq!(
             fs::read_to_string(blocked_output.join("keep-me"))?,
             "unchanged"
         );
+
+        let error =
+            write_ranked_profile_html(&output, "must not replace", ExistingOutputPolicy::Preserve)
+                .expect_err("no-clobber output must preserve an existing report");
+        assert_eq!(error.phase(), RankedReportFailurePhase::Output);
+        assert_eq!(error.kind(), "persist_failed");
+        assert_eq!(fs::read_to_string(&output)?, "complete report");
         Ok(())
     }
 }

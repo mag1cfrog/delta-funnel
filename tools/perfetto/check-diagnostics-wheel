@@ -540,6 +540,26 @@ with tempfile.TemporaryDirectory() as temp_dir:
     if "do not retry" not in report_failure.stderr:
         raise SystemExit("report failure did not protect a completed workload")
 
+    _, late_collision_report = capture_artifacts("late-report-collision")
+    late_collision, trace, report, status = run_capture(
+        "late-report-collision",
+        (
+            "from pathlib import Path; "
+            f"Path({str(late_collision_report)!r}).write_text("
+            "'concurrent complete report')"
+        ),
+    )
+    if (
+        late_collision.returncode != 0
+        or status["workload_status"] != "0"
+        or status["health_status"] != "0"
+        or status["report_status"] != "73"
+        or not trace.is_file()
+        or report.read_text() != "concurrent complete report"
+        or "do not retry" not in late_collision.stderr
+    ):
+        raise SystemExit("late report collision replaced a completed artifact")
+
     collision_marker = temp.joinpath("collision-workload-ran")
     _, collision_report = capture_artifacts("report-collision")
     collision_report.write_text("existing complete report")

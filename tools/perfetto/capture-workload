@@ -416,7 +416,7 @@ diagnostics_pid=
 diagnostics_stage=
 
 if (( health_status == 0 )); then
-  "$report_cli" report "$capture_path" --output "$report_path" &
+  "$report_cli" report "$capture_path" --output "$report_path" --no-clobber &
   diagnostics_pid=$!
   diagnostics_stage=report
   if wait "$diagnostics_pid"; then
