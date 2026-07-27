@@ -711,16 +711,28 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_version_one_golden_fixture() {
+    fn reads_the_version_one_golden_fixture_with_every_record_kind() {
+        let expected = sampled_document();
+        if std::env::var_os("DELTA_FUNNEL_UPDATE_RANKED_PROFILE_FIXTURE").is_some() {
+            fs::write(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/perfetto_profile/testdata/ranked_profile_v1.dfprofile"),
+                artifact_bytes(&expected),
+            )
+            .expect("golden fixture should be updated");
+            return;
+        }
+
+        let fixture = include_bytes!("testdata/ranked_profile_v1.dfprofile");
+        assert_eq!(artifact_bytes(&expected), fixture);
+
         let directory = tempfile::tempdir().expect("test directory should be created");
         let input = directory.path().join("golden.dfprofile");
-        let fixture = include_bytes!("testdata/ranked_profile_v1.dfprofile");
         fs::write(&input, fixture).expect("golden fixture should be copied");
-
-        let expected = document();
-        let loaded = read_ranked_profile_artifact(&input).expect("golden fixture should load");
-        assert_eq!(loaded, expected);
-        assert_eq!(artifact_bytes(&expected), fixture);
+        assert_eq!(
+            read_ranked_profile_artifact(&input).expect("golden fixture should load"),
+            expected
+        );
     }
 
     #[test]
