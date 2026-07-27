@@ -65,9 +65,15 @@ pub(super) fn read_ranked_profile_artifact(
         ));
     }
 
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)
+        .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
+    let payload = parse_header(&header, file_length)?;
+
     let mut bytes = AlignedVec::<16>::with_capacity(file_length);
     bytes.resize(file_length, 0);
-    file.read_exact(bytes.as_mut_slice())
+    bytes[..HEADER_LENGTH].copy_from_slice(&header);
+    file.read_exact(&mut bytes[HEADER_LENGTH..])
         .map_err(|_| input_failure("artifact_unreadable", "artifact could not be read"))?;
     let mut trailing_byte = [0_u8; 1];
     if file
@@ -80,7 +86,6 @@ pub(super) fn read_ranked_profile_artifact(
             "artifact changed while it was being read",
         ));
     }
-    let payload = parse_header(&bytes)?;
     let archived = rkyv::access::<ArchivedRankedProfileDocument, RkyvError>(&bytes[payload])
         .map_err(|_| input_failure("invalid_archive", "artifact payload is not a valid archive"))?;
     archived
@@ -171,7 +176,10 @@ fn encode_header(payload_length: u64) -> [u8; HEADER_LENGTH] {
     header
 }
 
-fn parse_header(bytes: &[u8]) -> Result<Range<usize>, RankedReportFailure> {
+fn parse_header(
+    bytes: &[u8; HEADER_LENGTH],
+    file_length: usize,
+) -> Result<Range<usize>, RankedReportFailure> {
     if bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
         return Err(input_failure(
             "invalid_artifact_magic",
@@ -249,13 +257,13 @@ fn parse_header(bytes: &[u8]) -> Result<Range<usize>, RankedReportFailure> {
     if expected_length > MAX_ARTIFACT_BYTES {
         return Err(artifact_too_large());
     }
-    if expected_length > bytes.len() {
+    if expected_length > file_length {
         return Err(input_failure(
             "truncated_artifact",
             "artifact payload is truncated",
         ));
     }
-    if expected_length < bytes.len() {
+    if expected_length < file_length {
         return Err(input_failure(
             "trailing_artifact_bytes",
             "artifact has bytes after its declared payload",
@@ -831,6 +839,20 @@ mod tests {
         let error = read_ranked_profile_artifact(&input)
             .expect_err("oversized artifact should be rejected");
         assert_eq!(error.kind(), "artifact_too_large");
+    }
+
+    #[test]
+    fn rejects_a_maximum_length_invalid_header_before_reading_its_payload() {
+        let directory = tempfile::tempdir().expect("test directory should be created");
+        let input = directory.path().join("invalid-sparse.dfprofile");
+        File::create(&input)
+            .and_then(|file| file.set_len(MAX_ARTIFACT_BYTES as u64))
+            .expect("sparse artifact should be created");
+
+        let error = read_ranked_profile_artifact(&input)
+            .expect_err("invalid header should be rejected without reading its payload");
+
+        assert_eq!(error.kind(), "invalid_artifact_magic");
     }
 
     #[test]
