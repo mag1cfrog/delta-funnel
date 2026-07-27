@@ -354,6 +354,7 @@ const textCell = (primary, detail, className = "") => {
     const secondary = document.createElement("span");
     secondary.className = "detail";
     secondary.textContent = detail;
+    secondary.title = detail;
     cell.appendChild(secondary);
   }
   return cell;
