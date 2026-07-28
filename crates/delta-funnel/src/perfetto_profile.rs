@@ -113,14 +113,41 @@ pub fn generate_ranked_profile_report(
     input: &Path,
     output: &Path,
 ) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_report_for_scope(input, output, None, ExistingOutputPolicy::Replace)
+    generate_ranked_profile_outputs_for_scope(
+        input,
+        output,
+        None,
+        None,
+        ExistingOutputPolicy::Replace,
+    )
 }
 
 fn generate_ranked_profile_report_without_clobber(
     input: &Path,
     output: &Path,
+    artifact_output: Option<&Path>,
 ) -> Result<PathBuf, RankedReportFailure> {
-    generate_ranked_profile_report_for_scope(input, output, None, ExistingOutputPolicy::Preserve)
+    generate_ranked_profile_outputs_for_scope(
+        input,
+        output,
+        artifact_output,
+        None,
+        ExistingOutputPolicy::Preserve,
+    )
+}
+
+fn generate_ranked_profile_report_outputs(
+    input: &Path,
+    output: &Path,
+    artifact_output: Option<&Path>,
+) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_outputs_for_scope(
+        input,
+        output,
+        artifact_output,
+        None,
+        ExistingOutputPolicy::Replace,
+    )
 }
 
 /// Generates one ranked HTML report for a host-selected operation capture.
@@ -151,6 +178,22 @@ pub fn generate_operation_ranked_profile_outputs(
     artifact_output: Option<&Path>,
     capture_scope: &OperationCaptureScope,
 ) -> Result<PathBuf, RankedReportFailure> {
+    generate_ranked_profile_outputs_for_scope(
+        input,
+        output,
+        artifact_output,
+        Some(capture_scope.id),
+        ExistingOutputPolicy::Replace,
+    )
+}
+
+fn generate_ranked_profile_outputs_for_scope(
+    input: &Path,
+    output: &Path,
+    artifact_output: Option<&Path>,
+    capture_scope_id: Option<u64>,
+    existing_output: ExistingOutputPolicy,
+) -> Result<PathBuf, RankedReportFailure> {
     let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
     let artifact_output = artifact_output
         .map(|artifact_output| {
@@ -169,12 +212,15 @@ pub fn generate_operation_ranked_profile_outputs(
         return Err(profile_outputs_alias_failure());
     }
 
-    let document = load_ranked_profile(&paths.input, Some(capture_scope.id))?;
+    let document = match capture_scope_id {
+        Some(capture_scope_id) => load_ranked_profile(&paths.input, Some(capture_scope_id))?,
+        None => load_ranked_profile_input(&paths.input)?,
+    };
     let html = render_ranked_profile_html(&document)?;
     if let Some(artifact) = artifact_output {
-        write_ranked_profile_artifact(&artifact.output, &document, ExistingOutputPolicy::Replace)?;
+        write_ranked_profile_artifact(&artifact.output, &document, existing_output)?;
     }
-    write_ranked_profile_html(&paths.output, &html, ExistingOutputPolicy::Replace)?;
+    write_ranked_profile_html(&paths.output, &html, existing_output)?;
     Ok(paths.output)
 }
 
@@ -184,22 +230,6 @@ fn profile_outputs_alias_failure() -> RankedReportFailure {
         "profile_outputs_alias",
         "ranked HTML and artifact outputs must name different files",
     )
-}
-
-fn generate_ranked_profile_report_for_scope(
-    input: &Path,
-    output: &Path,
-    capture_scope_id: Option<u64>,
-    existing_output: ExistingOutputPolicy,
-) -> Result<PathBuf, RankedReportFailure> {
-    let paths = preflight_ranked_report_paths(input, output).map_err(RankedReportFailure::from)?;
-    let document = match capture_scope_id {
-        Some(capture_scope_id) => load_ranked_profile(&paths.input, Some(capture_scope_id))?,
-        None => load_ranked_profile_input(&paths.input)?,
-    };
-    let html = render_ranked_profile_html(&document)?;
-    write_ranked_profile_html(&paths.output, &html, existing_output)?;
-    Ok(paths.output)
 }
 
 fn load_ranked_profile_input(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {

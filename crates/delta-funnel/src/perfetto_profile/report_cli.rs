@@ -53,7 +53,11 @@ struct RankedReportArgs {
     #[arg(long, value_name = "OUTPUT.profile.html", allow_hyphen_values = true)]
     output: Option<PathBuf>,
 
-    /// Refuse to replace an existing report destination.
+    /// Also retain the shared ranked model for later report or terminal use.
+    #[arg(long, value_name = "OUTPUT.dfprofile", allow_hyphen_values = true)]
+    artifact_output: Option<PathBuf>,
+
+    /// Refuse to replace either output destination.
     #[arg(long)]
     no_clobber: bool,
 }
@@ -188,6 +192,10 @@ enum CliArgumentError {
     MissingOutputValue,
     #[snafu(display("--output may be specified only once"))]
     DuplicateOutput,
+    #[snafu(display("--artifact-output requires a path"))]
+    MissingArtifactOutputValue,
+    #[snafu(display("--artifact-output may be specified only once"))]
+    DuplicateArtifactOutput,
     #[snafu(display("only one profile input path may be provided"))]
     MultipleInputs,
     #[snafu(display("limit must be between 1 and 200"))]
@@ -220,6 +228,8 @@ impl CliArgumentError {
             Self::MissingInput => "missing_input",
             Self::MissingOutputValue => "missing_output_value",
             Self::DuplicateOutput => "duplicate_output",
+            Self::MissingArtifactOutputValue => "missing_artifact_output_value",
+            Self::DuplicateArtifactOutput => "duplicate_artifact_output",
             Self::MultipleInputs => "multiple_inputs",
             Self::InvalidLimit => "invalid_limit",
             Self::InvalidDepth => "invalid_depth",
@@ -751,13 +761,21 @@ fn terminal_output_failure() -> RankedReportFailure {
 }
 
 fn run_report_command(args: RankedReportArgs) -> i32 {
-    let output = args
-        .output
-        .unwrap_or_else(|| default_report_path(&args.input));
-    let generated = if args.no_clobber {
-        super::generate_ranked_profile_report_without_clobber(&args.input, &output)
+    let RankedReportArgs {
+        input,
+        output,
+        artifact_output,
+        no_clobber,
+    } = args;
+    let output = output.unwrap_or_else(|| default_report_path(&input));
+    let generated = if no_clobber {
+        super::generate_ranked_profile_report_without_clobber(
+            &input,
+            &output,
+            artifact_output.as_deref(),
+        )
     } else {
-        super::generate_ranked_profile_report(&args.input, &output)
+        super::generate_ranked_profile_report_outputs(&input, &output, artifact_output.as_deref())
     };
     match generated {
         Ok(output) => {
@@ -865,6 +883,7 @@ fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
     let mut args = args.iter();
     let mut has_input = false;
     let mut has_output = false;
+    let mut has_artifact_output = false;
     let mut has_no_clobber = false;
     while let Some(argument) = args.next() {
         if matches!(argument.to_str(), Some("-h" | "--help")) {
@@ -877,6 +896,14 @@ fn first_report_argument_error(args: &[OsString]) -> Option<CliArgumentError> {
             has_output = true;
             if args.next().is_none() {
                 return Some(CliArgumentError::MissingOutputValue);
+            }
+        } else if argument == "--artifact-output" {
+            if has_artifact_output {
+                return Some(CliArgumentError::DuplicateArtifactOutput);
+            }
+            has_artifact_output = true;
+            if args.next().is_none() {
+                return Some(CliArgumentError::MissingArtifactOutputValue);
             }
         } else if argument == "--no-clobber" {
             if has_no_clobber {
@@ -1208,6 +1235,7 @@ mod tests {
         assert!(report_help.contains("<INPUT>"));
         assert!(report_help.contains("Perfetto trace or ranked profile artifact"));
         assert!(report_help.contains("--output <OUTPUT.profile.html>"));
+        assert!(report_help.contains("--artifact-output <OUTPUT.dfprofile>"));
         assert!(report_help.contains("--no-clobber"));
         let bare_report_help =
             PerfettoCli::try_parse_from(["delta-funnel-perfetto", "help", "report"])
@@ -1223,6 +1251,7 @@ mod tests {
                 command: PerfettoCommand::Report(RankedReportArgs {
                     input: PathBuf::from("capture.pftrace"),
                     output: None,
+                    artifact_output: None,
                     no_clobber: false,
                 }),
             }
@@ -1233,6 +1262,8 @@ mod tests {
             "report",
             "--output",
             "reports/capture.html",
+            "--artifact-output",
+            "reports/capture.dfprofile",
             "traces/capture",
         ])?;
         assert_eq!(
@@ -1241,6 +1272,7 @@ mod tests {
                 command: PerfettoCommand::Report(RankedReportArgs {
                     input: PathBuf::from("traces/capture"),
                     output: Some(PathBuf::from("reports/capture.html")),
+                    artifact_output: Some(PathBuf::from("reports/capture.dfprofile")),
                     no_clobber: false,
                 }),
             }
@@ -1257,6 +1289,7 @@ mod tests {
                 command: PerfettoCommand::Report(RankedReportArgs {
                     input: PathBuf::from("capture.pftrace"),
                     output: None,
+                    artifact_output: None,
                     no_clobber: true,
                 }),
             }
@@ -1680,12 +1713,29 @@ mod tests {
             (
                 vec![
                     OsString::from("report"),
+                    OsString::from("--artifact-output"),
+                ],
+                CliArgumentError::MissingArtifactOutputValue,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
                     OsString::from("trace.pftrace"),
                     OsString::from("--output"),
                     OsString::from("first.html"),
                     OsString::from("--output"),
                 ],
                 CliArgumentError::DuplicateOutput,
+            ),
+            (
+                vec![
+                    OsString::from("report"),
+                    OsString::from("trace.pftrace"),
+                    OsString::from("--artifact-output"),
+                    OsString::from("first.dfprofile"),
+                    OsString::from("--artifact-output"),
+                ],
+                CliArgumentError::DuplicateArtifactOutput,
             ),
             (
                 vec![

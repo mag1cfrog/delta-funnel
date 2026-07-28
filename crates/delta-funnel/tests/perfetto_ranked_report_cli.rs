@@ -22,11 +22,12 @@ use delta_funnel::perfetto_profile::{
 const OPERATION_OUTPUTS_CHILD: &str = "DELTA_FUNNEL_TEST_OPERATION_OUTPUTS_CHILD";
 
 #[test]
-fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dyn std::error::Error>>
-{
+fn generates_a_ranked_report_and_artifact_with_one_healthy_trace_query()
+-> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("capture.pftrace");
     let output = directory.path().join("capture.profile.html");
+    let artifact = directory.path().join("capture.dfprofile");
     let aggregate = directory.path().join("aggregate.csv");
     let trace_processor = directory.path().join("trace_processor_shell");
     let input_bytes = b"\x0a\x00";
@@ -49,6 +50,8 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
         .arg(&input)
         .arg("--output")
         .arg(&output)
+        .arg("--artifact-output")
+        .arg(&artifact)
         .env("TRACE_PROCESSOR_SHELL", &trace_processor)
         .env("DELTA_FUNNEL_TEST_AGGREGATE", &aggregate)
         .output()?;
@@ -64,6 +67,21 @@ fn generates_a_ranked_report_with_one_healthy_trace_query() -> Result<(), Box<dy
     assert!(html.contains("Function metrics are sampled on-CPU observations"));
     assert!(!html.contains("http://"));
     assert!(!html.contains("https://"));
+    assert!(artifact.is_file());
+    let inspect = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("inspect")
+        .arg(&artifact)
+        .env(
+            "TRACE_PROCESSOR_SHELL",
+            directory.path().join("unavailable"),
+        )
+        .output()?;
+    assert!(
+        inspect.status.success(),
+        "artifact inspection failed: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    assert!(String::from_utf8(inspect.stdout)?.contains("Delta Funnel preview"));
 
     #[cfg(target_os = "linux")]
     {

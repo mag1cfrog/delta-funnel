@@ -280,11 +280,21 @@ summary records how many CPUs actually contributed samples.
 
 ### Inspect ranked results in the terminal
 
+Materialize the shared ranked model once when an agent or script will inspect a
+whole-process capture repeatedly:
+
+```sh
+uv run delta-funnel-perfetto report \
+  target/perfetto-captures/query.pftrace \
+  --output target/perfetto-captures/query.profile.html \
+  --artifact-output target/perfetto-captures/query.dfprofile
+```
+
 Start with a bounded one-shot view of the operation roots:
 
 ```sh
 uv run delta-funnel-perfetto inspect \
-  target/perfetto-captures/query.pftrace
+  target/perfetto-captures/query.dfprofile
 ```
 
 Each semantic row reports an exact wall-clock duration and an
@@ -293,7 +303,7 @@ to two lower levels:
 
 ```sh
 uv run delta-funnel-perfetto inspect \
-  target/perfetto-captures/query.pftrace \
+  target/perfetto-captures/query.dfprofile \
   --semantic 42 \
   --depth 2 \
   --limit 30
@@ -305,7 +315,7 @@ call path:
 
 ```sh
 uv run delta-funnel-perfetto inspect \
-  target/perfetto-captures/query.pftrace \
+  target/perfetto-captures/query.dfprofile \
   --function 42:7 \
   --sort inclusive-cpu \
   --depth 2
@@ -330,7 +340,7 @@ without reloading and aggregating the trace:
 
 ```sh
 uv run delta-funnel-perfetto inspect \
-  target/perfetto-captures/query.pftrace \
+  target/perfetto-captures/query.dfprofile \
   --interactive
 ```
 
