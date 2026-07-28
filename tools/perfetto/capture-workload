@@ -481,7 +481,7 @@ finish_health "$diagnostics_status"
 diagnostics_pid=
 diagnostics_stage=
 
-if (( health_status == 0 )); then
+if (( diagnostics_status == 0 )); then
   setsid --wait "$report_cli" report "$capture_path" \
     --output "$report_path" --no-clobber &
   diagnostics_pid=$!
