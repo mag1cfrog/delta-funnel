@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.4.0...delta-funnel-v0.4.1) - 2026-07-28
+
+### Added
+
+- export reusable ranked profile artifacts while generating trace reports
+
+### Fixed
+
+- report unknown Python provider scan options accurately
+
+### Other
+
+- inspect reusable ranked profile artifacts without reprocessing raw traces
+
 ## [0.4.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.3...delta-funnel-v0.4.0) - 2026-07-28
 
 ### Added
