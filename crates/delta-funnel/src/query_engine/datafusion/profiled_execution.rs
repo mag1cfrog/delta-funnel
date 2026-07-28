@@ -27,7 +27,6 @@ impl QueryTraceIdentity {
         query_owner: Option<&str>,
     ) -> Option<Self> {
         debug_assert_ne!(context.operation_id(), 0);
-        debug_assert!(context.process_spans_enabled());
         let query_execution_id = context.next_query_execution_id()?;
         Some(Self {
             context,
@@ -41,7 +40,7 @@ impl QueryTraceIdentity {
         self.context.operation_id()
     }
 
-    pub(super) fn process_root_span(&self) -> Option<&tracing::Span> {
+    pub(super) fn process_root_span(&self) -> &tracing::Span {
         self.context.process_root_span()
     }
 

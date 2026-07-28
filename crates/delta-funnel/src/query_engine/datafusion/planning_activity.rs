@@ -14,21 +14,18 @@ use super::QueryTraceIdentity;
 #[derive(Clone)]
 struct PlanningActivityContext {
     identity: QueryTraceIdentity,
-    process_parent: Option<tracing::Span>,
+    process_parent: tracing::Span,
     active_spans: Arc<Mutex<Vec<ActivePlanningSpan>>>,
 }
 
 #[derive(Clone)]
 struct ActivePlanningSpan {
-    process_span: Option<tracing::Span>,
+    process_span: tracing::Span,
 }
 
 impl ActivePlanningSpan {
     fn key(&self) -> Option<u64> {
-        self.process_span
-            .as_ref()
-            .and_then(tracing::Span::id)
-            .map(|id| id.into_u64())
+        self.process_span.id().map(|id| id.into_u64())
     }
 }
 
@@ -44,7 +41,7 @@ where
     F: Future<Output = Result<T, E>>,
 {
     let process_span = process_query_planning_span(&identity);
-    let process_parent = process_span.as_ref().map(|span| span.span.clone());
+    let process_parent = process_span.span.clone();
     let planning = PLANNING_ACTIVITY.scope(
         PlanningActivityContext {
             identity,
@@ -53,18 +50,13 @@ where
         },
         future,
     );
-    let result = match &process_span {
-        Some(span) => planning.instrument(span.span.clone()).await,
-        None => planning.await,
-    };
-    if let Some(span) = process_span {
-        span.finish(if result.is_ok() { "ok" } else { "error" });
-    }
+    let result = planning.instrument(process_span.span.clone()).await;
+    process_span.finish(if result.is_ok() { "ok" } else { "error" });
     result
 }
 
-fn process_query_planning_span(identity: &QueryTraceIdentity) -> Option<ProcessPlanningSpan> {
-    let parent = identity.process_root_span()?;
+fn process_query_planning_span(identity: &QueryTraceIdentity) -> ProcessPlanningSpan {
+    let parent = identity.process_root_span();
     let span = tracing::trace_span!(
         target: crate::profiling::PROFILE_TARGET,
         parent: parent,
@@ -76,10 +68,10 @@ fn process_query_planning_span(identity: &QueryTraceIdentity) -> Option<ProcessP
         result = tracing::field::Empty,
         time_semantics = "wall_clock",
     );
-    Some(ProcessPlanningSpan {
+    ProcessPlanningSpan {
         span,
         result_recorded: false,
-    })
+    }
 }
 
 struct ProcessPlanningSpan {
@@ -110,7 +102,7 @@ pub(crate) fn profile_query_planning_sync_result<T, E>(
     let context = PLANNING_ACTIVITY.try_with(Clone::clone).ok();
     let span = context
         .as_ref()
-        .and_then(|context| context.start_span(name, activity));
+        .map(|context| context.start_span(name, activity));
     let result = match &span {
         Some(span) => span.in_process_scope(operation),
         None => operation(),
@@ -130,46 +122,43 @@ impl PlanningActivityContext {
         &self,
         name: &'static str,
         activity: &'static str,
-    ) -> Option<PlanningActivitySpanRecorder> {
-        let parent = self
+    ) -> PlanningActivitySpanRecorder {
+        let process_parent = self
             .active_spans
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .last()
-            .cloned();
-        let process_parent = parent
-            .and_then(|parent| parent.process_span)
-            .or_else(|| self.process_parent.clone());
-        let process_span = process_parent.map(|parent| {
-            let span = tracing::trace_span!(
-                target: PROFILE_TARGET,
-                parent: &parent,
-                "DataFusion planning activity",
-                operation_id = self.identity.operation_id(),
-                query_execution_id = self.identity.query_execution_id(),
-                query_scope = self.identity.query_scope().as_str(),
-                query_owner = self.identity.query_owner(),
-                planning_activity_name = name,
-                activity,
-                result = tracing::field::Empty,
-                time_semantics = "wall_clock",
+            .map_or_else(
+                || self.process_parent.clone(),
+                |parent| parent.process_span.clone(),
             );
-            (span, parent)
-        });
+        let span = tracing::trace_span!(
+            target: PROFILE_TARGET,
+            parent: &process_parent,
+            "DataFusion planning activity",
+            operation_id = self.identity.operation_id(),
+            query_execution_id = self.identity.query_execution_id(),
+            query_scope = self.identity.query_scope().as_str(),
+            query_owner = self.identity.query_owner(),
+            planning_activity_name = name,
+            activity,
+            result = tracing::field::Empty,
+            time_semantics = "wall_clock",
+        );
         let active_span = ActivePlanningSpan {
-            process_span: process_span.as_ref().map(|(span, _)| span.clone()),
+            process_span: span.clone(),
         };
         let key = active_span.key();
-        let stage = OperationStageTrace::from_process_span(process_span)?;
+        let stage = OperationStageTrace::from_process_span((span, process_parent));
         self.active_spans
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(active_span);
-        Some(PlanningActivitySpanRecorder {
+        PlanningActivitySpanRecorder {
             stage: Some(stage),
             context: self.clone(),
             key,
-        })
+        }
     }
 }
 

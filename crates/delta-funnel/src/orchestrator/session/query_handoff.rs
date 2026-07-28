@@ -2476,6 +2476,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_profile_and_process_spans_coexist_for_one_preview()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+
+        let preview = session
+            .preview_table_with_options(
+                &table,
+                PreviewOptions::new(2).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            )
+            .await?;
+        let profile = preview
+            .execution_profile()
+            .ok_or("expected exact execution profile")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.operators().is_empty());
+
+        let spans = capture.captured().spans();
+        assert!(spans.iter().any(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.name == "Delta Funnel preview"
+                && span.fields["result"] == "ok"
+        }));
+        assert!(spans.iter().any(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.name == "DataFusion operator activity"
+        }));
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_unknown_table_returns_dataframe_failure_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;

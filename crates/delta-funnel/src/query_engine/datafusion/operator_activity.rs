@@ -98,9 +98,8 @@ struct ActiveOperatorActivitySpan {
     query_execution_id: u64,
     worker_lane: ActivityWorkerLane,
     owns_worker_lane: bool,
-    process_span_active: bool,
     #[cfg(feature = "perfetto-profile")]
-    task_trace_context: Option<DataFusionTaskTraceContext>,
+    task_trace_context: DataFusionTaskTraceContext,
 }
 
 impl ActiveOperatorActivitySpan {
@@ -109,7 +108,6 @@ impl ActiveOperatorActivitySpan {
             && self.query_execution_id == other.query_execution_id
             && self.worker_lane == other.worker_lane
             && self.owns_worker_lane == other.owns_worker_lane
-            && self.process_span_active == other.process_span_active
     }
 }
 
@@ -154,10 +152,6 @@ impl OperatorActivityRecorder {
         activity: &'static str,
     ) -> Option<OperatorActivitySpanRecorder> {
         let operator_name = operator_name.into();
-        if !self.context.process_spans_enabled() {
-            return None;
-        }
-
         let (context, owns_worker_lane) = self.execution_context(partition, true);
         let process_parent_active = ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|active| {
             let active = active.borrow();
@@ -166,9 +160,7 @@ impl OperatorActivityRecorder {
                     && parent.query_execution_id == self.query_execution_id
                     && parent.worker_lane.id == context.worker_lane.id
             };
-            active
-                .last()
-                .is_some_and(|parent| matches_parent(parent) && parent.process_span_active)
+            active.last().is_some_and(matches_parent)
         });
         let records_detail = match self.context.reserve_operator_activity() {
             Ok(()) => true,
@@ -198,33 +190,24 @@ impl OperatorActivityRecorder {
             &context,
             process_parent_active,
         );
-        if process_span.is_none() {
-            if owns_worker_lane {
-                Self::release_worker_lane(&self.identities, context.worker_lane);
-            }
-            return None;
-        }
         let active = ActiveOperatorActivitySpan {
             operation_id: self.context.operation_id(),
             query_execution_id: self.query_execution_id,
             worker_lane: context.worker_lane,
             owns_worker_lane,
-            process_span_active: process_span.is_some(),
             #[cfg(feature = "perfetto-profile")]
-            task_trace_context: process_span.as_ref().map(|_| {
-                DataFusionTaskTraceContext::new(
-                    self.clone(),
-                    operator_name,
-                    node_id,
-                    parent_node_id,
-                    partition,
-                    stream_id,
-                )
-            }),
+            task_trace_context: DataFusionTaskTraceContext::new(
+                self.clone(),
+                operator_name,
+                node_id,
+                parent_node_id,
+                partition,
+                stream_id,
+            ),
         };
         ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active.clone()));
         Some(OperatorActivitySpanRecorder {
-            process_span,
+            process_span: Some(process_span),
             process_result_recorded: false,
             identities: Arc::clone(&self.identities),
             active,
@@ -237,9 +220,6 @@ impl OperatorActivityRecorder {
         partition: usize,
         stream_id: u64,
     ) -> Option<ExecutionActivitySpanRecorder> {
-        if !self.context.process_spans_enabled() {
-            return None;
-        }
         if let Err(limit) = self.context.reserve_operator_activity() {
             if limit.should_report {
                 self.report_truncation(limit.maximum_spans);
@@ -247,26 +227,24 @@ impl OperatorActivityRecorder {
             return None;
         }
 
-        let process_span = self.context.process_root_span().map(|parent| {
-            let span = tracing::trace_span!(
-                target: crate::profiling::PROFILE_TARGET,
-                parent: parent,
-                "DataFusion execution activity",
-                operation_id = self.context.operation_id(),
-                query_execution_id = self.query_execution_id,
-                query_scope = self.query_scope.as_str(),
-                query_owner = self.query_owner.as_deref(),
-                execution_activity_name = DELTA_SCAN_OUTPUT_WAIT_NAME,
-                node_id,
-                operator_partition = usize_to_u64_saturating(partition),
-                execution_stream_id = stream_id,
-                activity = DELTA_SCAN_OUTPUT_WAIT_ACTIVITY,
-                result = tracing::field::Empty,
-                time_semantics = "wall_clock",
-            );
-            (span, parent.clone())
-        });
-        let stage = OperationStageTrace::from_process_span(process_span)?;
+        let parent = self.context.process_root_span();
+        let span = tracing::trace_span!(
+            target: crate::profiling::PROFILE_TARGET,
+            parent: parent,
+            "DataFusion execution activity",
+            operation_id = self.context.operation_id(),
+            query_execution_id = self.query_execution_id,
+            query_scope = self.query_scope.as_str(),
+            query_owner = self.query_owner.as_deref(),
+            execution_activity_name = DELTA_SCAN_OUTPUT_WAIT_NAME,
+            node_id,
+            operator_partition = usize_to_u64_saturating(partition),
+            execution_stream_id = stream_id,
+            activity = DELTA_SCAN_OUTPUT_WAIT_ACTIVITY,
+            result = tracing::field::Empty,
+            time_semantics = "wall_clock",
+        );
+        let stage = OperationStageTrace::from_process_span((span, parent.clone()));
         Some(ExecutionActivitySpanRecorder { stage: Some(stage) })
     }
 
@@ -284,8 +262,8 @@ impl OperatorActivityRecorder {
         activity: &'static str,
         context: &ActivityExecutionContext,
         process_parent_active: bool,
-    ) -> Option<tracing::Span> {
-        let operation_root = self.context.process_root_span()?;
+    ) -> tracing::Span {
+        let operation_root = self.context.process_root_span();
         let current = tracing::Span::current();
         let parent = if process_parent_active {
             &current
@@ -314,7 +292,7 @@ impl OperatorActivityRecorder {
         if let Some(parent_node_id) = parent_node_id {
             span.record("parent_node_id", parent_node_id);
         }
-        Some(span)
+        span
     }
 
     fn next_stream_id(&self) -> u64 {
@@ -405,16 +383,15 @@ impl OperatorActivityRecorder {
     }
 
     fn report_truncation(&self, maximum_spans: u64) {
-        if let Some(root) = self.context.process_root_span() {
-            tracing::event!(
-                name: "Operator activity trace truncated",
-                target: crate::profiling::PROFILE_TARGET,
-                parent: root.id(),
-                tracing::Level::TRACE,
-                operation_id = self.context.operation_id(),
-                maximum_spans,
-            );
-        }
+        let root = self.context.process_root_span();
+        tracing::event!(
+            name: "Operator activity trace truncated",
+            target: crate::profiling::PROFILE_TARGET,
+            parent: root.id(),
+            tracing::Level::TRACE,
+            operation_id = self.context.operation_id(),
+            maximum_spans,
+        );
     }
 }
 

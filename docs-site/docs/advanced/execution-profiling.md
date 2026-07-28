@@ -4,7 +4,7 @@ Delta Funnel provides two operation-scoped profiling models:
 
 | Goal | Configuration | Output |
 | --- | --- | --- |
-| Measure exact phases and DataFusion operators | `execution_profile=True` | Returned profile |
+| Collect exact DataFusion operator metrics | `execution_profile=True` | Returned profile |
 | Rank sampled native CPU functions | `RankedProfileConfig` | Interactive HTML and optional `.dfprofile` artifact |
 
 Both options work with `Table.preview`, `Table.write_to_mssql`, and
@@ -84,8 +84,8 @@ error while still attempting to finish the report.
 
 ## Inspect returned preview diagnostics
 
-Use exact execution profiling when you need phase timings and DataFusion
-operator metrics without native CPU sampling:
+Use exact execution profiling when you need DataFusion operator metrics
+alongside the always-available phase timings, without native CPU sampling:
 
 ```python
 preview = table.preview(limit=20, execution_profile=True)

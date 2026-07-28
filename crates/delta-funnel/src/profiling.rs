@@ -93,7 +93,7 @@ pub(crate) struct OperationTraceContext {
     operation_id: u64,
     kind: OperationTraceKind,
     next_query_execution_id: Arc<AtomicU64>,
-    process_trace: Option<Arc<ProcessOperationTrace>>,
+    process_trace: Arc<ProcessOperationTrace>,
     operator_activity_budget: Arc<OperatorActivityBudget>,
 }
 
@@ -111,11 +111,11 @@ impl OperationTraceContext {
             operation_id,
             kind,
             next_query_execution_id: Arc::new(AtomicU64::new(1)),
-            process_trace: Some(Arc::new(ProcessOperationTrace::new(
+            process_trace: Arc::new(ProcessOperationTrace::new(
                 kind,
                 operation_id,
                 current_operation_capture_scope_id(),
-            ))),
+            )),
             operator_activity_budget: Arc::new(OperatorActivityBudget::new(
                 MAX_OPERATOR_ACTIVITY_SPANS,
             )),
@@ -144,22 +144,16 @@ impl OperationTraceContext {
         self.operation_id
     }
 
-    pub(crate) const fn process_spans_enabled(&self) -> bool {
-        self.process_trace.is_some()
-    }
-
-    pub(crate) fn process_root_span(&self) -> Option<&tracing::Span> {
-        self.process_trace.as_deref().map(|trace| &trace.span)
+    pub(crate) fn process_root_span(&self) -> &tracing::Span {
+        &self.process_trace.span
     }
 
     pub(crate) fn record_process_result(&self, result: &'static str) {
-        if let Some(trace) = &self.process_trace {
-            trace.record_result(result);
-        }
+        self.process_trace.record_result(result);
     }
 
-    fn start_process_phase(&self, phase: OperationTracePhase) -> Option<ProcessSpanTrace> {
-        let root = self.process_root_span()?;
+    fn start_process_phase(&self, phase: OperationTracePhase) -> ProcessSpanTrace {
+        let root = self.process_root_span();
         let span = tracing::trace_span!(
             target: PROFILE_TARGET,
             parent: root,
@@ -169,11 +163,11 @@ impl OperationTraceContext {
             result = tracing::field::Empty,
             time_semantics = "wall_clock",
         );
-        Some(ProcessSpanTrace {
+        ProcessSpanTrace {
             span,
             _parent: root.clone(),
             result_recorded: false,
-        })
+        }
     }
 
     fn start_process_stage(
@@ -181,8 +175,8 @@ impl OperationTraceContext {
         name: &'static str,
         category: &'static str,
         owner_id: Option<u64>,
-    ) -> Option<ProcessSpanTrace> {
-        let root = self.process_root_span()?;
+    ) -> ProcessSpanTrace {
+        let root = self.process_root_span();
         let span = tracing::trace_span!(
             target: PROFILE_TARGET,
             parent: root,
@@ -195,11 +189,11 @@ impl OperationTraceContext {
             result = tracing::field::Empty,
             time_semantics = "wall_clock",
         );
-        Some(ProcessSpanTrace {
+        ProcessSpanTrace {
             span,
             _parent: root.clone(),
             result_recorded: false,
-        })
+        }
     }
 
     pub(crate) fn next_query_execution_id(&self) -> Option<u64> {
@@ -226,7 +220,7 @@ impl ProcessOperationPhaseTracker {
         let context = context.cloned();
         let active = context
             .as_ref()
-            .and_then(|context| context.start_process_phase(phase));
+            .map(|context| context.start_process_phase(phase));
         Self { active, context }
     }
 
@@ -243,7 +237,7 @@ impl ProcessOperationPhaseTracker {
         self.active = self
             .context
             .as_ref()
-            .and_then(|context| context.start_process_phase(phase));
+            .map(|context| context.start_process_phase(phase));
     }
 
     pub(crate) fn finish(&mut self, result: &'static str) {
@@ -310,16 +304,14 @@ pub(crate) struct OperationStageTrace {
 }
 
 impl OperationStageTrace {
-    pub(crate) fn from_process_span(
-        process_span: Option<(tracing::Span, tracing::Span)>,
-    ) -> Option<Self> {
-        process_span.map(|(span, parent)| Self {
+    pub(crate) fn from_process_span((span, parent): (tracing::Span, tracing::Span)) -> Self {
+        Self {
             process_span: ProcessSpanTrace {
                 span,
                 _parent: parent,
                 result_recorded: false,
             },
-        })
+        }
     }
 
     pub(crate) fn start(
@@ -329,15 +321,13 @@ impl OperationStageTrace {
         owner_id: Option<u64>,
     ) -> Option<Self> {
         debug_assert!(owner_id.is_none_or(|owner_id| owner_id != 0));
-        context
-            .and_then(|context| {
-                context.start_process_stage(
-                    name,
-                    category,
-                    owner_id.filter(|owner_id| *owner_id != 0),
-                )
-            })
-            .map(|process_span| Self { process_span })
+        context.map(|context| Self {
+            process_span: context.start_process_stage(
+                name,
+                category,
+                owner_id.filter(|owner_id| *owner_id != 0),
+            ),
+        })
     }
 
     pub(crate) async fn instrument_future<F>(&self, future: F) -> F::Output

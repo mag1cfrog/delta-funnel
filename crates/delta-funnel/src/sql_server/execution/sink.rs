@@ -1978,7 +1978,7 @@ mod tests {
             })?;
         let root_id = trace_context
             .process_root_span()
-            .and_then(tracing::Span::id)
+            .id()
             .ok_or_else(|| DeltaFunnelError::Config {
                 message: "expected process root span".to_owned(),
             })?
