@@ -135,6 +135,11 @@ throughput, and peak RSS. Three repetitions are enough for a directional
 development comparison, but not for a hard performance threshold. Investigate
 host noise before attributing a small difference to a code change.
 
+`execution_profile_operator_count_max` records the largest retained operator
+count across repetitions. `execution_profile_metric_count_max` counts both
+aggregated and original per-partition metric entries because the profile keeps
+both representations.
+
 ### Compare Samply with exact execution profiling
 
 Use the same symbolized optimized binary for the disabled, Samply, and exact

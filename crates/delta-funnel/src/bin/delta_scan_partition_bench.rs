@@ -109,7 +109,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 20;
+const BENCHMARK_SCHEMA_VERSION: u32 = 21;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD: &str = "provider_partitioned_event_log_12m";
@@ -219,7 +219,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 71] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 73] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -290,6 +290,8 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 71] = [
     "batch_latency_micros_p99",
     "min_total_micros",
     "max_total_micros",
+    "execution_profile_operator_count_max",
+    "execution_profile_metric_count_max",
     "execution_profile_mode",
 ];
 
@@ -1012,6 +1014,8 @@ struct ProviderExecRunMeasurement {
     produced_batches: usize,
     process_peak_rss_bytes: Option<u64>,
     process_peak_rss_delta_bytes: Option<u64>,
+    execution_profile_operator_count: usize,
+    execution_profile_metric_count: usize,
     batch_latency_micros: Vec<u64>,
     read_stats: ProviderExecReadStatsMeasurement,
 }
@@ -1055,6 +1059,8 @@ struct ProviderExecSummary {
     batch_latency_micros: PercentileSummary,
     process_peak_rss_bytes: Option<u64>,
     process_peak_rss_delta_bytes: Option<u64>,
+    execution_profile_operator_count_max: usize,
+    execution_profile_metric_count_max: usize,
     min_total_micros: u64,
     max_total_micros: u64,
     read_stats: ProviderExecReadStatsSummary,
@@ -2498,6 +2504,23 @@ async fn run_provider_exec_write_workflow_once(
         .map(|output| output.batch_shaping().output_batches())
         .map(u64_to_usize_saturating)
         .fold(0_usize, usize::saturating_add);
+    let mut execution_profile_operator_count = 0_usize;
+    let mut execution_profile_metric_count = 0_usize;
+    for output in report.outputs() {
+        let delta_funnel::MssqlOutputWriteStatus::Succeeded(report) = output else {
+            continue;
+        };
+        let Some(profile) = report.execution_profile() else {
+            continue;
+        };
+        execution_profile_operator_count =
+            execution_profile_operator_count.saturating_add(profile.operators().len());
+        for operator in profile.operators() {
+            execution_profile_metric_count = execution_profile_metric_count
+                .saturating_add(operator.aggregated_metrics().len())
+                .saturating_add(operator.metrics().len());
+        }
+    }
     let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
     let provider_stats = report
         .sources()
@@ -2535,6 +2558,8 @@ async fn run_provider_exec_write_workflow_once(
         produced_batches,
         process_peak_rss_bytes,
         process_peak_rss_delta_bytes,
+        execution_profile_operator_count,
+        execution_profile_metric_count,
         batch_latency_micros,
         read_stats: provider_exec_read_stats_measurement(&provider_stats),
     })
@@ -2703,6 +2728,8 @@ async fn run_provider_exec_once(
         produced_batches,
         process_peak_rss_bytes,
         process_peak_rss_delta_bytes,
+        execution_profile_operator_count: 0,
+        execution_profile_metric_count: 0,
         batch_latency_micros,
         read_stats,
     })
@@ -2791,6 +2818,16 @@ fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> Provide
             .iter()
             .filter_map(|measurement| measurement.process_peak_rss_delta_bytes)
             .max(),
+        execution_profile_operator_count_max: measurements
+            .iter()
+            .map(|measurement| measurement.execution_profile_operator_count)
+            .max()
+            .unwrap_or(0),
+        execution_profile_metric_count_max: measurements
+            .iter()
+            .map(|measurement| measurement.execution_profile_metric_count)
+            .max()
+            .unwrap_or(0),
         min_total_micros: total_micros.iter().copied().min().unwrap_or(0),
         max_total_micros: total_micros.iter().copied().max().unwrap_or(0),
         read_stats: provider_exec_read_stats_summary(measurements),
@@ -3175,6 +3212,8 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         summary.batch_latency_micros.p99.to_string(),
         summary.min_total_micros.to_string(),
         summary.max_total_micros.to_string(),
+        summary.execution_profile_operator_count_max.to_string(),
+        summary.execution_profile_metric_count_max.to_string(),
         execution_profile_mode_name(input.execution_profile_mode).to_owned(),
     ]
 }
@@ -8128,6 +8167,8 @@ mod tests {
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"total_micros_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"source_rows_per_second_p99"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"batch_latency_micros_p99"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"execution_profile_operator_count_max"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"execution_profile_metric_count_max"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"execution_profile_mode"));
     }
 
@@ -8690,6 +8731,8 @@ mod tests {
             },
             process_peak_rss_bytes: Some(4096),
             process_peak_rss_delta_bytes: Some(1024),
+            execution_profile_operator_count_max: 7,
+            execution_profile_metric_count_max: 19,
             min_total_micros: 29,
             max_total_micros: 33,
             read_stats: ProviderExecReadStatsSummary {
@@ -8779,7 +8822,9 @@ mod tests {
         assert_eq!(row[49], "12");
         assert_eq!(row[51], "4096");
         assert_eq!(row[52], "1024");
-        assert_eq!(row[70], "detailed");
+        assert_eq!(row[70], "7");
+        assert_eq!(row[71], "19");
+        assert_eq!(row[72], "detailed");
     }
 
     #[test]
