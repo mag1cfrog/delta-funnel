@@ -6,7 +6,7 @@ DataFusion, Delta Kernel, Arrow, Parquet, and Tokio frames in one profile. It
 records operating-system threads rather than Delta Funnel logical workers.
 
 Samply is a standalone local development tool. It does not add a profiler to
-Delta Funnel or combine its samples with the semantic timeline.
+Delta Funnel or combine its samples with exact execution profiles.
 
 ## Install Samply and allow performance events
 

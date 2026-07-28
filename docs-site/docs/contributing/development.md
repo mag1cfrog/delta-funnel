@@ -54,7 +54,7 @@ existing server, and individual suite options.
 
 ## Profile a local workload
 
-Use [Profile Delta Funnel workloads](profiling.md) to choose between the stable
-semantic timeline, Samply, and the opt-in Perfetto diagnostic build. The guide
-covers symbolized builds, capture permissions, local data handling, and viewer
-workflows.
+Use [Profile Delta Funnel workloads](profiling.md) to choose between exact
+operator profiling, Samply, and the opt-in Perfetto diagnostic build. The
+guide covers symbolized builds, capture permissions, local data handling, and
+viewer workflows.

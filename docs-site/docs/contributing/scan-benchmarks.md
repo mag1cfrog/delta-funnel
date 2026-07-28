@@ -123,12 +123,10 @@ cargo run --release -p delta-funnel --bin delta_scan_partition_bench -- \
 
 Run both commands on an otherwise idle host. Keep their workload, seed,
 backend, scheduling profile, storage profile, repetition count, release build,
-and CSV schema version identical. Compare exact execution profiling against
-both of these references:
+and CSV schema version identical. Compare the two results:
 
-- Profiling disabled measures the total cost added by profiling.
-- The current exact execution mode measures whether a replacement profiler
-  improves or regresses the existing implementation.
+- The disabled run is the control.
+- The detailed run shows the cost of exact execution profiling.
 
 `total_micros` includes the measured workflow. Compare its percentiles,
 throughput, and peak RSS. Three repetitions are enough for a directional

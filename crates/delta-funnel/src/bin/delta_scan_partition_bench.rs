@@ -709,7 +709,7 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "Use --provider-exec-detailed-profile with the phase-aligned workflow to measure detailed profiling and trace export."
+        "Use --provider-exec-detailed-profile with the phase-aligned workflow to measure exact execution profiling overhead."
     )?;
     writeln!(output, "The default seed is {DEFAULT_BENCHMARK_SEED}.")?;
     Ok(())
@@ -7039,6 +7039,9 @@ mod tests {
         assert!(usage.contains("Use --provider-exec-workload"));
         assert!(usage.contains("Use --provider-exec-default-case"));
         assert!(usage.contains("Use --provider-exec-phase-aligned-workflow"));
+        assert!(usage.contains(
+            "Use --provider-exec-detailed-profile with the phase-aligned workflow to measure exact execution profiling overhead."
+        ));
         assert!(usage.contains("The default seed is 0."));
 
         Ok(())
