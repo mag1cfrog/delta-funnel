@@ -110,6 +110,7 @@ impl OperationCapture {
             tracebox.as_os_str(),
             &config_path,
             &trace,
+            authorize_tracebox_under_yama,
             delta_funnel::perfetto_profile::initialize_perfetto,
             delta_funnel::perfetto_profile::wait_for_capture,
         )?;
@@ -635,6 +636,7 @@ fn start_tracebox_with(
     tracebox: &OsStr,
     config: &Path,
     trace: &Path,
+    authorize: impl FnOnce(u32) -> Result<(), ProfilerFailure>,
     initialize: impl FnOnce() -> io::Result<()>,
     wait_for_capture: impl FnOnce(Duration) -> io::Result<()>,
 ) -> Result<ManagedTracebox, ProfilerFailure> {
@@ -669,7 +671,7 @@ fn start_tracebox_with(
             )
         })?;
     let mut tracebox = ManagedTracebox::new(child);
-    authorize_tracebox_under_yama(tracebox.id()?)?;
+    authorize(tracebox.id()?)?;
     tracebox.release_start_gate()?;
     wait_for_tracebox_readiness(tracebox.child_mut()?)?;
     if initialize().is_err() {
@@ -980,14 +982,36 @@ mod tests {
         let trace = directory.path().join("capture.pftrace");
 
         preflight_tracebox(OsStr::new(FAKE_TRACEBOX)).map_err(profiler_test_error)?;
+        let mut gate_observed = false;
         let mut tracebox = start_tracebox_with(
             OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
+            |pid| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let command_line = fs::read(format!("/proc/{pid}/cmdline"))
+                        .expect("the gated child command line must be readable");
+                    if command_line
+                        .split(|byte| *byte == 0)
+                        .any(|argument| argument == b"delta-funnel-tracebox-gate")
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "tracebox must remain behind the start gate until authorization"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                gate_observed = true;
+                authorize_tracebox_under_yama(pid)
+            },
             || Ok(()),
             |_| Ok(()),
         )
         .map_err(profiler_test_error)?;
+        assert!(gate_observed);
         if yama_ptrace_scope_is_relational().map_err(profiler_test_error)? {
             assert!(
                 !Command::new("sh")
@@ -1018,6 +1042,7 @@ mod tests {
             OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
+            authorize_tracebox_under_yama,
             || Err(io::Error::other("injected initialization failure")),
             |_| Ok(()),
         )
@@ -1034,6 +1059,50 @@ mod tests {
             .map_err(io::Error::other)?;
         // SAFETY: signal 0 only checks whether the captured numeric PID still exists.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_tracebox_is_reaped_when_authorization_fails() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("capture.pbtx");
+        fs::write(&config, "test config")?;
+        let trace = directory.path().join("capture.pftrace");
+        let mut child_pid = None;
+        let mut initialize_called = false;
+        let mut capture_wait_called = false;
+
+        let error = start_tracebox_with(
+            OsStr::new(FAKE_TRACEBOX),
+            &config,
+            &trace,
+            |pid| {
+                child_pid = Some(pid);
+                Err(ProfilerFailure::new(
+                    "ptrace_permission_failed",
+                    "injected authorization failure",
+                ))
+            },
+            || {
+                initialize_called = true;
+                Ok(())
+            },
+            |_| {
+                capture_wait_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("tracebox authorization must fail");
+        assert_eq!(error.kind, "ptrace_permission_failed");
+        assert!(!initialize_called);
+        assert!(!capture_wait_called);
+        assert!(!trace.with_extension("pid").exists());
+
+        let pid = child_pid.expect("the gated child PID must be captured");
+        // SAFETY: signal 0 only checks whether the captured numeric PID still exists.
+        assert_eq!(unsafe { libc::kill(pid.cast_signed(), 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
         Ok(())
     }
