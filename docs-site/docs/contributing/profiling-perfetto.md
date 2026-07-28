@@ -69,6 +69,16 @@ This loosens system-wide performance-event access. Do not use it on a shared or
 production host without approval. The temporary setting lasts until reboot.
 Do not run the Python workload or `tracebox` with `sudo`.
 
+When Linux Yama uses restricted ptrace mode (`ptrace_scope=1`),
+operation-scoped ranked profiling temporarily authorizes only the capture's
+tracebox process and its descendants to inspect the workload. The authorization
+ends when Delta Funnel stops and reaps that process.
+
+Yama permits only one declared ptracer per process. Starting a ranked profile
+therefore replaces any existing `PR_SET_PTRACER` declaration. Do not combine
+operation-scoped ranked profiling with a crash handler or debugger that relies
+on its own declaration.
+
 ## 2. Install the diagnostics wheel with uv
 
 Merge this configuration into the workload project's `pyproject.toml`. Keep
