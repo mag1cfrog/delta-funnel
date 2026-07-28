@@ -20,6 +20,14 @@ const TRACEBOX_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPTURE_ENABLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TRACEBOX_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const TRACEBOX_STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const TRACEBOX_START_GATE: &str = concat!(
+    "import os,sys;",
+    "os.read(0,1) or sys.exit(70);",
+    "fd=os.open(os.devnull,os.O_RDONLY);",
+    "os.dup2(fd,0);",
+    "os.close(fd);",
+    "os.execvp(sys.argv[2],sys.argv[2:])",
+);
 const SHORT_CAPTURE_CONFIG: &str = include_str!(concat!(
     env!("OUT_DIR"),
     "/perfetto/delta-funnel-standard.pbtx"
@@ -106,7 +114,14 @@ impl OperationCapture {
                 "temporary Perfetto capture config could not be written",
             )
         })?;
+        let python = env::current_exe().map_err(|_| {
+            ProfilerFailure::new(
+                "tracebox_start_failed",
+                "Python tracebox start gate could not be located",
+            )
+        })?;
         let tracebox = start_tracebox_with(
+            python.as_os_str(),
             tracebox.as_os_str(),
             &config_path,
             &trace,
@@ -280,8 +295,12 @@ fn yama_ptrace_scope_is_relational_at(path: &Path) -> Result<bool, ProfilerFailu
         }
     };
     match scope.trim() {
-        "0" | "2" | "3" => Ok(false),
+        "0" => Ok(false),
         "1" => Ok(true),
+        "2" | "3" => Err(ProfilerFailure::new(
+            "ptrace_permission_failed",
+            "Linux Yama ptrace mode does not support scoped tracebox authorization",
+        )),
         _ => Err(ProfilerFailure::new(
             "ptrace_permission_failed",
             "Linux Yama ptrace mode was not recognized",
@@ -633,6 +652,7 @@ fn mapped_file_paths(maps: &str) -> impl Iterator<Item = PathBuf> + '_ {
 }
 
 fn start_tracebox_with(
+    python: &OsStr,
     tracebox: &OsStr,
     config: &Path,
     trace: &Path,
@@ -640,12 +660,14 @@ fn start_tracebox_with(
     initialize: impl FnOnce() -> io::Result<()>,
     wait_for_capture: impl FnOnce(Duration) -> io::Result<()>,
 ) -> Result<ManagedTracebox, ProfilerFailure> {
-    // The shell keeps this PID stable across exec while preventing tracebox
-    // from inspecting the parent before Yama authorizes that exact PID.
-    let child = Command::new("/bin/sh")
+    // The Python process keeps this PID stable across exec while preventing
+    // tracebox from inspecting the parent before Yama authorizes that exact PID.
+    let child = Command::new(python)
         .args([
+            "-I",
+            "-S",
             "-c",
-            "IFS= read -r _ || exit 70; exec \"$@\" </dev/null",
+            TRACEBOX_START_GATE,
             "delta-funnel-tracebox-gate",
         ])
         .arg(tracebox)
@@ -811,6 +833,8 @@ mod tests {
     static TRACEBOX_TEST_LOCK: Mutex<()> = Mutex::new(());
     #[cfg(unix)]
     const FAKE_TRACEBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_tracebox.sh");
+    #[cfg(unix)]
+    const PYTHON: &str = "python3";
 
     #[test]
     fn current_process_config_scopes_samples_and_applies_both_supported_rates() {
@@ -930,20 +954,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn yama_scope_inspection_rejects_unreadable_and_unknown_values() -> io::Result<()> {
+    fn yama_scope_inspection_rejects_restrictive_unreadable_and_unknown_values() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let scope = directory.path().join("ptrace_scope");
-        for (value, relational) in [
-            ("0\n", false),
-            ("1\n", true),
-            ("2\n", false),
-            ("3\n", false),
-        ] {
+        for (value, relational) in [("0\n", false), ("1\n", true)] {
             fs::write(&scope, value)?;
             assert_eq!(
                 yama_ptrace_scope_is_relational_at(&scope).map_err(profiler_test_error)?,
                 relational,
             );
+        }
+
+        for value in ["2\n", "3\n"] {
+            fs::write(&scope, value)?;
+            let error = yama_ptrace_scope_is_relational_at(&scope)
+                .expect_err("a restrictive Yama mode must fail explicitly");
+            assert_eq!(error.kind, "ptrace_permission_failed");
         }
 
         fs::write(&scope, "unexpected\n")?;
@@ -984,6 +1010,7 @@ mod tests {
         preflight_tracebox(OsStr::new(FAKE_TRACEBOX)).map_err(profiler_test_error)?;
         let mut gate_observed = false;
         let mut tracebox = start_tracebox_with(
+            OsStr::new(PYTHON),
             OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
@@ -1039,6 +1066,7 @@ mod tests {
         let trace = directory.path().join("capture.pftrace");
 
         let error = start_tracebox_with(
+            OsStr::new(PYTHON),
             OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
@@ -1075,6 +1103,7 @@ mod tests {
         let mut capture_wait_called = false;
 
         let error = start_tracebox_with(
+            OsStr::new(PYTHON),
             OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
