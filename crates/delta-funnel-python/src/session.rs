@@ -623,19 +623,22 @@ fn parse_provider_scan_options(
     };
 
     for (key, value) in option_entries(py, provider_scan_options)? {
-        let value = usize_option(py, &value, key.as_str())?;
         match key.as_str() {
             "max_concurrent_file_reads_per_scan" => {
-                options.max_concurrent_file_reads_per_scan = Some(value);
+                options.max_concurrent_file_reads_per_scan =
+                    Some(usize_option(py, &value, key.as_str())?);
             }
             "max_concurrent_file_reads_per_partition" => {
-                options.max_concurrent_file_reads_per_partition = value;
+                options.max_concurrent_file_reads_per_partition =
+                    usize_option(py, &value, key.as_str())?;
             }
             "output_buffer_capacity_per_partition" => {
-                options.output_buffer_capacity_per_partition = value;
+                options.output_buffer_capacity_per_partition =
+                    usize_option(py, &value, key.as_str())?;
             }
             "native_async_prefetch_file_count_per_partition" => {
-                options.native_async_prefetch_file_count_per_partition = value;
+                options.native_async_prefetch_file_count_per_partition =
+                    usize_option(py, &value, key.as_str())?;
             }
             _ => {
                 return Err(unknown_option_error(py, "provider scan", key.as_str()));
@@ -3676,6 +3679,33 @@ union all select cast(902 as bigint) as order_id",),
                     "config"
                 );
             }
+
+            let provider_scan_options = PyDict::new(py);
+            provider_scan_options.set_item("reader_backend", "official_kernel")?;
+            let error = match PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            ) {
+                Ok(_) => {
+                    return Err(PyAssertionError::new_err(
+                        "expected unknown provider scan option error",
+                    ));
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "unknown_option"
+            );
+            assert_eq!(
+                error.value(py).getattr("message")?.extract::<String>()?,
+                "unknown provider scan option `reader_backend`"
+            );
 
             Ok(())
         })
