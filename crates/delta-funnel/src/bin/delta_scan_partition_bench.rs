@@ -2504,6 +2504,7 @@ async fn run_provider_exec_write_workflow_once(
         .map(|output| output.batch_shaping().output_batches())
         .map(u64_to_usize_saturating)
         .fold(0_usize, usize::saturating_add);
+    let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
     let mut execution_profile_operator_count = 0_usize;
     let mut execution_profile_metric_count = 0_usize;
     for output in report.outputs() {
@@ -2521,7 +2522,6 @@ async fn run_provider_exec_write_workflow_once(
                 .saturating_add(operator.metrics().len());
         }
     }
-    let total_micros = u128_to_u64_saturating(query_started.elapsed().as_micros()).max(1);
     let provider_stats = report
         .sources()
         .iter()
