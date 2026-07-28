@@ -233,15 +233,33 @@ fn profile_outputs_alias_failure() -> RankedReportFailure {
 }
 
 fn load_ranked_profile_input(input: &Path) -> Result<RankedProfileDocument, RankedReportFailure> {
-    let artifact_extension = input
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfprofile"));
-    if artifact_extension || has_ranked_profile_artifact_magic(input)? {
+    if is_ranked_profile_artifact(input)? {
         read_ranked_profile_artifact(input)
     } else {
         load_ranked_profile(input, None)
     }
+}
+
+fn load_ranked_profile_artifact_input(
+    input: &Path,
+) -> Result<RankedProfileDocument, RankedReportFailure> {
+    if is_ranked_profile_artifact(input)? {
+        read_ranked_profile_artifact(input)
+    } else {
+        Err(RankedReportFailure::new(
+            RankedReportFailurePhase::Input,
+            "ranked_artifact_required",
+            "terminal inspection requires a ranked profile artifact; convert a raw trace with `report --artifact-output`",
+        ))
+    }
+}
+
+fn is_ranked_profile_artifact(input: &Path) -> Result<bool, RankedReportFailure> {
+    let artifact_extension = input
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dfprofile"));
+    Ok(artifact_extension || has_ranked_profile_artifact_magic(input)?)
 }
 
 const CATEGORY: &str = "delta_funnel.profile";

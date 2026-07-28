@@ -290,6 +290,10 @@ uv run delta-funnel-perfetto report \
   --artifact-output target/perfetto-captures/query.dfprofile
 ```
 
+`inspect` accepts the `.dfprofile` artifact, not a raw trace, and never starts
+Trace Processor. Use `report --artifact-output` once to convert an older raw
+trace.
+
 Start with a bounded one-shot view of the operation roots:
 
 ```sh

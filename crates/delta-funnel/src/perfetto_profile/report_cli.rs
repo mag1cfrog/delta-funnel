@@ -64,8 +64,8 @@ struct RankedReportArgs {
 
 #[derive(Args, Debug, PartialEq, Eq)]
 struct InspectArgs {
-    /// Perfetto trace or ranked profile artifact to inspect.
-    #[arg(value_name = "INPUT")]
+    /// Ranked profile artifact to inspect.
+    #[arg(value_name = "INPUT.dfprofile")]
     input: PathBuf,
 
     /// Maximum number of rows to display.
@@ -459,7 +459,7 @@ fn run_inspect_command(args: InspectArgs) -> i32 {
         Ok(input) => input,
         Err(error) => return emit_failure(error.into()),
     };
-    match super::load_ranked_profile_input(&input) {
+    match super::load_ranked_profile_artifact_input(&input) {
         Ok(document) if args.interactive => {
             let stdin = io::stdin();
             let stdout = io::stdout();
@@ -1308,8 +1308,8 @@ mod tests {
             .ok_or("inspect help should stop parsing")?;
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         let help = help.to_string();
-        assert!(help.contains("<INPUT>"));
-        assert!(help.contains("Perfetto trace or ranked profile artifact"));
+        assert!(help.contains("<INPUT.dfprofile>"));
+        assert!(help.contains("Ranked profile artifact to inspect"));
         assert!(help.contains("--limit <LIMIT>"));
         assert!(help.contains("--semantic <ID>"));
         assert!(help.contains("--function <SEMANTIC_ID:FUNCTION_ID>"));
@@ -1328,7 +1328,7 @@ mod tests {
             PerfettoCli::try_parse_from([
                 "delta-funnel-perfetto",
                 "inspect",
-                "capture.pftrace",
+                "capture.dfprofile",
                 "--limit",
                 "7",
                 "--semantic",
@@ -1345,7 +1345,7 @@ mod tests {
             ])?,
             PerfettoCli {
                 command: PerfettoCommand::Inspect(InspectArgs {
-                    input: PathBuf::from("capture.pftrace"),
+                    input: PathBuf::from("capture.dfprofile"),
                     limit: 7,
                     semantic: Some(42),
                     function: None,
@@ -1362,13 +1362,13 @@ mod tests {
             PerfettoCli::try_parse_from([
                 "delta-funnel-perfetto",
                 "inspect",
-                "capture.pftrace",
+                "capture.dfprofile",
                 "--function",
                 "42:7",
             ])?,
             PerfettoCli {
                 command: PerfettoCommand::Inspect(InspectArgs {
-                    input: PathBuf::from("capture.pftrace"),
+                    input: PathBuf::from("capture.dfprofile"),
                     limit: DEFAULT_INSPECT_LIMIT,
                     semantic: None,
                     function: Some(FunctionSelector {
