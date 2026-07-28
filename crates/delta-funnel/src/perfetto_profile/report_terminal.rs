@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 
 use clap::ValueEnum;
+use snafu::Snafu;
 
 use super::ranked_report::{
     CompactFunctionTree, RankedFunction, RankedProfileDocument, RankedProfileMetadata,
@@ -43,39 +43,22 @@ pub(super) enum InspectSelection {
     Function { semantic_id: i64, function_id: i64 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
 pub(super) enum TerminalInspectError {
-    SemanticNotFound(i64),
+    #[snafu(display("semantic:{semantic_id} does not exist"))]
+    SemanticNotFound { semantic_id: i64 },
+    #[snafu(display("function:{semantic_id}:{function_id} does not exist"))]
     FunctionNotFound { semantic_id: i64, function_id: i64 },
 }
 
 impl TerminalInspectError {
     pub(super) const fn kind(self) -> &'static str {
         match self {
-            Self::SemanticNotFound(_) => "semantic_not_found",
+            Self::SemanticNotFound { .. } => "semantic_not_found",
             Self::FunctionNotFound { .. } => "function_not_found",
         }
     }
 }
-
-impl fmt::Display for TerminalInspectError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SemanticNotFound(semantic_id) => {
-                write!(formatter, "semantic:{semantic_id} does not exist")
-            }
-            Self::FunctionNotFound {
-                semantic_id,
-                function_id,
-            } => write!(
-                formatter,
-                "function:{semantic_id}:{function_id} does not exist"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TerminalInspectError {}
 
 pub(super) struct TerminalProfileIndex<'a> {
     document: &'a RankedProfileDocument,
@@ -309,7 +292,7 @@ fn render_semantic_view(
                 .semantics
                 .get(&semantic_id)
                 .copied()
-                .ok_or(TerminalInspectError::SemanticNotFound(semantic_id))
+                .ok_or(TerminalInspectError::SemanticNotFound { semantic_id })
         })
         .transpose()?;
 
@@ -1185,17 +1168,21 @@ mod tests {
         assert!(rendered.contains(
             "id=semantic:3 name=\"second (operation 1)\" kind=\"operation\" duration_ns=80 time_basis=exact:wall_clock operation_wall_percent=80.00%"
         ));
+        let error = render_terminal_view(
+            &document,
+            InspectSelection::Semantic(99),
+            InspectSort::Duration,
+            None,
+            10,
+            1,
+        )
+        .expect_err("missing semantic should fail");
         assert_eq!(
-            render_terminal_view(
-                &document,
-                InspectSelection::Semantic(99),
-                InspectSort::Duration,
-                None,
-                10,
-                1,
-            ),
-            Err(TerminalInspectError::SemanticNotFound(99))
+            error,
+            TerminalInspectError::SemanticNotFound { semantic_id: 99 }
         );
+        assert_eq!(error.kind(), "semantic_not_found");
+        assert_eq!(error.to_string(), "semantic:99 does not exist");
     }
 
     #[test]
@@ -1416,23 +1403,27 @@ mod tests {
         assert!(!exact.contains("id=function:1:12 "));
         assert!(!exact.contains("id=function:1:13 "));
 
-        assert_eq!(
-            render_terminal_view(
-                &document,
-                InspectSelection::Function {
-                    semantic_id: 2,
-                    function_id: 10,
-                },
-                InspectSort::InclusiveCpu,
-                None,
-                10,
-                1,
-            ),
-            Err(TerminalInspectError::FunctionNotFound {
+        let error = render_terminal_view(
+            &document,
+            InspectSelection::Function {
                 semantic_id: 2,
                 function_id: 10,
-            })
+            },
+            InspectSort::InclusiveCpu,
+            None,
+            10,
+            1,
+        )
+        .expect_err("missing function should fail");
+        assert_eq!(
+            error,
+            TerminalInspectError::FunctionNotFound {
+                semantic_id: 2,
+                function_id: 10,
+            }
         );
+        assert_eq!(error.kind(), "function_not_found");
+        assert_eq!(error.to_string(), "function:2:10 does not exist");
     }
 
     #[test]

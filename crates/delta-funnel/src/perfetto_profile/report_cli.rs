@@ -11,6 +11,7 @@ use std::str::FromStr;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
+use snafu::Snafu;
 
 use super::report_terminal::{
     InspectSelection, InspectSort, TerminalInspectError, TerminalProfileIndex,
@@ -176,53 +177,41 @@ impl FromStr for FunctionSelector {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
 enum CliArgumentError {
+    #[snafu(display("a diagnostics command is required"))]
     MissingCommand,
+    #[snafu(display("unknown diagnostics command"))]
     UnknownCommand,
+    #[snafu(display("a profile input path is required"))]
     MissingInput,
+    #[snafu(display("--output requires a path"))]
     MissingOutputValue,
+    #[snafu(display("--output may be specified only once"))]
     DuplicateOutput,
+    #[snafu(display("only one profile input path may be provided"))]
     MultipleInputs,
+    #[snafu(display("limit must be between 1 and 200"))]
     InvalidLimit,
+    #[snafu(display("depth must be between 0 and 32"))]
     InvalidDepth,
+    #[snafu(display("semantic ID must be a signed integer"))]
     InvalidSemanticId,
+    #[snafu(display("function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"))]
     InvalidFunctionId,
+    #[snafu(display("filter must contain between 1 and 128 characters"))]
     InvalidFilter,
+    #[snafu(display("sort must be duration, inclusive-cpu, self-cpu, or name"))]
     InvalidSort,
+    #[snafu(display("--semantic and --function cannot be used together"))]
     IncompatibleSelectors,
+    #[snafu(display("function callsites cannot be sorted by exact duration"))]
     IncompatibleSort,
+    #[snafu(display("option may be specified only once"))]
     DuplicateOption,
+    #[snafu(display("unknown option"))]
     UnknownOption,
 }
-
-impl fmt::Display for CliArgumentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            Self::MissingCommand => "a diagnostics command is required",
-            Self::UnknownCommand => "unknown diagnostics command",
-            Self::MissingInput => "a profile input path is required",
-            Self::MissingOutputValue => "--output requires a path",
-            Self::DuplicateOutput => "--output may be specified only once",
-            Self::MultipleInputs => "only one profile input path may be provided",
-            Self::InvalidLimit => "limit must be between 1 and 200",
-            Self::InvalidDepth => "depth must be between 0 and 32",
-            Self::InvalidSemanticId => "semantic ID must be a signed integer",
-            Self::InvalidFunctionId => {
-                "function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"
-            }
-            Self::InvalidFilter => "filter must contain between 1 and 128 characters",
-            Self::InvalidSort => "sort must be duration, inclusive-cpu, self-cpu, or name",
-            Self::IncompatibleSelectors => "--semantic and --function cannot be used together",
-            Self::IncompatibleSort => "function callsites cannot be sorted by exact duration",
-            Self::DuplicateOption => "option may be specified only once",
-            Self::UnknownOption => "unknown option",
-        };
-        formatter.write_str(message)
-    }
-}
-
-impl std::error::Error for CliArgumentError {}
 
 impl CliArgumentError {
     const fn kind(self) -> &'static str {
@@ -1978,6 +1967,10 @@ mod tests {
         let argument_failure = RankedReportFailure::from(CliArgumentError::MissingInput);
         assert_eq!(argument_failure.phase(), RankedReportFailurePhase::Argument);
         assert_eq!(argument_failure.kind(), "missing_input");
+        assert_eq!(
+            argument_failure.to_string(),
+            "a profile input path is required"
+        );
 
         let failure = RankedReportFailure::new(
             RankedReportFailurePhase::TraceProcessor,
