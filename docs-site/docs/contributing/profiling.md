@@ -96,6 +96,8 @@ for bounded traversal, exact identity selection, and full command examples.
 | Attributed | Samples assigned to one valid semantic context |
 | Ambiguous | Samples matching more than one valid context |
 | Unattributed | Samples that cannot be assigned to a semantic context |
+| Unresolved symbol | A native sample was retained, but its function name could not be resolved |
+| No native samples | The semantic scope has exact timing but no eligible native CPU sample; this does not prove idle time, I/O, or zero CPU use |
 
 Exact duration and CPU samples use different units. Function sample counts are
 not exact function wall time. Parallel semantic children may overlap, so their
