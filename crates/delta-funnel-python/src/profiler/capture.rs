@@ -5,7 +5,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs, io,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -153,7 +153,7 @@ impl OperationCapture {
 
 impl Drop for OperationCapture {
     fn drop(&mut self) {
-        if self.tracebox.is_running() {
+        if self.tracebox.has_child() {
             let _ = self.tracebox.stop();
             crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         }
@@ -211,7 +211,22 @@ impl ManagedTracebox {
         })
     }
 
-    const fn is_running(&self) -> bool {
+    fn release_start_gate(&mut self) -> Result<(), ProfilerFailure> {
+        let mut gate = self.child_mut()?.stdin.take().ok_or_else(|| {
+            ProfilerFailure::new(
+                "tracebox_start_failed",
+                "Perfetto tracebox start gate was not available",
+            )
+        })?;
+        gate.write_all(b"\n").map_err(|_| {
+            ProfilerFailure::new(
+                "tracebox_start_failed",
+                "Perfetto tracebox start gate could not be released",
+            )
+        })
+    }
+
+    const fn has_child(&self) -> bool {
         self.child.is_some()
     }
 
@@ -623,7 +638,15 @@ fn start_tracebox_with(
     initialize: impl FnOnce() -> io::Result<()>,
     wait_for_capture: impl FnOnce(Duration) -> io::Result<()>,
 ) -> Result<ManagedTracebox, ProfilerFailure> {
-    let child = Command::new(tracebox)
+    // The shell keeps this PID stable across exec while preventing tracebox
+    // from inspecting the parent before Yama authorizes that exact PID.
+    let child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "IFS= read -r _ || exit 70; exec \"$@\" </dev/null",
+            "delta-funnel-tracebox-gate",
+        ])
+        .arg(tracebox)
         .args([
             "--txt",
             "--system-sockets",
@@ -635,20 +658,19 @@ fn start_tracebox_with(
         .arg(config)
         .arg("--out")
         .arg(trace)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| {
-            let kind = if error.kind() == io::ErrorKind::NotFound {
-                "tracebox_unavailable"
-            } else {
-                "tracebox_start_failed"
-            };
-            ProfilerFailure::new(kind, "Perfetto tracebox could not be started")
+        .map_err(|_| {
+            ProfilerFailure::new(
+                "tracebox_start_failed",
+                "Perfetto tracebox could not be started",
+            )
         })?;
     let mut tracebox = ManagedTracebox::new(child);
     authorize_tracebox_under_yama(tracebox.id()?)?;
+    tracebox.release_start_gate()?;
     wait_for_tracebox_readiness(tracebox.child_mut()?)?;
     if initialize().is_err() {
         return Err(ProfilerFailure::new(
@@ -785,6 +807,8 @@ mod tests {
 
     #[cfg(unix)]
     static TRACEBOX_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(unix)]
+    const FAKE_TRACEBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_tracebox.sh");
 
     #[test]
     fn current_process_config_scopes_samples_and_applies_both_supported_rates() {
@@ -904,7 +928,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn yama_scope_inspection_is_explicit_and_fail_closed() -> io::Result<()> {
+    fn yama_scope_inspection_rejects_unreadable_and_unknown_values() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let scope = directory.path().join("ptrace_scope");
         for (value, relational) in [
@@ -951,35 +975,19 @@ mod tests {
             .expect("an absolute output file path must have a parent");
         assert!(parent.is_dir());
 
-        let script = directory.path().join("tracebox");
-        fs::write(
-            &script,
-            "#!/bin/sh\n\
-             if [ \"${1:-}\" = --version ]; then exit 0; fi\n\
-             if [ -r /proc/sys/kernel/yama/ptrace_scope ] && \
-                [ \"$(cat /proc/sys/kernel/yama/ptrace_scope)\" = 1 ]; then\n\
-               attempts=0\n\
-               until : <\"/proc/$PPID/mem\"; do\n\
-                 attempts=$((attempts + 1))\n\
-                 [ \"$attempts\" -lt 200 ] || exit 77\n\
-                 sleep 0.01\n\
-               done\n\
-             fi\n\
-             trap 'exit 0' TERM\n\
-             printf '\\000'\n\
-             while :; do sleep 1; done\n",
-        )?;
-        let mut permissions = fs::metadata(&script)?.permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions)?;
         let config = directory.path().join("capture.pbtx");
         fs::write(&config, "test config")?;
         let trace = directory.path().join("capture.pftrace");
 
-        preflight_tracebox(script.as_os_str()).map_err(profiler_test_error)?;
-        let mut tracebox =
-            start_tracebox_with(script.as_os_str(), &config, &trace, || Ok(()), |_| Ok(()))
-                .map_err(profiler_test_error)?;
+        preflight_tracebox(OsStr::new(FAKE_TRACEBOX)).map_err(profiler_test_error)?;
+        let mut tracebox = start_tracebox_with(
+            OsStr::new(FAKE_TRACEBOX),
+            &config,
+            &trace,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .map_err(profiler_test_error)?;
         if yama_ptrace_scope_is_relational().map_err(profiler_test_error)? {
             assert!(
                 !Command::new("sh")
@@ -991,7 +999,7 @@ mod tests {
             );
         }
         tracebox.stop().map_err(profiler_test_error)?;
-        assert!(!tracebox.is_running());
+        assert!(!tracebox.has_child());
         Ok(())
     }
 
@@ -1002,33 +1010,25 @@ mod tests {
             .lock()
             .map_err(|_| io::Error::other("tracebox test lock was poisoned"))?;
         let directory = tempfile::tempdir()?;
-        let script = directory.path().join("tracebox");
-        fs::write(
-            &script,
-            "#!/bin/sh\n\
-             trap 'exit 0' TERM\n\
-             printf '%s\\n' \"$$\" >\"$0.pid\"\n\
-             printf '\\000'\n\
-             while :; do sleep 1; done\n",
-        )?;
-        let mut permissions = fs::metadata(&script)?.permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions)?;
         let config = directory.path().join("capture.pbtx");
         fs::write(&config, "test config")?;
         let trace = directory.path().join("capture.pftrace");
 
         let error = start_tracebox_with(
-            script.as_os_str(),
+            OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
             || Err(io::Error::other("injected initialization failure")),
             |_| Ok(()),
         )
         .expect_err("producer initialization must fail");
-        assert_eq!(error.kind, "producer_initialization_failed");
+        assert_eq!(
+            error.kind, "producer_initialization_failed",
+            "{}",
+            error.message
+        );
 
-        let pid = fs::read_to_string(script.with_extension("pid"))?
+        let pid = fs::read_to_string(trace.with_extension("pid"))?
             .trim()
             .parse::<i32>()
             .map_err(io::Error::other)?;
