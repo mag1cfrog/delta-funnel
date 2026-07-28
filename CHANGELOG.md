@@ -11,54 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- [**breaking**] simplify exact execution profiling to lightweight operator metrics and retire legacy timeline exports
-- persist operation-scoped ranked profiles for reusable HTML and terminal inspection ([#606](https://github.com/mag1cfrog/delta-funnel/pull/606))
-- generate ranked HTML reports automatically after whole-process Perfetto captures
-- generate operation-scoped ranked HTML profiles directly from Python preview and write APIs
-- add an installable terminal explorer for ranked Perfetto profiles
-- generate self-contained ranked profiling reports with exact phase timing and native CPU callsites
-- preserve native sample attribution across DataFusion and S3 execution
-- add configurable end-to-end semantic stages to Perfetto profiles
-- show Delta scan output waits as wall-clock Perfetto stages
-- show nested DataFusion planning activities in Perfetto without profile=True ([#543](https://github.com/mag1cfrog/delta-funnel/pull/543))
-- show preview, SQL Server write, and write-all subphases in Perfetto profiles
-- add bounded Perfetto streaming captures with machine-readable health checks ([#532](https://github.com/mag1cfrog/delta-funnel/pull/532))
-- add opt-in Python activation for unified Perfetto diagnostics
-- add an opt-in Perfetto prototype for unified semantic timelines and sampled native Rust call stacks
-- add worker-oriented DataFusion operator and planning activity to execution traces
-- add wall-clock profiling timelines and Chrome Trace exports for previews and writes ([#508](https://github.com/mag1cfrog/delta-funnel/pull/508))
-- add explicit Python configurations for exact execution and ranked CPU profiling
-- publish installable Perfetto diagnostics wheels with one-command workload capture
+- add opt-in ranked native CPU profiling to diagnostics-enabled Linux builds for Python previews, SQL Server writes, and `write_all`, with self-contained interactive HTML reports and optional reusable `.dfprofile` artifacts ([#581](https://github.com/mag1cfrog/delta-funnel/pull/581), [#606](https://github.com/mag1cfrog/delta-funnel/pull/606))
+- add `delta-funnel-perfetto` commands for terminal inspection, HTML generation, and bounded 100 or 1000 Hz whole-process capture with health checks and native symbolization ([#532](https://github.com/mag1cfrog/delta-funnel/pull/532), [#535](https://github.com/mag1cfrog/delta-funnel/pull/535), [#566](https://github.com/mag1cfrog/delta-funnel/pull/566), [#595](https://github.com/mag1cfrog/delta-funnel/pull/595))
+- attribute sampled native call trees to exact semantic phases across DataFusion, Delta Lake, S3, and SQL Server work, with readable call-chain compaction and explicit incomplete, ambiguous, unresolved, and missing-sample states ([#545](https://github.com/mag1cfrog/delta-funnel/issues/545))
+
+### Changed
+
+- [**breaking**] replace Python `profile=True` and `write_all(options={"profile": True})` with the top-level `execution_profile=True` option for returned DataFusion operator metrics; remove `Preview.export_trace()` and use `RankedProfileConfig` for interactive diagnostics instead ([#611](https://github.com/mag1cfrog/delta-funnel/pull/611), [#613](https://github.com/mag1cfrog/delta-funnel/pull/613))
+- [**breaking**] remove Rust `QueryExecutionProfile::to_trace_event_json_value()` and the legacy handcrafted Chrome Trace timeline export; exact execution profiles now remain focused on typed operator metrics ([#613](https://github.com/mag1cfrog/delta-funnel/pull/613))
 
 ### Fixed
 
-- keep ranked profiling details readable within their table columns
-- distinguish individual write_all outputs and queries in profiling reports
-- distinguish concurrent operations in ranked profiling reports
-- keep ranked profiling reports usable after incomplete Perfetto captures
-- keep native function roots discoverable in bounded terminal profiles
-- make ranked profiling symbols readable and resolve native leaf frames correctly
-- simplify native call chains in profile reports without discarding captured frames
-- show concise native function names while preserving full symbols in profile reports
-- resolve native symbols and report profile capture quality
-- make operation profiles report complete native stack coverage across all CPUs
-- collapse zero-cost runtime wrappers and keep ranked profile call trees readable
-- keep native function call stacks visible in profiles with many semantic activities
-- make detailed operation traces complete and reliable across previews and SQL Server writes, and document profiling overhead ([#519](https://github.com/mag1cfrog/delta-funnel/pull/519))
-- make query and worker trace labels unambiguous for filtering
-- make Perfetto native symbolization fail fast and discover cached debug symbols reliably ([#595](https://github.com/mag1cfrog/delta-funnel/pull/595))
-- return a Python error for concurrent Session catalog mutation ([#580](https://github.com/mag1cfrog/delta-funnel/pull/580))
-
-### Other
-
-- align ranked profiling errors with SNAFU while preserving failure contracts ([#615](https://github.com/mag1cfrog/delta-funnel/pull/615))
-- document intentional hyper-util tracing feature activation
-- remove retired synthetic Perfetto composition validation and terminology
-- upgrade and consolidate the Delta Kernel engine integration
-- Add an interactive ranked profiling report for drilling from operations into native functions
-- isolate profiling integrations for targeted diagnostics CI
-- Add a safe Perfetto capture workflow for unified Python diagnostics
-- make opt-in Perfetto diagnostics reusable from the core crate
+- return a structured `DeltaFunnelError` instead of `PanicException` when concurrent Python code attempts unsupported `Session` catalog mutation ([#580](https://github.com/mag1cfrog/delta-funnel/pull/580))
 
 ## [0.3.3](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.2...delta-funnel-v0.3.3) - 2026-07-16
 
