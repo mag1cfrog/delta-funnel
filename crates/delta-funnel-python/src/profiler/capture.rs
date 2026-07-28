@@ -52,6 +52,7 @@ pub(super) struct OperationCapture {
     directory: tempfile::TempDir,
     symbolize: bool,
     child: Option<Child>,
+    ptrace_permission: Option<TraceboxPtracePermission>,
     reservation: Option<ProfileReservation>,
     scope: delta_funnel::perfetto_profile::OperationCaptureScope,
 }
@@ -106,7 +107,7 @@ impl OperationCapture {
                 "temporary Perfetto capture config could not be written",
             )
         })?;
-        let child = start_tracebox_with(
+        let (child, ptrace_permission) = start_tracebox_with(
             tracebox.as_os_str(),
             &config_path,
             &trace,
@@ -121,6 +122,7 @@ impl OperationCapture {
             directory,
             symbolize: sample_hz == 1000,
             child: Some(child),
+            ptrace_permission: Some(ptrace_permission),
             reservation: Some(reservation),
             scope,
         })
@@ -139,6 +141,7 @@ impl OperationCapture {
         })?;
         let stop_result = stop_tracebox(child);
         crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
+        drop(self.ptrace_permission.take());
         drop(self.reservation.take());
         stop_result?;
         let report_trace = if self.symbolize {
@@ -163,6 +166,7 @@ impl Drop for OperationCapture {
             let _ = stop_tracebox(child);
             crate::perfetto_diagnostics::refresh_perfetto_capture_filter();
         }
+        drop(self.ptrace_permission.take());
     }
 }
 
@@ -186,6 +190,48 @@ impl ProfileReservation {
 impl Drop for ProfileReservation {
     fn drop(&mut self) {
         OPERATION_PROFILE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct TraceboxPtracePermission {
+    active: bool,
+}
+
+impl TraceboxPtracePermission {
+    fn grant(tracebox_pid: u32) -> Result<Self, ProfilerFailure> {
+        let active = yama_ptrace_scope_is_restricted();
+        if !active {
+            return Ok(Self { active });
+        }
+        set_ptracer(tracebox_pid.into()).map_err(|_| {
+            ProfilerFailure::new(
+                "ptrace_permission_failed",
+                "Perfetto tracebox could not be authorized to inspect this process",
+            )
+        })?;
+        Ok(Self { active })
+    }
+}
+
+fn yama_ptrace_scope_is_restricted() -> bool {
+    fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").is_ok_and(|scope| scope.trim() == "1")
+}
+
+impl Drop for TraceboxPtracePermission {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = set_ptracer(0);
+        }
+    }
+}
+
+fn set_ptracer(pid: libc::c_ulong) -> io::Result<()> {
+    // SAFETY: PR_SET_PTRACER accepts a process ID or zero and retains no pointer.
+    if unsafe { libc::prctl(libc::PR_SET_PTRACER, pid, 0, 0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -527,7 +573,7 @@ fn start_tracebox_with(
     trace: &Path,
     initialize: impl FnOnce() -> io::Result<()>,
     wait_for_capture: impl FnOnce(Duration) -> io::Result<()>,
-) -> Result<Child, ProfilerFailure> {
+) -> Result<(Child, TraceboxPtracePermission), ProfilerFailure> {
     let mut child = Command::new(tracebox)
         .args([
             "--txt",
@@ -552,6 +598,13 @@ fn start_tracebox_with(
             };
             ProfilerFailure::new(kind, "Perfetto tracebox could not be started")
         })?;
+    let ptrace_permission = match TraceboxPtracePermission::grant(child.id()) {
+        Ok(permission) => permission,
+        Err(error) => {
+            let _ = stop_tracebox(child);
+            return Err(error);
+        }
+    };
     let readiness = wait_for_tracebox_readiness(&mut child);
     if let Err(error) = readiness {
         let _ = stop_tracebox(child);
@@ -571,7 +624,7 @@ fn start_tracebox_with(
             "Perfetto capture did not enable Delta Funnel profiling",
         ));
     }
-    Ok(child)
+    Ok((child, ptrace_permission))
 }
 
 fn wait_for_tracebox_readiness(child: &mut Child) -> Result<(), ProfilerFailure> {
@@ -810,7 +863,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tracebox_readiness_and_shutdown_use_one_managed_child() -> io::Result<()> {
+    fn tracebox_lifecycle_scopes_ptrace_permission_to_managed_child() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("reports/profile.html");
         let output = prepare_output_path(&output).map_err(profiler_test_error)?;
@@ -824,6 +877,11 @@ mod tests {
             &script,
             "#!/bin/sh\n\
              if [ \"${1:-}\" = --version ]; then exit 0; fi\n\
+             sleep 0.05\n\
+             if [ -r /proc/sys/kernel/yama/ptrace_scope ] && \
+                [ \"$(cat /proc/sys/kernel/yama/ptrace_scope)\" = 1 ]; then\n\
+               : <\"/proc/$PPID/mem\" || exit 77\n\
+             fi\n\
              trap 'exit 0' TERM\n\
              printf '\\000'\n\
              while :; do :; done\n",
@@ -836,9 +894,22 @@ mod tests {
         let trace = directory.path().join("capture.pftrace");
 
         preflight_tracebox(script.as_os_str()).map_err(profiler_test_error)?;
-        let child = start_tracebox_with(script.as_os_str(), &config, &trace, || Ok(()), |_| Ok(()))
-            .map_err(profiler_test_error)?;
-        stop_tracebox(child).map_err(profiler_test_error)
+        let (child, ptrace_permission) =
+            start_tracebox_with(script.as_os_str(), &config, &trace, || Ok(()), |_| Ok(()))
+                .map_err(profiler_test_error)?;
+        stop_tracebox(child).map_err(profiler_test_error)?;
+        drop(ptrace_permission);
+        if yama_ptrace_scope_is_restricted() {
+            assert!(
+                !Command::new("sh")
+                    .args(["-c", ": <\"/proc/$PPID/mem\""])
+                    .stderr(Stdio::null())
+                    .status()?
+                    .success(),
+                "dropping the capture must revoke the temporary ptrace permission"
+            );
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
