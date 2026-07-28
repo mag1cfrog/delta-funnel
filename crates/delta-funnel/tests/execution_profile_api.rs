@@ -9,10 +9,9 @@ use datafusion::{
 };
 use delta_funnel::{
     DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, DeltaProviderReadStatsSnapshot,
-    ExecutionProfileMode, MssqlWriteFailureContext, MssqlWriteReport, OperationTimeline,
-    OutputWritePlan, QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionMetricValue,
-    QueryExecutionOperatorProfile, QueryExecutionOutcome, QueryExecutionProfile,
-    QueryExecutionScope, WriteAllCacheAliasReport, WriteAllCacheFailure, WriteAllReport,
+    ExecutionProfileMode, MssqlWriteReport, OutputWritePlan, QueryExecutionMetric,
+    QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
+    QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope, WriteAllCacheAliasReport,
     datafusion_query_output_stream, progress::ProgressReporter,
 };
 use serde_json::Value;
@@ -57,18 +56,8 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
     let _: ExecutionProfileMode = ExecutionProfileMode::default();
     let _: for<'a> fn(&'a MssqlWriteReport) -> Option<&'a QueryExecutionProfile> =
         MssqlWriteReport::execution_profile;
-    let _: for<'a> fn(&'a MssqlWriteReport) -> Option<&'a OperationTimeline> =
-        MssqlWriteReport::operation_timeline;
-    let _: fn(&MssqlWriteReport) -> Option<Value> = MssqlWriteReport::to_trace_event_json_value;
-    let _: for<'a> fn(&'a MssqlWriteFailureContext) -> Option<&'a OperationTimeline> =
-        MssqlWriteFailureContext::operation_timeline;
     let _: for<'a> fn(&'a WriteAllCacheAliasReport) -> Option<&'a QueryExecutionProfile> =
         WriteAllCacheAliasReport::execution_profile;
-    let _: for<'a> fn(&'a WriteAllReport) -> Option<&'a OperationTimeline> =
-        WriteAllReport::operation_timeline;
-    let _: fn(&WriteAllReport) -> Option<Value> = WriteAllReport::to_trace_event_json_value;
-    let _: for<'a> fn(&'a WriteAllCacheFailure) -> Option<&'a OperationTimeline> =
-        WriteAllCacheFailure::operation_timeline;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionScope = QueryExecutionProfile::scope;
     let _: fn(&QueryExecutionProfile) -> QueryExecutionOutcome = QueryExecutionProfile::outcome;
     let _: fn(&QueryExecutionProfile) -> bool = QueryExecutionProfile::partial;
@@ -77,7 +66,6 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
     let _: for<'a> fn(&'a QueryExecutionProfile) -> &'a [QueryExecutionOperatorProfile] =
         QueryExecutionProfile::operators;
     let _: fn(&QueryExecutionProfile) -> Value = QueryExecutionProfile::to_json_value;
-    let _: fn(&QueryExecutionProfile) -> Value = QueryExecutionProfile::to_trace_event_json_value;
 
     let _: fn(&QueryExecutionOperatorProfile) -> u64 = QueryExecutionOperatorProfile::node_id;
     let _: fn(&QueryExecutionOperatorProfile) -> Option<u64> =

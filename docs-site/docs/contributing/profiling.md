@@ -12,7 +12,7 @@ Perfetto diagnostics currently require a diagnostics-enabled build on Linux
 x86_64. Follow [Set up Perfetto diagnostics for Python](profiling-perfetto.md)
 once before using either view.
 
-`ExecutionProfileConfig` provides a separate, diagnostics-free path for exact
+Pass `execution_profile=True` for a separate, diagnostics-free path to exact
 semantic and operator data. It does not collect native CPU stacks.
 
 ## Explore one operation in HTML

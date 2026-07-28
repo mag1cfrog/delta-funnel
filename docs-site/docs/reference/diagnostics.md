@@ -155,10 +155,9 @@ between `cache_alias_install` and `cache_alias_restore` but is not itself a
 cache phase. Do not add the phase durations and interpret the result as wall
 time.
 
-Detailed write-all traces position the seven non-overlapping cache actions on
-the root wall clock. The aggregate `cache_alias_materialization_total` remains
-in the report but is not duplicated as another trace span over its five child
-actions.
+The seven leaf cache actions do not overlap. The aggregate
+`cache_alias_materialization_total` remains in the report and contains its
+five materialization phases.
 
 On a materialization failure, both the causal leaf and
 `cache_alias_materialization_total` are `failed`. Later unstarted phases are
@@ -184,7 +183,6 @@ failure = error.context
 attempted_aliases = failure["aliases"]
 primary_table_id = failure["primary_failed_alias_table_id"]
 completed_workflow = failure["workflow"]
-partial_timeline = failure["operation_timeline"]
 ```
 
 `aliases` contains each attempted alias exactly once in cache-selection order.
@@ -203,10 +201,8 @@ completed output reports are not lost.
 
 Rust callers match `DeltaFunnelError::WriteAllCache { failure, source }` and
 read `WriteAllCacheFailure::aliases()`,
-`primary_failed_alias_table_id()`, `workflow()`, and `operation_timeline()`.
-The partial timeline is present when exact execution profiling was enabled and
-uses a failed root status. `source` retains the original primary error and its
-source chain.
+`primary_failed_alias_table_id()`, and `workflow()`. `source` retains the
+original primary error and its source chain.
 
 These lifecycle timings describe cache orchestration boundaries. An exact
 execution operator profile is separately opt-in and describes work inside one

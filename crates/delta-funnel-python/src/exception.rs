@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn completed_operation_report_is_attached_to_a_late_python_error() -> PyResult<()> {
         Python::attach(|py| {
-            let error = PyOSError::new_err("trace export failed");
+            let error = PyOSError::new_err("post-operation processing failed");
             let report = serde_json::json!({"output_name": "orders"});
 
             attach_operation_result(py, &error, "completed", None, Some(&report));

@@ -4,11 +4,11 @@ Delta Funnel provides two operation-scoped profiling models:
 
 | Goal | Configuration | Output |
 | --- | --- | --- |
-| Measure exact phases and DataFusion operators | `ExecutionProfileConfig` | Returned profile and optional Chrome Trace Event JSON |
+| Collect exact DataFusion operator metrics | `execution_profile=True` | Returned profile |
 | Rank sampled native CPU functions | `RankedProfileConfig` | Interactive HTML and optional `.dfprofile` artifact |
 
-Both configurations work with `Table.preview`, `Table.write_to_mssql`, and
-`Session.write_all`. You can pass either one or both to the same operation.
+Both options work with `Table.preview`, `Table.write_to_mssql`, and
+`Session.write_all`. You can enable either one or both for the same operation.
 Neither is enabled by default.
 
 Exact execution profiling works in normal wheels. Ranked profiling requires a
@@ -84,16 +84,11 @@ error while still attempting to finish the report.
 
 ## Inspect returned preview diagnostics
 
-Use exact execution profiling when you need phase timings and DataFusion
-operator metrics without native CPU sampling:
+Use exact execution profiling when you need DataFusion operator metrics
+alongside the always-available phase timings, without native CPU sampling:
 
 ```python
-from deltafunnel import ExecutionProfileConfig
-
-preview = table.preview(
-    limit=20,
-    execution_profile=ExecutionProfileConfig(),
-)
+preview = table.preview(limit=20, execution_profile=True)
 
 for timing in preview.phase_timings:
     print(timing["phase_name"], timing["status"], timing["elapsed_micros"])
@@ -102,36 +97,14 @@ profile = preview.execution_profile
 ```
 
 `phase_timings` is available for every executed preview. The returned
-`execution_profile` is populated only when you pass an
-`ExecutionProfileConfig`. A failure before physical planning completes cannot
-produce an operator profile.
+`execution_profile` is populated only when you pass `execution_profile=True`.
+A failure before physical planning completes cannot produce an operator
+profile.
 
 The returned profile follows the
 [execution profile schema](../reference/execution-profile.md#profile-schema).
 Operator metrics are cumulative and may overlap, so do not add them together
 and call the result wall time.
-
-### Export a preview trace
-
-Set the destination before the operation:
-
-```python
-preview = table.preview(
-    limit=100_000,
-    execution_profile=ExecutionProfileConfig(
-        chrome_trace_path="preview-trace.json",
-    ),
-)
-```
-
-Open the result with `vizviewer preview-trace.json`, Perfetto, or another
-Chrome Trace Event viewer. The root event covers the complete preview wall
-clock. The trace positions phase, planning, and operator activity beneath the
-same origin.
-
-The trace parent directory must exist. Delta Funnel opens the destination
-before the operation starts and writes the trace after the result is available.
-`Preview` has no separate export method.
 
 ## Inspect returned SQL Server output diagnostics
 
@@ -142,36 +115,18 @@ report = table.write_to_mssql(
     schema="dbo",
     table="daily_orders",
     load_mode="create_and_load",
-    execution_profile=ExecutionProfileConfig(),
+    execution_profile=True,
 )
 
 profile = report["execution_profile"]
-timeline = report["operation_timeline"]
+phase_timings = report["phase_timings"]
 ```
 
-The profile describes query execution. The timeline also covers SQL Server
-planning, stream consumption, writer finalization, validation, swap, and
-cleanup. A failed call can retain a completed query profile when the failure
+The profile describes DataFusion query execution. `phase_timings` describes
+the SQL Server planning, stream consumption, writer finalization, validation,
+swap, and cleanup phases. Each timing has an elapsed duration but no start
+offset. A failed call can retain a completed query profile when the failure
 happened later in the SQL Server lifecycle.
-
-### Export a one-output write trace
-
-```python
-report = table.write_to_mssql(
-    schema="dbo",
-    table="daily_orders",
-    load_mode="create_and_load",
-    execution_profile=ExecutionProfileConfig(
-        chrome_trace_path="daily-orders-write.json",
-    ),
-)
-```
-
-Delta Funnel preflights the destination before database mutation. If final
-serialization or writing still fails after SQL Server succeeds, the exception
-reports `deltafunnel_operation_status="completed"` and carries the sanitized
-report in `deltafunnel_operation_report`. Do not retry a write solely because
-profile export failed.
 
 ### Inspect write-all profiles
 
@@ -181,7 +136,7 @@ Enable exact profiling for every attempted output and executed cache alias:
 report = session.write_all(
     outputs,
     options={"cache_mode": "auto"},
-    execution_profile=ExecutionProfileConfig(),
+    execution_profile=True,
 )
 ```
 
@@ -191,33 +146,15 @@ Skipped outputs are not attempted and also have no profile. See
 [Multiple outputs and shared caching](multiple-outputs.md) for report
 navigation.
 
-### Export a write-all trace
-
-```python
-report = session.write_all(
-    outputs,
-    options={"cache_mode": "auto"},
-    execution_profile=ExecutionProfileConfig(
-        chrome_trace_path="write-all-trace.json",
-    ),
-)
-```
-
-The root event covers the complete multi-output wall clock. Output attempts,
-cache lifecycle work, query planning, operator activity, and SQL Server phases
-share that origin, so overlap is visible without adding independent durations.
-
 ## Combine exact and ranked profiling
 
-Pass both configurations when you need returned operator metrics, a Chrome
-timeline, and ranked native CPU functions from the same operation:
+Pass both configurations when you need returned operator metrics and ranked
+native CPU functions from the same operation:
 
 ```python
 preview = table.preview(
     limit=100_000,
-    execution_profile=ExecutionProfileConfig(
-        chrome_trace_path="target/profiles/preview-trace.json",
-    ),
+    execution_profile=True,
     ranked_profile=RankedProfileConfig(
         "target/profiles/preview.profile.html",
         sample_hz=1000,
@@ -226,9 +163,9 @@ preview = table.preview(
 )
 ```
 
-In this example, all three output paths must name different files. This also
-applies when symlinks or hard links make two paths refer to the same file.
-Ranked profiling does not enable the returned exact execution profile.
+The ranked report and artifact paths must name different files. This also
+applies when symlinks or hard links make them refer to the same file. Ranked
+profiling does not enable the returned exact execution profile.
 
 ## Migrate from the earlier Python API
 
@@ -236,13 +173,15 @@ The profiling API changed before 1.0. Replace earlier calls as follows:
 
 | Earlier call | Replacement |
 | --- | --- |
-| `profile=True` | `execution_profile=ExecutionProfileConfig()` |
-| `trace_path="trace.json"` | `execution_profile=ExecutionProfileConfig(chrome_trace_path="trace.json")` |
-| `preview.export_trace("trace.json")` | Set `chrome_trace_path` before calling `preview` |
+| `profile=True` | `execution_profile=True` |
+| `trace_path="trace.json"` | No direct replacement; use a ranked report for interactive diagnosis |
+| `ExecutionProfileConfig()` | `execution_profile=True` |
+| `ExecutionProfileConfig(chrome_trace_path="trace.json")` | `execution_profile=True` for returned exact metrics, or `RankedProfileConfig(...)` for an interactive report |
+| `preview.export_trace("trace.json")` | No direct replacement |
 | `ProfilerConfig("report.html")` | `RankedProfileConfig("report.html")` |
 | `artifact_output="profile.dfprofile"` | `artifact_path="profile.dfprofile"` |
 | `profiler=config` | `ranked_profile=config` |
-| `options={"profile": True}` | Top-level `execution_profile=ExecutionProfileConfig()` |
+| `options={"profile": True}` | Top-level `execution_profile=True` |
 
 The old names are not compatibility aliases. Python rejects them instead of
 silently selecting a different profiling model.
@@ -254,6 +193,6 @@ silently selecting a different profiling model.
 - [Execution profile reference](../reference/execution-profile.md) defines
   returned operator metrics and redaction.
 - [Diagnostics reference](../reference/diagnostics.md) defines operation
-  timelines and terminal events.
+  phase timings and terminal events.
 - [Perfetto diagnostics runbook](../contributing/profiling-perfetto.md) covers
   diagnostics-wheel setup, symbols, CLI inspection, and advanced raw capture.

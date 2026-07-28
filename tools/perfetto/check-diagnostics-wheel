@@ -93,6 +93,7 @@ artifact_fixture=$(realpath -- "$artifact_fixture")
 
 native_module=$(DELTA_FUNNEL_TEST_ARTIFACT="$artifact_fixture" "$venv_python" - <<'PY'
 import json
+import inspect
 import os
 import shlex
 import signal
@@ -211,11 +212,22 @@ with tempfile.TemporaryDirectory() as artifact_temp_dir:
     )
     session = deltafunnel.Session()
     table = session.table_from_sql("select 1 as value")
+    if "execution_profile=False, ranked_profile=None" not in str(
+        inspect.signature(table.preview)
+    ):
+        raise SystemExit("installed preview has the wrong profiling signature")
+    exact = table.preview(progress=False, execution_profile=True)
+    if (
+        exact.execution_profile["scope"] != "preview"
+        or not exact.execution_profile["operators"]
+    ):
+        raise SystemExit("installed diagnostics wheel did not return an exact profile")
     for operation_name, operation in [
         (
             "preview",
             lambda: table.preview(
                 progress=False,
+                execution_profile=True,
                 ranked_profile=ranked_profile,
             ),
         ),
@@ -224,6 +236,7 @@ with tempfile.TemporaryDirectory() as artifact_temp_dir:
             lambda: session.write_all(
                 [],
                 progress=False,
+                execution_profile=True,
                 ranked_profile=ranked_profile,
             ),
         ),

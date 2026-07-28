@@ -105,17 +105,8 @@ pages:
 <a id="inspect-returned-preview-diagnostics"></a>
 - [Returned preview diagnostics](execution-profiling.md#inspect-returned-preview-diagnostics)
 
-<a id="export-a-preview-trace"></a>
-- [Export a preview trace](execution-profiling.md#export-a-preview-trace)
-
 <a id="inspect-returned-sql-server-output-diagnostics"></a>
 - [Returned SQL Server output diagnostics](execution-profiling.md#inspect-returned-sql-server-output-diagnostics)
-
-<a id="export-a-one-output-write-trace"></a>
-- [Export a one-output write trace](execution-profiling.md#export-a-one-output-write-trace)
-
-<a id="export-a-write-all-trace"></a>
-- [Export a write-all trace](execution-profiling.md#export-a-write-all-trace)
 
 <a id="inspect-returned-write-all-cache-diagnostics"></a>
 - [Returned write-all cache diagnostics](../reference/diagnostics.md#inspect-returned-write-all-cache-diagnostics)

@@ -2,7 +2,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::Instant,
 };
 
 use datafusion::{
@@ -23,9 +23,8 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 #[cfg(test)]
 use crate::MssqlOutputBatchStreamFactory;
 use crate::{
-    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, OperationTimeline,
-    PhaseTimingReport, PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope,
-    ReportReasonCode, TimelineSpanStatus,
+    DeltaFunnelError, ExecutionProfileMode, MssqlOutputBatchStream, PhaseTimingReport,
+    PreviewFailureContext, QueryExecutionProfile, QueryExecutionScope, ReportReasonCode,
     observability::{DeltaProviderScanOutcome, delta_provider_parquet_io_summary},
     profiling::{
         OperationStageTrace, OperationTraceContext, OperationTraceKind, OperationTracePhase,
@@ -43,7 +42,6 @@ use crate::{
         profiled_datafusion_query_output_stream_with_effective_root,
         snapshot_delta_provider_read_stats, with_query_planning_activity,
     },
-    report::OperationTimelineRecorder,
     usize_to_u64_saturating,
 };
 
@@ -606,22 +604,23 @@ pub(super) fn batch_stream_for_physical_plan(
 }
 
 struct PreviewTimingTracker {
+    started_at: Instant,
     phase_timings: Vec<PhaseTimingReport>,
-    timeline: OperationTimelineRecorder,
     process_phases: ProcessOperationPhaseTracker,
     trace_context: Option<OperationTraceContext>,
 }
 
 struct PreviewPhaseTimer {
     phase_name: &'static str,
+    started_at: Instant,
     stage: Option<OperationStageTrace>,
 }
 
 impl PreviewTimingTracker {
     fn start() -> Self {
         Self {
+            started_at: Instant::now(),
             phase_timings: Vec::with_capacity(PREVIEW_PHASE_NAMES.len()),
-            timeline: OperationTimelineRecorder::start(),
             process_phases: ProcessOperationPhaseTracker::default(),
             trace_context: None,
         }
@@ -631,62 +630,45 @@ impl PreviewTimingTracker {
         let display_name = preview_phase_display_name(phase_name);
         let stage = OperationStageTrace::start(
             self.trace_context.as_ref(),
-            Some(&self.timeline),
             display_name,
             "delta_funnel.preview.phase",
-            display_name,
             None,
-        )
-        .map(|stage| {
-            stage.with_attribute(
-                "phase_name",
-                serde_json::Value::String(phase_name.to_owned()),
-            )
-        });
-        debug_assert!(stage.is_some());
-        PreviewPhaseTimer { phase_name, stage }
+        );
+        PreviewPhaseTimer {
+            phase_name,
+            started_at: Instant::now(),
+            stage,
+        }
     }
 
     fn record_completed(&mut self, timer: PreviewPhaseTimer) {
-        let timing = self.record_timing(timer, TimelineSpanStatus::Completed);
+        let timing = self.record_timing(timer, true);
         self.phase_timings.push(timing);
     }
 
-    fn record_timing(
-        &mut self,
-        timer: PreviewPhaseTimer,
-        status: TimelineSpanStatus,
-    ) -> PhaseTimingReport {
-        let duration = timer
-            .stage
-            .map(|stage| stage.finish_with_duration(status))
-            .unwrap_or_default();
-        match status {
-            TimelineSpanStatus::Completed => {
-                PhaseTimingReport::completed(timer.phase_name, duration)
+    fn record_timing(&mut self, timer: PreviewPhaseTimer, completed: bool) -> PhaseTimingReport {
+        let duration = timer.started_at.elapsed();
+        if let Some(stage) = timer.stage {
+            if completed {
+                stage.completed();
+            } else {
+                stage.failed();
             }
-            TimelineSpanStatus::Failed | TimelineSpanStatus::Cancelled => {
-                PhaseTimingReport::failed(timer.phase_name, duration)
-            }
+        }
+        if completed {
+            PhaseTimingReport::completed(timer.phase_name, duration)
+        } else {
+            PhaseTimingReport::failed(timer.phase_name, duration)
         }
     }
 
-    fn completed(
-        mut self,
-        execution_profile: Option<&QueryExecutionProfile>,
-    ) -> (Vec<PhaseTimingReport>, OperationTimeline) {
+    fn completed(mut self) -> Vec<PhaseTimingReport> {
         self.process_phases.finish("ok");
-        if let Some(execution_profile) = execution_profile {
-            self.timeline.append_operator_lifecycles(execution_profile);
-        }
-        let timeline = self
-            .timeline
-            .finish("Preview total", TimelineSpanStatus::Completed);
         self.phase_timings.push(PhaseTimingReport::completed(
             PREVIEW_TOTAL_PHASE,
-            Duration::from_micros(timeline.total_duration_micros()),
+            self.started_at.elapsed(),
         ));
-        (self.phase_timings, timeline)
+        self.phase_timings
     }
 
     fn failed(
@@ -695,7 +677,7 @@ impl PreviewTimingTracker {
         execution_profile: Option<QueryExecutionProfile>,
         source: DeltaFunnelError,
     ) -> DeltaFunnelError {
-        let failed_timing = self.record_timing(timer, TimelineSpanStatus::Failed);
+        let failed_timing = self.record_timing(timer, false);
         self.process_phases.finish("error");
         let failed_phase = failed_timing.phase_name().to_owned();
         self.phase_timings.push(failed_timing);
@@ -708,22 +690,17 @@ impl PreviewTimingTracker {
             .extend(remaining_non_total_phases.iter().map(|phase_name| {
                 PhaseTimingReport::not_started(*phase_name, ReportReasonCode::PriorFailure)
             }));
-        if let Some(execution_profile) = execution_profile.as_ref() {
-            self.timeline.append_operator_lifecycles(execution_profile);
-        }
-        let timeline = self
-            .timeline
-            .finish("Preview total", TimelineSpanStatus::Failed);
         self.phase_timings.push(PhaseTimingReport::failed(
             PREVIEW_TOTAL_PHASE,
-            Duration::from_micros(timeline.total_duration_micros()),
+            self.started_at.elapsed(),
         ));
 
         DeltaFunnelError::PreviewFailed {
-            context: Box::new(
-                PreviewFailureContext::new(failed_phase, self.phase_timings, execution_profile)
-                    .with_operation_timeline(timeline),
-            ),
+            context: Box::new(PreviewFailureContext::new(
+                failed_phase,
+                self.phase_timings,
+                execution_profile,
+            )),
             source: Box::new(source),
         }
     }
@@ -864,11 +841,7 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
     ) -> Result<TablePreview, DeltaFunnelError> {
         let mut timings = PreviewTimingTracker::start();
-        let trace_context = OperationTraceContext::start(
-            OperationTraceKind::Preview,
-            (options.execution_profile_mode() == ExecutionProfileMode::Detailed)
-                .then(|| timings.timeline.clone()),
-        );
+        let trace_context = OperationTraceContext::start(OperationTraceKind::Preview);
         timings.trace_context = trace_context.clone();
         timings.process_phases = ProcessOperationPhaseTracker::start(
             trace_context.as_ref(),
@@ -1117,13 +1090,12 @@ fn format_preview_result(
     };
     timings.record_completed(format_html_timer);
 
-    let (phase_timings, operation_timeline) = timings.completed(execution_profile.as_ref());
+    let phase_timings = timings.completed();
     Ok(TablePreview::from_execution(
         text,
         html,
         phase_timings,
         execution_profile,
-        Some(operation_timeline),
     ))
 }
 
@@ -1295,7 +1267,7 @@ mod tests {
         DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
         DeltaSourceConfig, ExecutionProfileMode, PhaseStatus, PreviewFailureContext,
         PreviewOptions, QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
-        QueryOptions, ReportReasonCode, TimelineSpanStatus, TimelineSpanTimeSemantics,
+        QueryOptions, ReportReasonCode,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         query_engine::datafusion::{
@@ -1385,32 +1357,6 @@ mod tests {
                 !expected_status.is_not_started()
             );
         }
-        let timeline = context
-            .operation_timeline()
-            .ok_or("expected preview failure timeline")?;
-        crate::report::trace_contract::validate_operation_trace(timeline)?;
-        assert_eq!(timeline.status(), TimelineSpanStatus::Failed);
-        assert_eq!(
-            timeline.total_duration_micros(),
-            context
-                .phase_timings()
-                .last()
-                .and_then(crate::PhaseTimingReport::elapsed_micros)
-                .ok_or("expected failed preview total duration")?
-        );
-        assert_eq!(
-            timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "delta_funnel.preview.phase")
-                .count(),
-            failed_index + 1
-        );
-        assert!(timeline.spans().iter().all(|span| {
-            span.start_offset_micros()
-                .saturating_add(span.duration_micros())
-                <= timeline.total_duration_micros()
-        }));
         Ok(())
     }
 
@@ -1973,12 +1919,12 @@ mod tests {
         let physical_plan = dataframe.create_physical_plan().await?;
         let failing_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamSetupFailingPlan::new(physical_plan));
-        let timeline = crate::report::OperationTimelineRecorder::start();
-        let context =
-            crate::profiling::OperationTraceContext::start_for_test(Some(timeline.clone()), false)
-                .ok_or("expected semantic trace context")?;
-        let trace_identity = QueryTraceIdentity::new(context, QueryExecutionScope::Preview, None)
-            .ok_or("expected query trace identity")?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let context = crate::profiling::OperationTraceContext::start_for_test(true)
+            .ok_or("expected process trace context")?;
+        let trace_identity =
+            QueryTraceIdentity::new(context.clone(), QueryExecutionScope::Preview, None)
+                .ok_or("expected query trace identity")?;
 
         let failure = match super::profiled_datafusion_query_output_stream_with_effective_root(
             Arc::clone(&failing_plan),
@@ -1991,11 +1937,12 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&failure.effective_profile_root, &failing_plan));
         assert_eq!(failure.effective_profile_root.name(), failing_plan.name());
-        let timeline = timeline.finish("profiled setup", TimelineSpanStatus::Failed);
-        assert!(timeline.spans().iter().any(|span| {
-            span.category() == "datafusion.operator.activity"
-                && span.name() == failing_plan.name()
-                && span.status() == TimelineSpanStatus::Failed
+        context.record_process_result("error");
+        drop(context);
+        assert!(capture.captured().spans().iter().any(|span| {
+            span.name == "DataFusion operator activity"
+                && span.fields["operator_name"] == failing_plan.name()
+                && span.fields["result"] == "error"
         }));
         Ok(())
     }
@@ -2430,21 +2377,6 @@ mod tests {
             timing.status() == PhaseStatus::completed() && timing.elapsed_micros().is_some()
         }));
         assert_eq!(preview.execution_profile(), None);
-        assert!(preview.to_trace_event_json_value().is_none());
-        let timeline = preview
-            .operation_timeline()
-            .ok_or(DeltaFunnelError::Config {
-                message: "expected preview operation timeline".to_owned(),
-            })?;
-        assert_eq!(timeline.status(), TimelineSpanStatus::Completed);
-        assert_eq!(timeline.spans().len(), PREVIEW_PHASES.len() - 1);
-        assert!(timeline.spans().iter().all(|span| {
-            span.time_semantics() == TimelineSpanTimeSemantics::WallClock
-                && span
-                    .start_offset_micros()
-                    .saturating_add(span.duration_micros())
-                    <= timeline.total_duration_micros()
-        }));
         assert!(execution_profile_events(capture.captured()).is_empty());
         Ok(())
     }
@@ -2544,6 +2476,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_profile_and_process_spans_coexist_for_one_preview()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        let table = session
+            .table_from_sql("select 1 as id union all select 2 as id")
+            .await?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+
+        let preview = session
+            .preview_table_with_options(
+                &table,
+                PreviewOptions::new(2).with_execution_profile_mode(ExecutionProfileMode::Detailed),
+            )
+            .await?;
+        let profile = preview
+            .execution_profile()
+            .ok_or("expected exact execution profile")?;
+        assert_eq!(profile.outcome(), QueryExecutionOutcome::Success);
+        assert!(!profile.operators().is_empty());
+
+        let spans = capture.captured().spans();
+        assert!(spans.iter().any(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.name == "Delta Funnel preview"
+                && span.fields["result"] == "ok"
+        }));
+        assert!(spans.iter().any(|span| {
+            span.target == crate::profiling::PROFILE_TARGET
+                && span.name == "DataFusion operator activity"
+        }));
+        assert_eq!(execution_profile_events(capture.captured()).len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn preview_unknown_table_returns_dataframe_failure_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -2570,8 +2537,7 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
         let context_json = context.to_json_value();
         assert_eq!(context_json["failed_phase"], "preview_dataframe_planning");
-        assert_eq!(context_json.as_object().map(serde_json::Map::len), Some(4));
-        assert_eq!(context_json["operation_timeline"]["status"], "failed");
+        assert_eq!(context_json.as_object().map(serde_json::Map::len), Some(3));
         assert!(context_json.get("source").is_none());
         let spans = capture.captured().spans();
         let root = spans
@@ -2665,8 +2631,6 @@ mod tests {
             .table_from_sql("select 1 as id union all select 2 as id")
             .await?;
         let capture = TracingCapture::start();
-        let mut saw_operator_execute = false;
-        let mut saw_operator_poll = false;
 
         for limit in [0, 1] {
             let preview = session
@@ -2694,72 +2658,8 @@ mod tests {
                     .iter()
                     .all(|timing| timing.status() == PhaseStatus::completed())
             );
-            let timeline = preview
-                .operation_timeline()
-                .ok_or("expected detailed preview timeline")?;
-            crate::report::trace_contract::validate_operation_trace(timeline)?;
-            assert_eq!(timeline.status(), TimelineSpanStatus::Completed);
-            let phase_spans = timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "delta_funnel.preview.phase")
-                .collect::<Vec<_>>();
-            assert_eq!(phase_spans.len(), PREVIEW_PHASES.len() - 1);
-            for (timing, span) in preview.phase_timings().iter().zip(phase_spans) {
-                assert_eq!(timing.elapsed_micros(), Some(span.duration_micros()));
-            }
-            assert!(
-                timeline
-                    .spans()
-                    .iter()
-                    .filter(|span| span.category() == "datafusion.operator.lifecycle")
-                    .all(|span| { span.time_semantics() == TimelineSpanTimeSemantics::Lifecycle })
-            );
-            for span in timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "datafusion.operator.activity")
-            {
-                assert_eq!(span.time_semantics(), TimelineSpanTimeSemantics::WallClock);
-                saw_operator_execute |= span.attributes()["activity"] == "execute";
-                saw_operator_poll |= span.attributes()["activity"] == "poll_next";
-                assert!(span.attributes()["query_execution_id"].is_u64());
-                assert!(span.attributes()["worker_lane_id"].is_u64());
-                assert!(span.attributes()["worker_kind"].is_string());
-                assert!(span.attributes()["execution_stream_id"].is_u64());
-                assert!(span.attributes()["node_id"].is_u64());
-                assert!(span.attributes()["operator_partition"].is_u64());
-                assert!(span.attributes()["worker_thread_id"].is_string());
-            }
-            let trace = preview
-                .to_trace_event_json_value()
-                .ok_or("expected detailed preview trace")?;
-            assert_eq!(
-                trace["delta_funnel_timeline"]["total_duration_micros"],
-                timeline.total_duration_micros()
-            );
-            assert_eq!(trace["delta_funnel_profile"]["scope"], "preview");
-            let activity_span_count = timeline
-                .spans()
-                .iter()
-                .filter(|span| span.category() == "datafusion.operator.activity")
-                .count();
-            let activity_events = trace["traceEvents"]
-                .as_array()
-                .ok_or("expected trace events")?
-                .iter()
-                .filter(|event| event["cat"] == "datafusion.operator.activity")
-                .collect::<Vec<_>>();
-            assert_eq!(activity_events.len(), activity_span_count);
-            assert!(activity_events.iter().all(|event| {
-                event["ph"] == "X"
-                    && event["args"]["time_semantics"] == "wall_clock"
-                    && event["args"]["attributes"]["activity"].is_string()
-            }));
         }
 
-        assert!(saw_operator_execute);
-        assert!(saw_operator_poll);
         assert_eq!(execution_profile_events(capture.captured()).len(), 2);
         Ok(())
     }
@@ -2892,9 +2792,6 @@ mod tests {
         let profile = preview
             .execution_profile()
             .ok_or("expected detailed Delta preview profile")?;
-        let timeline = preview
-            .operation_timeline()
-            .ok_or("expected detailed Delta preview timeline")?;
         let snapshot = profile
             .operators()
             .iter()
@@ -2904,80 +2801,6 @@ mod tests {
         assert_eq!(snapshot.source_name, "orders");
         assert!(snapshot.files_planned > 0);
         assert!(snapshot.rows_produced > 0);
-        let planning_spans = timeline
-            .spans()
-            .iter()
-            .filter(|span| span.category() == "datafusion.planning.activity")
-            .collect::<Vec<_>>();
-        for name in [
-            "Delta scan planning",
-            "Delta projection planning",
-            "Delta filter planning",
-            "Delta Kernel scan construction",
-            "Delta partition target selection",
-            "Delta scan metadata expansion",
-            "Delta file task partitioning",
-            "Delta scan execution setup",
-        ] {
-            assert!(planning_spans.iter().any(|span| span.name() == name));
-        }
-        let physical_planning = timeline
-            .spans()
-            .iter()
-            .find(|span| {
-                span.category() == "delta_funnel.preview.phase"
-                    && span.name() == "Physical planning"
-            })
-            .ok_or("expected physical planning phase")?;
-        for span in &planning_spans {
-            assert_eq!(span.track_name(), "DataFusion query planning / preview");
-            assert_eq!(span.status(), TimelineSpanStatus::Completed);
-            assert_eq!(span.attributes()["result"], "ok");
-            assert_eq!(span.attributes()["query_execution_id"], 1);
-            assert_eq!(span.attributes()["query_scope"], "preview");
-            assert_eq!(span.attributes().get("query_owner"), None);
-            assert!(physical_planning.start_offset_micros() <= span.start_offset_micros());
-            assert!(
-                physical_planning
-                    .start_offset_micros()
-                    .saturating_add(physical_planning.duration_micros())
-                    >= span
-                        .start_offset_micros()
-                        .saturating_add(span.duration_micros())
-            );
-
-            if span.name() == "Delta scan planning" {
-                assert_eq!(span.parent_id(), None);
-                continue;
-            }
-            let parent_id = span
-                .parent_id()
-                .ok_or("expected planning activity parent")?;
-            let parent = planning_spans
-                .iter()
-                .find(|candidate| candidate.id() == parent_id)
-                .ok_or("expected recorded planning activity parent")?;
-            assert_eq!(parent.track_name(), span.track_name());
-            assert!(parent.start_offset_micros() <= span.start_offset_micros());
-            assert!(
-                parent
-                    .start_offset_micros()
-                    .saturating_add(parent.duration_micros())
-                    >= span
-                        .start_offset_micros()
-                        .saturating_add(span.duration_micros())
-            );
-        }
-        let trace = preview
-            .to_trace_event_json_value()
-            .ok_or("expected detailed Delta preview trace")?;
-        let planning_event_count = trace["traceEvents"]
-            .as_array()
-            .ok_or("expected trace events")?
-            .iter()
-            .filter(|event| event["cat"] == "datafusion.planning.activity")
-            .count();
-        assert_eq!(planning_event_count, planning_spans.len());
         let provider_events = provider_io_events(capture.captured());
         assert_eq!(provider_events.len(), 1);
         assert_provider_io_event_matches_snapshot(&provider_events[0], snapshot, "success");

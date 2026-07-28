@@ -80,9 +80,7 @@ impl DataFusionTaskTraceContext {
             query_execution_id: self.activity.query_execution_id,
             worker_lane: context.worker_lane,
             owns_worker_lane,
-            timeline_span_id: None,
-            process_span_active: true,
-            task_trace_context: Some(self.clone()),
+            task_trace_context: self.clone(),
         };
         ACTIVE_OPERATOR_ACTIVITY_SPANS.with(|spans| spans.borrow_mut().push(active.clone()));
         let guard = DataFusionTaskScope {
@@ -137,7 +135,7 @@ fn current_datafusion_task_trace_context() -> Option<DataFusionTaskTraceContext>
             spans
                 .borrow()
                 .last()
-                .and_then(|active| active.task_trace_context.clone())
+                .map(|active| active.task_trace_context.clone())
         })
         .ok()
         .flatten()

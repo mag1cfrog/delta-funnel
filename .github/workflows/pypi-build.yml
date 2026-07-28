@@ -266,13 +266,29 @@ jobs:
           )"
           python -m pip install "$abi3_wheel"
           python - <<'PY'
+          import inspect
+
           import deltafunnel
 
           session = deltafunnel.Session()
           assert repr(session).startswith("deltafunnel.Session(")
-          execution_profile = deltafunnel.ExecutionProfileConfig()
-          assert execution_profile.chrome_trace_path is None
+          assert not hasattr(deltafunnel, "ExecutionProfileConfig")
           assert not hasattr(deltafunnel, "ProfilerConfig")
+          table = session.table_from_sql("select 1 as value")
+          assert str(inspect.signature(table.preview)) == (
+              "(limit=20, *, progress=None, execution_profile=False, "
+              "ranked_profile=None)"
+          )
+          assert "execution_profile=False, ranked_profile=None" in str(
+              inspect.signature(table.write_to_mssql)
+          )
+          assert "execution_profile=False, ranked_profile=None" in str(
+              inspect.signature(session.write_all)
+          )
+          assert table.preview(progress=False).execution_profile is None
+          exact = table.preview(progress=False, execution_profile=True)
+          assert exact.execution_profile["scope"] == "preview"
+          assert exact.execution_profile["operators"]
           print(deltafunnel.__version__)
           PY
 

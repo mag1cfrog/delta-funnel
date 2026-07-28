@@ -639,15 +639,10 @@ where
             stage_context,
             "Poll query batch",
             "delta_funnel.write.stream",
-            "Query stream polling",
-            input_batches.saturating_add(1),
-            None,
         );
         let Some(batch) = batches.next().await else {
             phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
-            complete_batch_span(
-                poll_span.map(|span| span.with_attribute("end_of_stream", true.into())),
-            );
+            complete_batch_span(poll_span);
             break;
         };
         phase_timings.add_poll_batch_stream(poll_started_at.elapsed());
@@ -693,9 +688,6 @@ where
             stage_context,
             "Validate batch schema",
             "delta_funnel.write.batch",
-            "Batch schema validation",
-            input_batches,
-            Some(row_count),
         );
         let validation_result = arrow_tiberius::validate_record_batch_schema_against_mappings(
             &batch,
@@ -737,9 +729,6 @@ where
             stage_context,
             "Write batch to SQL Server",
             "delta_funnel.write.batch",
-            "SQL Server batch writes",
-            input_batches,
-            Some(row_count),
         );
         let write_batch_result = MssqlBulkLoadWriter::write_batch(&mut writer, &batch).await;
         phase_timings.add_write_batch(write_batch_started_at.elapsed());
@@ -792,7 +781,6 @@ where
     let finalize_span = stage_context.start(
         "Finalize SQL Server writer",
         "delta_funnel.write.sql_server",
-        "Finalize writer",
     );
     let finish = MssqlBulkLoadWriter::finish(writer);
     let finish_result = match &finalize_span {
@@ -858,17 +846,8 @@ fn start_batch_span(
     stage_context: OperationStageContext<'_>,
     name: &'static str,
     category: &'static str,
-    track_name: &'static str,
-    batch_index: u64,
-    row_count: Option<u64>,
 ) -> Option<OperationStageTrace> {
-    stage_context.start(name, category, track_name).map(|span| {
-        let span = span.with_attribute("batch_index", batch_index.into());
-        match row_count {
-            Some(row_count) => span.with_attribute("row_count", row_count.into()),
-            None => span,
-        }
-    })
+    stage_context.start(name, category)
 }
 
 fn complete_batch_span(span: Option<OperationStageTrace>) {
@@ -1221,7 +1200,6 @@ mod tests {
         DeltaFunnelError, MssqlBatchShapingReport, MssqlConnectionConfig, MssqlConnectionSource,
         MssqlOutputFieldReport, MssqlTargetConfig, MssqlTargetTable, MssqlWriteStats, PhaseStatus,
         PhaseTimingReport, ReportReasonCode, ValidationStatus, plan_mssql_target_for_output,
-        report::OperationTimelineRecorder,
     };
 
     fn secret_connection() -> Result<MssqlConnectionConfig, DeltaFunnelError> {
@@ -1895,58 +1873,6 @@ mod tests {
         let log = lock_fake_writer_log(&log)?;
         assert_eq!(log.batch_rows, vec![2, 1]);
         assert_eq!(log.finish_count, 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn detailed_write_loop_positions_each_batch_step_on_one_clock()
-    -> Result<(), DeltaFunnelError> {
-        let output_plan = output_plan_for_orders_schema()?;
-        let writer = FakeBulkLoadWriter::default().delay_writes_by(Duration::from_millis(2));
-        let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
-        let second = orders_batch(vec![3], vec![None])?;
-        let batches = stream::iter(vec![Ok(first), Ok(second)]);
-        let timeline = OperationTimelineRecorder::start();
-
-        write_mssql_batches_with_writer_and_stage_context(
-            &output_plan,
-            batches,
-            writer,
-            default_mssql_write_backend(),
-            None,
-            OperationStageContext::from_timeline(Some(&timeline)),
-        )
-        .await?;
-
-        let timeline = timeline.finish("write", crate::TimelineSpanStatus::Completed);
-        assert_eq!(timeline.spans().len(), 8);
-        assert_eq!(
-            timeline
-                .spans()
-                .iter()
-                .filter(|span| span.name() == "Poll query batch")
-                .count(),
-            3
-        );
-        assert_eq!(
-            timeline
-                .spans()
-                .iter()
-                .filter(|span| span.name() == "Write batch to SQL Server")
-                .count(),
-            2
-        );
-        assert!(timeline.spans().iter().any(|span| {
-            span.name() == "Write batch to SQL Server"
-                && span.attributes()["batch_index"] == 1
-                && span.attributes()["row_count"] == 2
-                && span.duration_micros() > 0
-        }));
-        assert!(timeline.spans().iter().all(|span| {
-            span.start_offset_micros()
-                .saturating_add(span.duration_micros())
-                <= timeline.total_duration_micros()
-        }));
         Ok(())
     }
 

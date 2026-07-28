@@ -12,57 +12,11 @@ mod capture;
 
 const RANKED_PROFILE_PHASE: &str = "ranked_profile";
 
-/// Immutable configuration for exact execution profiling.
-#[pyclass(frozen, name = "ExecutionProfileConfig", module = "deltafunnel")]
-pub(crate) struct PyExecutionProfileConfig {
-    chrome_trace_path: Option<PathBuf>,
-}
-
-impl PyExecutionProfileConfig {
-    pub(crate) fn chrome_trace_path(&self) -> Option<&Path> {
-        self.chrome_trace_path.as_deref()
-    }
-}
-
-pub(crate) fn execution_profile_mode(
-    config: Option<&PyExecutionProfileConfig>,
-) -> delta_funnel::ExecutionProfileMode {
-    if config.is_some() {
+pub(crate) fn execution_profile_mode(enabled: bool) -> delta_funnel::ExecutionProfileMode {
+    if enabled {
         delta_funnel::ExecutionProfileMode::Detailed
     } else {
         delta_funnel::ExecutionProfileMode::Disabled
-    }
-}
-
-#[pymethods]
-impl PyExecutionProfileConfig {
-    #[new]
-    #[pyo3(signature = (*, chrome_trace_path=None))]
-    fn new(py: Python<'_>, chrome_trace_path: Option<PathBuf>) -> PyResult<Self> {
-        if chrome_trace_path
-            .as_deref()
-            .is_some_and(|path| path.file_name().is_none())
-        {
-            return Err(config_py_error(
-                py,
-                "invalid_option_value",
-                "`chrome_trace_path` must name a file".to_owned(),
-            ));
-        }
-        Ok(Self { chrome_trace_path })
-    }
-
-    #[getter]
-    fn get_chrome_trace_path(&self) -> Option<&Path> {
-        self.chrome_trace_path()
-    }
-
-    fn __repr__(&self) -> String {
-        let chrome_trace_path = self
-            .chrome_trace_path
-            .as_ref()
-            .map_or_else(|| "None".to_owned(), |path| format!("{path:?}"));
-        format!("deltafunnel.ExecutionProfileConfig(chrome_trace_path={chrome_trace_path})")
     }
 }
 
@@ -155,7 +109,6 @@ impl PyRankedProfileConfig {
 }
 
 pub(crate) fn add_profiler(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<PyExecutionProfileConfig>()?;
     module.add_class::<PyRankedProfileConfig>()
 }
 
@@ -177,7 +130,6 @@ pub(crate) fn in_ranked_profile_scope<T>(
 pub(crate) fn start_ranked_profile(
     py: Python<'_>,
     config: Option<&PyRankedProfileConfig>,
-    chrome_trace_path: Option<&Path>,
 ) -> PyResult<Option<RankedProfileCapture>> {
     let Some(config) = config else {
         return Ok(None);
@@ -185,7 +137,7 @@ pub(crate) fn start_ranked_profile(
 
     #[cfg(not(all(feature = "perfetto-profile", target_os = "linux")))]
     {
-        let _ = (config, chrome_trace_path);
+        let _ = config;
         Err(ranked_profile_py_error(
             py,
             "not_available",
@@ -200,7 +152,7 @@ pub(crate) fn start_ranked_profile(
             .artifact_path()
             .map(|path| resolve_output_path(py, path))
             .transpose()?;
-        validate_output_paths(py, &output, artifact_output.as_deref(), chrome_trace_path)?;
+        validate_output_paths(py, &output, artifact_output.as_deref())?;
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
         let sample_hz = config.sampling_frequency();
         let tracebox = tracebox_launcher(py)?;
@@ -217,7 +169,6 @@ fn validate_output_paths(
     py: Python<'_>,
     output: &Path,
     artifact_output: Option<&Path>,
-    chrome_trace_path: Option<&Path>,
 ) -> PyResult<()> {
     let paths_alias = |left: &Path, right: &Path| {
         delta_funnel::perfetto_profile::output_paths_alias(left, right).map_err(|_| {
@@ -237,24 +188,6 @@ fn validate_output_paths(
             "`RankedProfileConfig.report_path` and `RankedProfileConfig.artifact_path` must name different files"
                 .to_owned(),
         ));
-    }
-    if let Some(chrome_trace_path) = chrome_trace_path {
-        if paths_alias(output, chrome_trace_path)? {
-            return Err(config_py_error(
-                py,
-                "invalid_option_value",
-                "`ExecutionProfileConfig.chrome_trace_path` and `RankedProfileConfig.report_path` must name different files".to_owned(),
-            ));
-        }
-        if let Some(artifact_output) = artifact_output
-            && paths_alias(artifact_output, chrome_trace_path)?
-        {
-            return Err(config_py_error(
-                py,
-                "invalid_option_value",
-                "`ExecutionProfileConfig.chrome_trace_path` and `RankedProfileConfig.artifact_path` must name different files".to_owned(),
-            ));
-        }
     }
     Ok(())
 }
@@ -366,23 +299,20 @@ mod tests {
     use crate::deltafunnel;
 
     #[test]
-    fn profile_configs_expose_distinct_immutable_python_contracts() -> PyResult<()> {
+    fn ranked_config_and_exact_boolean_expose_distinct_python_contracts() -> PyResult<()> {
         let stub = include_str!("../deltafunnel.pyi");
-        assert!(stub.contains("class ExecutionProfileConfig:"));
-        assert!(stub.contains("chrome_trace_path: str | PathLike[str] | None = None"));
+        assert!(!stub.contains("class ExecutionProfileConfig:"));
+        assert!(stub.contains("execution_profile: bool = False"));
         assert!(stub.contains("class RankedProfileConfig:"));
         assert!(stub.contains("report_path: str | PathLike[str]"));
         assert!(stub.contains("sample_hz: Literal[100, 1000] = 1000"));
         assert!(stub.contains("artifact_path: str | PathLike[str] | None = None"));
         assert_eq!(
-            execution_profile_mode(None),
+            execution_profile_mode(false),
             delta_funnel::ExecutionProfileMode::Disabled
         );
-        let exact_config = PyExecutionProfileConfig {
-            chrome_trace_path: None,
-        };
         assert_eq!(
-            execution_profile_mode(Some(&exact_config)),
+            execution_profile_mode(true),
             delta_funnel::ExecutionProfileMode::Detailed
         );
 
@@ -390,48 +320,7 @@ mod tests {
             let module = PyModule::new(py, "deltafunnel")?;
             deltafunnel(&module)?;
             assert!(module.getattr("ProfilerConfig").is_err());
-
-            let execution_profile = module.getattr("ExecutionProfileConfig")?;
-            let default_execution = execution_profile.call0()?;
-            assert_eq!(
-                default_execution
-                    .getattr("chrome_trace_path")?
-                    .extract::<Option<PathBuf>>()?,
-                None
-            );
-            assert_eq!(
-                default_execution.repr()?.to_str()?,
-                "deltafunnel.ExecutionProfileConfig(chrome_trace_path=None)"
-            );
-
-            let pathlib_path = py
-                .import("pathlib")?
-                .getattr("Path")?
-                .call1(("query.trace.json",))?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("chrome_trace_path", pathlib_path)?;
-            let execution_with_trace = execution_profile.call((), Some(&kwargs))?;
-            assert_eq!(
-                execution_with_trace
-                    .getattr("chrome_trace_path")?
-                    .extract::<PathBuf>()?,
-                PathBuf::from("query.trace.json")
-            );
-            assert!(
-                execution_with_trace
-                    .setattr("chrome_trace_path", "other.trace.json")
-                    .expect_err("the config must be immutable")
-                    .is_instance_of::<PyAttributeError>(py)
-            );
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("chrome_trace_path", "")?;
-            let empty_trace = execution_profile
-                .call((), Some(&kwargs))
-                .expect_err("an empty Chrome trace path must be rejected");
-            assert_eq!(
-                empty_trace.value(py).getattr("kind")?.extract::<String>()?,
-                "invalid_option_value"
-            );
+            assert!(module.getattr("ExecutionProfileConfig").is_err());
 
             let ranked_profile = module.getattr("RankedProfileConfig")?;
             let default = ranked_profile.call1(("query.profile.html",))?;
@@ -539,34 +428,13 @@ mod tests {
                 .transpose()?;
             assert!(output.is_absolute());
             assert!(artifact_output.as_deref().is_some_and(Path::is_absolute));
-            let error = validate_output_paths(py, &output, artifact_output.as_deref(), None)
+            let error = validate_output_paths(py, &output, artifact_output.as_deref())
                 .expect_err("HTML and artifact outputs must not alias");
             assert_eq!(
                 error.value(py).getattr("kind")?.extract::<String>()?,
                 "invalid_option_value"
             );
 
-            let config = PyRankedProfileConfig {
-                report_path: PathBuf::from("profile.html"),
-                sample_hz: 1_000,
-                artifact_path: Some(PathBuf::from("profile.dfprofile")),
-            };
-            let output = resolve_output_path(py, config.report_path())?;
-            let artifact_output = config
-                .artifact_path()
-                .map(|output| resolve_output_path(py, output))
-                .transpose()?;
-            let trace_path = resolve_output_path(py, Path::new("./profile.dfprofile"))?;
-            assert!(output.is_absolute());
-            assert!(artifact_output.as_deref().is_some_and(Path::is_absolute));
-            assert!(trace_path.is_absolute());
-            let error =
-                validate_output_paths(py, &output, artifact_output.as_deref(), Some(&trace_path))
-                    .expect_err("trace and artifact outputs must not alias");
-            assert_eq!(
-                error.value(py).getattr("kind")?.extract::<String>()?,
-                "invalid_option_value"
-            );
             Ok(())
         })
     }

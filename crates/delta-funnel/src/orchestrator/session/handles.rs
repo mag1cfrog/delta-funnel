@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::{
-    ExecutionProfileMode, MssqlTargetConfig, MssqlTargetOutputPlan, OperationTimeline,
-    PhaseTimingReport, QueryExecutionProfile, ReportReasonCode, ResolvedMssqlTarget,
+    ExecutionProfileMode, MssqlTargetConfig, MssqlTargetOutputPlan, PhaseTimingReport,
+    QueryExecutionProfile, ReportReasonCode, ResolvedMssqlTarget,
     support::sanitize_text_for_display,
 };
 
@@ -152,7 +152,6 @@ pub struct PreviewFailureContext {
     failed_phase: String,
     phase_timings: Vec<PhaseTimingReport>,
     execution_profile: Option<QueryExecutionProfile>,
-    operation_timeline: Option<OperationTimeline>,
 }
 
 impl PreviewFailureContext {
@@ -165,13 +164,7 @@ impl PreviewFailureContext {
             failed_phase,
             phase_timings,
             execution_profile,
-            operation_timeline: None,
         }
-    }
-
-    pub(crate) fn with_operation_timeline(mut self, timeline: OperationTimeline) -> Self {
-        self.operation_timeline = Some(timeline);
-        self
     }
 
     /// Returns the stable name of the phase that failed.
@@ -192,12 +185,6 @@ impl PreviewFailureContext {
     pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
         self.execution_profile.as_ref()
     }
-
-    /// Returns the partial wall-clock timeline captured through the failure.
-    #[must_use]
-    pub const fn operation_timeline(&self) -> Option<&OperationTimeline> {
-        self.operation_timeline.as_ref()
-    }
 }
 
 /// Rendered bounded preview of a lazy table.
@@ -207,7 +194,6 @@ pub struct TablePreview {
     html: String,
     phase_timings: Vec<PhaseTimingReport>,
     execution_profile: Option<QueryExecutionProfile>,
-    operation_timeline: Option<OperationTimeline>,
 }
 
 impl TablePreview {
@@ -227,7 +213,6 @@ impl TablePreview {
                 })
                 .collect(),
             None,
-            None,
         )
     }
 
@@ -236,14 +221,12 @@ impl TablePreview {
         html: String,
         phase_timings: Vec<PhaseTimingReport>,
         execution_profile: Option<QueryExecutionProfile>,
-        operation_timeline: Option<OperationTimeline>,
     ) -> Self {
         Self {
             text,
             html,
             phase_timings,
             execution_profile,
-            operation_timeline,
         }
     }
 
@@ -269,12 +252,6 @@ impl TablePreview {
     #[must_use]
     pub const fn execution_profile(&self) -> Option<&QueryExecutionProfile> {
         self.execution_profile.as_ref()
-    }
-
-    /// Returns the complete wall-clock timeline captured for this preview.
-    #[must_use]
-    pub const fn operation_timeline(&self) -> Option<&OperationTimeline> {
-        self.operation_timeline.as_ref()
     }
 }
 
@@ -464,8 +441,6 @@ mod tests {
             assert_eq!(timing.elapsed_micros(), None);
         }
         assert_eq!(preview.execution_profile(), None);
-        assert_eq!(preview.operation_timeline(), None);
-        assert!(preview.to_trace_event_json_value().is_none());
     }
 
     #[test]

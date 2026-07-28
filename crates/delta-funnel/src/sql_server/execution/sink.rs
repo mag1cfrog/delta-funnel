@@ -15,7 +15,7 @@ use crate::{
     profiling::{OperationStageContext, OperationStageTrace},
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     report::{
-        OperationTimelineRecorder, PhaseTimer,
+        PhaseTimer,
         sql_server::{MssqlBatchShapingReport, MssqlWriteReportMetrics},
     },
 };
@@ -100,14 +100,10 @@ pub(crate) async fn write_output_batches_to_mssql_for_workflow_with_stage_contex
 where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
-    let output_name = resolved_target.output_name().to_owned();
-    let planning_span = stage_context
-        .start(
-            "Plan SQL Server connection request",
-            "delta_funnel.write.planning",
-            "SQL Server connection planning",
-        )
-        .map(|span| span.with_attribute("output_name", output_name.into()));
+    let planning_span = stage_context.start(
+        "Plan SQL Server connection request",
+        "delta_funnel.write.planning",
+    );
     let request = match plan_mssql_output_connection_request(
         output_schema,
         resolved_target,
@@ -255,11 +251,8 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
     {
         let initialize_timer = PhaseTimer::start(INITIALIZE_WRITER_PHASE);
-        let initialize_span = stage_context.start(
-            "Initialize bulk writer",
-            "delta_funnel.write.sql_server",
-            "Initialize writer",
-        );
+        let initialize_span =
+            stage_context.start("Initialize bulk writer", "delta_funnel.write.sql_server");
         let writer = match self
             .initialize_writer(output_plan, prepared_target, options)
             .await
@@ -276,11 +269,8 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         complete_sink_span(initialize_span);
         let initialize_timing = initialize_timer.completed();
 
-        let write_span = stage_context.start(
-            "Stream and write batches",
-            "delta_funnel.write.streaming",
-            "Stream and write batches",
-        );
+        let write_span =
+            stage_context.start("Stream and write batches", "delta_funnel.write.streaming");
         let write_result = write_mssql_batches_with_writer_and_stage_context(
             output_plan,
             batches,
@@ -407,11 +397,8 @@ where
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
     let output_plan = request.output_plan().clone();
-    let connect_span = stage_context.start(
-        "Connect to SQL Server",
-        "delta_funnel.write.sql_server",
-        "SQL Server connection",
-    );
+    let connect_span =
+        stage_context.start("Connect to SQL Server", "delta_funnel.write.sql_server");
     let connection = match connect_mssql_output_client(request).await {
         Ok(connection) => {
             complete_sink_span(connect_span);
@@ -472,31 +459,6 @@ where
     C: MssqlOneOutputSinkConnection + 'static,
     S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
 {
-    write_mssql_output_batches_on_connection_with_phase_timings_and_timeline(
-        output_plan,
-        connection,
-        batches,
-        options,
-        validation_options,
-        phase_timings,
-        None,
-    )
-    .await
-}
-
-async fn write_mssql_output_batches_on_connection_with_phase_timings_and_timeline<C, S>(
-    output_plan: MssqlTargetOutputPlan,
-    connection: C,
-    batches: S,
-    options: MssqlWriteBackend,
-    validation_options: ValidationOptions,
-    phase_timings: Vec<PhaseTimingReport>,
-    timeline: Option<&OperationTimelineRecorder>,
-) -> Result<MssqlWriteReport, DeltaFunnelError>
-where
-    C: MssqlOneOutputSinkConnection + 'static,
-    S: Stream<Item = Result<RecordBatch, DeltaFunnelError>> + Send,
-{
     run_mssql_output_batches_on_connection_with_stage_context(
         output_plan,
         connection,
@@ -505,7 +467,7 @@ where
         validation_options,
         phase_timings,
         None,
-        OperationStageContext::from_timeline(timeline),
+        OperationStageContext::default(),
     )
     .await
 }
@@ -561,11 +523,8 @@ where
         output_plan.output_name(),
     );
     let prepare_timer = PhaseTimer::start(PREPARE_TARGET_LIFECYCLE_PHASE);
-    let prepare_span = stage_context.start(
-        "Prepare target lifecycle",
-        "delta_funnel.write.sql_server",
-        "Prepare target",
-    );
+    let prepare_span =
+        stage_context.start("Prepare target lifecycle", "delta_funnel.write.sql_server");
     let prepared_target = match connection.prepare_target_lifecycle(&output_plan).await {
         Ok(prepared_target) => {
             complete_sink_span(prepare_span);
@@ -585,7 +544,6 @@ where
             stage_context.start(
                 "Read pre-write target row count",
                 "delta_funnel.write.validation",
-                "Pre-write validation",
             )
         })
         .flatten();
@@ -643,11 +601,7 @@ where
                 != TargetValidationMode::Disabled
                 || output_plan.load_mode() == LoadMode::Replace)
                 .then(|| {
-                    stage_context.start(
-                        "Validate written target",
-                        "delta_funnel.write.validation",
-                        "Post-write validation",
-                    )
+                    stage_context.start("Validate written target", "delta_funnel.write.validation")
                 })
                 .flatten();
             let validation_result = validate_written_target(
@@ -675,11 +629,8 @@ where
                     }
                     let swap_span = (output_plan.load_mode() == LoadMode::Replace)
                         .then(|| {
-                            stage_context.start(
-                                "Swap replace target",
-                                "delta_funnel.write.sql_server",
-                                "Swap target",
-                            )
+                            stage_context
+                                .start("Swap replace target", "delta_funnel.write.sql_server")
                         })
                         .flatten();
                     let swap_result = swap_replace_target_after_validation(
@@ -1235,11 +1186,8 @@ where
         );
     }
     let cleanup_timer = PhaseTimer::start(CLEANUP_PHASE);
-    let cleanup_span = stage_context.start(
-        "Clean up prepared target",
-        "delta_funnel.write.sql_server",
-        "Cleanup",
-    );
+    let cleanup_span =
+        stage_context.start("Clean up prepared target", "delta_funnel.write.sql_server");
     match connection
         .cleanup_prepared_target(output_plan, Some(prepared_target))
         .await
@@ -1875,7 +1823,11 @@ mod tests {
         let validation_options =
             ValidationOptions::new().with_target_validation_mode(TargetValidationMode::Disabled);
         let (reporter, phases) = recording_reporter();
-        let timeline = OperationTimelineRecorder::start();
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let trace_context = OperationTraceContext::start(OperationTraceKind::MssqlWrite)
+            .ok_or_else(|| DeltaFunnelError::Config {
+                message: "expected process trace context".to_owned(),
+            })?;
 
         let report = run_mssql_output_batches_on_connection_with_stage_context(
             output_plan,
@@ -1885,10 +1837,11 @@ mod tests {
             validation_options,
             Vec::new(),
             Some(&reporter),
-            OperationStageContext::from_timeline(Some(&timeline)),
+            OperationStageContext::new(Some(&trace_context), None),
         )
         .await?;
-        let timeline = timeline.finish("write", crate::TimelineSpanStatus::Completed);
+        trace_context.record_process_result("ok");
+        drop(trace_context);
 
         assert_eq!(
             logged_events(&log)?,
@@ -1897,23 +1850,22 @@ mod tests {
         assert_eq!(report.output_name(), "orders_output");
         assert_eq!(report.stats().rows_written(), 3);
         assert_eq!(report.stats().batches_written(), 2);
-        assert!(
-            timeline
-                .spans()
-                .iter()
-                .any(|span| span.name() == "Prepare target lifecycle")
-        );
-        assert!(
-            timeline
-                .spans()
-                .iter()
-                .any(|span| span.name() == "Stream and write batches")
-        );
+        let spans = capture.captured().spans();
+        assert!(spans.iter().any(|span| {
+            span.name == "Delta Funnel operation stage"
+                && span.fields["stage_name"] == "Prepare target lifecycle"
+        }));
+        assert!(spans.iter().any(|span| {
+            span.name == "Delta Funnel operation stage"
+                && span.fields["stage_name"] == "Stream and write batches"
+        }));
         assert_eq!(
-            timeline
-                .spans()
+            spans
                 .iter()
-                .filter(|span| span.name() == "Write batch to SQL Server")
+                .filter(|span| {
+                    span.name == "Delta Funnel operation stage"
+                        && span.fields["stage_name"] == "Write batch to SQL Server"
+                })
                 .count(),
             2
         );
@@ -2020,13 +1972,13 @@ mod tests {
         let batches = stream::iter(vec![Ok(orders_batch(2)?), Ok(orders_batch(1)?)]);
         let (reporter, phases) = recording_reporter();
         let capture = TracingCapture::start_with_profile_spans_enabled();
-        let trace_context = OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
+        let trace_context = OperationTraceContext::start(OperationTraceKind::MssqlWrite)
             .ok_or_else(|| DeltaFunnelError::Config {
                 message: "expected process trace context".to_owned(),
             })?;
         let root_id = trace_context
             .process_root_span()
-            .and_then(tracing::Span::id)
+            .id()
             .ok_or_else(|| DeltaFunnelError::Config {
                 message: "expected process root span".to_owned(),
             })?
@@ -3532,7 +3484,7 @@ mod tests {
         let connection = FakeSinkConnection::with_log(Arc::clone(&log)).fail_write();
         let batches = stream::iter(vec![Ok(orders_batch(1)?)]);
         let capture = TracingCapture::start_with_profile_spans_enabled();
-        let trace_context = OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
+        let trace_context = OperationTraceContext::start(OperationTraceKind::MssqlWrite)
             .ok_or_else(|| DeltaFunnelError::Config {
                 message: "expected process trace context".to_owned(),
             })?;

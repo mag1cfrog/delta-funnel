@@ -18,7 +18,7 @@ use crate::{
     ValidationStatus, observability, plan_mssql_target_for_resolved_output,
     profiling::{OperationStageContext, OperationStageTrace, OperationTraceContext},
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
-    report::{OperationTimelineRecorder, PhaseTimer},
+    report::PhaseTimer,
     support::sanitize_text_for_display,
 };
 
@@ -920,22 +920,11 @@ where
         operation_trace_context,
         stage_owner_id,
     } = job;
-    let operation_timeline = operation_trace_context
-        .as_ref()
-        .and_then(OperationTraceContext::timeline);
     let stage_context =
         OperationStageContext::new(operation_trace_context.as_ref(), stage_owner_id);
     let output_stage = operation_trace_context
         .as_ref()
-        .and_then(|_| {
-            stage_context.start_with_timeline_name(
-                "Execute output",
-                format!("Execute output: {}", target.output_name()),
-                "delta_funnel.write_all.output",
-                format!("Output: {}", target.output_name()),
-            )
-        })
-        .map(|span| span.with_attribute("output_name", target.output_name().to_owned().into()));
+        .and_then(|_| stage_context.start("Execute output", "delta_funnel.write_all.output"));
     if let Some(reporter) = progress_reporter.as_ref() {
         reporter.emit(&ProgressEvent::phase_changed(
             ProgressPhase::SettingUpStream,
@@ -946,11 +935,6 @@ where
     let (query_execution, stream_setup_timing) = match create_query_execution().await {
         Ok(query_execution) => (query_execution, stream_setup_timer.completed()),
         Err(failure) => {
-            append_error_profile_to_timeline(
-                operation_timeline,
-                &failure.error,
-                target.output_name(),
-            );
             fail_output_stage(output_stage);
             planned_phase_timings.extend(failure.query_phase_timings);
             let failure = MssqlWriteFailureReport::from_error(
@@ -991,24 +975,8 @@ where
         None => write_result,
     };
     match &write_result {
-        Ok(report) => {
-            if let (Some(timeline), Some(profile)) =
-                (operation_timeline, report.execution_profile())
-            {
-                let output_name = target.output_name();
-                timeline.append_operator_lifecycles_with_owner(
-                    profile,
-                    "output_name",
-                    output_name,
-                    &format!("Output: {output_name}"),
-                );
-            }
-            complete_output_stage(output_stage);
-        }
-        Err(error) => {
-            append_error_profile_to_timeline(operation_timeline, error, target.output_name());
-            fail_output_stage(output_stage);
-        }
+        Ok(_) => complete_output_stage(output_stage),
+        Err(_) => fail_output_stage(output_stage),
     }
     match write_result {
         Ok(report) => {
@@ -1031,24 +999,6 @@ where
             );
             MssqlOutputWriteStatus::Failed(failure)
         }
-    }
-}
-
-fn append_error_profile_to_timeline(
-    timeline: Option<&OperationTimelineRecorder>,
-    error: &DeltaFunnelError,
-    output_name: &str,
-) {
-    if let (Some(timeline), Some(profile)) = (
-        timeline,
-        failure_context(error).and_then(|context| context.report().execution_profile()),
-    ) {
-        timeline.append_operator_lifecycles_with_owner(
-            profile,
-            "output_name",
-            output_name,
-            &format!("Output: {output_name}"),
-        );
     }
 }
 

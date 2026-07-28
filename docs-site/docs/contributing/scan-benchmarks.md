@@ -123,41 +123,20 @@ cargo run --release -p delta-funnel --bin delta_scan_partition_bench -- \
 
 Run both commands on an otherwise idle host. Keep their workload, seed,
 backend, scheduling profile, storage profile, repetition count, release build,
-and CSV schema version identical. Compare exact execution profiling against
-both of these references:
+and CSV schema version identical. Compare the two results:
 
-- Profiling disabled measures the total cost added by profiling.
-- The current exact execution mode measures whether a replacement profiler
-  improves or regresses the existing implementation.
+- The disabled run is the control.
+- The detailed run shows the cost of exact execution profiling.
 
-`total_micros` includes the measured workflow but excludes Chrome trace
-serialization. `trace_export_micros` records trace construction and compact
-JSON serialization separately. Peak RSS is sampled after serialization, so it
-includes retained profiling data and trace export memory. The
-`operation_timeline_span_count_max`, `trace_event_count_max`, and
-`trace_json_bytes_max` columns report the largest value observed across the
-repetitions.
+`total_micros` includes the measured workflow. Compare its percentiles,
+throughput, and peak RSS. Three repetitions are enough for a directional
+development comparison, but not for a hard performance threshold. Investigate
+host noise before attributing a small difference to a code change.
 
-### Reference result from 2026-07-16
-
-This directional baseline was collected at commit `b464b9e60b1f` on Linux
-x86-64 with an AMD Ryzen 7 8845HS, 8 cores, 16 hardware threads, 16 available
-parallelism slots, and Rust 1.97.0. Each row summarizes three repetitions.
-
-| Metric | Disabled | Detailed | Change |
-| --- | ---: | ---: | ---: |
-| Workflow time p50 | 24.874 s | 30.154 s | +21.2% |
-| Workflow time p95 | 25.704 s | 32.935 s | +28.1% |
-| Source rows per second p50 | 538,507 | 444,216 | -17.5% |
-| Peak RSS increase | 14,683.5 MiB | 16,512.2 MiB | +12.5% |
-| Operation timeline spans, maximum | 0 | 192,739 | n/a |
-| Chrome trace events, maximum | 0 | 193,222 | n/a |
-| Compact trace JSON size, maximum | 0 | 344.8 MiB | n/a |
-| Trace export time p50 | 0 | 5.478 s | n/a |
-
-Three repetitions are enough for a reproducible development baseline, but not
-for a hard performance threshold. Repeat the comparison and investigate host
-noise before attributing a small difference to a code change.
+`execution_profile_operator_count_max` records the largest retained operator
+count across repetitions. `execution_profile_metric_count_max` counts both
+aggregated and original per-partition metric entries because the profile keeps
+both representations.
 
 ### Compare Samply with exact execution profiling
 
@@ -218,41 +197,6 @@ Samply startup and profile finalization. Each `/usr/bin/time` result captures
 the corresponding command wall time, including startup and finalization.
 Bracketing the matrix with two controls makes host drift visible instead of
 attributing it to the profiler.
-
-#### Samply comparison from 2026-07-17
-
-This directional comparison was collected at commit `c60857d41673` on Fedora
-Linux 43 x86-64 with an AMD Ryzen 7 8845HS, 8 cores, 16 hardware threads, 16
-available parallelism slots, Samply 0.13.1 at its default 1000 Hz rate, and
-Rust 1.97.0. Every case used the same `profiling` binary and three repetitions.
-The execution order was disabled control, exact execution profiling, Samply,
-then disabled control.
-
-| Metric | Disabled before | Detailed | Samply | Disabled after |
-| --- | ---: | ---: | ---: | ---: |
-| Workflow time p50 | 22.362 s | 30.581 s | 22.021 s | 21.377 s |
-| Workflow time p95 | 23.024 s | 31.497 s | 22.209 s | 22.058 s |
-| Source rows per second p50 | 598,994 | 438,016 | 608,259 | 626,612 |
-| Benchmark process peak RSS increase | 14,800.9 MiB | 16,701.2 MiB | 14,744.7 MiB | 14,595.3 MiB |
-| Command wall time, three repetitions | 88.88 s | 127.05 s | 89.18 s | 86.23 s |
-| Operation timeline spans, maximum | 0 | 189,666 | 0 | 0 |
-| Chrome trace events, maximum | 0 | 190,149 | 0 | 0 |
-| Compact Chrome trace size, maximum | 0 | 338.3 MiB | 0 | 0 |
-| Chrome trace export time p50 | 0 | 5.310 s | 0 | 0 |
-| Samply profile size, three repetitions | 0 | 0 | 4.7 MiB | 0 |
-
-Samply's workflow p50 was 1.5% below the first control and 3.0% above the
-second control. Its throughput and the benchmark process's peak RSS also
-remained within the range of the controls. The RSS field does not include the
-separate Samply recorder process. The controls themselves differed by 4.6%, so
-this sample found no measurable Samply slowdown. The profile contained 287,020
-samples; 119 events, about 0.04%, were lost.
-
-Detailed profiling was 36.8% to 43.1% slower than the controls, reduced median
-throughput by 26.9% to 30.1%, and increased peak RSS by 12.8% to 14.4%. It also
-serialized one Chrome trace per repetition after the measured workflow. These
-results show a material difference on this workload, but they remain a
-directional development measurement rather than a hard performance guarantee.
 
 ## Compare results
 

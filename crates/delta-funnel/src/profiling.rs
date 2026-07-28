@@ -7,16 +7,9 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
-use serde_json::Value;
 use tracing::Instrument;
-
-use crate::{
-    TimelineSpanStatus,
-    report::{OperationTimelineRecorder, OperationTimelineSpanRecorder},
-};
 
 pub(crate) const PROFILE_TARGET: &str = "delta_funnel::profile";
 #[cfg(feature = "perfetto-profile")]
@@ -94,31 +87,23 @@ impl OperationTracePhase {
     }
 }
 
-/// One canonical identity and optional semantic sink for a profiled operation.
+/// One canonical identity for a profiled operation.
 #[derive(Debug, Clone)]
 pub(crate) struct OperationTraceContext {
     operation_id: u64,
     kind: OperationTraceKind,
     next_query_execution_id: Arc<AtomicU64>,
-    timeline: Option<OperationTimelineRecorder>,
-    process_trace: Option<Arc<ProcessOperationTrace>>,
+    process_trace: Arc<ProcessOperationTrace>,
     operator_activity_budget: Arc<OperatorActivityBudget>,
 }
 
 impl OperationTraceContext {
-    pub(crate) fn start(
-        kind: OperationTraceKind,
-        timeline: Option<OperationTimelineRecorder>,
-    ) -> Option<Self> {
-        Self::start_for_modes(kind, timeline, process_spans_enabled())
+    pub(crate) fn start(kind: OperationTraceKind) -> Option<Self> {
+        Self::start_for_mode(kind, process_spans_enabled())
     }
 
-    fn start_for_modes(
-        kind: OperationTraceKind,
-        timeline: Option<OperationTimelineRecorder>,
-        process_spans_enabled: bool,
-    ) -> Option<Self> {
-        if timeline.is_none() && !process_spans_enabled {
+    fn start_for_mode(kind: OperationTraceKind, process_spans_enabled: bool) -> Option<Self> {
+        if !process_spans_enabled {
             return None;
         }
         let operation_id = allocate_id(&NEXT_OPERATION_ID)?;
@@ -126,14 +111,11 @@ impl OperationTraceContext {
             operation_id,
             kind,
             next_query_execution_id: Arc::new(AtomicU64::new(1)),
-            timeline,
-            process_trace: process_spans_enabled.then(|| {
-                Arc::new(ProcessOperationTrace::new(
-                    kind,
-                    operation_id,
-                    current_operation_capture_scope_id(),
-                ))
-            }),
+            process_trace: Arc::new(ProcessOperationTrace::new(
+                kind,
+                operation_id,
+                current_operation_capture_scope_id(),
+            )),
             operator_activity_budget: Arc::new(OperatorActivityBudget::new(
                 MAX_OPERATOR_ACTIVITY_SPANS,
             )),
@@ -141,12 +123,8 @@ impl OperationTraceContext {
     }
 
     #[cfg(test)]
-    pub(crate) fn start_for_test(
-        timeline: Option<OperationTimelineRecorder>,
-        process_spans_enabled: bool,
-    ) -> Option<Self> {
+    pub(crate) fn start_for_test(process_spans_enabled: bool) -> Option<Self> {
         Self::start_for_test_with_operator_activity_limit(
-            timeline,
             process_spans_enabled,
             MAX_OPERATOR_ACTIVITY_SPANS,
         )
@@ -154,12 +132,10 @@ impl OperationTraceContext {
 
     #[cfg(test)]
     pub(crate) fn start_for_test_with_operator_activity_limit(
-        timeline: Option<OperationTimelineRecorder>,
         process_spans_enabled: bool,
         maximum_spans: u64,
     ) -> Option<Self> {
-        let mut context =
-            Self::start_for_modes(OperationTraceKind::Preview, timeline, process_spans_enabled)?;
+        let mut context = Self::start_for_mode(OperationTraceKind::Preview, process_spans_enabled)?;
         context.operator_activity_budget = Arc::new(OperatorActivityBudget::new(maximum_spans));
         Some(context)
     }
@@ -168,26 +144,16 @@ impl OperationTraceContext {
         self.operation_id
     }
 
-    pub(crate) const fn timeline(&self) -> Option<&OperationTimelineRecorder> {
-        self.timeline.as_ref()
-    }
-
-    pub(crate) const fn process_spans_enabled(&self) -> bool {
-        self.process_trace.is_some()
-    }
-
-    pub(crate) fn process_root_span(&self) -> Option<&tracing::Span> {
-        self.process_trace.as_deref().map(|trace| &trace.span)
+    pub(crate) fn process_root_span(&self) -> &tracing::Span {
+        &self.process_trace.span
     }
 
     pub(crate) fn record_process_result(&self, result: &'static str) {
-        if let Some(trace) = &self.process_trace {
-            trace.record_result(result);
-        }
+        self.process_trace.record_result(result);
     }
 
-    fn start_process_phase(&self, phase: OperationTracePhase) -> Option<ProcessSpanTrace> {
-        let root = self.process_root_span()?;
+    fn start_process_phase(&self, phase: OperationTracePhase) -> ProcessSpanTrace {
+        let root = self.process_root_span();
         let span = tracing::trace_span!(
             target: PROFILE_TARGET,
             parent: root,
@@ -197,11 +163,11 @@ impl OperationTraceContext {
             result = tracing::field::Empty,
             time_semantics = "wall_clock",
         );
-        Some(ProcessSpanTrace {
+        ProcessSpanTrace {
             span,
             _parent: root.clone(),
             result_recorded: false,
-        })
+        }
     }
 
     fn start_process_stage(
@@ -209,8 +175,8 @@ impl OperationTraceContext {
         name: &'static str,
         category: &'static str,
         owner_id: Option<u64>,
-    ) -> Option<ProcessSpanTrace> {
-        let root = self.process_root_span()?;
+    ) -> ProcessSpanTrace {
+        let root = self.process_root_span();
         let span = tracing::trace_span!(
             target: PROFILE_TARGET,
             parent: root,
@@ -223,11 +189,11 @@ impl OperationTraceContext {
             result = tracing::field::Empty,
             time_semantics = "wall_clock",
         );
-        Some(ProcessSpanTrace {
+        ProcessSpanTrace {
             span,
             _parent: root.clone(),
             result_recorded: false,
-        })
+        }
     }
 
     pub(crate) fn next_query_execution_id(&self) -> Option<u64> {
@@ -254,7 +220,7 @@ impl ProcessOperationPhaseTracker {
         let context = context.cloned();
         let active = context
             .as_ref()
-            .and_then(|context| context.start_process_phase(phase));
+            .map(|context| context.start_process_phase(phase));
         Self { active, context }
     }
 
@@ -271,7 +237,7 @@ impl ProcessOperationPhaseTracker {
         self.active = self
             .context
             .as_ref()
-            .and_then(|context| context.start_process_phase(phase));
+            .map(|context| context.start_process_phase(phase));
     }
 
     pub(crate) fn finish(&mut self, result: &'static str) {
@@ -304,11 +270,10 @@ impl Drop for ProcessSpanTrace {
     }
 }
 
-/// Read-only destinations and identity shared by one operation's bounded stages.
+/// Read-only identity shared by one operation's bounded stages.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OperationStageContext<'a> {
     operation: Option<&'a OperationTraceContext>,
-    timeline: Option<&'a OperationTimelineRecorder>,
     owner_id: Option<u64>,
 }
 
@@ -317,164 +282,75 @@ impl<'a> OperationStageContext<'a> {
         operation: Option<&'a OperationTraceContext>,
         owner_id: Option<u64>,
     ) -> Self {
-        let timeline = match operation {
-            Some(operation) => operation.timeline(),
-            None => None,
-        };
         Self {
             operation,
-            timeline,
             owner_id,
         }
     }
 
-    pub(crate) const fn from_timeline(timeline: Option<&'a OperationTimelineRecorder>) -> Self {
+    pub(crate) fn start(
+        self,
+        name: &'static str,
+        category: &'static str,
+    ) -> Option<OperationStageTrace> {
+        OperationStageTrace::start(self.operation, name, category, self.owner_id)
+    }
+}
+
+/// One bounded wall-clock stage in the process trace.
+#[derive(Debug)]
+pub(crate) struct OperationStageTrace {
+    process_span: ProcessSpanTrace,
+}
+
+impl OperationStageTrace {
+    pub(crate) fn from_process_span((span, parent): (tracing::Span, tracing::Span)) -> Self {
         Self {
-            operation: None,
-            timeline,
-            owner_id: None,
+            process_span: ProcessSpanTrace {
+                span,
+                _parent: parent,
+                result_recorded: false,
+            },
         }
     }
 
     pub(crate) fn start(
-        self,
-        name: &'static str,
-        category: &'static str,
-        track_name: impl Into<String>,
-    ) -> Option<OperationStageTrace> {
-        OperationStageTrace::start_with_timeline_name(
-            self.operation,
-            self.timeline,
-            name,
-            name,
-            category,
-            track_name,
-            self.owner_id,
-        )
-    }
-
-    pub(crate) fn start_with_timeline_name(
-        self,
-        name: &'static str,
-        timeline_name: impl Into<String>,
-        category: &'static str,
-        track_name: impl Into<String>,
-    ) -> Option<OperationStageTrace> {
-        OperationStageTrace::start_with_timeline_name(
-            self.operation,
-            self.timeline,
-            name,
-            timeline_name,
-            category,
-            track_name,
-            self.owner_id,
-        )
-    }
-}
-
-/// One bounded wall-clock stage shared by the stable timeline and process trace.
-#[derive(Debug)]
-pub(crate) struct OperationStageTrace {
-    timeline_span: Option<OperationTimelineSpanRecorder>,
-    process_span: Option<ProcessSpanTrace>,
-}
-
-impl OperationStageTrace {
-    pub(crate) fn from_parts(
-        timeline_span: Option<OperationTimelineSpanRecorder>,
-        process_span: Option<(tracing::Span, tracing::Span)>,
-    ) -> Option<Self> {
-        let process_span = process_span.map(|(span, parent)| ProcessSpanTrace {
-            span,
-            _parent: parent,
-            result_recorded: false,
-        });
-        (timeline_span.is_some() || process_span.is_some()).then_some(Self {
-            timeline_span,
-            process_span,
-        })
-    }
-
-    pub(crate) fn start(
         context: Option<&OperationTraceContext>,
-        timeline: Option<&OperationTimelineRecorder>,
         name: &'static str,
         category: &'static str,
-        track_name: impl Into<String>,
-        owner_id: Option<u64>,
-    ) -> Option<Self> {
-        Self::start_with_timeline_name(
-            context, timeline, name, name, category, track_name, owner_id,
-        )
-    }
-
-    fn start_with_timeline_name(
-        context: Option<&OperationTraceContext>,
-        timeline: Option<&OperationTimelineRecorder>,
-        name: &'static str,
-        timeline_name: impl Into<String>,
-        category: &'static str,
-        track_name: impl Into<String>,
         owner_id: Option<u64>,
     ) -> Option<Self> {
         debug_assert!(owner_id.is_none_or(|owner_id| owner_id != 0));
-        let timeline_span =
-            timeline.map(|timeline| timeline.start_span(timeline_name, category, track_name));
-        let process_span = context.and_then(|context| {
-            context.start_process_stage(name, category, owner_id.filter(|owner_id| *owner_id != 0))
-        });
-        (timeline_span.is_some() || process_span.is_some()).then_some(Self {
-            timeline_span,
-            process_span,
+        context.map(|context| Self {
+            process_span: context.start_process_stage(
+                name,
+                category,
+                owner_id.filter(|owner_id| *owner_id != 0),
+            ),
         })
-    }
-
-    pub(crate) fn with_attribute(mut self, name: impl Into<String>, value: Value) -> Self {
-        self.timeline_span = self
-            .timeline_span
-            .map(|span| span.with_attribute(name, value));
-        self
     }
 
     pub(crate) async fn instrument_future<F>(&self, future: F) -> F::Output
     where
         F: Future,
     {
-        match &self.process_span {
-            Some(process_span) => future.instrument(process_span.span.clone()).await,
-            None => future.await,
-        }
+        future.instrument(self.process_span.span.clone()).await
     }
 
     pub(crate) fn in_process_scope<T>(&self, operation: impl FnOnce() -> T) -> T {
-        match &self.process_span {
-            Some(process_span) => process_span.span.in_scope(operation),
-            None => operation(),
-        }
+        self.process_span.span.in_scope(operation)
     }
 
     pub(crate) fn completed(self) {
-        let _ = self.finish_with_duration(TimelineSpanStatus::Completed);
+        self.finish("ok");
     }
 
     pub(crate) fn failed(self) {
-        let _ = self.finish_with_duration(TimelineSpanStatus::Failed);
+        self.finish("error");
     }
 
-    pub(crate) fn finish_with_duration(mut self, status: TimelineSpanStatus) -> Duration {
-        let duration = self
-            .timeline_span
-            .take()
-            .map(|span| span.finish_with_duration(status))
-            .unwrap_or_default();
-        if let Some(span) = self.process_span.take() {
-            span.finish(match status {
-                TimelineSpanStatus::Completed => "ok",
-                TimelineSpanStatus::Failed => "error",
-                TimelineSpanStatus::Cancelled => "cancelled",
-            });
-        }
-        duration
+    fn finish(self, result: &'static str) {
+        self.process_span.finish(result);
     }
 }
 
@@ -598,78 +474,9 @@ fn process_spans_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{observability::test_capture::TracingCapture, report::OperationTimelineRecorder};
+    use crate::observability::test_capture::TracingCapture;
 
     use super::*;
-
-    #[test]
-    fn activation_modes_share_one_context_without_requiring_a_timeline() {
-        assert!(
-            OperationTraceContext::start_for_modes(OperationTraceKind::Preview, None, false)
-                .is_none()
-        );
-
-        let semantic_timeline = OperationTimelineRecorder::start();
-        let semantic = OperationTraceContext::start_for_modes(
-            OperationTraceKind::Preview,
-            Some(semantic_timeline.clone()),
-            false,
-        )
-        .expect("semantic tracing should create a context");
-        let process =
-            OperationTraceContext::start_for_modes(OperationTraceKind::MssqlWrite, None, true)
-                .expect("process tracing should create a context");
-        let combined_timeline = OperationTimelineRecorder::start();
-        let combined = OperationTraceContext::start_for_modes(
-            OperationTraceKind::WriteAll,
-            Some(combined_timeline.clone()),
-            true,
-        )
-        .expect("combined tracing should create one context");
-
-        assert!(semantic.timeline().is_some());
-        assert!(!semantic.process_spans_enabled());
-        assert!(process.timeline().is_none());
-        assert!(process.process_spans_enabled());
-        assert!(combined.timeline().is_some());
-        assert!(combined.process_spans_enabled());
-        assert!(semantic.operation_id() < process.operation_id());
-        assert!(process.operation_id() < combined.operation_id());
-
-        semantic_timeline
-            .start_span("semantic", "test", "test")
-            .completed();
-        assert_eq!(
-            semantic_timeline
-                .finish("semantic", crate::TimelineSpanStatus::Completed)
-                .spans()
-                .len(),
-            1
-        );
-        combined_timeline
-            .start_span("combined", "test", "test")
-            .completed();
-        assert_eq!(
-            combined_timeline
-                .finish("combined", crate::TimelineSpanStatus::Completed)
-                .spans()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn query_ids_are_local_to_their_operation_context() {
-        let first = OperationTraceContext::start_for_modes(OperationTraceKind::Preview, None, true)
-            .expect("process tracing should create a context");
-        let second =
-            OperationTraceContext::start_for_modes(OperationTraceKind::Preview, None, true)
-                .expect("process tracing should create a context");
-
-        assert_eq!(first.next_query_execution_id(), Some(1));
-        assert_eq!(first.next_query_execution_id(), Some(2));
-        assert_eq!(second.next_query_execution_id(), Some(1));
-    }
 
     #[test]
     fn identity_allocation_stops_instead_of_wrapping() {
@@ -679,336 +486,51 @@ mod tests {
         assert_eq!(allocate_id(&counter), None);
     }
 
-    #[cfg(feature = "perfetto-profile")]
     #[test]
-    fn operation_capture_scope_restores_nested_and_panicking_calls() {
-        assert_eq!(current_operation_capture_scope_id(), None);
-        in_operation_capture_scope(1, || {
-            assert_eq!(current_operation_capture_scope_id(), Some(1));
-            let _ = std::panic::catch_unwind(|| {
-                in_operation_capture_scope(2, || {
-                    std::panic::resume_unwind(Box::new("scope test"));
-                });
-            });
-            assert_eq!(current_operation_capture_scope_id(), Some(1));
-        });
-        assert_eq!(current_operation_capture_scope_id(), None);
-    }
-
-    #[test]
-    fn process_activation_uses_the_profile_callsite() {
-        use tracing::subscriber::{NoSubscriber, with_default};
-        use tracing_subscriber::Registry;
-
-        let _guard = crate::observability::test_capture::tracing_test_guard();
-        let disabled = with_default(NoSubscriber::default(), || {
-            tracing::callsite::rebuild_interest_cache();
-            OperationTraceContext::start(OperationTraceKind::Preview, None)
-        });
-        let enabled = with_default(Registry::default(), || {
-            tracing::callsite::rebuild_interest_cache();
-            OperationTraceContext::start(OperationTraceKind::Preview, None)
-        });
-
-        assert!(disabled.is_none());
-        assert!(enabled.is_some());
-    }
-
-    #[test]
-    fn operation_spans_record_bounded_identity_result_and_cancellation() {
+    fn operation_and_stage_spans_record_identity_and_terminal_results() {
         let capture = TracingCapture::start_with_profile_spans_enabled();
-        let application_span = tracing::info_span!("application operation");
-        let application_guard = application_span.enter();
-        #[cfg(feature = "perfetto-profile")]
-        let completed = in_operation_capture_scope(42, || {
-            OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
-                .expect("process tracing should create a context")
-        });
-        #[cfg(not(feature = "perfetto-profile"))]
-        let completed = OperationTraceContext::start(OperationTraceKind::MssqlWrite, None)
-            .expect("process tracing should create a context");
-        let completed_id = completed.operation_id();
-        completed.record_process_result("ok");
-        drop(completed);
-
-        let cancelled = OperationTraceContext::start(OperationTraceKind::Preview, None)
-            .expect("process tracing should create a context");
-        let cancelled_id = cancelled.operation_id();
+        let operation = OperationTraceContext::start_for_test(true)
+            .expect("profile tracing should create an operation");
+        let operation_id = operation.operation_id();
+        let completed = OperationStageContext::new(Some(&operation), Some(7))
+            .start("Completed stage", "delta_funnel.test")
+            .expect("the completed stage should start");
+        completed.completed();
+        let cancelled = OperationStageContext::new(Some(&operation), None)
+            .start("Cancelled stage", "delta_funnel.test")
+            .expect("the cancelled stage should start");
         drop(cancelled);
-        drop(application_guard);
-        drop(application_span);
+        operation.record_process_result("ok");
+        drop(operation);
 
-        let spans = capture
-            .captured()
-            .spans()
-            .into_iter()
-            .filter(|span| span.target == PROFILE_TARGET)
-            .collect::<Vec<_>>();
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].name, "Delta Funnel SQL Server write");
-        assert_eq!(spans[0].fields["operation_id"], completed_id.to_string());
-        assert_eq!(
-            spans[0].fields["capture_scope_id"],
-            if cfg!(feature = "perfetto-profile") {
-                "42"
-            } else {
-                "0"
-            }
-        );
-        assert_eq!(spans[0].fields["result"], "ok");
-        assert_eq!(spans[1].name, "Delta Funnel preview");
-        assert_eq!(spans[1].fields["operation_id"], cancelled_id.to_string());
-        assert_eq!(spans[1].fields["capture_scope_id"], "0");
-        assert_eq!(spans[1].fields["result"], "cancelled");
-        assert!(spans.iter().all(|span| {
-            span.target == PROFILE_TARGET
-                && span.level == tracing::Level::TRACE
-                && span.parent_id.is_none()
-                && span.fields["time_semantics"] == "wall_clock"
-                && span.enter_count == 0
-                && span.exit_count == 0
-                && span.closed
-        }));
-    }
-
-    #[test]
-    fn operation_phase_retains_its_root_and_records_cancellation() {
-        let capture = TracingCapture::start_with_profile_spans_enabled();
-        let context = OperationTraceContext::start(OperationTraceKind::Preview, None)
-            .expect("process tracing should create a context");
-        let root_id = context
-            .process_root_span()
-            .expect("process tracing should create a root span")
-            .id()
-            .expect("the root span should be enabled")
-            .into_u64();
-        let phases =
-            ProcessOperationPhaseTracker::start(Some(&context), OperationTracePhase::Execution);
-
-        drop(context);
-        let open_root = capture
-            .captured()
-            .spans()
-            .into_iter()
-            .find(|span| span.id == root_id)
-            .expect("the operation root should be captured");
-        assert!(!open_root.closed);
-
-        drop(phases);
         let spans = capture.captured().spans();
         let root = spans
             .iter()
-            .find(|span| span.id == root_id)
+            .find(|span| span.name == "Delta Funnel preview")
             .expect("the operation root should be captured");
-        let phase = spans
+        assert_eq!(root.fields["operation_id"], operation_id.to_string());
+        assert_eq!(root.fields["result"], "ok");
+
+        let stages = spans
             .iter()
-            .find(|span| span.name == "Delta Funnel operation phase")
-            .expect("the operation phase should be captured");
-        assert!(root.closed);
-        assert_eq!(root.fields["result"], "cancelled");
-        assert!(phase.closed);
-        assert_eq!(phase.parent_id, Some(root_id));
-        assert_eq!(phase.fields["phase"], "execution");
-        assert_eq!(phase.fields["result"], "cancelled");
-        assert_eq!(phase.fields["time_semantics"], "wall_clock");
-        assert_eq!(phase.enter_count, 0);
-        assert_eq!(phase.exit_count, 0);
+            .filter(|span| span.name == "Delta Funnel operation stage")
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 2);
+        assert!(stages.iter().all(|span| span.parent_id == Some(root.id)));
+        assert_eq!(stages[0].fields["stage_name"], "Completed stage");
+        assert_eq!(stages[0].fields["stage_owner_id"], "7");
+        assert_eq!(stages[0].fields["result"], "ok");
+        assert_eq!(stages[1].fields["stage_name"], "Cancelled stage");
+        assert_eq!(stages[1].fields["result"], "cancelled");
     }
 
     #[test]
-    fn operation_stage_routes_all_activation_modes_and_terminal_results() {
-        let capture = TracingCapture::start_with_profile_spans_enabled();
+    fn disabled_process_tracing_creates_no_context_or_stage() {
+        assert!(OperationTraceContext::start_for_test(false).is_none());
         assert!(
-            OperationStageTrace::start(
-                None,
-                None,
-                "Disabled stage",
-                "delta_funnel.test",
-                "Disabled track",
-                None,
-            )
-            .is_none()
+            OperationStageContext::default()
+                .start("Disabled stage", "delta_funnel.test")
+                .is_none()
         );
-
-        let timeline_only = OperationTimelineRecorder::start();
-        let semantic = OperationTraceContext::start_for_modes(
-            OperationTraceKind::Preview,
-            Some(timeline_only.clone()),
-            false,
-        )
-        .expect("the timeline should create a context");
-        OperationStageTrace::start(
-            Some(&semantic),
-            semantic.timeline(),
-            "Timeline stage",
-            "delta_funnel.test.timeline",
-            "Timeline track",
-            None,
-        )
-        .expect("the timeline stage should start")
-        .with_attribute("phase_name", Value::String("timeline_stage".to_owned()))
-        .finish_with_duration(TimelineSpanStatus::Completed);
-        let timeline_only = timeline_only.finish("timeline only", TimelineSpanStatus::Completed);
-        assert_eq!(timeline_only.spans().len(), 1);
-        assert_eq!(timeline_only.spans()[0].name(), "Timeline stage");
-        assert_eq!(
-            timeline_only.spans()[0].attributes()["phase_name"],
-            "timeline_stage"
-        );
-
-        let process =
-            OperationTraceContext::start_for_modes(OperationTraceKind::MssqlWrite, None, true)
-                .expect("process tracing should create a context");
-        let process_root_id = process
-            .process_root_span()
-            .and_then(tracing::Span::id)
-            .expect("the process root should be enabled")
-            .into_u64();
-        let process_stage = OperationStageTrace::start(
-            Some(&process),
-            None,
-            "Process stage",
-            "delta_funnel.test.process",
-            "Unused timeline track",
-            Some(7),
-        )
-        .expect("the process stage should start");
-        drop(process);
-        assert!(
-            !capture
-                .captured()
-                .spans()
-                .into_iter()
-                .find(|span| span.id == process_root_id)
-                .expect("the process root should be captured")
-                .closed
-        );
-        process_stage.finish_with_duration(TimelineSpanStatus::Completed);
-
-        let combined_timeline = OperationTimelineRecorder::start();
-        let combined = OperationTraceContext::start_for_modes(
-            OperationTraceKind::WriteAll,
-            Some(combined_timeline.clone()),
-            true,
-        )
-        .expect("combined tracing should create a context");
-        OperationStageTrace::start(
-            Some(&combined),
-            combined.timeline(),
-            "Combined stage",
-            "delta_funnel.test.combined",
-            "Combined track",
-            None,
-        )
-        .expect("the combined stage should start")
-        .finish_with_duration(TimelineSpanStatus::Failed);
-        let combined_timeline = combined_timeline.finish("combined", TimelineSpanStatus::Failed);
-        assert_eq!(
-            combined_timeline.spans()[0].status(),
-            TimelineSpanStatus::Failed
-        );
-        drop(combined);
-
-        let cancelled_timeline = OperationTimelineRecorder::start();
-        let cancelled = OperationTraceContext::start_for_modes(
-            OperationTraceKind::Preview,
-            Some(cancelled_timeline.clone()),
-            true,
-        )
-        .expect("combined tracing should create a context");
-        let cancelled_stage = OperationStageTrace::start(
-            Some(&cancelled),
-            cancelled.timeline(),
-            "Cancelled stage",
-            "delta_funnel.test.cancelled",
-            "Cancelled track",
-            None,
-        )
-        .expect("the cancelled stage should start");
-        drop(cancelled);
-        drop(cancelled_stage);
-        let cancelled_timeline =
-            cancelled_timeline.finish("cancelled", TimelineSpanStatus::Cancelled);
-        assert_eq!(
-            cancelled_timeline.spans()[0].status(),
-            TimelineSpanStatus::Cancelled
-        );
-
-        let stages = capture
-            .captured()
-            .spans()
-            .into_iter()
-            .filter(|span| span.name == "Delta Funnel operation stage")
-            .collect::<Vec<_>>();
-        assert_eq!(stages.len(), 3);
-        assert_eq!(stages[0].parent_id, Some(process_root_id));
-        assert_eq!(stages[0].fields["operation_kind"], "mssql_write");
-        assert_eq!(stages[0].fields["stage_name"], "Process stage");
-        assert_eq!(
-            stages[0].fields["stage_category"],
-            "delta_funnel.test.process"
-        );
-        assert_eq!(stages[0].fields["stage_owner_id"], "7");
-        assert_eq!(stages[0].fields["result"], "ok");
-        assert_eq!(stages[1].fields["result"], "error");
-        assert_eq!(stages[2].fields["result"], "cancelled");
-        assert!(stages.iter().all(|stage| {
-            stage.target == PROFILE_TARGET
-                && stage.level == tracing::Level::TRACE
-                && stage.fields["time_semantics"] == "wall_clock"
-                && stage.enter_count == 0
-                && stage.exit_count == 0
-                && stage.closed
-        }));
-    }
-
-    #[tokio::test]
-    async fn operation_stage_instruments_existing_dependency_spans() {
-        let capture = TracingCapture::start_with_profile_spans_enabled();
-        let context =
-            OperationTraceContext::start_for_modes(OperationTraceKind::MssqlWrite, None, true)
-                .expect("process tracing should create a context");
-        let stage = OperationStageTrace::start(
-            Some(&context),
-            None,
-            "Finalize SQL Server writer",
-            "delta_funnel.write.sql_server",
-            "Finalize writer",
-            Some(1),
-        )
-        .expect("the process stage should start");
-        let stage_id = stage
-            .process_span
-            .as_ref()
-            .and_then(|span| span.span.id())
-            .expect("the process stage should be enabled")
-            .into_u64();
-
-        stage
-            .instrument_future(async {
-                let dependency = tracing::info_span!(
-                    target: "tiberius_raw_bulk::protocol",
-                    "protocol.bulk_load.finalize.result"
-                );
-                drop(dependency);
-            })
-            .await;
-        stage.completed();
-        drop(context);
-
-        let spans = capture.captured().spans();
-        let dependency = spans
-            .iter()
-            .find(|span| span.name == "protocol.bulk_load.finalize.result")
-            .expect("the dependency span should be captured");
-        assert_eq!(dependency.parent_id, Some(stage_id));
-        assert!(dependency.closed);
-        let stage = spans
-            .iter()
-            .find(|span| span.id == stage_id)
-            .expect("the process stage should be captured");
-        assert!(stage.enter_count > 0);
-        assert_eq!(stage.exit_count, stage.enter_count);
-        assert!(stage.closed);
     }
 }

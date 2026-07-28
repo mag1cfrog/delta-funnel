@@ -23,7 +23,7 @@ use crate::{
         execution_profile::QueryExecutionProfileConsumer, instrument_query_execution_plan,
         with_query_planning_activity,
     },
-    report::{OperationTimelineRecorder, PhaseTimer},
+    report::PhaseTimer,
     support::sanitize_text_for_display,
 };
 
@@ -154,11 +154,8 @@ impl<'a> MssqlScopedCacheAliasReplacement<'a> {
             operation_trace_context,
         } = self;
         let restore_timer = PhaseTimer::start(CACHE_ALIAS_RESTORE_PHASE);
-        let restore_span = start_cache_alias_cleanup_span(
-            operation_trace_context.as_ref(),
-            &alias_name,
-            "Restore cache alias",
-        );
+        let restore_span =
+            start_cache_alias_cleanup_span(operation_trace_context.as_ref(), "Restore cache alias");
         let restore_result = context
             .deregister_table(alias_name.as_str())
             .map_err(|error| {
@@ -289,11 +286,7 @@ impl DeltaFunnelSession {
             })?;
 
         let install_timer = PhaseTimer::start(CACHE_ALIAS_INSTALL_PHASE);
-        let install_span = start_cache_alias_span(
-            trace_context.as_ref(),
-            alias_name.as_str(),
-            "Install cache alias",
-        );
+        let install_span = start_cache_alias_span(trace_context.as_ref(), "Install cache alias");
         let original_provider = match self.install_scoped_cache_alias_provider(
             alias_name.as_str(),
             provider,
@@ -404,13 +397,11 @@ impl DeltaFunnelSession {
         profile_mode: ExecutionProfileMode,
         trace_context: Option<&OperationTraceContext>,
     ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
-        let operation_timeline = trace_context.and_then(OperationTraceContext::timeline);
         let materialization_timer = PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE);
         let mut phase_timings = Vec::with_capacity(8);
 
         let resolution_timer = PhaseTimer::start(CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE);
-        let resolution_span =
-            start_cache_alias_span(trace_context, alias_name, "Resolve cache DataFrame");
+        let resolution_span = start_cache_alias_span(trace_context, "Resolve cache DataFrame");
         let dataframe = match self.context.table(alias_name).await {
             Ok(dataframe) => dataframe,
             Err(error) => {
@@ -436,8 +427,7 @@ impl DeltaFunnelSession {
         });
         let task_ctx = Arc::new(dataframe.task_ctx());
         let planning_timer = PhaseTimer::start(CACHE_ALIAS_PHYSICAL_PLANNING_PHASE);
-        let planning_span =
-            start_cache_alias_span(trace_context, alias_name, "Build cache physical plan");
+        let planning_span = start_cache_alias_span(trace_context, "Build cache physical plan");
         let physical_plan_result = match &trace_identity {
             Some(trace_identity) => {
                 with_query_planning_activity(
@@ -467,8 +457,7 @@ impl DeltaFunnelSession {
         let schema = physical_plan.schema();
         let read_stats_handles = collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         let stream_setup_timer = PhaseTimer::start(CACHE_ALIAS_STREAM_SETUP_PHASE);
-        let stream_setup_span =
-            start_cache_alias_span(trace_context, alias_name, "Set up cache streams");
+        let stream_setup_span = start_cache_alias_span(trace_context, "Set up cache streams");
         let physical_plan = match trace_identity {
             Some(trace_identity) => {
                 match instrument_query_execution_plan(physical_plan, trace_identity) {
@@ -517,11 +506,6 @@ impl DeltaFunnelSession {
             Err(error) => {
                 fail_cache_alias_span(stream_setup_span);
                 let execution_profile = clone_terminal_execution_profile(profile_result);
-                append_cache_operator_lifecycles(
-                    operation_timeline,
-                    execution_profile.as_ref(),
-                    alias_name,
-                );
                 return Err(cache_alias_materialization_failure(
                     error,
                     phase_timings,
@@ -535,18 +519,12 @@ impl DeltaFunnelSession {
         phase_timings.push(stream_setup_timer.completed());
 
         let collect_timer = PhaseTimer::start(CACHE_ALIAS_EXECUTE_COLLECT_PHASE);
-        let collect_span =
-            start_cache_alias_span(trace_context, alias_name, "Execute and collect cache");
+        let collect_span = start_cache_alias_span(trace_context, "Execute and collect cache");
         let partitions = match collect_cache_partitions(streams, sampler, alias_name).await {
             Ok(partitions) => partitions,
             Err(error) => {
                 fail_cache_alias_span(collect_span);
                 let execution_profile = clone_terminal_execution_profile(profile_result);
-                append_cache_operator_lifecycles(
-                    operation_timeline,
-                    execution_profile.as_ref(),
-                    alias_name,
-                );
                 return Err(cache_alias_materialization_failure(
                     error,
                     phase_timings,
@@ -559,15 +537,8 @@ impl DeltaFunnelSession {
         complete_cache_alias_span(collect_span);
         phase_timings.push(collect_timer.completed());
         let execution_profile = clone_terminal_execution_profile(profile_result);
-        append_cache_operator_lifecycles(
-            operation_timeline,
-            execution_profile.as_ref(),
-            alias_name,
-        );
-
         let memtable_timer = PhaseTimer::start(CACHE_ALIAS_MEMTABLE_BUILD_PHASE);
-        let memtable_span =
-            start_cache_alias_span(trace_context, alias_name, "Build cache MemTable");
+        let memtable_span = start_cache_alias_span(trace_context, "Build cache MemTable");
         let cached_provider = match MemTable::try_new(schema, partitions) {
             Ok(cached_provider) => cached_provider,
             Err(error) => {
@@ -654,7 +625,6 @@ impl DeltaFunnelSession {
         let restore_timer = PhaseTimer::start(CACHE_ALIAS_RESTORE_PHASE);
         let restore_span = start_cache_alias_cleanup_span(
             trace_context,
-            alias_name,
             "Restore cache alias after install failure",
         );
         let restore_result = self.context.register_table(alias_name, original_provider);
@@ -683,47 +653,20 @@ impl DeltaFunnelSession {
 
 fn start_cache_alias_span(
     trace_context: Option<&OperationTraceContext>,
-    alias_name: &str,
     name: &'static str,
 ) -> Option<OperationStageTrace> {
     let trace_context = trace_context?;
     OperationStageContext::new(Some(trace_context), None)
-        .start(
-            name,
-            "delta_funnel.write_all.cache",
-            format!("Cache alias: {alias_name}"),
-        )
-        .map(|span| span.with_attribute("alias", alias_name.to_owned().into()))
+        .start(name, "delta_funnel.write_all.cache")
 }
 
 fn start_cache_alias_cleanup_span(
     trace_context: Option<&OperationTraceContext>,
-    alias_name: &str,
     name: &'static str,
 ) -> Option<OperationStageTrace> {
     let trace_context = trace_context?;
     OperationStageContext::new(Some(trace_context), None)
-        .start(
-            name,
-            "delta_funnel.write_all.cache",
-            format!("Cache cleanup: {alias_name}"),
-        )
-        .map(|span| span.with_attribute("alias", alias_name.to_owned().into()))
-}
-
-fn append_cache_operator_lifecycles(
-    operation_timeline: Option<&OperationTimelineRecorder>,
-    execution_profile: Option<&QueryExecutionProfile>,
-    alias_name: &str,
-) {
-    if let (Some(timeline), Some(profile)) = (operation_timeline, execution_profile) {
-        timeline.append_operator_lifecycles_with_owner(
-            profile,
-            "cache_alias",
-            alias_name,
-            &format!("Cache alias: {alias_name}"),
-        );
-    }
+        .start(name, "delta_funnel.write_all.cache")
 }
 
 fn complete_cache_alias_span(span: Option<OperationStageTrace>) {
@@ -1741,16 +1684,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detailed_cache_materialization_positions_operator_lifecycles()
+    async fn detailed_cache_materialization_records_profile_and_process_spans()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let pending = session
             .table_from_sql("select 1 as id union all select 2 as id")
             .await?;
         session.register_alias("cache_alias", &pending)?;
-        let timeline = OperationTimelineRecorder::start();
-        let trace_context = OperationTraceContext::start_for_test(Some(timeline.clone()), false)
-            .ok_or("expected semantic trace context")?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let trace_context =
+            OperationTraceContext::start_for_test(true).ok_or("expected process trace context")?;
 
         let materialized = session
             .materialize_cache_with_trace_context(
@@ -1763,35 +1706,22 @@ mod tests {
             .map_err(CacheAliasPhaseFailure::into_source)?;
 
         assert!(materialized.execution_profile.is_some());
-        let timeline = timeline.finish(
-            "cache materialization",
-            crate::TimelineSpanStatus::Completed,
-        );
-        let operator_spans = timeline
-            .spans()
+        trace_context.record_process_result("ok");
+        drop(trace_context);
+        let spans = capture.captured().spans();
+        let operator_spans = spans
             .iter()
-            .filter(|span| span.category() == "datafusion.operator.lifecycle")
+            .filter(|span| span.name == "DataFusion operator activity")
             .collect::<Vec<_>>();
         assert!(!operator_spans.is_empty());
         assert!(operator_spans.iter().all(|span| {
-            span.attributes()["cache_alias"] == "cache_alias"
-                && span.track_name().starts_with("Cache alias: cache_alias / ")
+            span.fields["query_scope"] == "write_all_cache_alias"
+                && span.fields["query_owner"] == "cache_alias"
         }));
-        let activity_spans = timeline
-            .spans()
-            .iter()
-            .filter(|span| span.category() == "datafusion.operator.activity")
-            .collect::<Vec<_>>();
-        assert!(!activity_spans.is_empty());
-        assert!(activity_spans.iter().all(|span| {
-            span.attributes()["query_execution_id"].is_u64()
-                && span.attributes()["worker_lane_id"].is_u64()
-                && span.attributes()["worker_kind"].is_string()
-                && span.track_name().starts_with("DataFusion query ")
-        }));
-        assert!(timeline.spans().iter().any(|span| {
-            span.name() == "Execute and collect cache"
-                && span.track_name() == "Cache alias: cache_alias"
+        assert!(spans.iter().any(|span| {
+            span.name == "Delta Funnel operation stage"
+                && span.fields["stage_name"] == "Execute and collect cache"
+                && span.fields["result"] == "ok"
         }));
         Ok(())
     }
@@ -1805,11 +1735,11 @@ mod tests {
             "cache_alias",
             table.path().to_string_lossy().to_string(),
         ))?;
-        let timeline = OperationTimelineRecorder::start();
-        let trace_context = OperationTraceContext::start_for_test(Some(timeline.clone()), false)
-            .ok_or("expected semantic trace context")?;
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let trace_context =
+            OperationTraceContext::start_for_test(true).ok_or("expected process trace context")?;
 
-        session
+        let materialized = session
             .materialize_cache_with_trace_context(
                 "cache_alias",
                 None,
@@ -1819,31 +1749,29 @@ mod tests {
             .await
             .map_err(CacheAliasPhaseFailure::into_source)?;
 
-        let timeline = timeline.finish(
-            "cache materialization",
-            crate::TimelineSpanStatus::Completed,
-        );
-        let planning_spans = timeline
-            .spans()
+        assert!(materialized.execution_profile.is_some());
+        trace_context.record_process_result("ok");
+        drop(trace_context);
+        let spans = capture.captured().spans();
+        let planning_spans = spans
             .iter()
-            .filter(|span| span.category() == "datafusion.planning.activity")
+            .filter(|span| span.name == "DataFusion planning activity")
             .collect::<Vec<_>>();
         assert!(
             planning_spans
                 .iter()
-                .any(|span| span.name() == "Delta scan planning")
+                .any(|span| span.fields["planning_activity_name"] == "Delta scan planning")
         );
         assert!(planning_spans.iter().all(|span| {
-            span.track_name() == "DataFusion query planning / cache alias: cache_alias"
-                && span.attributes()["query_scope"] == "write_all_cache_alias"
-                && span.attributes()["query_owner"] == "cache_alias"
+            span.fields["query_scope"] == "write_all_cache_alias"
+                && span.fields["query_owner"] == "cache_alias"
         }));
-        let planning_query_id = planning_spans[0].attributes()["query_execution_id"].clone();
-        assert!(timeline.spans().iter().any(|span| {
-            span.category() == "datafusion.operator.activity"
-                && span.attributes()["query_execution_id"] == planning_query_id
-                && span.attributes()["query_scope"] == "write_all_cache_alias"
-                && span.attributes()["query_owner"] == "cache_alias"
+        let planning_query_id = &planning_spans[0].fields["query_execution_id"];
+        assert!(spans.iter().any(|span| {
+            span.name == "DataFusion operator activity"
+                && &span.fields["query_execution_id"] == planning_query_id
+                && span.fields["query_scope"] == "write_all_cache_alias"
+                && span.fields["query_owner"] == "cache_alias"
         }));
         Ok(())
     }

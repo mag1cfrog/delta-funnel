@@ -152,7 +152,7 @@ mod tests {
     use delta_funnel::{LoadMode, MssqlTableName, connect_mssql_client_from_ado_string};
     use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyModule};
+    use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyList, PyModule};
     use std::{
         env,
         error::Error,
@@ -190,12 +190,12 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once(") -> Report:"))
             .map_or("", |(signature, _)| signature);
 
-        assert!(signature.contains("execution_profile: ExecutionProfileConfig | None = None"));
+        assert!(signature.contains("execution_profile: bool = False"));
         assert!(signature.contains("ranked_profile: RankedProfileConfig | None = None"));
         for retired in [
-            "profile: bool",
-            "trace_path: str",
-            "profiler: RankedProfileConfig",
+            "\n        profile:",
+            "\n        trace_path:",
+            "\n        profiler:",
         ] {
             assert!(!signature.contains(retired));
         }
@@ -387,6 +387,21 @@ mod tests {
             let session = module.getattr("Session")?.call0()?;
             let table = session.call_method1("table_from_sql", ("select 1 as id",))?;
             let initial_adapter_count = adapter_creation_count();
+            for invalid in [0, 1] {
+                let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+                kwargs.set_item("execution_profile", invalid)?;
+                let error = table
+                    .call_method("write_to_mssql", (), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyTypeError>(py));
+            }
+            let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
+            kwargs.set_item("execution_profile", py.None())?;
+            let error = table
+                .call_method("write_to_mssql", (), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
+
             for retired in ["profile", "trace_path", "profiler"] {
                 let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
                 kwargs.set_item("progress", true)?;
@@ -397,17 +412,15 @@ mod tests {
                 assert!(error.is_instance_of::<PyTypeError>(py));
             }
 
+            let ranked_profile = module
+                .getattr("RankedProfileConfig")?
+                .call1(("dry-run.profile.html",))?;
             for (argument, config) in [
                 (
                     "execution_profile",
-                    module.getattr("ExecutionProfileConfig")?.call0()?,
+                    PyBool::new(py, true).to_owned().into_any(),
                 ),
-                (
-                    "ranked_profile",
-                    module
-                        .getattr("RankedProfileConfig")?
-                        .call1(("dry-run.profile.html",))?,
-                ),
+                ("ranked_profile", ranked_profile),
             ] {
                 let kwargs = mssql_kwargs(py, "dbo", "orders", "create_and_load")?;
                 kwargs.set_item("dry_run", true)?;
@@ -430,7 +443,7 @@ mod tests {
                 .to_string();
             assert_eq!(
                 signature,
-                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, execution_profile=None, ranked_profile=None)"
+                "(*, schema, table, load_mode, dry_run=None, name=None, connection_string=None, progress=None, execution_profile=False, ranked_profile=None)"
             );
             Ok(())
         })
@@ -520,8 +533,7 @@ union all select cast(103 as bigint) as order_id",),
                 table.table().as_str(),
                 "create_and_load",
             )?;
-            let execution_profile = module.getattr("ExecutionProfileConfig")?.call0()?;
-            kwargs.set_item("execution_profile", execution_profile)?;
+            kwargs.set_item("execution_profile", true)?;
 
             let report = source.call_method("write_to_mssql", (), Some(&kwargs))?;
             let report_repr = report.repr()?.extract::<String>()?;
