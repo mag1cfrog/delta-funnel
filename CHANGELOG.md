@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.3...delta-funnel-v0.4.0) - 2026-07-28
+
+### Added
+
+- add opt-in ranked native CPU profiling to diagnostics-enabled Linux builds for Python previews, SQL Server writes, and `write_all`, with self-contained interactive HTML reports and optional reusable `.dfprofile` artifacts ([#581](https://github.com/mag1cfrog/delta-funnel/pull/581), [#606](https://github.com/mag1cfrog/delta-funnel/pull/606))
+- add `delta-funnel-perfetto` commands for terminal inspection, HTML generation, and bounded 100 or 1000 Hz whole-process capture with health checks and native symbolization ([#532](https://github.com/mag1cfrog/delta-funnel/pull/532), [#535](https://github.com/mag1cfrog/delta-funnel/pull/535), [#566](https://github.com/mag1cfrog/delta-funnel/pull/566), [#595](https://github.com/mag1cfrog/delta-funnel/pull/595))
+- attribute sampled native call trees to exact semantic phases across DataFusion, Delta Lake, S3, and SQL Server work, with readable call-chain compaction and explicit incomplete, ambiguous, unresolved, and missing-sample states ([#545](https://github.com/mag1cfrog/delta-funnel/issues/545))
+
+### Changed
+
+- [**breaking**] replace Python `profile=True` and `write_all(options={"profile": True})` with the top-level `execution_profile=True` option for returned DataFusion operator metrics; remove `Preview.export_trace()` and use `RankedProfileConfig` for interactive diagnostics instead ([#611](https://github.com/mag1cfrog/delta-funnel/pull/611), [#613](https://github.com/mag1cfrog/delta-funnel/pull/613))
+- [**breaking**] remove Rust `QueryExecutionProfile::to_trace_event_json_value()` and the legacy handcrafted Chrome Trace timeline export; exact execution profiles now remain focused on typed operator metrics ([#613](https://github.com/mag1cfrog/delta-funnel/pull/613))
+
+### Fixed
+
+- return a structured `DeltaFunnelError` instead of `PanicException` when concurrent Python code attempts unsupported `Session` catalog mutation ([#580](https://github.com/mag1cfrog/delta-funnel/pull/580))
+
 ## [0.3.3](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.3.2...delta-funnel-v0.3.3) - 2026-07-16
 
 ### Added
