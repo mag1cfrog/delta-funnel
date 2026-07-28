@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 use super::report_terminal::{
     InspectSelection, InspectSort, TerminalInspectError, TerminalProfileIndex,
@@ -343,52 +343,28 @@ impl From<TerminalInspectError> for RankedReportFailure {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 pub(super) enum RankedReportPathError {
-    InputUnreadable(io::Error),
+    #[snafu(display("profile input is not readable: {source}"))]
+    InputUnreadable { source: io::Error },
+    #[snafu(display("profile input is not a file"))]
     InputNotFile,
+    #[snafu(display("output path has no file name"))]
     OutputHasNoFileName,
+    #[snafu(display("existing output is not a file"))]
     OutputNotFile,
+    #[snafu(display("output parent path is not a directory"))]
     OutputParentNotDirectory,
-    OutputInspection(io::Error),
+    #[snafu(display("output path could not be inspected: {source}"))]
+    OutputInspection { source: io::Error },
+    #[snafu(display("profile input and output resolve to the same file"))]
     InputOutputAlias,
-}
-
-impl fmt::Display for RankedReportPathError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InputUnreadable(error) => {
-                write!(formatter, "profile input is not readable: {error}")
-            }
-            Self::InputNotFile => formatter.write_str("profile input is not a file"),
-            Self::OutputHasNoFileName => formatter.write_str("output path has no file name"),
-            Self::OutputNotFile => formatter.write_str("existing output is not a file"),
-            Self::OutputParentNotDirectory => {
-                formatter.write_str("output parent path is not a directory")
-            }
-            Self::OutputInspection(error) => {
-                write!(formatter, "output path could not be inspected: {error}")
-            }
-            Self::InputOutputAlias => {
-                formatter.write_str("profile input and output resolve to the same file")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RankedReportPathError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InputUnreadable(error) | Self::OutputInspection(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 impl From<RankedReportPathError> for RankedReportFailure {
     fn from(error: RankedReportPathError) -> Self {
         let (phase, kind) = match &error {
-            RankedReportPathError::InputUnreadable(_) => {
+            RankedReportPathError::InputUnreadable { .. } => {
                 (RankedReportFailurePhase::Input, "unreadable")
             }
             RankedReportPathError::InputNotFile => (RankedReportFailurePhase::Input, "not_file"),
@@ -399,7 +375,7 @@ impl From<RankedReportPathError> for RankedReportFailure {
             RankedReportPathError::OutputParentNotDirectory => {
                 (RankedReportFailurePhase::Output, "parent_not_directory")
             }
-            RankedReportPathError::OutputInspection(_) => {
+            RankedReportPathError::OutputInspection { .. } => {
                 (RankedReportFailurePhase::Output, "inspection_failed")
             }
             RankedReportPathError::InputOutputAlias => {
@@ -991,9 +967,9 @@ pub(super) fn preflight_ranked_report_paths(
     let current_dir = if input.is_relative() || output.is_relative() {
         Some(std::env::current_dir().map_err(|error| {
             if input.is_relative() {
-                RankedReportPathError::InputUnreadable(error)
+                RankedReportPathError::InputUnreadable { source: error }
             } else {
-                RankedReportPathError::OutputInspection(error)
+                RankedReportPathError::OutputInspection { source: error }
             }
         })?)
     } else {
@@ -1009,7 +985,9 @@ pub(super) fn preflight_ranked_report_paths(
         Ok(true) => return Err(RankedReportPathError::InputOutputAlias),
         Ok(false) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
+        Err(error) => {
+            return Err(RankedReportPathError::OutputInspection { source: error });
+        }
     }
     Ok(RankedReportPaths { input, output })
 }
@@ -1017,19 +995,16 @@ pub(super) fn preflight_ranked_report_paths(
 pub(super) fn preflight_ranked_profile_input(
     input: &Path,
 ) -> Result<PathBuf, RankedReportPathError> {
-    let input = absolute_path(input).map_err(RankedReportPathError::InputUnreadable)?;
-    let input_file =
-        super::open_profile_input(&input).map_err(RankedReportPathError::InputUnreadable)?;
+    let input = absolute_path(input).context(InputUnreadableSnafu)?;
+    let input_file = super::open_profile_input(&input).context(InputUnreadableSnafu)?;
     if !input_file
         .metadata()
-        .map_err(RankedReportPathError::InputUnreadable)?
+        .context(InputUnreadableSnafu)?
         .is_file()
     {
         return Err(RankedReportPathError::InputNotFile);
     }
-    let input = input
-        .canonicalize()
-        .map_err(RankedReportPathError::InputUnreadable)?;
+    let input = input.canonicalize().context(InputUnreadableSnafu)?;
     Ok(input)
 }
 
@@ -1050,7 +1025,9 @@ fn inspect_output_path(output: &Path) -> Result<(), RankedReportPathError> {
         Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
             return Err(RankedReportPathError::OutputParentNotDirectory);
         }
-        Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
+        Err(error) => {
+            return Err(RankedReportPathError::OutputInspection { source: error });
+        }
     }
 
     let mut ancestor = output
@@ -1068,7 +1045,9 @@ fn inspect_output_path(output: &Path) -> Result<(), RankedReportPathError> {
             Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
                 return Err(RankedReportPathError::OutputParentNotDirectory);
             }
-            Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
+            Err(error) => {
+                return Err(RankedReportPathError::OutputInspection { source: error });
+            }
         }
     }
 }
@@ -1986,6 +1965,21 @@ mod tests {
         let path_failure = RankedReportFailure::from(RankedReportPathError::InputOutputAlias);
         assert_eq!(path_failure.phase(), RankedReportFailurePhase::Output);
         assert_eq!(path_failure.kind(), "aliases_input");
+
+        let path_error = RankedReportPathError::InputUnreadable {
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
+        };
+        let source = std::error::Error::source(&path_error)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .ok_or("path error should retain its I/O source")?;
+        assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+        let input_failure = RankedReportFailure::from(path_error);
+        assert_eq!(input_failure.phase(), RankedReportFailurePhase::Input);
+        assert_eq!(input_failure.kind(), "unreadable");
+        assert_eq!(
+            input_failure.to_string(),
+            "profile input is not readable: access denied"
+        );
 
         let typo = vec![OsString::from("reprot")];
         let typo_error = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "reprot"])
