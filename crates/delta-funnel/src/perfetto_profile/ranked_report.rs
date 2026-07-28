@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::hash::Hash;
 
 use serde::{Deserialize, Serialize};
+use snafu::Snafu;
 
 // This covers the 246,095-node production fixture while bounding
 // report memory. Raise it only with production and browser evidence.
@@ -419,13 +419,19 @@ pub(super) struct RankedProfileDocument {
     pub functions: Vec<RankedFunction>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
 pub(super) enum RankedProfileValidationError {
+    #[snafu(display(
+        "profile has {count} {record_kind} records, exceeding the {limit} record limit"
+    ))]
     TooManyRecords {
         record_kind: &'static str,
         count: usize,
         limit: usize,
     },
+    #[snafu(display(
+        "{record_kind} ID {record_id} {field} has {char_count} characters, exceeding the {limit} character limit"
+    ))]
     DisplayStringTooLong {
         record_kind: &'static str,
         record_id: i64,
@@ -433,111 +439,141 @@ pub(super) enum RankedProfileValidationError {
         char_count: usize,
         limit: usize,
     },
+    #[snafu(display(
+        "function ID {function_id} under semantic ID {semantic_id} has unsafe {field}"
+    ))]
     UnsafeFunctionMetadata {
         semantic_id: i64,
         function_id: i64,
         field: &'static str,
     },
-    UnsupportedSchemaVersion {
-        schema_version: u32,
-    },
+    #[snafu(display("profile schema version {schema_version} is unsupported"))]
+    UnsupportedSchemaVersion { schema_version: u32 },
+    #[snafu(display("profile sample frequency must be greater than zero"))]
     InvalidSampleFrequency,
+    #[snafu(display("profile {field} must be {expected}"))]
     InvalidUnit {
         field: &'static str,
         expected: &'static str,
     },
-    InconsistentCaptureHealth {
-        reason: &'static str,
-    },
-    InvalidSemanticTimeSemantics {
-        semantic_id: i64,
-    },
+    #[snafu(display("profile capture health is inconsistent: {reason}"))]
+    InconsistentCaptureHealth { reason: &'static str },
+    #[snafu(display("semantic ID {semantic_id} has invalid time semantics"))]
+    InvalidSemanticTimeSemantics { semantic_id: i64 },
+    #[snafu(display("semantic ID {semantic_id} has an invalid interval: {reason}"))]
     InvalidSemanticInterval {
         semantic_id: i64,
         reason: &'static str,
     },
+    #[snafu(display("profile has no semantic nodes"))]
     MissingSemanticNodes,
-    DuplicateSemanticId {
-        semantic_id: i64,
-    },
+    #[snafu(display("semantic ID {semantic_id} is duplicated"))]
+    DuplicateSemanticId { semantic_id: i64 },
+    #[snafu(display("semantic ID {semantic_id} has missing parent {parent_semantic_id}"))]
     MissingSemanticParent {
         semantic_id: i64,
         parent_semantic_id: i64,
     },
+    #[snafu(display("semantic ID {semantic_id} has cross-operation parent {parent_semantic_id}"))]
     CrossOperationSemanticParent {
         semantic_id: i64,
         parent_semantic_id: i64,
     },
-    SemanticCycle {
-        semantic_id: i64,
-    },
+    #[snafu(display("semantic ID {semantic_id} belongs to a cycle"))]
+    SemanticCycle { semantic_id: i64 },
+    #[snafu(display("operation ID {operation_id} has {root_count} semantic roots"))]
     InvalidOperationRootCount {
         operation_id: i64,
         root_count: usize,
     },
-    InvalidOperationRootKind {
-        operation_id: i64,
-        semantic_id: i64,
-    },
-    MissingFunctionOwner {
-        semantic_id: i64,
-        function_id: i64,
-    },
-    DuplicateFunctionId {
-        semantic_id: i64,
-        function_id: i64,
-    },
+    #[snafu(display("semantic ID {semantic_id} violates operation ID {operation_id} root policy"))]
+    InvalidOperationRootKind { operation_id: i64, semantic_id: i64 },
+    #[snafu(display("function ID {function_id} has missing semantic owner {semantic_id}"))]
+    MissingFunctionOwner { semantic_id: i64, function_id: i64 },
+    #[snafu(display("function ID {function_id} is duplicated under semantic ID {semantic_id}"))]
+    DuplicateFunctionId { semantic_id: i64, function_id: i64 },
+    #[snafu(display(
+        "function ID {function_id} under semantic ID {semantic_id} has missing parent {parent_function_id}"
+    ))]
     MissingFunctionParent {
         semantic_id: i64,
         function_id: i64,
         parent_function_id: i64,
     },
+    #[snafu(display(
+        "function ID {function_id} under semantic ID {semantic_id} has cross-semantic parent {parent_function_id}"
+    ))]
     CrossSemanticFunctionParent {
         semantic_id: i64,
         function_id: i64,
         parent_function_id: i64,
     },
-    FunctionCycle {
-        semantic_id: i64,
-        function_id: i64,
-    },
+    #[snafu(display(
+        "function ID {function_id} under semantic ID {semantic_id} belongs to a cycle"
+    ))]
+    FunctionCycle { semantic_id: i64, function_id: i64 },
+    #[snafu(display("{record_kind} ID {record_id} has negative {field}: {value}"))]
     NegativeSampleCount {
         record_kind: &'static str,
         record_id: i64,
         field: &'static str,
         value: i64,
     },
-    SampleCountOverflow {
-        scope: &'static str,
-    },
+    #[snafu(display("{scope} sample count overflowed"))]
+    SampleCountOverflow { scope: &'static str },
+    #[snafu(display(
+        "eligible sample count {eligible_sample_count} does not equal classified count {classified_sample_count}"
+    ))]
     CoverageMismatch {
         eligible_sample_count: i64,
         classified_sample_count: i64,
     },
+    #[snafu(display(
+        "declared direct sample count {declared_sample_count} does not equal semantic count {semantic_sample_count}"
+    ))]
     DirectSampleMismatch {
         declared_sample_count: i64,
         semantic_sample_count: i64,
     },
+    #[snafu(display(
+        "{} direct sample count {direct_sample_count} does not equal classified native stack count {classified_sample_count}",
+        semantic_id.map_or_else(
+            || "profile".to_owned(),
+            |semantic_id| format!("semantic ID {semantic_id}")
+        )
+    ))]
     FunctionCoverageMismatch {
         semantic_id: Option<i64>,
         direct_sample_count: i64,
         classified_sample_count: i64,
     },
+    #[snafu(display(
+        "declared {field} {declared_sample_count} does not equal semantic count {semantic_sample_count}"
+    ))]
     FunctionCoverageSummaryMismatch {
         field: &'static str,
         declared_sample_count: i64,
         semantic_sample_count: i64,
     },
+    #[snafu(display(
+        "semantic ID {semantic_id} inclusive count {declared_sample_count} does not equal computed count {computed_sample_count}"
+    ))]
     SemanticInclusiveMismatch {
         semantic_id: i64,
         declared_sample_count: i64,
         computed_sample_count: i64,
     },
+    #[snafu(display(
+        "semantic ID {semantic_id} captured native stack count {captured_sample_count} does not equal function self count {function_sample_count}"
+    ))]
     FunctionSelfMismatch {
         semantic_id: i64,
         captured_sample_count: i64,
         function_sample_count: i64,
     },
+    #[snafu(display(
+        "function ID {function_id} under semantic ID {semantic_id} inclusive count {declared_sample_count} does not equal computed count {computed_sample_count}"
+    ))]
     FunctionInclusiveMismatch {
         semantic_id: i64,
         function_id: i64,
@@ -553,216 +589,6 @@ struct OperationRootState {
     first_root_is_operation: bool,
     first_non_root_operation_id: Option<i64>,
 }
-
-impl fmt::Display for RankedProfileValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooManyRecords {
-                record_kind,
-                count,
-                limit,
-            } => write!(
-                formatter,
-                "profile has {count} {record_kind} records, exceeding the {limit} record limit"
-            ),
-            Self::DisplayStringTooLong {
-                record_kind,
-                record_id,
-                field,
-                char_count,
-                limit,
-            } => write!(
-                formatter,
-                "{record_kind} ID {record_id} {field} has {char_count} characters, exceeding the {limit} character limit"
-            ),
-            Self::UnsafeFunctionMetadata {
-                semantic_id,
-                function_id,
-                field,
-            } => write!(
-                formatter,
-                "function ID {function_id} under semantic ID {semantic_id} has unsafe {field}"
-            ),
-            Self::UnsupportedSchemaVersion { schema_version } => {
-                write!(
-                    formatter,
-                    "profile schema version {schema_version} is unsupported"
-                )
-            }
-            Self::InvalidSampleFrequency => {
-                write!(
-                    formatter,
-                    "profile sample frequency must be greater than zero"
-                )
-            }
-            Self::InvalidUnit { field, expected } => {
-                write!(formatter, "profile {field} must be {expected}")
-            }
-            Self::InconsistentCaptureHealth { reason } => {
-                write!(
-                    formatter,
-                    "profile capture health is inconsistent: {reason}"
-                )
-            }
-            Self::InvalidSemanticTimeSemantics { semantic_id } => write!(
-                formatter,
-                "semantic ID {semantic_id} has invalid time semantics"
-            ),
-            Self::InvalidSemanticInterval {
-                semantic_id,
-                reason,
-            } => write!(
-                formatter,
-                "semantic ID {semantic_id} has an invalid interval: {reason}"
-            ),
-            Self::MissingSemanticNodes => write!(formatter, "profile has no semantic nodes"),
-            Self::DuplicateSemanticId { semantic_id } => {
-                write!(formatter, "semantic ID {semantic_id} is duplicated")
-            }
-            Self::MissingSemanticParent {
-                semantic_id,
-                parent_semantic_id,
-            } => write!(
-                formatter,
-                "semantic ID {semantic_id} has missing parent {parent_semantic_id}"
-            ),
-            Self::CrossOperationSemanticParent {
-                semantic_id,
-                parent_semantic_id,
-            } => write!(
-                formatter,
-                "semantic ID {semantic_id} has cross-operation parent {parent_semantic_id}"
-            ),
-            Self::SemanticCycle { semantic_id } => {
-                write!(formatter, "semantic ID {semantic_id} belongs to a cycle")
-            }
-            Self::InvalidOperationRootCount {
-                operation_id,
-                root_count,
-            } => write!(
-                formatter,
-                "operation ID {operation_id} has {root_count} semantic roots"
-            ),
-            Self::InvalidOperationRootKind {
-                operation_id,
-                semantic_id,
-            } => write!(
-                formatter,
-                "semantic ID {semantic_id} violates operation ID {operation_id} root policy"
-            ),
-            Self::MissingFunctionOwner {
-                semantic_id,
-                function_id,
-            } => write!(
-                formatter,
-                "function ID {function_id} has missing semantic owner {semantic_id}"
-            ),
-            Self::DuplicateFunctionId {
-                semantic_id,
-                function_id,
-            } => write!(
-                formatter,
-                "function ID {function_id} is duplicated under semantic ID {semantic_id}"
-            ),
-            Self::MissingFunctionParent {
-                semantic_id,
-                function_id,
-                parent_function_id,
-            } => write!(
-                formatter,
-                "function ID {function_id} under semantic ID {semantic_id} has missing parent {parent_function_id}"
-            ),
-            Self::CrossSemanticFunctionParent {
-                semantic_id,
-                function_id,
-                parent_function_id,
-            } => write!(
-                formatter,
-                "function ID {function_id} under semantic ID {semantic_id} has cross-semantic parent {parent_function_id}"
-            ),
-            Self::FunctionCycle {
-                semantic_id,
-                function_id,
-            } => write!(
-                formatter,
-                "function ID {function_id} under semantic ID {semantic_id} belongs to a cycle"
-            ),
-            Self::NegativeSampleCount {
-                record_kind,
-                record_id,
-                field,
-                value,
-            } => write!(
-                formatter,
-                "{record_kind} ID {record_id} has negative {field}: {value}"
-            ),
-            Self::SampleCountOverflow { scope } => {
-                write!(formatter, "{scope} sample count overflowed")
-            }
-            Self::CoverageMismatch {
-                eligible_sample_count,
-                classified_sample_count,
-            } => write!(
-                formatter,
-                "eligible sample count {eligible_sample_count} does not equal classified count {classified_sample_count}"
-            ),
-            Self::DirectSampleMismatch {
-                declared_sample_count,
-                semantic_sample_count,
-            } => write!(
-                formatter,
-                "declared direct sample count {declared_sample_count} does not equal semantic count {semantic_sample_count}"
-            ),
-            Self::FunctionCoverageMismatch {
-                semantic_id,
-                direct_sample_count,
-                classified_sample_count,
-            } => write!(
-                formatter,
-                "{} direct sample count {direct_sample_count} does not equal classified native stack count {classified_sample_count}",
-                semantic_id.map_or_else(
-                    || "profile".to_owned(),
-                    |semantic_id| { format!("semantic ID {semantic_id}") }
-                )
-            ),
-            Self::FunctionCoverageSummaryMismatch {
-                field,
-                declared_sample_count,
-                semantic_sample_count,
-            } => write!(
-                formatter,
-                "declared {field} {declared_sample_count} does not equal semantic count {semantic_sample_count}"
-            ),
-            Self::SemanticInclusiveMismatch {
-                semantic_id,
-                declared_sample_count,
-                computed_sample_count,
-            } => write!(
-                formatter,
-                "semantic ID {semantic_id} inclusive count {declared_sample_count} does not equal computed count {computed_sample_count}"
-            ),
-            Self::FunctionSelfMismatch {
-                semantic_id,
-                captured_sample_count,
-                function_sample_count,
-            } => write!(
-                formatter,
-                "semantic ID {semantic_id} captured native stack count {captured_sample_count} does not equal function self count {function_sample_count}"
-            ),
-            Self::FunctionInclusiveMismatch {
-                semantic_id,
-                function_id,
-                declared_sample_count,
-                computed_sample_count,
-            } => write!(
-                formatter,
-                "function ID {function_id} under semantic ID {semantic_id} inclusive count {declared_sample_count} does not equal computed count {computed_sample_count}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RankedProfileValidationError {}
 
 impl RankedProfileDocument {
     pub fn normalize_source_metadata(&mut self) {
@@ -1771,6 +1597,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_validation_error_messages() {
+        assert_eq!(
+            RankedProfileValidationError::InvalidSampleFrequency.to_string(),
+            "profile sample frequency must be greater than zero"
+        );
+        assert_eq!(
+            RankedProfileValidationError::TooManyRecords {
+                record_kind: "function",
+                count: 11,
+                limit: 10,
+            }
+            .to_string(),
+            "profile has 11 function records, exceeding the 10 record limit"
+        );
+        assert_eq!(
+            RankedProfileValidationError::FunctionCoverageMismatch {
+                semantic_id: None,
+                direct_sample_count: 7,
+                classified_sample_count: 5,
+            }
+            .to_string(),
+            "profile direct sample count 7 does not equal classified native stack count 5"
+        );
+        assert_eq!(
+            RankedProfileValidationError::FunctionCoverageMismatch {
+                semantic_id: Some(3),
+                direct_sample_count: 7,
+                classified_sample_count: 5,
+            }
+            .to_string(),
+            "semantic ID 3 direct sample count 7 does not equal classified native stack count 5"
+        );
+    }
 
     fn semantic(
         semantic_id: i64,

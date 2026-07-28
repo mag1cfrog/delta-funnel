@@ -1,6 +1,5 @@
 use std::env;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 #[cfg(test)]
 use std::fs::File;
@@ -11,6 +10,7 @@ use std::str::FromStr;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
+use snafu::{ResultExt, Snafu};
 
 use super::report_terminal::{
     InspectSelection, InspectSort, TerminalInspectError, TerminalProfileIndex,
@@ -176,53 +176,41 @@ impl FromStr for FunctionSelector {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
 enum CliArgumentError {
+    #[snafu(display("a diagnostics command is required"))]
     MissingCommand,
+    #[snafu(display("unknown diagnostics command"))]
     UnknownCommand,
+    #[snafu(display("a profile input path is required"))]
     MissingInput,
+    #[snafu(display("--output requires a path"))]
     MissingOutputValue,
+    #[snafu(display("--output may be specified only once"))]
     DuplicateOutput,
+    #[snafu(display("only one profile input path may be provided"))]
     MultipleInputs,
+    #[snafu(display("limit must be between 1 and 200"))]
     InvalidLimit,
+    #[snafu(display("depth must be between 0 and 32"))]
     InvalidDepth,
+    #[snafu(display("semantic ID must be a signed integer"))]
     InvalidSemanticId,
+    #[snafu(display("function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"))]
     InvalidFunctionId,
+    #[snafu(display("filter must contain between 1 and 128 characters"))]
     InvalidFilter,
+    #[snafu(display("sort must be duration, inclusive-cpu, self-cpu, or name"))]
     InvalidSort,
+    #[snafu(display("--semantic and --function cannot be used together"))]
     IncompatibleSelectors,
+    #[snafu(display("function callsites cannot be sorted by exact duration"))]
     IncompatibleSort,
+    #[snafu(display("option may be specified only once"))]
     DuplicateOption,
+    #[snafu(display("unknown option"))]
     UnknownOption,
 }
-
-impl fmt::Display for CliArgumentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            Self::MissingCommand => "a diagnostics command is required",
-            Self::UnknownCommand => "unknown diagnostics command",
-            Self::MissingInput => "a profile input path is required",
-            Self::MissingOutputValue => "--output requires a path",
-            Self::DuplicateOutput => "--output may be specified only once",
-            Self::MultipleInputs => "only one profile input path may be provided",
-            Self::InvalidLimit => "limit must be between 1 and 200",
-            Self::InvalidDepth => "depth must be between 0 and 32",
-            Self::InvalidSemanticId => "semantic ID must be a signed integer",
-            Self::InvalidFunctionId => {
-                "function ID must use SEMANTIC_ID:FUNCTION_ID signed integers"
-            }
-            Self::InvalidFilter => "filter must contain between 1 and 128 characters",
-            Self::InvalidSort => "sort must be duration, inclusive-cpu, self-cpu, or name",
-            Self::IncompatibleSelectors => "--semantic and --function cannot be used together",
-            Self::IncompatibleSort => "function callsites cannot be sorted by exact duration",
-            Self::DuplicateOption => "option may be specified only once",
-            Self::UnknownOption => "unknown option",
-        };
-        formatter.write_str(message)
-    }
-}
-
-impl std::error::Error for CliArgumentError {}
 
 impl CliArgumentError {
     const fn kind(self) -> &'static str {
@@ -285,7 +273,8 @@ impl RankedReportFailurePhase {
 }
 
 /// Structured failure from ranked profile report generation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("{message}"))]
 pub struct RankedReportFailure {
     phase: RankedReportFailurePhase,
     kind: &'static str,
@@ -326,14 +315,6 @@ impl RankedReportFailure {
     }
 }
 
-impl fmt::Display for RankedReportFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RankedReportFailure {}
-
 impl From<CliArgumentError> for RankedReportFailure {
     fn from(error: CliArgumentError) -> Self {
         Self::new(
@@ -354,52 +335,28 @@ impl From<TerminalInspectError> for RankedReportFailure {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Snafu)]
 pub(super) enum RankedReportPathError {
-    InputUnreadable(io::Error),
+    #[snafu(display("profile input is not readable: {source}"))]
+    InputUnreadable { source: io::Error },
+    #[snafu(display("profile input is not a file"))]
     InputNotFile,
+    #[snafu(display("output path has no file name"))]
     OutputHasNoFileName,
+    #[snafu(display("existing output is not a file"))]
     OutputNotFile,
+    #[snafu(display("output parent path is not a directory"))]
     OutputParentNotDirectory,
-    OutputInspection(io::Error),
+    #[snafu(display("output path could not be inspected: {source}"))]
+    OutputInspection { source: io::Error },
+    #[snafu(display("profile input and output resolve to the same file"))]
     InputOutputAlias,
-}
-
-impl fmt::Display for RankedReportPathError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InputUnreadable(error) => {
-                write!(formatter, "profile input is not readable: {error}")
-            }
-            Self::InputNotFile => formatter.write_str("profile input is not a file"),
-            Self::OutputHasNoFileName => formatter.write_str("output path has no file name"),
-            Self::OutputNotFile => formatter.write_str("existing output is not a file"),
-            Self::OutputParentNotDirectory => {
-                formatter.write_str("output parent path is not a directory")
-            }
-            Self::OutputInspection(error) => {
-                write!(formatter, "output path could not be inspected: {error}")
-            }
-            Self::InputOutputAlias => {
-                formatter.write_str("profile input and output resolve to the same file")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RankedReportPathError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InputUnreadable(error) | Self::OutputInspection(error) => Some(error),
-            _ => None,
-        }
-    }
 }
 
 impl From<RankedReportPathError> for RankedReportFailure {
     fn from(error: RankedReportPathError) -> Self {
         let (phase, kind) = match &error {
-            RankedReportPathError::InputUnreadable(_) => {
+            RankedReportPathError::InputUnreadable { .. } => {
                 (RankedReportFailurePhase::Input, "unreadable")
             }
             RankedReportPathError::InputNotFile => (RankedReportFailurePhase::Input, "not_file"),
@@ -410,7 +367,7 @@ impl From<RankedReportPathError> for RankedReportFailure {
             RankedReportPathError::OutputParentNotDirectory => {
                 (RankedReportFailurePhase::Output, "parent_not_directory")
             }
-            RankedReportPathError::OutputInspection(_) => {
+            RankedReportPathError::OutputInspection { .. } => {
                 (RankedReportFailurePhase::Output, "inspection_failed")
             }
             RankedReportPathError::InputOutputAlias => {
@@ -1002,9 +959,9 @@ pub(super) fn preflight_ranked_report_paths(
     let current_dir = if input.is_relative() || output.is_relative() {
         Some(std::env::current_dir().map_err(|error| {
             if input.is_relative() {
-                RankedReportPathError::InputUnreadable(error)
+                RankedReportPathError::InputUnreadable { source: error }
             } else {
-                RankedReportPathError::OutputInspection(error)
+                RankedReportPathError::OutputInspection { source: error }
             }
         })?)
     } else {
@@ -1020,7 +977,9 @@ pub(super) fn preflight_ranked_report_paths(
         Ok(true) => return Err(RankedReportPathError::InputOutputAlias),
         Ok(false) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
+        Err(error) => {
+            return Err(RankedReportPathError::OutputInspection { source: error });
+        }
     }
     Ok(RankedReportPaths { input, output })
 }
@@ -1028,19 +987,16 @@ pub(super) fn preflight_ranked_report_paths(
 pub(super) fn preflight_ranked_profile_input(
     input: &Path,
 ) -> Result<PathBuf, RankedReportPathError> {
-    let input = absolute_path(input).map_err(RankedReportPathError::InputUnreadable)?;
-    let input_file =
-        super::open_profile_input(&input).map_err(RankedReportPathError::InputUnreadable)?;
+    let input = absolute_path(input).context(InputUnreadableSnafu)?;
+    let input_file = super::open_profile_input(&input).context(InputUnreadableSnafu)?;
     if !input_file
         .metadata()
-        .map_err(RankedReportPathError::InputUnreadable)?
+        .context(InputUnreadableSnafu)?
         .is_file()
     {
         return Err(RankedReportPathError::InputNotFile);
     }
-    let input = input
-        .canonicalize()
-        .map_err(RankedReportPathError::InputUnreadable)?;
+    let input = input.canonicalize().context(InputUnreadableSnafu)?;
     Ok(input)
 }
 
@@ -1061,7 +1017,9 @@ fn inspect_output_path(output: &Path) -> Result<(), RankedReportPathError> {
         Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
             return Err(RankedReportPathError::OutputParentNotDirectory);
         }
-        Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
+        Err(error) => {
+            return Err(RankedReportPathError::OutputInspection { source: error });
+        }
     }
 
     let mut ancestor = output
@@ -1079,7 +1037,9 @@ fn inspect_output_path(output: &Path) -> Result<(), RankedReportPathError> {
             Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
                 return Err(RankedReportPathError::OutputParentNotDirectory);
             }
-            Err(error) => return Err(RankedReportPathError::OutputInspection(error)),
+            Err(error) => {
+                return Err(RankedReportPathError::OutputInspection { source: error });
+            }
         }
     }
 }
@@ -1978,6 +1938,10 @@ mod tests {
         let argument_failure = RankedReportFailure::from(CliArgumentError::MissingInput);
         assert_eq!(argument_failure.phase(), RankedReportFailurePhase::Argument);
         assert_eq!(argument_failure.kind(), "missing_input");
+        assert_eq!(
+            argument_failure.to_string(),
+            "a profile input path is required"
+        );
 
         let failure = RankedReportFailure::new(
             RankedReportFailurePhase::TraceProcessor,
@@ -1993,6 +1957,21 @@ mod tests {
         let path_failure = RankedReportFailure::from(RankedReportPathError::InputOutputAlias);
         assert_eq!(path_failure.phase(), RankedReportFailurePhase::Output);
         assert_eq!(path_failure.kind(), "aliases_input");
+
+        let path_error = RankedReportPathError::InputUnreadable {
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
+        };
+        let source = std::error::Error::source(&path_error)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .ok_or("path error should retain its I/O source")?;
+        assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+        let input_failure = RankedReportFailure::from(path_error);
+        assert_eq!(input_failure.phase(), RankedReportFailurePhase::Input);
+        assert_eq!(input_failure.kind(), "unreadable");
+        assert_eq!(
+            input_failure.to_string(),
+            "profile input is not readable: access denied"
+        );
 
         let typo = vec![OsString::from("reprot")];
         let typo_error = PerfettoCli::try_parse_from(["delta-funnel-perfetto", "reprot"])
