@@ -500,6 +500,9 @@ important fields are:
 An incomplete trace may still contain useful retained intervals. Do not assume
 anything about omitted time. The short mode preserves its beginning; streaming
 mode can retain different intervals as buffers drain and wrap.
+When the health query succeeds, `capture-workload` still generates the ranked
+report from those retained intervals and reports the incomplete health status
+separately.
 
 ### Troubleshoot activation
 

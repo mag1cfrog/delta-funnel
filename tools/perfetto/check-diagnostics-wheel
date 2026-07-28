@@ -321,7 +321,11 @@ def write_fake_trace_processor(path):
         "  if [[ ${DELTA_FUNNEL_TEST_REPORT_FAILURE:-0} == 1 ]]; then\n"
         "    exit 65\n"
         "  fi\n"
-        "  cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
+        "  if [[ ${DELTA_FUNNEL_TEST_CAPTURE_COMPLETE:-1} == 0 ]]; then\n"
+        "    cat \"$DELTA_FUNNEL_TEST_INCOMPLETE_AGGREGATE\"\n"
+        "  else\n"
+        "    cat \"$DELTA_FUNNEL_TEST_AGGREGATE\"\n"
+        "  fi\n"
         "elif [[ $query == *delta_funnel_capture_health_input* && "
         "$query == *selected_operations* ]]; then\n"
         "  if [[ -n ${DELTA_FUNNEL_TEST_HEALTH_BLOCK_FILE:-} ]]; then\n"
@@ -504,6 +508,19 @@ with tempfile.TemporaryDirectory() as temp_dir:
             for record in records
         )
     )
+    incomplete_records = json.loads(json.dumps(records))
+    incomplete_metadata = incomplete_records[0]["record"]
+    incomplete_metadata["capture_complete"] = False
+    incomplete_metadata["semantic_complete"] = False
+    incomplete_metadata["truncation_marker_count"] = 1
+    incomplete_aggregate = temp.joinpath("incomplete-aggregate.csv")
+    incomplete_aggregate.write_text(
+        '"record_hex"\n'
+        + "".join(
+            f'"{json.dumps(record, separators=(",", ":")).encode().hex()}"\n'
+            for record in incomplete_records
+        )
+    )
     fake_trace_processor = temp.joinpath("trace_processor_shell")
     write_fake_trace_processor(fake_trace_processor)
     fake_tracebox = temp.joinpath("tracebox")
@@ -554,6 +571,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
             "PERF": str(fake_perf),
             "TRACE_PROCESSOR_SHELL": str(fake_trace_processor),
             "DELTA_FUNNEL_TEST_AGGREGATE": str(aggregate),
+            "DELTA_FUNNEL_TEST_INCOMPLETE_AGGREGATE": str(incomplete_aggregate),
             **environment,
         }
 
@@ -705,11 +723,18 @@ with tempfile.TemporaryDirectory() as temp_dir:
         raise SystemExit("capture health failure replaced the workload result")
     if (
         status["health_status"] != "65"
-        or status["report_status"] != "125"
+        or status["report_status"] != "0"
         or not trace.is_file()
-        or report.exists()
+        or not report.is_file()
+        or status.get("report") != str(report)
+        or '"capture_complete":false' not in report.read_text()
+        or '"truncation_marker_count":1' not in report.read_text()
     ):
-        raise SystemExit("unhealthy raw capture did not skip report generation")
+        raise SystemExit(
+            "unhealthy raw capture did not retain its ranked report: "
+            f"status={status}, stdout={unhealthy.stdout!r}, "
+            f"stderr={unhealthy.stderr!r}, report_exists={report.is_file()}"
+        )
     if "do not retry" not in unhealthy.stderr:
         raise SystemExit("capture health failure did not protect a completed workload")
 
