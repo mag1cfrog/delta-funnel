@@ -83,6 +83,16 @@ fn generates_a_ranked_report_and_artifact_with_one_healthy_trace_query()
     );
     assert!(String::from_utf8(inspect.stdout)?.contains("Delta Funnel preview"));
 
+    let raw_inspect = Command::new(env!("CARGO_BIN_EXE_delta-funnel-perfetto"))
+        .arg("inspect")
+        .arg(&input)
+        .env("TRACE_PROCESSOR_SHELL", &trace_processor)
+        .output()?;
+    assert_eq!(raw_inspect.status.code(), Some(66));
+    let failure: serde_json::Value = serde_json::from_slice(&raw_inspect.stderr)?;
+    assert_eq!(failure["phase"], "input");
+    assert_eq!(failure["kind"], "ranked_artifact_required");
+
     #[cfg(target_os = "linux")]
     {
         let failed_output = directory.path().join("stdout-failure.profile.html");
