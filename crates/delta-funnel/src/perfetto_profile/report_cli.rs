@@ -1,6 +1,5 @@
 use std::env;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 #[cfg(test)]
 use std::fs::File;
@@ -274,7 +273,8 @@ impl RankedReportFailurePhase {
 }
 
 /// Structured failure from ranked profile report generation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("{message}"))]
 pub struct RankedReportFailure {
     phase: RankedReportFailurePhase,
     kind: &'static str,
@@ -314,14 +314,6 @@ impl RankedReportFailure {
         .to_string()
     }
 }
-
-impl fmt::Display for RankedReportFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RankedReportFailure {}
 
 impl From<CliArgumentError> for RankedReportFailure {
     fn from(error: CliArgumentError) -> Self {
