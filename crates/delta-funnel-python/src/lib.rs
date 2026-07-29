@@ -11,6 +11,8 @@ mod profiler;
 mod progress;
 mod session;
 mod table;
+#[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+mod yama;
 
 #[cfg(test)]
 pub(crate) mod test_support {

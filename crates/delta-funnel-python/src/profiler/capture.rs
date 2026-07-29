@@ -16,6 +16,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::yama::authorize_tracebox;
+#[cfg(test)]
+use crate::yama::ptrace_scope_is_relational;
+
 const TRACEBOX_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPTURE_ENABLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TRACEBOX_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,7 +129,7 @@ impl OperationCapture {
             tracebox.as_os_str(),
             &config_path,
             &trace,
-            authorize_tracebox_under_yama,
+            |pid| authorize_tracebox(pid).map_err(profiler_failure_from_ptrace),
             delta_funnel::perfetto_profile::initialize_perfetto,
             delta_funnel::perfetto_profile::wait_for_capture,
         )?;
@@ -265,58 +269,8 @@ impl Drop for ManagedTracebox {
     }
 }
 
-fn authorize_tracebox_under_yama(tracebox_pid: u32) -> Result<(), ProfilerFailure> {
-    if !yama_ptrace_scope_is_relational()? {
-        return Ok(());
-    }
-    // Yama removes this process-wide declaration when the managed tracer exits.
-    // Do not clear it blindly: another thread may have replaced the single slot.
-    set_ptracer(tracebox_pid.into()).map_err(|_| {
-        ProfilerFailure::new(
-            "ptrace_permission_failed",
-            "Perfetto tracebox could not be authorized to inspect this process",
-        )
-    })
-}
-
-fn yama_ptrace_scope_is_relational() -> Result<bool, ProfilerFailure> {
-    yama_ptrace_scope_is_relational_at(Path::new("/proc/sys/kernel/yama/ptrace_scope"))
-}
-
-fn yama_ptrace_scope_is_relational_at(path: &Path) -> Result<bool, ProfilerFailure> {
-    let scope = match fs::read_to_string(path) {
-        Ok(scope) => scope,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => {
-            return Err(ProfilerFailure::new(
-                "ptrace_permission_failed",
-                "Linux Yama ptrace mode could not be inspected",
-            ));
-        }
-    };
-    match scope.trim() {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        "2" | "3" => Err(ProfilerFailure::new(
-            "ptrace_permission_failed",
-            "Linux Yama ptrace mode does not support scoped tracebox authorization",
-        )),
-        _ => Err(ProfilerFailure::new(
-            "ptrace_permission_failed",
-            "Linux Yama ptrace mode was not recognized",
-        )),
-    }
-}
-
-fn set_ptracer(pid: libc::c_ulong) -> io::Result<()> {
-    let zero: libc::c_ulong = 0;
-    // SAFETY: every variadic argument has C unsigned-long width; PR_SET_PTRACER
-    // reads arg2 as a PID, ignores the zeroed remaining arguments, and retains no pointer.
-    if unsafe { libc::prctl(libc::PR_SET_PTRACER, pid, zero, zero, zero) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+fn profiler_failure_from_ptrace(error: crate::yama::PtraceAuthorizationError) -> ProfilerFailure {
+    ProfilerFailure::new(error.kind, error.message)
 }
 
 fn prepare_output_path(output: &Path) -> Result<PathBuf, ProfilerFailure> {
@@ -954,43 +908,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn yama_scope_inspection_rejects_restrictive_unreadable_and_unknown_values() -> io::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let scope = directory.path().join("ptrace_scope");
-        for (value, relational) in [("0\n", false), ("1\n", true)] {
-            fs::write(&scope, value)?;
-            assert_eq!(
-                yama_ptrace_scope_is_relational_at(&scope).map_err(profiler_test_error)?,
-                relational,
-            );
-        }
-
-        for value in ["2\n", "3\n"] {
-            fs::write(&scope, value)?;
-            let error = yama_ptrace_scope_is_relational_at(&scope)
-                .expect_err("a restrictive Yama mode must fail explicitly");
-            assert_eq!(error.kind, "ptrace_permission_failed");
-        }
-
-        fs::write(&scope, "unexpected\n")?;
-        let error = yama_ptrace_scope_is_relational_at(&scope)
-            .expect_err("an unknown Yama mode must fail explicitly");
-        assert_eq!(error.kind, "ptrace_permission_failed");
-
-        fs::remove_file(&scope)?;
-        assert!(
-            !yama_ptrace_scope_is_relational_at(&scope).map_err(profiler_test_error)?,
-            "a missing Yama sysctl means the LSM is unavailable"
-        );
-
-        let error = yama_ptrace_scope_is_relational_at(directory.path())
-            .expect_err("an unreadable Yama sysctl must fail explicitly");
-        assert_eq!(error.kind, "ptrace_permission_failed");
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn tracebox_lifecycle_authorizes_only_the_managed_child() -> io::Result<()> {
         let _tracebox_test_guard = TRACEBOX_TEST_LOCK
             .lock()
@@ -1032,14 +949,16 @@ mod tests {
                     thread::sleep(Duration::from_millis(1));
                 }
                 gate_observed = true;
-                authorize_tracebox_under_yama(pid)
+                authorize_tracebox(pid).map_err(profiler_failure_from_ptrace)
             },
             || Ok(()),
             |_| Ok(()),
         )
         .map_err(profiler_test_error)?;
         assert!(gate_observed);
-        if yama_ptrace_scope_is_relational().map_err(profiler_test_error)? {
+        if ptrace_scope_is_relational()
+            .map_err(|error| profiler_test_error(profiler_failure_from_ptrace(error)))?
+        {
             assert!(
                 !Command::new("sh")
                     .args(["-c", ": <\"/proc/$PPID/mem\""])
@@ -1070,7 +989,7 @@ mod tests {
             OsStr::new(FAKE_TRACEBOX),
             &config,
             &trace,
-            authorize_tracebox_under_yama,
+            |pid| authorize_tracebox(pid).map_err(profiler_failure_from_ptrace),
             || Err(io::Error::other("injected initialization failure")),
             |_| Ok(()),
         )

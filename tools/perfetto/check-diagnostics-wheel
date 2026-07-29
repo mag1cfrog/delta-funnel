@@ -144,6 +144,15 @@ for name in config_names:
         raise SystemExit(
             f"installed diagnostics config has an invalid kernel buffer: {name}"
         )
+    target_fields = [field for field in fields if field.startswith("target_cmdline:")]
+    if target_fields != ['target_cmdline: "delta-funnel-perfetto-preview"']:
+        raise SystemExit(
+            f"installed diagnostics config has an invalid workload target: {name}"
+        )
+    if any(field.startswith("target_pid:") for field in fields):
+        raise SystemExit(
+            f"installed diagnostics config has a stale workload PID: {name}"
+        )
     for category in [
         'enabled_categories: "delta_funnel.profile"',
         'enabled_categories: "delta_funnel.profile.context"',
@@ -194,6 +203,84 @@ invalid_command = subprocess.run(
 )
 if invalid_command.returncode != 64:
     raise SystemExit("delta-funnel-perfetto did not reject an invalid command")
+
+handshake_probe = (
+    "import os, deltafunnel\n"
+    "private_names = {\n"
+    "    'DELTA_FUNNEL_PERFETTO_TRACEBOX_PID',\n"
+    "    'DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET',\n"
+    "    'DELTA_FUNNEL_PERFETTO_WORKLOAD_PID',\n"
+    "}\n"
+    "if os.environ.get('DELTA_FUNNEL_PERFETTO_WORKLOAD_PID') == 'SELF':\n"
+    "    os.environ['DELTA_FUNNEL_PERFETTO_WORKLOAD_PID'] = str(os.getpid())\n"
+    "try:\n"
+    "    deltafunnel.init_perfetto_diagnostics()\n"
+    "except deltafunnel.DeltaFunnelError as error:\n"
+    "    if (error.phase, error.kind) != "
+    "('perfetto_diagnostics', os.environ['EXPECTED_HANDSHAKE_KIND']):\n"
+    "        raise SystemExit(93)\n"
+    "    if private_names & os.environ.keys():\n"
+    "        raise SystemExit(95)\n"
+    "else:\n"
+    "    raise SystemExit(94)\n"
+)
+handshake_base_environment = {
+    name: value
+    for name, value in os.environ.items()
+    if name
+    not in {
+        "DELTA_FUNNEL_PERFETTO_TRACEBOX_PID",
+        "DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET",
+        "DELTA_FUNNEL_PERFETTO_WORKLOAD_PID",
+    }
+}
+for handshake_environment, expected_kind in [
+    ({"DELTA_FUNNEL_PERFETTO_TRACEBOX_PID": "1"}, "capture_handshake_invalid"),
+    (
+        {"DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET": "/tmp/missing.sock"},
+        "capture_handshake_invalid",
+    ),
+    ({"DELTA_FUNNEL_PERFETTO_WORKLOAD_PID": "1"}, "capture_handshake_invalid"),
+    (
+        {
+            "DELTA_FUNNEL_PERFETTO_TRACEBOX_PID": "0",
+            "DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET": "/tmp/missing.sock",
+            "DELTA_FUNNEL_PERFETTO_WORKLOAD_PID": "SELF",
+        },
+        "capture_handshake_invalid",
+    ),
+    (
+        {
+            "DELTA_FUNNEL_PERFETTO_TRACEBOX_PID": "1",
+            "DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET": "/tmp/missing.sock",
+            "DELTA_FUNNEL_PERFETTO_WORKLOAD_PID": "0",
+        },
+        "capture_handshake_invalid",
+    ),
+    (
+        {
+            "DELTA_FUNNEL_PERFETTO_TRACEBOX_PID": "1",
+            "DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET": "/tmp/missing.sock",
+            "DELTA_FUNNEL_PERFETTO_WORKLOAD_PID": "SELF",
+        },
+        "capture_handshake_failed",
+    ),
+]:
+    malformed_handshake = subprocess.run(
+        [sys.executable, "-c", handshake_probe],
+        env={
+            **handshake_base_environment,
+            **handshake_environment,
+            "EXPECTED_HANDSHAKE_KIND": expected_kind,
+        },
+        capture_output=True,
+        text=True,
+    )
+    if malformed_handshake.returncode != 0:
+        raise SystemExit(
+            "diagnostics initializer accepted a malformed external handshake: "
+            f"{malformed_handshake.stderr!r}"
+        )
 
 with tempfile.TemporaryDirectory() as artifact_temp_dir:
     artifact = Path(os.environ["DELTA_FUNNEL_TEST_ARTIFACT"])
@@ -531,9 +618,40 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "  exit \"${DELTA_FUNNEL_TEST_TRACEBOX_QUERY_STATUS:-0}\"\n"
         "fi\n"
         "output=\n"
+        "config=\n"
         "while (( $# > 0 )); do\n"
-        "  if [[ $1 == --out ]]; then output=$2; shift 2; else shift; fi\n"
+        "  case $1 in\n"
+        "    --out) output=$2; shift 2 ;;\n"
+        "    --config) config=$2; shift 2 ;;\n"
+        "    *) shift ;;\n"
+        "  esac\n"
         "done\n"
+        "config_target_pid=\n"
+        "config_target_count=0\n"
+        "config_target_cmdline_count=0\n"
+        "while IFS= read -r line; do\n"
+        "  if [[ $line =~ ^[[:space:]]*target_pid:"
+        "[[:space:]]*([1-9][0-9]*)[[:space:]]*$ ]]; then\n"
+        "    config_target_pid=${BASH_REMATCH[1]}\n"
+        "    (( config_target_count += 1 ))\n"
+        "  fi\n"
+        "  if [[ $line =~ ^[[:space:]]*target_cmdline: ]]; then\n"
+        "    (( config_target_cmdline_count += 1 ))\n"
+        "  fi\n"
+        "done <\"$config\"\n"
+        "if (( config_target_count != 1 || config_target_cmdline_count != 0 )); then\n"
+        "  exit 68\n"
+        "fi\n"
+        "if [[ -n ${DELTA_FUNNEL_TEST_EXPECT_TARGET_PID_FILE:-} ]]; then\n"
+        "  for _ in {1..1000}; do\n"
+        "    [[ -s $DELTA_FUNNEL_TEST_EXPECT_TARGET_PID_FILE ]] && break\n"
+        "    sleep 0.01\n"
+        "  done\n"
+        "  expected_target_pid=$(<\"$DELTA_FUNNEL_TEST_EXPECT_TARGET_PID_FILE\")\n"
+        "  if [[ $config_target_pid != \"$expected_target_pid\" ]]; then\n"
+        "    exit 68\n"
+        "  fi\n"
+        "fi\n"
         "printf '\\x0a\\x00' >\"$output\"\n"
         "if [[ ${DELTA_FUNNEL_TEST_READINESS_FAILURE:-0} == 1 ]]; then\n"
         "  printf '\\1' >&3\n"
@@ -544,7 +662,29 @@ with tempfile.TemporaryDirectory() as temp_dir:
         "else\n"
         "  trap 'exit \"${DELTA_FUNNEL_TEST_TRACEBOX_STOP_STATUS:-0}\"' TERM\n"
         "fi\n"
+        "if [[ -n ${DELTA_FUNNEL_TEST_READINESS_MARKER:-} ]]; then\n"
+        "  sleep 0.2\n"
+        "  printf 'ready\\n' >\"$DELTA_FUNNEL_TEST_READINESS_MARKER\"\n"
+        "fi\n"
         "printf '\\0' >&3\n"
+        "if [[ -n ${DELTA_FUNNEL_TEST_PTRACE_TARGET_FILE:-} ]]; then\n"
+        "  (\n"
+        "    for _ in {1..1000}; do\n"
+        "      [[ -s $DELTA_FUNNEL_TEST_PTRACE_TARGET_FILE ]] && break\n"
+        "      sleep 0.01\n"
+        "    done\n"
+        "    target_pid=$(<\"$DELTA_FUNNEL_TEST_PTRACE_TARGET_FILE\")\n"
+        "    if [[ $target_pid != \"$config_target_pid\" ]]; then\n"
+        "      printf 'target-mismatch\\n' >\"$DELTA_FUNNEL_TEST_PTRACE_RESULT_FILE\"\n"
+        "      exit 0\n"
+        "    fi\n"
+        "    if exec 4<\"/proc/$target_pid/mem\"; then\n"
+        "      printf 'authorized\\n' >\"$DELTA_FUNNEL_TEST_PTRACE_RESULT_FILE\"\n"
+        "    else\n"
+        "      printf 'denied\\n' >\"$DELTA_FUNNEL_TEST_PTRACE_RESULT_FILE\"\n"
+        "    fi\n"
+        "  ) &\n"
+        "fi\n"
         "while :; do sleep 1; done\n"
     )
     fake_tracebox.chmod(0o700)
@@ -575,14 +715,28 @@ with tempfile.TemporaryDirectory() as temp_dir:
             **environment,
         }
 
+    external_capture_activation = (
+        "import os, deltafunnel\n"
+        "try:\n"
+        "    deltafunnel.init_perfetto_diagnostics(wait_timeout_seconds=0)\n"
+        "except deltafunnel.DeltaFunnelError as error:\n"
+        "    if error.kind not in {'capture_timeout', 'capture_unavailable'}:\n"
+        "        raise\n"
+    )
+
     def run_capture(
         name,
         workload="pass",
+        workload_args=(),
+        activate=True,
+        pass_fds=(),
         suffix=".pftrace",
         target=sys.executable,
         **environment,
     ):
         trace, report = capture_artifacts(name, suffix)
+        if activate:
+            workload = external_capture_activation + workload
         result = subprocess.run(
             [
                 capture,
@@ -592,11 +746,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
                 target,
                 "-c",
                 workload,
+                *workload_args,
             ],
             env=capture_environment(**environment),
             cwd=temp,
             capture_output=True,
             text=True,
+            pass_fds=pass_fds,
         )
         lines = result.stdout.splitlines()
         fields = (
@@ -669,16 +825,253 @@ with tempfile.TemporaryDirectory() as temp_dir:
         f"trace={trace} report={report}"
     )
     if captured.returncode != 0 or captured.stdout.splitlines()[-1] != expected_status:
-        raise SystemExit(f"capture-workload returned an invalid status: {status}")
+        raise SystemExit(
+            "capture-workload returned an invalid status: "
+            f"{status}; returncode={captured.returncode}; "
+            f"stdout={captured.stdout!r}; stderr={captured.stderr!r}"
+        )
     if trace.read_bytes() != trace_bytes:
         raise SystemExit("automatic report generation modified the raw trace")
     if not report.is_file() or "Delta Funnel preview" not in report.read_text():
         raise SystemExit("capture-workload did not generate the ranked report")
 
+    managed_readiness_marker = temp.joinpath("managed-readiness")
+    managed_readiness, trace, report, status = run_capture(
+        "managed-readiness",
+        (
+            "from pathlib import Path\n"
+            f"marker = Path({str(managed_readiness_marker)!r})\n"
+            "if not marker.is_file() or marker.read_text() != 'ready\\n':\n"
+            "    raise SystemExit(97)\n"
+        ),
+        DELTA_FUNNEL_TEST_READINESS_MARKER=str(managed_readiness_marker),
+    )
+    if (
+        managed_readiness.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "0"
+        or not trace.is_file()
+        or not report.is_file()
+    ):
+        raise SystemExit("workload resumed before managed tracebox readiness")
+
+    child_handshake_probe = (
+        "import deltafunnel\n"
+        "try:\n"
+        "    deltafunnel.init_perfetto_diagnostics(wait_timeout_seconds=0)\n"
+        "except deltafunnel.DeltaFunnelError as error:\n"
+        "    if error.kind != 'capture_handshake_failed':\n"
+        "        raise SystemExit(94)\n"
+        "else:\n"
+        "    raise SystemExit(95)\n"
+    )
+    inherited_child, trace, report, status = run_capture(
+        "inherited-child-handshake",
+        (
+            "import subprocess, sys\n"
+            f"child = subprocess.run([sys.executable, '-c', {child_handshake_probe!r}])\n"
+            "if child.returncode != 0:\n"
+            "    raise SystemExit(96)\n"
+            + external_capture_activation
+        ),
+        activate=False,
+    )
+    if (
+        inherited_child.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "0"
+        or not trace.is_file()
+        or not report.is_file()
+    ):
+        raise SystemExit("a child process consumed the parent capture handshake")
+
+    argument_marker = temp.joinpath("literal-arguments")
+    workload_arguments = [
+        "space value",
+        "Unicode 名称",
+        "--leading-hyphen",
+        "semi;touch injected-argument",
+    ]
+    literal_arguments, trace, report, status = run_capture(
+        "literal-arguments",
+        (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"expected = {workload_arguments!r}\n"
+            "if sys.argv[1:] != expected:\n"
+            "    raise SystemExit(91)\n"
+            f"Path({str(argument_marker)!r}).write_text('preserved')\n"
+        ),
+        workload_args=workload_arguments,
+    )
+    if (
+        literal_arguments.returncode != 0
+        or status["workload_status"] != "0"
+        or argument_marker.read_text() != "preserved"
+        or temp.joinpath("injected-argument").exists()
+    ):
+        raise SystemExit("capture-workload did not preserve workload arguments literally")
+
+    executable_dir = temp.joinpath("executable-workload")
+    executable_dir.mkdir()
+    executable_marker = temp.joinpath("executable-workload-runs")
+    executable_pid_marker = temp.joinpath("executable-workload-pid")
+    executable_workload = executable_dir.joinpath("job.py")
+    executable_workload.write_text(
+        f"#!{sys.executable}\n"
+        + "import os\n"
+        + "from pathlib import Path\n"
+        + f"Path({str(executable_pid_marker)!r}).write_text(str(os.getpid()))\n"
+        + external_capture_activation
+        + f"with Path({str(executable_marker)!r}).open('a') as marker:\n"
+        + "    marker.write('run\\n')\n"
+    )
+    executable_workload.chmod(0o700)
+    executable, trace, report, status = run_capture(
+        "executable-workload",
+        activate=False,
+        target=executable_workload,
+        DELTA_FUNNEL_TEST_EXPECT_TARGET_PID_FILE=str(executable_pid_marker),
+        PATH=f"{Path(perfetto_cli).parent}{os.pathsep}{os.environ['PATH']}",
+    )
+    if (
+        executable.returncode != 0
+        or status["workload_status"] != "0"
+        or executable_marker.read_text().splitlines() != ["run"]
+        or not trace.is_file()
+        or not report.is_file()
+    ):
+        raise SystemExit(
+            "capture-workload did not run an executable workload exactly once: "
+            f"returncode={executable.returncode}, status={status!r}, "
+            f"pid_marker={executable_pid_marker.read_text() if executable_pid_marker.exists() else None!r}, "
+            f"run_marker={executable_marker.read_text() if executable_marker.exists() else None!r}, "
+            f"stdout={executable.stdout!r}, stderr={executable.stderr!r}"
+        )
+
+    inherited_descriptor_marker = temp.joinpath("inherited-descriptor")
+    inherited_descriptor = os.open(
+        inherited_descriptor_marker,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        inherited, trace, report, status = run_capture(
+            "inherited-descriptor",
+            f"os.write({inherited_descriptor}, b'preserved')",
+            pass_fds=(inherited_descriptor,),
+        )
+    finally:
+        os.close(inherited_descriptor)
+    if (
+        inherited.returncode != 0
+        or status["workload_status"] != "0"
+        or inherited_descriptor_marker.read_text() != "preserved"
+    ):
+        raise SystemExit("capture-workload clobbered an inherited workload descriptor")
+
+    delayed_activation, trace, report, status = run_capture(
+        "delayed-activation",
+        "import time; time.sleep(16)\n" + external_capture_activation,
+        activate=False,
+    )
+    if (
+        delayed_activation.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "0"
+        or not trace.is_file()
+        or not report.is_file()
+    ):
+        raise SystemExit("capture-workload timed out before diagnostics activation")
+
+    ptrace_target = temp.joinpath("ptrace-target")
+    ptrace_result = temp.joinpath("ptrace-result")
+    unrelated_ptrace_result = temp.joinpath("unrelated-ptrace-result")
+    unrelated_ptrace_probe = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, time\n"
+                "from pathlib import Path\n"
+                f"target = Path({str(ptrace_target)!r})\n"
+                "deadline = time.monotonic() + 10\n"
+                "while not target.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+                "if not target.exists():\n"
+                "    raise SystemExit(93)\n"
+                "try:\n"
+                "    descriptor = os.open("
+                "f'/proc/{int(target.read_text())}/mem', os.O_RDONLY)\n"
+                "except OSError as error:\n"
+                "    outcome = f'denied:{error.errno}\\n'\n"
+                "else:\n"
+                "    os.close(descriptor)\n"
+                "    outcome = 'authorized\\n'\n"
+                f"Path({str(unrelated_ptrace_result)!r}).write_text(outcome)\n"
+            ),
+        ]
+    )
+    try:
+        ptrace_capture, trace, report, status = run_capture(
+            "scoped-ptrace",
+            (
+                "import time\n"
+                "from pathlib import Path\n"
+                f"Path({str(ptrace_target)!r}).write_text(str(os.getpid()))\n"
+                "deadline = time.monotonic() + 10\n"
+                f"managed = Path({str(ptrace_result)!r})\n"
+                f"unrelated = Path({str(unrelated_ptrace_result)!r})\n"
+                "while (not managed.exists() or not unrelated.exists()) "
+                "and time.monotonic() < deadline:\n"
+                "    time.sleep(0.01)\n"
+                "if not managed.exists() or managed.read_text() != 'authorized\\n':\n"
+                "    raise SystemExit(92)\n"
+                "if not unrelated.exists():\n"
+                "    raise SystemExit(93)\n"
+            ),
+            DELTA_FUNNEL_TEST_PTRACE_TARGET_FILE=str(ptrace_target),
+            DELTA_FUNNEL_TEST_PTRACE_RESULT_FILE=str(ptrace_result),
+        )
+    finally:
+        unrelated_ptrace_probe.wait(timeout=10)
+    if (
+        ptrace_capture.returncode != 0
+        or status["workload_status"] != "0"
+        or ptrace_result.read_text() != "authorized\n"
+        or unrelated_ptrace_probe.returncode != 0
+    ):
+        raise SystemExit("managed tracebox did not receive scoped ptrace access")
+    ptrace_scope = Path("/proc/sys/kernel/yama/ptrace_scope")
+    if (
+        ptrace_scope.is_file()
+        and ptrace_scope.read_text().strip() == "1"
+        and not unrelated_ptrace_result.read_text().startswith("denied:")
+    ):
+        raise SystemExit("scoped ptrace authorization leaked to an unrelated process")
+
+    missing_activation, trace, report, status = run_capture(
+        "missing-activation",
+        activate=False,
+    )
+    if (
+        missing_activation.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] == "0"
+        or trace.exists()
+        or report.exists()
+        or "do not retry" not in missing_activation.stderr
+    ):
+        raise SystemExit("missing workload activation did not fail explicitly")
+
     incomplete_bin = temp.joinpath("incomplete-report-bin")
     incomplete_bin.mkdir()
     incomplete_python = incomplete_bin.joinpath("python")
-    incomplete_python.symlink_to(sys.executable)
+    incomplete_python.write_text(
+        "#!/usr/bin/env bash\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n"
+    )
+    incomplete_python.chmod(0o700)
     incomplete_report_cli = incomplete_bin.joinpath("delta-funnel-perfetto")
     incomplete_report_cli.write_text("#!/usr/bin/env bash\nexit 0\n")
     incomplete_report_cli.chmod(0o700)
@@ -697,7 +1090,12 @@ with tempfile.TemporaryDirectory() as temp_dir:
         or report.exists()
         or "do not retry" not in missing_report.stderr
     ):
-        raise SystemExit("successful report command fabricated a missing artifact")
+        raise SystemExit(
+            "successful report command fabricated a missing artifact: "
+            f"returncode={missing_report.returncode}, status={status!r}, "
+            f"trace_exists={trace.exists()}, report_exists={report.exists()}, "
+            f"stdout={missing_report.stdout!r}, stderr={missing_report.stderr!r}"
+        )
 
     failed, trace, report, status = run_capture(
         "workload-failure",
@@ -844,12 +1242,13 @@ with tempfile.TemporaryDirectory() as temp_dir:
 
     readiness, trace, report, status = run_capture(
         "readiness-failure",
+        "import time; time.sleep(60)",
         DELTA_FUNNEL_TEST_READINESS_FAILURE="1",
     )
     if readiness.returncode != 69:
         raise SystemExit("tracebox readiness failure returned the wrong wrapper status")
     if (
-        status["workload_status"] != "125"
+        status["workload_status"] != "143"
         or status["tracebox_status"] != "69"
         or status["health_status"] != "125"
         or status["report_status"] != "125"
@@ -857,6 +1256,52 @@ with tempfile.TemporaryDirectory() as temp_dir:
         or report.exists()
     ):
         raise SystemExit("tracebox readiness failure fabricated a completed outcome")
+
+    graceful_readiness_workload = (
+        "import signal, time\n"
+        "def complete_on_term(*_):\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, complete_on_term)\n"
+        + external_capture_activation
+        + "time.sleep(60)\n"
+    )
+    graceful_readiness, trace, report, status = run_capture(
+        "graceful-readiness-failure",
+        graceful_readiness_workload,
+        activate=False,
+        DELTA_FUNNEL_TEST_READINESS_FAILURE="1",
+    )
+    if (
+        graceful_readiness.returncode != 0
+        or status["workload_status"] != "0"
+        or status["tracebox_status"] != "69"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or not trace.is_file()
+        or report.exists()
+        or "do not retry" not in graceful_readiness.stderr
+    ):
+        raise SystemExit("diagnostics failure replaced a successful workload result")
+
+    chosen_failure_workload = graceful_readiness_workload.replace(
+        "SystemExit(0)", "SystemExit(42)"
+    )
+    chosen_failure, trace, report, status = run_capture(
+        "chosen-readiness-failure",
+        chosen_failure_workload,
+        activate=False,
+        DELTA_FUNNEL_TEST_READINESS_FAILURE="1",
+    )
+    if (
+        chosen_failure.returncode != 42
+        or status["workload_status"] != "42"
+        or status["tracebox_status"] != "69"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or not trace.is_file()
+        or report.exists()
+    ):
+        raise SystemExit("diagnostics failure replaced a workload-chosen failure")
 
     hostile_name = "space and Unicode 名称;touch injected"
     hostile, trace, report, status = run_capture(
@@ -873,8 +1318,16 @@ with tempfile.TemporaryDirectory() as temp_dir:
     ):
         raise SystemExit("capture artifact paths were not handled literally")
 
-    def interrupt_capture(name, marker, workload="pass", **environment):
+    def interrupt_capture(
+        name,
+        marker,
+        workload="pass",
+        activate=True,
+        **environment,
+    ):
         trace, report = capture_artifacts(name)
+        if activate:
+            workload = external_capture_activation + workload
         process = subprocess.Popen(
             [
                 capture,
@@ -918,6 +1371,29 @@ with tempfile.TemporaryDirectory() as temp_dir:
                 os.kill(pid, signal.SIGKILL)
                 raise SystemExit(f"interrupted {stage} left process {pid} running")
             time.sleep(0.01)
+
+    preactivation_started = temp.joinpath("preactivation-started")
+    interrupted, trace, report, status, _ = interrupt_capture(
+        "interrupted-before-activation",
+        preactivation_started,
+        (
+            "from pathlib import Path; import os, time; "
+            f"Path({str(preactivation_started)!r}).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        ),
+        activate=False,
+    )
+    if (
+        interrupted.returncode != 143
+        or status["workload_status"] != "143"
+        or status["tracebox_status"] != "143"
+        or status["health_status"] != "125"
+        or status["report_status"] != "125"
+        or trace.exists()
+        or report.exists()
+    ):
+        raise SystemExit("pre-activation interruption did not reap capture processes")
+    assert_process_stopped(preactivation_started, "pre-activation workload")
 
     workload_started = temp.joinpath("workload-started")
     interrupted, interrupted_trace, interrupted_report, status, _ = (

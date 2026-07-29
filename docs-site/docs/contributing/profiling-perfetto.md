@@ -69,15 +69,15 @@ This loosens system-wide performance-event access. Do not use it on a shared or
 production host without approval. The temporary setting lasts until reboot.
 Do not run the Python workload or `tracebox` with `sudo`.
 
-When Linux Yama uses restricted ptrace mode (`ptrace_scope=1`),
-operation-scoped ranked profiling temporarily authorizes only the capture's
-tracebox process and its descendants to inspect the workload. The authorization
-ends when Delta Funnel stops and reaps that process.
+When Linux Yama uses restricted ptrace mode (`ptrace_scope=1`), operation-scoped
+and whole-process profiling temporarily authorize only the capture's tracebox
+process and its descendants to inspect the workload. The authorization ends
+when Delta Funnel stops and reaps that process.
 
 Yama permits only one declared ptracer per process. Starting a ranked profile
 therefore replaces any existing `PR_SET_PTRACER` declaration. Do not combine
-operation-scoped ranked profiling with a crash handler or debugger that relies
-on its own declaration.
+Delta Funnel profiling with a crash handler or debugger that relies on its own
+declaration.
 
 ## 2. Install the diagnostics wheel with uv
 
@@ -234,7 +234,10 @@ if not deltafunnel.init_perfetto_diagnostics():
 ```
 
 Activation is process-wide. Every later Delta Funnel operation in that Python
-process can appear in the trace.
+process can appear in the trace. During `capture-workload`, this call initializes
+the producer, authorizes the gated tracebox process, and starts the capture.
+Python imports and other code that run before this call are intentionally
+outside the profile.
 
 ### Record the workload
 
@@ -247,9 +250,11 @@ capture because existing trace and report files are never overwritten:
   -- "$environment_python" path/to/workload.py
 ```
 
-The command starts Perfetto, waits until all data sources are ready, runs the
-workload, finalizes and checks the saved trace, then generates the sibling
-ranked report. A successful run creates:
+The command starts the workload with tracebox held behind a private start gate.
+The activation call above releases tracebox after scoped authorization, then
+waits until all data sources are ready before returning to the workload. The
+command finalizes and checks the saved trace, then generates the sibling ranked
+report. A successful run creates:
 
 ```text
 target/perfetto-captures/query.pftrace
@@ -531,6 +536,9 @@ not_available
 invalid_logger
 invalid_wait_timeout
 producer_initialization_failed
+capture_handshake_invalid
+capture_handshake_failed
+ptrace_permission_failed
 capture_timeout
 capture_unavailable
 ```
