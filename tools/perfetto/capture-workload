@@ -105,7 +105,7 @@ fi
 tracebox=${TRACEBOX:-$script_dir/delta-funnel-tracebox}
 trace_processor=${TRACE_PROCESSOR_SHELL:-trace_processor_shell}
 perf=${PERF:-perf}
-for executable in "$tracebox" "$trace_processor" "$perf" awk timeout od setsid; do
+for executable in "$tracebox" "$trace_processor" "$perf" awk od setsid; do
   if ! command -v "$executable" >/dev/null 2>&1; then
     printf 'capture-workload: required command is unavailable: %s\n' \
       "$executable" >&2
@@ -163,7 +163,6 @@ fi
 shift
 
 target_dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd -P)
-target_name=$(basename -- "$target")
 report_cli=$target_dir/delta-funnel-perfetto
 if [[ ! -x $report_cli ]]; then
   report_cli=$(command -v delta-funnel-perfetto) || {
@@ -177,19 +176,40 @@ if ! "$report_cli" report --help >/dev/null; then
     'capture-workload: ranked report command is unavailable' >&2
   exit 69
 fi
-launcher=$target_dir/delta-funnel-perfetto-preview
-if [[ -e $launcher || -L $launcher ]]; then
-  if [[ ! -x $launcher ]] || [[ ! $launcher -ef $target ]]; then
-    printf 'capture-workload: incompatible diagnostics launcher: %s\n' \
-      "$launcher" >&2
-    exit 73
+report_cli_dir=$(CDPATH= cd -- "$(dirname -- "$report_cli")" && pwd -P)
+gate_python=
+for candidate in "$report_cli_dir/python3" "$report_cli_dir/python"; do
+  if [[ -x $candidate ]]; then
+    gate_python=$candidate
+    break
   fi
-else
-  ln -s -- "$target_name" "$launcher"
+done
+if [[ -z $gate_python ]]; then
+  IFS= read -r report_cli_shebang <"$report_cli" || true
+  case $report_cli_shebang in
+    '#!'/*)
+      candidate=${report_cli_shebang#\#!}
+      if [[ $candidate != *' '* && -x $candidate ]]; then
+        gate_python=$candidate
+      fi
+      ;;
+  esac
 fi
-runtime_dir=$(mktemp -d "$capture_dir/.delta-funnel-perfetto.XXXXXX")
-ready_fifo=$runtime_dir/tracebox-ready
+if [[ -z $gate_python ]]; then
+  printf '%s\n' \
+    'capture-workload: diagnostics Python interpreter is unavailable' >&2
+  exit 127
+fi
+runtime_dir=$(mktemp -d /tmp/delta-funnel-perfetto.XXXXXX)
+runtime_dir=$(CDPATH= cd -- "$runtime_dir" && pwd -P)
+tracebox_ready_file=$runtime_dir/tracebox-ready
+tracebox_gate_socket=$runtime_dir/tracebox-gate.sock
+tracebox_gate_ready_file=$runtime_dir/tracebox-gate-ready
+tracebox_workload_pid_file=$runtime_dir/workload-pid
+tracebox_gate_connected_file=$runtime_dir/tracebox-gate-connected
+tracebox_activated_file=$runtime_dir/tracebox-activated
 trace_pid=
+tracebox_target_pid=
 workload_pid=
 diagnostics_pid=
 diagnostics_stage=
@@ -302,6 +322,10 @@ stop_workload() {
   workload_pid=
 }
 
+workload_stopped_by_wrapper() {
+  [[ $workload_status == 137 || $workload_status == 143 ]]
+}
+
 finish_health() {
   local status=$1
   if (( status != 0 )); then
@@ -385,6 +409,7 @@ trap 'interruption_status=130; interruption_signal=INT; exit 130' INT
 trap 'interruption_status=143; interruption_signal=TERM; exit 143' TERM
 trap 'interruption_status=129; interruption_signal=HUP; exit 129' HUP
 
+capture_config_template=$runtime_dir/capture-template.pbtx
 capture_config=$runtime_dir/capture.pbtx
 if ! awk -v sample_hz="$sample_hz" '
   BEGIN {
@@ -409,11 +434,22 @@ if ! awk -v sample_hz="$sample_hz" '
       sub(/[0-9]+/, ring_buffer_pages)
     }
   }
+  /^[[:space:]]*target_cmdline:/ {
+    target_count++
+  }
+  /^[[:space:]]*target_cmdline:[[:space:]]*"delta-funnel-perfetto-preview"[[:space:]]*$/ {
+    canonical_target_count++
+  }
+  /^[[:space:]]*target_pid:/ {
+    target_pid_count++
+  }
   { print }
   END {
-    if (frequency_count != 1 || read_period_count != 1 || ring_buffer_pages_count != 1) exit 1
+    if (frequency_count != 1 || read_period_count != 1 ||
+        ring_buffer_pages_count != 1 || target_count != 1 ||
+        canonical_target_count != 1 || target_pid_count != 0) exit 1
   }
-' "$packaged_capture_config" >"$capture_config"; then
+' "$packaged_capture_config" >"$capture_config_template"; then
   printf 'capture-workload: failed to prepare Perfetto sampling config: %s\n' \
     "$packaged_capture_config" >&2
   exit 69
@@ -431,30 +467,223 @@ fi
   exit 77
 }
 
-mkfifo "$ready_fifo"
-setsid --wait "$tracebox" --txt --system-sockets --no-clobber \
+# The diagnostics interpreter owns this gate so its PID survives tracebox exec.
+# READY is pre-commit; only the intended workload's RELEASE publishes activation.
+tracebox_start_gate='import os
+import socket
+import struct
+import sys
+import time
+
+def create_marker(path, contents=b""):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as marker:
+        marker.write(contents)
+
+def read_pid(path):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            with open(path, "rb") as source:
+                return int(source.read())
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.01)
+    raise SystemExit(70)
+
+os.setsid()
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+server.listen(1)
+create_marker(sys.argv[2], str(os.getpid()).encode())
+connection, _ = server.accept()
+credentials = connection.getsockopt(
+    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+)
+peer_pid, _, _ = struct.unpack("3i", credentials)
+if peer_pid != read_pid(sys.argv[3]):
+    raise SystemExit(70)
+create_marker(sys.argv[4])
+connection.sendall(b"R")
+if connection.recv(1) != b"\n":
+    raise SystemExit(70)
+create_marker(sys.argv[5])
+
+read_descriptor, write_descriptor = os.pipe()
+if os.fork() == 0:
+    server.close()
+    os.close(write_descriptor)
+    readiness = os.read(read_descriptor, 1) or b"\xff"
+    os.close(read_descriptor)
+    readiness_descriptor = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        readiness_descriptor = os.open(sys.argv[6], flags, 0o600)
+    except OSError:
+        readiness = b"\xff"
+    try:
+        connection.sendall(readiness)
+    except OSError:
+        pass
+    connection.close()
+    if readiness_descriptor is not None:
+        with os.fdopen(readiness_descriptor, "wb") as marker:
+            marker.write(readiness)
+    os._exit(0)
+
+os.close(read_descriptor)
+connection.close()
+server.close()
+if write_descriptor != 3:
+    os.dup2(write_descriptor, 3)
+    os.close(write_descriptor)
+os.set_inheritable(3, True)
+os.execvp(sys.argv[7], sys.argv[7:])'
+"$gate_python" -I -S -c "$tracebox_start_gate" \
+  "$tracebox_gate_socket" \
+  "$tracebox_gate_ready_file" \
+  "$tracebox_workload_pid_file" \
+  "$tracebox_gate_connected_file" \
+  "$tracebox_activated_file" \
+  "$tracebox_ready_file" \
+  "$tracebox" \
+  --txt --system-sockets --no-clobber \
   --notify-fd 3 \
   --config "$capture_config" \
-  --out "$capture_path" \
-  3>"$ready_fifo" &
+  --out "$capture_path" &
 trace_pid=$!
 
-if readiness_raw=$(timeout 15 od -An -tu1 -N1 "$ready_fifo"); then
-  readiness=$(tr -d '[:space:]' <<<"$readiness_raw")
-else
-  readiness=
+for (( poll = 0; poll < 1500; poll++ )); do
+  if [[ -s $tracebox_gate_ready_file ]] || process_finished "$trace_pid"; then
+    break
+  fi
+  sleep 0.01
+done
+if [[ -s $tracebox_gate_ready_file ]]; then
+  tracebox_target_pid=$(<"$tracebox_gate_ready_file")
 fi
-rm -f -- "$ready_fifo"
-if [[ $readiness != 0 ]]; then
+if [[ ! $tracebox_target_pid =~ ^[1-9][0-9]*$ ]] ||
+   (( tracebox_target_pid > 2147483647 )) ||
+   [[ $tracebox_target_pid != "$trace_pid" ]]; then
   stop_tracebox
   emit_status 125 "${tracebox_status:-125}" 125 125
-  printf 'capture-workload: tracebox readiness failed: status=%s\n' \
-    "${tracebox_status:-125}" >&2
+  printf '%s\n' \
+    'capture-workload: tracebox start gate did not become ready' >&2
   exit 69
 fi
 
-setsid --wait "$launcher" "$@" &
+(
+  export DELTA_FUNNEL_PERFETTO_TRACEBOX_PID=$tracebox_target_pid
+  export DELTA_FUNNEL_PERFETTO_TRACEBOX_GATE_SOCKET=$tracebox_gate_socket
+  export DELTA_FUNNEL_PERFETTO_WORKLOAD_PID=$BASHPID
+  exec setsid --wait "$target" "$@"
+) &
 workload_pid=$!
+if ! awk -v target_pid="$workload_pid" '
+  /^[[:space:]]*target_cmdline:/ {
+    target_count++
+  }
+  /^[[:space:]]*target_cmdline:[[:space:]]*"delta-funnel-perfetto-preview"[[:space:]]*$/ {
+    replacement_count++
+    indent = $0
+    sub(/[^[:space:]].*$/, "", indent)
+    printf "%starget_pid: %s\n", indent, target_pid
+    next
+  }
+  { print }
+  END {
+    if (target_count != 1 || replacement_count != 1) exit 1
+  }
+' "$capture_config_template" >"$capture_config"; then
+  workload_finished=0
+  if process_finished "$workload_pid"; then
+    workload_finished=1
+  fi
+  stop_workload
+  stop_tracebox
+  emit_status "${workload_status:-125}" "${tracebox_status:-125}" 125 125
+  warn_if_completed_workload
+  printf '%s\n' \
+    'capture-workload: failed to scope Perfetto sampling to the workload' >&2
+  if (( workload_finished == 1 )) || ! workload_stopped_by_wrapper; then
+    exit "$workload_status"
+  fi
+  exit 69
+fi
+printf '%s' "$workload_pid" >"$tracebox_workload_pid_file"
+
+while [[ ! -e $tracebox_activated_file ]]; do
+  if process_finished "$workload_pid"; then
+    # A connected gate may still have the committed release byte queued after
+    # an unusually fast workload exit. Let it publish activation or exit.
+    if [[ -e $tracebox_gate_connected_file ]]; then
+      for (( poll = 0; poll < 1500; poll++ )); do
+        if [[ -e $tracebox_activated_file ]] ||
+           process_finished "$trace_pid"; then
+          break
+        fi
+        sleep 0.01
+      done
+      if [[ -e $tracebox_activated_file ]]; then
+        break
+      fi
+    fi
+    stop_workload
+    stop_tracebox
+    emit_status "$workload_status" "${tracebox_status:-125}" 125 125
+    warn_if_completed_workload
+    printf '%s\n' \
+      'capture-workload: workload exited before activating Perfetto diagnostics' >&2
+    exit "$workload_status"
+  fi
+  if process_finished "$trace_pid"; then
+    workload_finished=0
+    if process_finished "$workload_pid"; then
+      workload_finished=1
+    fi
+    stop_workload
+    stop_tracebox
+    emit_status "${workload_status:-125}" "${tracebox_status:-125}" 125 125
+    warn_if_completed_workload
+    printf '%s\n' \
+      'capture-workload: tracebox start gate failed before activation' >&2
+    if (( workload_finished == 1 )) || ! workload_stopped_by_wrapper; then
+      exit "$workload_status"
+    fi
+    exit 69
+  fi
+  sleep 0.01
+done
+
+# Producer initialization and scoped ptrace authorization are complete here.
+# Let the native 15-second managed-readiness deadline report first.
+readiness=
+for (( poll = 0; poll < 2000; poll++ )); do
+  if [[ -s $tracebox_ready_file ]] || process_finished "$trace_pid"; then
+    break
+  fi
+  sleep 0.01
+done
+if [[ -s $tracebox_ready_file ]]; then
+  readiness=$(od -An -tu1 -N1 "$tracebox_ready_file" | tr -d '[:space:]')
+fi
+if [[ $readiness != 0 ]]; then
+  workload_finished=0
+  if process_finished "$workload_pid"; then
+    workload_finished=1
+  fi
+  stop_workload
+  stop_tracebox
+  emit_status "${workload_status:-125}" "${tracebox_status:-125}" 125 125
+  warn_if_completed_workload
+  printf 'capture-workload: tracebox readiness failed: status=%s\n' \
+    "${tracebox_status:-125}" >&2
+  if (( workload_finished == 1 )) || ! workload_stopped_by_wrapper; then
+    exit "$workload_status"
+  fi
+  exit 69
+fi
+
 if wait "$workload_pid"; then
   workload_status=0
 else
