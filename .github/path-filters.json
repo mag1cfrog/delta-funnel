@@ -30,6 +30,7 @@
     "crates/delta-funnel-python/src/perfetto_diagnostics.rs",
     "crates/delta-funnel-python/src/profiler.rs",
     "crates/delta-funnel-python/src/profiler/**",
+    "crates/delta-funnel-python/src/session.rs",
     "tools/perfetto/**",
     ".github/path-filters.json",
     ".github/workflows/ci.yml",

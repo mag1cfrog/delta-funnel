@@ -7,9 +7,10 @@ Delta Funnel provides two operation-scoped profiling models:
 | Collect exact DataFusion operator metrics | `execution_profile=True` | Returned profile |
 | Rank sampled native CPU functions | `RankedProfileConfig` | Interactive HTML and optional `.dfprofile` artifact |
 
-Both options work with `Table.preview`, `Table.write_to_mssql`, and
-`Session.write_all`. You can enable either one or both for the same operation.
-Neither is enabled by default.
+Both options work with `Table.preview`, `Table.write_to_mssql`,
+`Session.write_all`, and `Session.write_all_for_stream_benchmark`. You can
+enable either one or both for the same operation. Neither is enabled by
+default.
 
 Exact execution profiling works in normal wheels. Ranked profiling requires a
 diagnostics-enabled Linux wheel and the setup in
@@ -167,7 +168,9 @@ report = session.write_all_for_stream_benchmark(
 The benchmark drains every output batch and retains row counts, schema checks,
 cache materialization, exact profiles, and the operation-scoped ranked profile.
 It skips SQL Server lifecycle work, target validation, bulk encoding, writes,
-and cleanup, so use regular `write_all` when measuring end-to-end behavior.
+and cleanup. Produced counts are reported through `output_row_count` and
+`batch_shaping`; `write_stats` remains zero because no rows are written. Use
+regular `write_all` when measuring end-to-end behavior.
 
 ## Combine exact and ranked profiling
 

@@ -909,11 +909,7 @@ where
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     batch_shaping,
-                    MssqlWriteProgress::new(
-                        shaped_rows,
-                        shaped_batches,
-                        elapsed_ms_since(started_at),
-                    ),
+                    MssqlWriteProgress::new(0, 0, elapsed_ms_since(started_at)),
                     false,
                     cleanup,
                 )
@@ -948,11 +944,7 @@ where
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     batch_shaping,
-                    MssqlWriteProgress::new(
-                        shaped_rows,
-                        shaped_batches,
-                        elapsed_ms_since(started_at),
-                    ),
+                    MssqlWriteProgress::new(0, 0, elapsed_ms_since(started_at)),
                     false,
                     cleanup,
                 )
@@ -974,7 +966,7 @@ where
         write_report_metrics(
             RowCount::exact(input_rows),
             batch_shaping,
-            MssqlWriteProgress::new(shaped_rows, shaped_batches, elapsed_ms_since(started_at)),
+            MssqlWriteProgress::new(0, 0, elapsed_ms_since(started_at)),
             false,
             cleanup,
         )
@@ -1877,7 +1869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_benchmark_drain_counts_rows_without_writing_batches()
+    async fn stream_benchmark_drain_counts_rows_and_reports_zero_writes()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
         let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
@@ -1887,8 +1879,8 @@ mod tests {
         let report = drain_mssql_batches_for_stream_benchmark(&output_plan, batches).await?;
 
         assert_eq!(report.output_name(), "orders_output");
-        assert_eq!(report.stats().rows_written(), 3);
-        assert_eq!(report.stats().batches_written(), 2);
+        assert_eq!(report.stats().rows_written(), 0);
+        assert_eq!(report.stats().batches_written(), 0);
         assert_eq!(report.output_row_count(), RowCount::exact(3));
         assert_batch_shaping(report.batch_shaping(), PhaseStatus::completed(), 2, 3, 2, 3);
         assert_phase_timing(

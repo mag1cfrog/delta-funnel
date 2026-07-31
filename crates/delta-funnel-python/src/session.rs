@@ -2646,7 +2646,7 @@ mod tests {
     }
 
     #[test]
-    fn write_all_stream_benchmark_drains_rows_without_sql_server() -> PyResult<()> {
+    fn write_all_stream_benchmark_caches_and_drains_without_sql_server() -> PyResult<()> {
         Python::attach(|py| {
             let session = Py::new(
                 py,
@@ -2663,15 +2663,31 @@ mod tests {
                     None,
                 )?,
             )?;
-            let table = session.bind(py).call_method(
+            let shared = session.bind(py).call_method(
                 "table_from_sql",
                 ("select 1 as id union all select 2 as id",),
                 None,
             )?;
-            let spec =
-                table.call_method("to_mssql", (), Some(&mssql_kwargs(py, "stream_benchmark")?))?;
-            let outputs = PyList::new(py, [&spec])?;
+            shared.call_method("alias", ("shared_benchmark",), None)?;
+            let west = session.bind(py).call_method(
+                "table_from_sql",
+                ("select id from shared_benchmark where id = 1",),
+                None,
+            )?;
+            let east = session.bind(py).call_method(
+                "table_from_sql",
+                ("select id from shared_benchmark where id = 2",),
+                None,
+            )?;
+            let west_spec =
+                west.call_method("to_mssql", (), Some(&mssql_kwargs(py, "west_benchmark")?))?;
+            let east_spec =
+                east.call_method("to_mssql", (), Some(&mssql_kwargs(py, "east_benchmark")?))?;
+            let outputs = PyList::new(py, [&west_spec, &east_spec])?;
             let kwargs = PyDict::new(py);
+            let options = PyDict::new(py);
+            options.set_item("cache_mode", "auto")?;
+            kwargs.set_item("options", options)?;
             kwargs.set_item("execution_profile", true)?;
 
             let report = session.bind(py).call_method(
@@ -2681,35 +2697,74 @@ mod tests {
             )?;
             let report = report.cast::<PyDict>()?;
             assert!(required_item(report, "all_succeeded")?.extract::<bool>()?);
+            let cache = required_item(report, "cache")?;
+            let cache = cache.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(cache, "kind")?.extract::<String>()?,
+                "cache_aliases"
+            );
+            let aliases = required_item(cache, "aliases")?;
+            let aliases = aliases.cast::<PyList>()?;
+            assert_eq!(aliases.len(), 1);
+            let alias = aliases.get_item(0)?;
+            let alias = alias.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(alias, "alias")?.extract::<String>()?,
+                "shared_benchmark"
+            );
+            assert_eq!(
+                required_item(alias, "status")?.extract::<String>()?,
+                "materialized_and_restored"
+            );
+            assert!(!required_item(alias, "execution_profile")?.is_none());
+            let output_indexes = required_item(alias, "output_indexes")?;
+            let output_indexes = output_indexes.cast::<PyList>()?;
+            assert_eq!(output_indexes.len(), 2);
+            assert_eq!(output_indexes.get_item(0)?.extract::<u64>()?, 0);
+            assert_eq!(output_indexes.get_item(1)?.extract::<u64>()?, 1);
+
             let workflow = required_item(report, "workflow")?;
             let workflow = workflow.cast::<PyDict>()?;
             let outputs = required_item(workflow, "outputs")?;
             let outputs = outputs.cast::<PyList>()?;
-            let output = outputs.get_item(0)?;
-            let output = output.cast::<PyDict>()?;
-            assert_eq!(
-                required_item(output, "kind")?.extract::<String>()?,
-                "succeeded"
-            );
-            assert_eq!(
-                required_item(output, "output_name")?.extract::<String>()?,
-                "stream_benchmark"
-            );
-            let output_row_count = required_item(output, "output_row_count")?;
-            let output_row_count = output_row_count.cast::<PyDict>()?;
-            assert_eq!(
-                required_item(output_row_count, "value")?.extract::<u64>()?,
-                2
-            );
-            let validation = required_item(output, "validation_status")?;
-            let validation = validation.cast::<PyDict>()?;
-            assert_eq!(
-                required_item(validation, "kind")?.extract::<String>()?,
-                "skipped"
-            );
-            let output_report = required_item(output, "report")?;
-            let output_report = output_report.cast::<PyDict>()?;
-            assert!(!required_item(output_report, "execution_profile")?.is_none());
+            assert_eq!(outputs.len(), 2);
+            for (index, output_name) in ["west_benchmark", "east_benchmark"].iter().enumerate() {
+                let output = outputs.get_item(index)?;
+                let output = output.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(output, "kind")?.extract::<String>()?,
+                    "succeeded"
+                );
+                assert_eq!(
+                    required_item(output, "output_name")?.extract::<String>()?,
+                    *output_name
+                );
+                let output_row_count = required_item(output, "output_row_count")?;
+                let output_row_count = output_row_count.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(output_row_count, "value")?.extract::<u64>()?,
+                    1
+                );
+                let validation = required_item(output, "validation_status")?;
+                let validation = validation.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(validation, "kind")?.extract::<String>()?,
+                    "skipped"
+                );
+                let output_report = required_item(output, "report")?;
+                let output_report = output_report.cast::<PyDict>()?;
+                assert!(!required_item(output_report, "execution_profile")?.is_none());
+                let write_stats = required_item(output_report, "write_stats")?;
+                let write_stats = write_stats.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(write_stats, "rows_written")?.extract::<u64>()?,
+                    0
+                );
+                assert_eq!(
+                    required_item(write_stats, "batches_written")?.extract::<u64>()?,
+                    0
+                );
+            }
 
             Ok(())
         })
