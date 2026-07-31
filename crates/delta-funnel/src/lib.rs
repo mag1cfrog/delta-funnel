@@ -105,6 +105,9 @@ mod sql_server;
 mod support;
 mod table_formats;
 
+#[doc(hidden)]
+pub const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS: u64 = profiling::DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS;
+
 pub use error::{DeltaFunnelError, SqlTablePhase};
 pub use orchestrator::{
     DeltaFunnelRuntime, DeltaFunnelSession, LazyTable, LazyTableKind, MssqlOutputTarget,

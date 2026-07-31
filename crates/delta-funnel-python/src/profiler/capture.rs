@@ -852,12 +852,18 @@ mod tests {
             assert!(!config.contains("target_cpu:"));
         }
 
-        let larger = current_process_capture_config(
-            100,
-            NonZeroU64::new(500_000).expect("the larger activity span limit must be positive"),
-        )
-        .expect("the packaged streaming config must support a larger activity span limit");
-        assert!(larger.contains("size_kb: 265536"));
+        for (maximum_spans, expected_buffer_size_kb) in
+            [(1, 65_536), (500_000, 265_536), (u64::MAX, 1_048_576)]
+        {
+            let config = current_process_capture_config(
+                100,
+                NonZeroU64::new(maximum_spans).expect("the activity span limit must be positive"),
+            )
+            .expect("the packaged streaming config must support the activity span limit");
+            assert!(config.contains(&format!(
+                "size_kb: {expected_buffer_size_kb}  # semantic activity buffer"
+            )));
+        }
 
         let first = ProfileReservation::acquire().expect("the first profile must reserve capture");
         let second = ProfileReservation::acquire()

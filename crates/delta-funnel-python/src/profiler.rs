@@ -14,7 +14,7 @@ use crate::{exception::delta_funnel_py_error, session::config_py_error};
 mod capture;
 
 const RANKED_PROFILE_PHASE: &str = "ranked_profile";
-const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
+const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS: u64 = delta_funnel::DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS;
 
 pub(crate) fn execution_profile_mode(enabled: bool) -> delta_funnel::ExecutionProfileMode {
     if enabled {

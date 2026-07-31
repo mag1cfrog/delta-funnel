@@ -62,8 +62,10 @@ ranked_profile = RankedProfileConfig(
 
 Higher limits increase trace volume, memory use, and profiling overhead. Delta
 Funnel scales the semantic trace buffer up to 1 GiB with this value. Rerun the
-capture and confirm `capture_complete=true`, `semantic_complete=true`, and
-`truncation_marker_count=0` before relying on complete semantic attribution.
+capture and inspect the artifact. A healthy inspection omits the capture-health
+warning block. If the block appears, do not rely on complete semantic
+attribution until `capture_complete` and `semantic_complete` are true and
+`truncation_marker_count` is zero.
 
 Use the same configuration for a single SQL Server write:
 
