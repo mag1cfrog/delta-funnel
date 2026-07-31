@@ -4,8 +4,7 @@
 duration_ms: 720000
 
 # Periodically drain both ring buffers into the output file. Five seconds is
-# Perfetto's default long-trace period; the 64 MiB buffers retain ample headroom
-# over the measured data produced between writes by the canonical workload.
+# Perfetto's default long-trace period.
 write_into_file: true
 file_write_period_ms: 5000
 max_file_size_bytes: 536870912
@@ -15,9 +14,10 @@ max_file_size_bytes: 536870912
 # transparently decompress the resulting trace.
 compression_type: COMPRESSION_TYPE_DEFLATE
 
-# Exact semantic Track Events: 64 MiB.
+# Exact semantic Track Events. The Python capture config scales this buffer
+# when a caller raises the detailed activity span limit.
 buffers {
-  size_kb: 65536
+  size_kb: 65536  # semantic activity buffer
   fill_policy: RING_BUFFER
 }
 

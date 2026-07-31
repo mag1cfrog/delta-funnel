@@ -5,7 +5,7 @@ duration_ms: 120000
 
 # Exact semantic Track Events: 128 MiB.
 buffers {
-  size_kb: 131072
+  size_kb: 131072  # semantic activity buffer
   fill_policy: DISCARD
 }
 

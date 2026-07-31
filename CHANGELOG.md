@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- configure the per-operation ranked-profile activity span limit from Python
+- scale the ranked-profile semantic buffer for higher activity span limits
+
 ### Fixed
 
 - authorize operation-scoped diagnostics captures on Linux hosts using Yama restricted ptrace

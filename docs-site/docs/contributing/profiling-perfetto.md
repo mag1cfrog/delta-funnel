@@ -513,7 +513,9 @@ important fields are:
   values reduce native sampling confidence but do not erase exact semantics.
 - `truncation_marker_count`: the documented per-operation activity budget was
   reached. This is not buffer loss. Detailed child spans stop, while Perfetto
-  retains task-root contexts for native sample attribution.
+  retains task-root contexts for native sample attribution. Increase
+  `RankedProfileConfig.max_operator_activity_spans` and recapture when complete
+  child attribution is required.
 - `saved_file_bytes`: the factual file size.
 
 An incomplete trace may still contain useful retained intervals. Do not assume

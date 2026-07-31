@@ -35,6 +35,7 @@ class RankedProfileConfig:
     report_path: Path
     sample_hz: Literal[100, 1000]
     artifact_path: Path | None
+    max_operator_activity_spans: int
 
     def __init__(
         self,
@@ -42,6 +43,7 @@ class RankedProfileConfig:
         *,
         sample_hz: Literal[100, 1000] = 1000,
         artifact_path: str | PathLike[str] | None = None,
+        max_operator_activity_spans: int = 100_000,
     ) -> None: ...
 
 
