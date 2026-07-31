@@ -92,6 +92,15 @@ class Session:
         ranked_profile: RankedProfileConfig | None = None,
     ) -> Report: ...
 
+    def write_all_for_stream_benchmark(
+        self,
+        outputs: Sequence[MssqlOutputSpec],
+        *,
+        options: WriteAllExecutionOptions | None = None,
+        execution_profile: bool = False,
+        ranked_profile: RankedProfileConfig | None = None,
+    ) -> Report: ...
+
 
 class PendingDeltaSource:
     def alias(self, name: str, *, progress: bool | None = None) -> Table: ...

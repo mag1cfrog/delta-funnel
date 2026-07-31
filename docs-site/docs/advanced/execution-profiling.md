@@ -146,6 +146,29 @@ Skipped outputs are not attempted and also have no profile. See
 [Multiple outputs and shared caching](multiple-outputs.md) for report
 navigation.
 
+### Profile write-all without SQL Server I/O
+
+Use the stream benchmark path to execute full output queries and shared-cache
+work without opening SQL Server connections:
+
+```python
+report = session.write_all_for_stream_benchmark(
+    outputs,
+    options={"cache_mode": "auto"},
+    execution_profile=True,
+    ranked_profile=RankedProfileConfig(
+        "target/profiles/write-all-stream.profile.html",
+        sample_hz=1000,
+        artifact_path="target/profiles/write-all-stream.dfprofile",
+    ),
+)
+```
+
+The benchmark drains every output batch and retains row counts, schema checks,
+cache materialization, exact profiles, and the operation-scoped ranked profile.
+It skips SQL Server lifecycle work, target validation, bulk encoding, writes,
+and cleanup, so use regular `write_all` when measuring end-to-end behavior.
+
 ## Combine exact and ranked profiling
 
 Pass both configurations when you need returned operator metrics and ranked

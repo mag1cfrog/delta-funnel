@@ -299,6 +299,29 @@ workflow examples and
 [Inspect write-all profiles](../advanced/execution-profiling.md#inspect-write-all-profiles)
 for profile ownership.
 
+<a id="session-write-all-for-stream-benchmark"></a>
+##### `Session.write_all_for_stream_benchmark`
+
+```python
+def write_all_for_stream_benchmark(
+    self,
+    outputs: Sequence[MssqlOutputSpec],
+    *,
+    options: WriteAllExecutionOptions | None = None,
+    execution_profile: bool = False,
+    ranked_profile: RankedProfileConfig | None = None,
+) -> Report
+```
+
+Executes and fully drains several output streams without contacting SQL Server.
+The method preserves normal output planning, shared-cache work, DataFusion
+execution, row counting, and batch schema validation. It skips SQL Server
+lifecycle work, bulk writes, target validation, and cleanup. Output specs must
+still resolve valid target and connection configuration for planning.
+
+Use this method only to benchmark query and stream execution without SQL Server
+I/O. It does not predict end-to-end write performance.
+
 <a id="pending-delta-source"></a>
 #### `PendingDeltaSource`
 

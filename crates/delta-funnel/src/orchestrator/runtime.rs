@@ -314,6 +314,23 @@ impl DeltaFunnelRuntime {
             .block_on(session.write_all_with_options(requests, options))
     }
 
+    /// Blocks on the local stream-draining write-all benchmark.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`DeltaFunnelSession::write_all_for_stream_benchmark`].
+    #[doc(hidden)]
+    pub fn write_all_for_stream_benchmark(
+        &self,
+        session: &DeltaFunnelSession,
+        requests: &[OutputWritePlan],
+        options: WriteAllOptions,
+    ) -> Result<WriteAllReport, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.write_all_for_stream_benchmark(requests, options))
+    }
+
     /// Runs a multi-output write and reports its live progress to the caller.
     ///
     /// Progress describes work while it is happening. The returned report
