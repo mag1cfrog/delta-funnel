@@ -47,6 +47,24 @@ delta-funnel-perfetto report target/profiles/preview.dfprofile \
   --output target/profiles/preview-again.profile.html
 ```
 
+Capture health reports a truncation marker when an operation exceeds the
+default 100,000 detailed operator activity spans. Raise the limit for that
+workload without changing its DataFusion execution configuration:
+
+```python
+ranked_profile = RankedProfileConfig(
+    "target/profiles/full-source.profile.html",
+    sample_hz=100,
+    artifact_path="target/profiles/full-source.dfprofile",
+    max_operator_activity_spans=1_000_000,
+)
+```
+
+Higher limits increase trace volume, memory use, and profiling overhead. Delta
+Funnel scales the semantic trace buffer up to 1 GiB with this value. Rerun the
+capture and confirm `capture_complete=true`, `semantic_complete=true`, and
+`truncation_marker_count=0` before relying on complete semantic attribution.
+
 Use the same configuration for a single SQL Server write:
 
 ```python

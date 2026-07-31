@@ -6,6 +6,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs, io,
     io::{Read, Write},
+    num::NonZeroU64,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -16,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS;
 use crate::yama::authorize_tracebox;
 #[cfg(test)]
 use crate::yama::ptrace_scope_is_relational;
@@ -24,6 +26,10 @@ const TRACEBOX_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CAPTURE_ENABLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TRACEBOX_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const TRACEBOX_STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// ponytail: cap automatic sizing at 1 GiB; expose buffer sizing only if healthy
+// captures exceed it.
+const MAX_SEMANTIC_BUFFER_SIZE_KB: u64 = 1024 * 1024;
+const BYTES_PER_ADDITIONAL_ACTIVITY_SPAN: u64 = 512;
 const TRACEBOX_START_GATE: &str = concat!(
     "import os,sys;",
     "os.read(0,1) or sys.exit(70);",
@@ -73,11 +79,13 @@ impl OperationCapture {
         output: PathBuf,
         artifact_output: Option<PathBuf>,
         sample_hz: u16,
+        max_operator_activity_spans: NonZeroU64,
         tracebox: PathBuf,
     ) -> Result<Self, ProfilerFailure> {
         let reservation = ProfileReservation::acquire()?;
-        let scope =
-            delta_funnel::perfetto_profile::OperationCaptureScope::allocate().ok_or_else(|| {
+        let scope = delta_funnel::perfetto_profile::OperationCaptureScope::allocate()
+            .map(|scope| scope.with_max_operator_activity_spans(max_operator_activity_spans))
+            .ok_or_else(|| {
                 ProfilerFailure::new(
                     "capture_scope_unavailable",
                     "operation profile scope identity could not be allocated",
@@ -111,7 +119,7 @@ impl OperationCapture {
             })?;
         let trace = directory.path().join("operation.pftrace");
         let config_path = directory.path().join("capture.pbtx");
-        let config = current_process_capture_config(sample_hz)?;
+        let config = current_process_capture_config(sample_hz, max_operator_activity_spans)?;
         fs::write(&config_path, config).map_err(|_| {
             ProfilerFailure::new(
                 "capture_config_failed",
@@ -317,17 +325,41 @@ fn prepare_output_path(output: &Path) -> Result<PathBuf, ProfilerFailure> {
     Ok(output)
 }
 
-fn current_process_capture_config(sample_hz: u16) -> Result<String, ProfilerFailure> {
-    let (template, read_period_ms, ring_buffer_pages, unwind_mode) = match sample_hz {
-        100 => (STREAMING_CAPTURE_CONFIG, 100, 256, "UNWIND_DWARF"),
-        1000 => (SHORT_CAPTURE_CONFIG, 10, 512, "UNWIND_KERNEL_FRAME_POINTER"),
-        _ => {
-            return Err(ProfilerFailure::new(
-                "invalid_sample_frequency",
-                "profile sample frequency must be 100 or 1000 Hz",
-            ));
-        }
-    };
+fn current_process_capture_config(
+    sample_hz: u16,
+    max_operator_activity_spans: NonZeroU64,
+) -> Result<String, ProfilerFailure> {
+    let (template, read_period_ms, ring_buffer_pages, unwind_mode, base_semantic_buffer_size_kb) =
+        match sample_hz {
+            100 => (
+                STREAMING_CAPTURE_CONFIG,
+                100,
+                256,
+                "UNWIND_DWARF",
+                65_536_u64,
+            ),
+            1000 => (
+                SHORT_CAPTURE_CONFIG,
+                10,
+                512,
+                "UNWIND_KERNEL_FRAME_POINTER",
+                131_072_u64,
+            ),
+            _ => {
+                return Err(ProfilerFailure::new(
+                    "invalid_sample_frequency",
+                    "profile sample frequency must be 100 or 1000 Hz",
+                ));
+            }
+        };
+    let additional_buffer_size_kb = max_operator_activity_spans
+        .get()
+        .saturating_sub(DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS)
+        .saturating_mul(BYTES_PER_ADDITIONAL_ACTIVITY_SPAN)
+        .div_ceil(1024);
+    let semantic_buffer_size_kb = base_semantic_buffer_size_kb
+        .saturating_add(additional_buffer_size_kb)
+        .min(MAX_SEMANTIC_BUFFER_SIZE_KB);
     [
         ("frequency: 100", format!("frequency: {sample_hz}")),
         (
@@ -345,6 +377,14 @@ fn current_process_capture_config(sample_hz: u16) -> Result<String, ProfilerFail
         (
             "target_cmdline: \"delta-funnel-perfetto-preview\"",
             format!("target_pid: {}", std::process::id()),
+        ),
+        (
+            if sample_hz == 100 {
+                "size_kb: 65536  # semantic activity buffer"
+            } else {
+                "size_kb: 131072  # semantic activity buffer"
+            },
+            format!("size_kb: {semantic_buffer_size_kb}  # semantic activity buffer"),
         ),
     ]
     .into_iter()
@@ -796,8 +836,12 @@ mod tests {
             (100, 100, 256, "UNWIND_DWARF"),
             (1000, 10, 512, "UNWIND_KERNEL_FRAME_POINTER"),
         ] {
-            let config = current_process_capture_config(sample_hz)
-                .expect("the packaged config must support operation capture");
+            let config = current_process_capture_config(
+                sample_hz,
+                NonZeroU64::new(DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS)
+                    .expect("the default activity span limit must be positive"),
+            )
+            .expect("the packaged config must support operation capture");
             assert!(config.contains(&format!("frequency: {sample_hz}")));
             assert!(config.contains(&format!("ring_buffer_read_period_ms: {read_period_ms}")));
             assert!(config.contains(&format!("ring_buffer_pages: {ring_buffer_pages}")));
@@ -807,6 +851,13 @@ mod tests {
             assert_eq!(config.contains("write_into_file: true"), sample_hz == 100);
             assert!(!config.contains("target_cpu:"));
         }
+
+        let larger = current_process_capture_config(
+            100,
+            NonZeroU64::new(500_000).expect("the larger activity span limit must be positive"),
+        )
+        .expect("the packaged streaming config must support a larger activity span limit");
+        assert!(larger.contains("size_kb: 265536"));
 
         let first = ProfileReservation::acquire().expect("the first profile must reserve capture");
         let second = ProfileReservation::acquire()

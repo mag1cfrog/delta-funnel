@@ -3,6 +3,7 @@
 //! This module does not install a tracing subscriber or manage the external capture process.
 
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{OnceLock, atomic::AtomicU64};
 use std::time::{Duration, Instant};
@@ -19,7 +20,9 @@ use perfetto_sdk::{
     track_event_begin, track_event_categories, track_event_category_enabled, track_event_end,
 };
 
-use crate::profiling::{allocate_id, in_operation_capture_scope};
+use crate::profiling::{
+    DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS, allocate_id, in_operation_capture_scope,
+};
 use crate::query_engine::datafusion::initialize_datafusion_task_tracing;
 
 mod profile_layer;
@@ -271,12 +274,18 @@ const DELTA_SCAN_OUTPUT_SIBLING_ORDER_BASE: u64 = 1_000_000;
 const PRODUCER_SHMEM_SIZE_HINT_KB: u32 = 32 * 1024;
 static PERFETTO_INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
 static NEXT_OPERATION_CAPTURE_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS_NON_ZERO: NonZeroU64 =
+    match NonZeroU64::new(DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS) {
+        Some(maximum_spans) => maximum_spans,
+        None => panic!("the default operator activity span limit must be positive"),
+    };
 
 /// Unique correlation scope for one host-managed operation capture.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct OperationCaptureScope {
     id: u64,
+    max_operator_activity_spans: NonZeroU64,
 }
 
 impl OperationCaptureScope {
@@ -284,7 +293,16 @@ impl OperationCaptureScope {
     pub fn allocate() -> Option<Self> {
         allocate_id(&NEXT_OPERATION_CAPTURE_SCOPE_ID)
             .filter(|id| i64::try_from(*id).is_ok())
-            .map(|id| Self { id })
+            .map(|id| Self {
+                id,
+                max_operator_activity_spans: DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS_NON_ZERO,
+            })
+    }
+
+    /// Overrides the detailed operator activity span limit for this capture.
+    pub fn with_max_operator_activity_spans(mut self, maximum_spans: NonZeroU64) -> Self {
+        self.max_operator_activity_spans = maximum_spans;
+        self
     }
 
     /// Runs the operation entry point inside this capture scope.
@@ -300,7 +318,7 @@ impl OperationCaptureScope {
             }
         );
         let _context = OperationCaptureContext;
-        in_operation_capture_scope(self.id, operation)
+        in_operation_capture_scope(self.id, self.max_operator_activity_spans.get(), operation)
     }
 }
 

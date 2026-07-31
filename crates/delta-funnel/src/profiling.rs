@@ -19,37 +19,49 @@ pub(crate) const OBJECT_STORE_TRANSPORT_CONTEXT_NAME: &str =
     "DataFusion object store transport context";
 #[cfg(feature = "perfetto-profile")]
 pub(crate) const OBJECT_STORE_TRANSPORT_DISPLAY_NAME: &str = "Object store transport";
-const MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
+pub(crate) const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+struct OperationCaptureSettings {
+    id: u64,
+    max_operator_activity_spans: u64,
+}
+
 thread_local! {
-    static OPERATION_CAPTURE_SCOPE_ID: Cell<Option<u64>> = const { Cell::new(None) };
+    static OPERATION_CAPTURE_SETTINGS: Cell<Option<OperationCaptureSettings>> =
+        const { Cell::new(None) };
 }
 
 #[cfg(feature = "perfetto-profile")]
 pub(crate) fn in_operation_capture_scope<T>(
     capture_scope_id: u64,
+    max_operator_activity_spans: u64,
     operation: impl FnOnce() -> T,
 ) -> T {
     debug_assert_ne!(capture_scope_id, 0);
-    let previous =
-        OPERATION_CAPTURE_SCOPE_ID.with(|current| current.replace(Some(capture_scope_id)));
+    debug_assert_ne!(max_operator_activity_spans, 0);
+    let settings = OperationCaptureSettings {
+        id: capture_scope_id,
+        max_operator_activity_spans,
+    };
+    let previous = OPERATION_CAPTURE_SETTINGS.with(|current| current.replace(Some(settings)));
     let _reset = OperationCaptureScopeReset(previous);
     operation()
 }
 
-fn current_operation_capture_scope_id() -> Option<u64> {
-    OPERATION_CAPTURE_SCOPE_ID.get()
+fn current_operation_capture_settings() -> Option<OperationCaptureSettings> {
+    OPERATION_CAPTURE_SETTINGS.get()
 }
 
 #[cfg(feature = "perfetto-profile")]
-struct OperationCaptureScopeReset(Option<u64>);
+struct OperationCaptureScopeReset(Option<OperationCaptureSettings>);
 
 #[cfg(feature = "perfetto-profile")]
 impl Drop for OperationCaptureScopeReset {
     fn drop(&mut self) {
-        OPERATION_CAPTURE_SCOPE_ID.set(self.0);
+        OPERATION_CAPTURE_SETTINGS.set(self.0);
     }
 }
 
@@ -107,6 +119,7 @@ impl OperationTraceContext {
             return None;
         }
         let operation_id = allocate_id(&NEXT_OPERATION_ID)?;
+        let capture = current_operation_capture_settings();
         Some(Self {
             operation_id,
             kind,
@@ -114,10 +127,12 @@ impl OperationTraceContext {
             process_trace: Arc::new(ProcessOperationTrace::new(
                 kind,
                 operation_id,
-                current_operation_capture_scope_id(),
+                capture.map(|capture| capture.id),
             )),
             operator_activity_budget: Arc::new(OperatorActivityBudget::new(
-                MAX_OPERATOR_ACTIVITY_SPANS,
+                capture.map_or(DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS, |capture| {
+                    capture.max_operator_activity_spans
+                }),
             )),
         })
     }
@@ -126,7 +141,7 @@ impl OperationTraceContext {
     pub(crate) fn start_for_test(process_spans_enabled: bool) -> Option<Self> {
         Self::start_for_test_with_operator_activity_limit(
             process_spans_enabled,
-            MAX_OPERATOR_ACTIVITY_SPANS,
+            DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS,
         )
     }
 
@@ -532,5 +547,32 @@ mod tests {
                 .start("Disabled stage", "delta_funnel.test")
                 .is_none()
         );
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[test]
+    fn operation_capture_scope_applies_operator_activity_limit() {
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let operation = in_operation_capture_scope(42, 2, || {
+            OperationTraceContext::start(OperationTraceKind::Preview)
+                .expect("profile tracing should create an operation")
+        });
+
+        assert!(operation.reserve_operator_activity().is_ok());
+        assert!(operation.reserve_operator_activity().is_ok());
+        let limit = operation
+            .reserve_operator_activity()
+            .expect_err("the configured activity limit must be enforced");
+        assert_eq!(limit.maximum_spans, 2);
+        operation.record_process_result("ok");
+        drop(operation);
+
+        let root = capture
+            .captured()
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "Delta Funnel preview")
+            .expect("the operation root should be captured");
+        assert_eq!(root.fields["capture_scope_id"], "42");
     }
 }

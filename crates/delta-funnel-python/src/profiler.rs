@@ -1,6 +1,9 @@
 //! Python profiling configuration and ranked-profile lifecycle entry points.
 
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroU64,
+    path::{Path, PathBuf},
+};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool};
@@ -11,6 +14,7 @@ use crate::{exception::delta_funnel_py_error, session::config_py_error};
 mod capture;
 
 const RANKED_PROFILE_PHASE: &str = "ranked_profile";
+const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS: u64 = 100_000;
 
 pub(crate) fn execution_profile_mode(enabled: bool) -> delta_funnel::ExecutionProfileMode {
     if enabled {
@@ -28,6 +32,7 @@ pub(crate) struct PyRankedProfileConfig {
     report_path: PathBuf,
     sample_hz: u16,
     artifact_path: Option<PathBuf>,
+    max_operator_activity_spans: NonZeroU64,
 }
 
 impl PyRankedProfileConfig {
@@ -45,17 +50,29 @@ impl PyRankedProfileConfig {
     fn artifact_path(&self) -> Option<&Path> {
         self.artifact_path.as_deref()
     }
+
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    const fn maximum_operator_activity_spans(&self) -> NonZeroU64 {
+        self.max_operator_activity_spans
+    }
 }
 
 #[pymethods]
 impl PyRankedProfileConfig {
     #[new]
-    #[pyo3(signature = (report_path, *, sample_hz=1000, artifact_path=None))]
+    #[pyo3(signature = (
+        report_path,
+        *,
+        sample_hz=1000,
+        artifact_path=None,
+        max_operator_activity_spans=DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS,
+    ))]
     fn new(
         py: Python<'_>,
         report_path: PathBuf,
         #[pyo3(from_py_with = parse_sample_hz)] sample_hz: u16,
         artifact_path: Option<PathBuf>,
+        #[pyo3(from_py_with = parse_max_operator_activity_spans)] max_operator_activity_spans: u64,
     ) -> PyResult<Self> {
         if report_path.file_name().is_none() {
             return Err(config_py_error(
@@ -74,10 +91,19 @@ impl PyRankedProfileConfig {
                 "`artifact_path` must name a file".to_owned(),
             ));
         }
+        let max_operator_activity_spans =
+            NonZeroU64::new(max_operator_activity_spans).ok_or_else(|| {
+                config_py_error(
+                    py,
+                    "invalid_option_value",
+                    "`max_operator_activity_spans` must be a positive integer".to_owned(),
+                )
+            })?;
         Ok(Self {
             report_path,
             sample_hz,
             artifact_path,
+            max_operator_activity_spans,
         })
     }
 
@@ -96,14 +122,19 @@ impl PyRankedProfileConfig {
         self.artifact_path.as_deref()
     }
 
+    #[getter]
+    const fn max_operator_activity_spans(&self) -> u64 {
+        self.max_operator_activity_spans.get()
+    }
+
     fn __repr__(&self) -> String {
         let artifact_path = self
             .artifact_path
             .as_ref()
             .map_or_else(|| "None".to_owned(), |path| format!("{path:?}"));
         format!(
-            "deltafunnel.RankedProfileConfig(report_path={:?}, sample_hz={}, artifact_path={})",
-            self.report_path, self.sample_hz, artifact_path
+            "deltafunnel.RankedProfileConfig(report_path={:?}, sample_hz={}, artifact_path={}, max_operator_activity_spans={})",
+            self.report_path, self.sample_hz, artifact_path, self.max_operator_activity_spans,
         )
     }
 }
@@ -155,9 +186,16 @@ pub(crate) fn start_ranked_profile(
         validate_output_paths(py, &output, artifact_output.as_deref())?;
         crate::perfetto_diagnostics::ensure_perfetto_subscriber(py)?;
         let sample_hz = config.sampling_frequency();
+        let max_operator_activity_spans = config.maximum_operator_activity_spans();
         let tracebox = tracebox_launcher(py)?;
         py.detach(move || {
-            capture::OperationCapture::start(output, artifact_output, sample_hz, tracebox)
+            capture::OperationCapture::start(
+                output,
+                artifact_output,
+                sample_hz,
+                max_operator_activity_spans,
+                tracebox,
+            )
         })
         .map(|capture| Some(RankedProfileCapture { capture }))
         .map_err(|error| ranked_profile_failure_py_error(py, error))
@@ -287,6 +325,21 @@ fn parse_sample_hz(value: &Bound<'_, PyAny>) -> PyResult<u16> {
     }
 }
 
+fn parse_max_operator_activity_spans(value: &Bound<'_, PyAny>) -> PyResult<u64> {
+    let maximum_spans = if value.is_instance_of::<PyBool>() {
+        None
+    } else {
+        value.extract::<u64>().ok().filter(|maximum| *maximum > 0)
+    };
+    maximum_spans.ok_or_else(|| {
+        config_py_error(
+            value.py(),
+            "invalid_option_value",
+            "`max_operator_activity_spans` must be a positive integer".to_owned(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -298,6 +351,13 @@ mod tests {
     use super::*;
     use crate::deltafunnel;
 
+    #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
+    const DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS_NON_ZERO: NonZeroU64 =
+        match NonZeroU64::new(DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS) {
+            Some(maximum_spans) => maximum_spans,
+            None => panic!("the default operator activity span limit must be positive"),
+        };
+
     #[test]
     fn ranked_config_and_exact_boolean_expose_distinct_python_contracts() -> PyResult<()> {
         let stub = include_str!("../deltafunnel.pyi");
@@ -307,6 +367,7 @@ mod tests {
         assert!(stub.contains("report_path: str | PathLike[str]"));
         assert!(stub.contains("sample_hz: Literal[100, 1000] = 1000"));
         assert!(stub.contains("artifact_path: str | PathLike[str] | None = None"));
+        assert!(stub.contains("max_operator_activity_spans: int = 100_000"));
         assert_eq!(
             execution_profile_mode(false),
             delta_funnel::ExecutionProfileMode::Disabled
@@ -331,13 +392,19 @@ mod tests {
             assert_eq!(default.getattr("sample_hz")?.extract::<u16>()?, 1000);
             assert_eq!(
                 default
+                    .getattr("max_operator_activity_spans")?
+                    .extract::<u64>()?,
+                DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS
+            );
+            assert_eq!(
+                default
                     .getattr("artifact_path")?
                     .extract::<Option<PathBuf>>()?,
                 None
             );
             assert_eq!(
                 default.repr()?.to_str()?,
-                "deltafunnel.RankedProfileConfig(report_path=\"query.profile.html\", sample_hz=1000, artifact_path=None)"
+                "deltafunnel.RankedProfileConfig(report_path=\"query.profile.html\", sample_hz=1000, artifact_path=None, max_operator_activity_spans=100000)"
             );
             assert!(
                 default
@@ -353,12 +420,19 @@ mod tests {
             let kwargs = PyDict::new(py);
             kwargs.set_item("sample_hz", 100)?;
             kwargs.set_item("artifact_path", "lower-volume.dfprofile")?;
+            kwargs.set_item("max_operator_activity_spans", 500_000)?;
             let lower_volume = ranked_profile.call((pathlib_path,), Some(&kwargs))?;
             assert_eq!(
                 lower_volume.getattr("report_path")?.extract::<PathBuf>()?,
                 PathBuf::from("lower-volume.profile.html")
             );
             assert_eq!(lower_volume.getattr("sample_hz")?.extract::<u16>()?, 100);
+            assert_eq!(
+                lower_volume
+                    .getattr("max_operator_activity_spans")?
+                    .extract::<u64>()?,
+                500_000
+            );
             assert_eq!(
                 lower_volume
                     .getattr("artifact_path")?
@@ -378,6 +452,26 @@ mod tests {
                 let error = ranked_profile
                     .call(("query.profile.html",), Some(&kwargs))
                     .expect_err("invalid sample frequency must be rejected");
+                let value = error.value(py);
+                assert_eq!(value.getattr("phase")?.extract::<String>()?, "config");
+                assert_eq!(
+                    value.getattr("kind")?.extract::<String>()?,
+                    "invalid_option_value"
+                );
+            }
+
+            let invalid_span_limits = [
+                0_i32.into_bound_py_any(py)?,
+                true.into_bound_py_any(py)?,
+                (-1_i32).into_bound_py_any(py)?,
+                "100000".into_bound_py_any(py)?,
+            ];
+            for invalid in invalid_span_limits {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("max_operator_activity_spans", invalid)?;
+                let error = ranked_profile
+                    .call(("query.profile.html",), Some(&kwargs))
+                    .expect_err("invalid operator activity span limit must be rejected");
                 let value = error.value(py);
                 assert_eq!(value.getattr("phase")?.extract::<String>()?, "config");
                 assert_eq!(
@@ -420,6 +514,7 @@ mod tests {
                 report_path: PathBuf::from("profile.html"),
                 sample_hz: 1_000,
                 artifact_path: Some(PathBuf::from("./profile.html")),
+                max_operator_activity_spans: DEFAULT_MAX_OPERATOR_ACTIVITY_SPANS_NON_ZERO,
             };
             let output = resolve_output_path(py, config.report_path())?;
             let artifact_output = config

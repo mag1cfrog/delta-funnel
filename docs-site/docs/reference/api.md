@@ -125,6 +125,7 @@ class RankedProfileConfig:
     report_path: Path
     sample_hz: Literal[100, 1000]
     artifact_path: Path | None
+    max_operator_activity_spans: int
 
     def __init__(
         self,
@@ -132,6 +133,7 @@ class RankedProfileConfig:
         *,
         sample_hz: Literal[100, 1000] = 1000,
         artifact_path: str | PathLike[str] | None = None,
+        max_operator_activity_spans: int = 100_000,
     ) -> None
 ```
 
@@ -139,7 +141,9 @@ Configures one operation-scoped ranked HTML report. Set `artifact_path` to
 retain the same model as a `.dfprofile` file for later HTML or terminal
 inspection. The configuration is immutable. Delta Funnel creates missing
 parent directories. Use 1000 Hz for short operations and 100 Hz for longer
-captures.
+captures. `max_operator_activity_spans` is the positive per-operation limit
+for detailed DataFusion activity spans. Increase it from its 100,000 default
+only when capture health reports an activity truncation marker.
 
 Only one ranked profile can be active in a process. The type is importable from
 every wheel, but using it requires a diagnostics-enabled Linux build. It does
