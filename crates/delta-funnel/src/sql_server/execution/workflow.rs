@@ -729,6 +729,10 @@ pub(crate) struct MssqlStreamBenchmarkOutputWriter;
 
 #[async_trait]
 pub(crate) trait MssqlWorkflowOutputWriter: Send {
+    fn reports_sql_write_phase(&self) -> bool {
+        true
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the workflow writer receives one planned write plus profiling state"
@@ -777,6 +781,10 @@ impl MssqlWorkflowOutputWriter for MssqlWorkflowSinkWriter {
 
 #[async_trait]
 impl MssqlWorkflowOutputWriter for MssqlStreamBenchmarkOutputWriter {
+    fn reports_sql_write_phase(&self) -> bool {
+        false
+    }
+
     async fn write_output(
         &mut self,
         output_schema: SchemaRef,
@@ -955,6 +963,7 @@ where
     } = query_execution;
     planned_phase_timings.extend(query_phase_timings);
 
+    let reports_sql_write_phase = writer.reports_sql_write_phase();
     let write_timer = PhaseTimer::start(SQL_WRITE_PHASE);
     let write_result = writer
         .write_output(
@@ -974,6 +983,13 @@ where
         Some(attach_profile) => attach_profile(write_result),
         None => write_result,
     };
+    let write_timing = if !reports_sql_write_phase {
+        PhaseTimingReport::not_started(SQL_WRITE_PHASE, ReportReasonCode::NotExecuted)
+    } else if write_result.is_ok() {
+        write_timer.completed()
+    } else {
+        write_timer.failed()
+    };
     match &write_result {
         Ok(_) => complete_output_stage(output_stage),
         Err(_) => fail_output_stage(output_stage),
@@ -983,7 +999,7 @@ where
             let report = report.with_phase_timings(output_write_phase_timings(
                 planned_phase_timings,
                 stream_setup_timing,
-                write_timer.completed(),
+                write_timing,
             ));
             MssqlOutputWriteStatus::Succeeded(report)
         }
@@ -994,7 +1010,7 @@ where
                 output_write_failure_phase_timings(
                     planned_phase_timings,
                     stream_setup_timing,
-                    write_timer.failed(),
+                    write_timing,
                 ),
             );
             MssqlOutputWriteStatus::Failed(failure)

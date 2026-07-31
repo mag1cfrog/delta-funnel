@@ -327,6 +327,14 @@ with tempfile.TemporaryDirectory() as artifact_temp_dir:
                 ranked_profile=ranked_profile,
             ),
         ),
+        (
+            "write_all_for_stream_benchmark",
+            lambda: session.write_all_for_stream_benchmark(
+                [],
+                execution_profile=True,
+                ranked_profile=ranked_profile,
+            ),
+        ),
     ]:
         try:
             operation()

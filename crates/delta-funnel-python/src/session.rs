@@ -2764,6 +2764,31 @@ mod tests {
                     required_item(write_stats, "batches_written")?.extract::<u64>()?,
                     0
                 );
+                assert_eq!(
+                    required_item(write_stats, "elapsed_ms")?.extract::<u64>()?,
+                    0
+                );
+                let phase_timings = required_item(output_report, "phase_timings")?;
+                let phase_timings = phase_timings.cast::<PyList>()?;
+                let mut sql_write_status = None;
+                let mut finalize_status = None;
+                for timing in phase_timings.iter() {
+                    let timing = timing.cast::<PyDict>()?;
+                    let phase_name = required_item(timing, "phase_name")?.extract::<String>()?;
+                    if phase_name == "sql_write" || phase_name == "finalize" {
+                        let status = required_item(timing, "status")?;
+                        let status = status.cast::<PyDict>()?;
+                        let status = required_item(status, "kind")?.extract::<String>()?;
+                        assert!(required_item(timing, "elapsed_micros")?.is_none());
+                        if phase_name == "sql_write" {
+                            sql_write_status = Some(status);
+                        } else {
+                            finalize_status = Some(status);
+                        }
+                    }
+                }
+                assert_eq!(sql_write_status.as_deref(), Some("not_started"));
+                assert_eq!(finalize_status.as_deref(), Some("not_started"));
             }
 
             Ok(())
