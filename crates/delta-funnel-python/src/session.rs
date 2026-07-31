@@ -164,25 +164,16 @@ impl PySession {
         execution_profile: bool,
         ranked_profile: Option<PyRef<'_, PyRankedProfileConfig>>,
     ) -> PyResult<Py<PyAny>> {
-        for output in &outputs {
-            if !output.belongs_to_session(py, &slf) {
-                return Err(config_py_error(
-                    py,
-                    "output_session_mismatch",
-                    "all output specs must belong to this Session".to_owned(),
-                ));
-            }
-        }
-        let requests = outputs
-            .iter()
-            .map(|output| {
-                output.write_plan(if dry_run == Some(true) {
-                    delta_funnel::RunMode::DryRun
-                } else {
-                    delta_funnel::RunMode::Execute
-                })
-            })
-            .collect::<Vec<_>>();
+        let requests = write_all_requests(
+            py,
+            &slf,
+            &outputs,
+            if dry_run == Some(true) {
+                delta_funnel::RunMode::DryRun
+            } else {
+                delta_funnel::RunMode::Execute
+            },
+        )?;
 
         if dry_run == Some(true) {
             if execution_profile || ranked_profile.is_some() {
@@ -238,6 +229,71 @@ impl PySession {
             (Ok((report, _)), Ok(_)) => Ok(report),
         }
     }
+
+    /// Executes and drains multiple output streams without contacting SQL Server.
+    ///
+    /// This benchmark path preserves output planning, shared-cache work,
+    /// DataFusion execution, batch polling, row counting, and schema validation.
+    /// It skips SQL Server lifecycle work, bulk writes, target validation, and
+    /// cleanup. Pass `execution_profile=True` for exact output and cache-alias
+    /// profiles, or `ranked_profile=RankedProfileConfig(...)` for one sampled
+    /// native CPU report covering the complete operation.
+    #[pyo3(signature = (outputs, *, options=None, execution_profile=false, ranked_profile=None))]
+    fn write_all_for_stream_benchmark(
+        slf: Py<Self>,
+        py: Python<'_>,
+        outputs: Vec<PyRef<'_, PyMssqlOutputSpec>>,
+        options: Option<&Bound<'_, PyDict>>,
+        execution_profile: bool,
+        ranked_profile: Option<PyRef<'_, PyRankedProfileConfig>>,
+    ) -> PyResult<Py<PyAny>> {
+        let requests = write_all_requests(py, &slf, &outputs, delta_funnel::RunMode::Execute)?;
+        let options = parse_write_all_options(py, options)?
+            .with_execution_profile_mode(execution_profile_mode(execution_profile));
+        let ranked_capture = start_ranked_profile(py, ranked_profile.as_deref())?;
+        drop(ranked_profile);
+        let write = in_ranked_profile_scope(ranked_capture.as_ref(), || {
+            slf.borrow(py)
+                .execute_write_all_for_stream_benchmark(py, &requests, options)
+        });
+        let ranked_result = ranked_capture
+            .map(|ranked_capture| ranked_capture.finish(py))
+            .transpose();
+        match (write, ranked_result) {
+            (Err(error), _) => Err(error),
+            (Ok((report, status)), Err(error)) => {
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_status", status);
+                let _ = error
+                    .value(py)
+                    .setattr("deltafunnel_operation_report", report.bind(py));
+                Err(error)
+            }
+            (Ok((report, _)), Ok(_)) => Ok(report),
+        }
+    }
+}
+
+fn write_all_requests(
+    py: Python<'_>,
+    session: &Py<PySession>,
+    outputs: &[PyRef<'_, PyMssqlOutputSpec>],
+    run_mode: delta_funnel::RunMode,
+) -> PyResult<Vec<delta_funnel::OutputWritePlan>> {
+    for output in outputs {
+        if !output.belongs_to_session(py, session) {
+            return Err(config_py_error(
+                py,
+                "output_session_mismatch",
+                "all output specs must belong to this Session".to_owned(),
+            ));
+        }
+    }
+    Ok(outputs
+        .iter()
+        .map(|output| output.write_plan(run_mode))
+        .collect())
 }
 
 impl PySession {
@@ -424,6 +480,30 @@ impl PySession {
             progress.finish(py, report.as_ref().err(), operation_report.as_ref())?;
         }
         let report = report?;
+        let status = if report.all_succeeded() {
+            "completed"
+        } else {
+            "completed_with_failures"
+        };
+        let report_value = report.to_json_value();
+        Ok((json_value_to_py(py, &report_value)?, status))
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the GIL-detached call carries the core error until Python conversion resumes"
+    )]
+    fn execute_write_all_for_stream_benchmark(
+        &self,
+        py: Python<'_>,
+        requests: &[delta_funnel::OutputWritePlan],
+        options: delta_funnel::WriteAllOptions,
+    ) -> PyResult<(Py<PyAny>, &'static str)> {
+        let report = py.detach(|| {
+            self.runtime
+                .write_all_for_stream_benchmark(&self.inner, requests, options)
+        });
+        let report = report.map_err(|error| rust_error_to_py(py, error))?;
         let status = if report.all_succeeded() {
             "completed"
         } else {
@@ -1266,6 +1346,21 @@ mod tests {
         assert!(!signature.contains("trace_path:"));
         assert!(!signature.contains("profiler:"));
         assert!(!signature.contains("options: Options"));
+    }
+
+    #[test]
+    fn pyi_stub_exposes_stream_benchmark_profiling_options() {
+        let stub = include_str!("../deltafunnel.pyi");
+        let signature = stub
+            .split_once("def write_all_for_stream_benchmark(")
+            .and_then(|(_, tail)| tail.split_once(") -> Report:"))
+            .map_or("", |(signature, _)| signature);
+
+        assert!(signature.contains("options: WriteAllExecutionOptions | None = None"));
+        assert!(signature.contains("execution_profile: bool = False"));
+        assert!(signature.contains("ranked_profile: RankedProfileConfig | None = None"));
+        assert!(!signature.contains("dry_run:"));
+        assert!(!signature.contains("progress:"));
     }
 
     #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
@@ -2545,6 +2640,156 @@ mod tests {
                 "dry_run"
             );
             assert!(!phase_timings.is_empty());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn write_all_stream_benchmark_caches_and_drains_without_sql_server() -> PyResult<()> {
+        Python::attach(|py| {
+            let session = Py::new(
+                py,
+                PySession::new(
+                    py,
+                    Some(
+                        "server=tcp:benchmark.invalid;database=benchmark;user=benchmark;password=benchmark"
+                            .to_owned(),
+                    ),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+            )?;
+            let shared = session.bind(py).call_method(
+                "table_from_sql",
+                ("select 1 as id union all select 2 as id",),
+                None,
+            )?;
+            shared.call_method("alias", ("shared_benchmark",), None)?;
+            let west = session.bind(py).call_method(
+                "table_from_sql",
+                ("select id from shared_benchmark where id = 1",),
+                None,
+            )?;
+            let east = session.bind(py).call_method(
+                "table_from_sql",
+                ("select id from shared_benchmark where id = 2",),
+                None,
+            )?;
+            let west_spec =
+                west.call_method("to_mssql", (), Some(&mssql_kwargs(py, "west_benchmark")?))?;
+            let east_spec =
+                east.call_method("to_mssql", (), Some(&mssql_kwargs(py, "east_benchmark")?))?;
+            let outputs = PyList::new(py, [&west_spec, &east_spec])?;
+            let kwargs = PyDict::new(py);
+            let options = PyDict::new(py);
+            options.set_item("cache_mode", "auto")?;
+            kwargs.set_item("options", options)?;
+            kwargs.set_item("execution_profile", true)?;
+
+            let report = session.bind(py).call_method(
+                "write_all_for_stream_benchmark",
+                (outputs,),
+                Some(&kwargs),
+            )?;
+            let report = report.cast::<PyDict>()?;
+            assert!(required_item(report, "all_succeeded")?.extract::<bool>()?);
+            let cache = required_item(report, "cache")?;
+            let cache = cache.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(cache, "kind")?.extract::<String>()?,
+                "cache_aliases"
+            );
+            let aliases = required_item(cache, "aliases")?;
+            let aliases = aliases.cast::<PyList>()?;
+            assert_eq!(aliases.len(), 1);
+            let alias = aliases.get_item(0)?;
+            let alias = alias.cast::<PyDict>()?;
+            assert_eq!(
+                required_item(alias, "alias")?.extract::<String>()?,
+                "shared_benchmark"
+            );
+            assert_eq!(
+                required_item(alias, "status")?.extract::<String>()?,
+                "materialized_and_restored"
+            );
+            assert!(!required_item(alias, "execution_profile")?.is_none());
+            let output_indexes = required_item(alias, "output_indexes")?;
+            let output_indexes = output_indexes.cast::<PyList>()?;
+            assert_eq!(output_indexes.len(), 2);
+            assert_eq!(output_indexes.get_item(0)?.extract::<u64>()?, 0);
+            assert_eq!(output_indexes.get_item(1)?.extract::<u64>()?, 1);
+
+            let workflow = required_item(report, "workflow")?;
+            let workflow = workflow.cast::<PyDict>()?;
+            let outputs = required_item(workflow, "outputs")?;
+            let outputs = outputs.cast::<PyList>()?;
+            assert_eq!(outputs.len(), 2);
+            for (index, output_name) in ["west_benchmark", "east_benchmark"].iter().enumerate() {
+                let output = outputs.get_item(index)?;
+                let output = output.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(output, "kind")?.extract::<String>()?,
+                    "succeeded"
+                );
+                assert_eq!(
+                    required_item(output, "output_name")?.extract::<String>()?,
+                    *output_name
+                );
+                let output_row_count = required_item(output, "output_row_count")?;
+                let output_row_count = output_row_count.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(output_row_count, "value")?.extract::<u64>()?,
+                    1
+                );
+                let validation = required_item(output, "validation_status")?;
+                let validation = validation.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(validation, "kind")?.extract::<String>()?,
+                    "skipped"
+                );
+                let output_report = required_item(output, "report")?;
+                let output_report = output_report.cast::<PyDict>()?;
+                assert!(!required_item(output_report, "execution_profile")?.is_none());
+                let write_stats = required_item(output_report, "write_stats")?;
+                let write_stats = write_stats.cast::<PyDict>()?;
+                assert_eq!(
+                    required_item(write_stats, "rows_written")?.extract::<u64>()?,
+                    0
+                );
+                assert_eq!(
+                    required_item(write_stats, "batches_written")?.extract::<u64>()?,
+                    0
+                );
+                assert_eq!(
+                    required_item(write_stats, "elapsed_ms")?.extract::<u64>()?,
+                    0
+                );
+                let phase_timings = required_item(output_report, "phase_timings")?;
+                let phase_timings = phase_timings.cast::<PyList>()?;
+                let mut sql_write_status = None;
+                let mut finalize_status = None;
+                for timing in phase_timings.iter() {
+                    let timing = timing.cast::<PyDict>()?;
+                    let phase_name = required_item(timing, "phase_name")?.extract::<String>()?;
+                    if phase_name == "sql_write" || phase_name == "finalize" {
+                        let status = required_item(timing, "status")?;
+                        let status = status.cast::<PyDict>()?;
+                        let status = required_item(status, "kind")?.extract::<String>()?;
+                        assert!(required_item(timing, "elapsed_micros")?.is_none());
+                        if phase_name == "sql_write" {
+                            sql_write_status = Some(status);
+                        } else {
+                            finalize_status = Some(status);
+                        }
+                    }
+                }
+                assert_eq!(sql_write_status.as_deref(), Some("not_started"));
+                assert_eq!(finalize_status.as_deref(), Some("not_started"));
+            }
 
             Ok(())
         })

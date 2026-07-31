@@ -15,6 +15,7 @@ examples, start with the [Python quickstart](../python-api-walkthrough.md) or
 | Write one SQL Server output | [`Table.write_to_mssql`](#table-write-to-mssql) |
 | Define one of several outputs | [`Table.to_mssql`](#table-to-mssql) |
 | Write several outputs | [`Session.write_all`](#session-write-all) |
+| Profile several outputs without SQL Server I/O | [`Session.write_all_for_stream_benchmark`](#session-write-all-for-stream-benchmark) |
 | Enable Python logging | [`init_logging`](#init-logging) |
 | Enable Perfetto diagnostics | [`init_perfetto_diagnostics`](#init-perfetto-diagnostics) |
 | Enable exact execution profiling | Pass `execution_profile=True` to an operation |
@@ -298,6 +299,31 @@ See [Multiple outputs and shared caching](../advanced/multiple-outputs.md) for
 workflow examples and
 [Inspect write-all profiles](../advanced/execution-profiling.md#inspect-write-all-profiles)
 for profile ownership.
+
+<a id="session-write-all-for-stream-benchmark"></a>
+##### `Session.write_all_for_stream_benchmark`
+
+```python
+def write_all_for_stream_benchmark(
+    self,
+    outputs: Sequence[MssqlOutputSpec],
+    *,
+    options: WriteAllExecutionOptions | None = None,
+    execution_profile: bool = False,
+    ranked_profile: RankedProfileConfig | None = None,
+) -> Report
+```
+
+Executes and fully drains several output streams without contacting SQL Server.
+The method preserves normal output planning, shared-cache work, DataFusion
+execution, row counting, and batch schema validation. It skips SQL Server
+lifecycle work, bulk writes, target validation, and cleanup. Output specs must
+still resolve valid target and connection configuration for planning.
+Produced counts are available through `output_row_count` and `batch_shaping`;
+`write_stats` remains zero because the benchmark writes no rows.
+
+Use this method only to benchmark query and stream execution without SQL Server
+I/O. It does not predict end-to-end write performance.
 
 <a id="pending-delta-source"></a>
 #### `PendingDeltaSource`

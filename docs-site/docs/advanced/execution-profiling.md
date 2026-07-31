@@ -7,9 +7,10 @@ Delta Funnel provides two operation-scoped profiling models:
 | Collect exact DataFusion operator metrics | `execution_profile=True` | Returned profile |
 | Rank sampled native CPU functions | `RankedProfileConfig` | Interactive HTML and optional `.dfprofile` artifact |
 
-Both options work with `Table.preview`, `Table.write_to_mssql`, and
-`Session.write_all`. You can enable either one or both for the same operation.
-Neither is enabled by default.
+Both options work with `Table.preview`, `Table.write_to_mssql`,
+`Session.write_all`, and `Session.write_all_for_stream_benchmark`. You can
+enable either one or both for the same operation. Neither is enabled by
+default.
 
 Exact execution profiling works in normal wheels. Ranked profiling requires a
 diagnostics-enabled Linux wheel and the setup in
@@ -145,6 +146,31 @@ operation that fails before its profile observer is installed has no profile.
 Skipped outputs are not attempted and also have no profile. See
 [Multiple outputs and shared caching](multiple-outputs.md) for report
 navigation.
+
+### Profile write-all without SQL Server I/O
+
+Use the stream benchmark path to execute full output queries and shared-cache
+work without opening SQL Server connections:
+
+```python
+report = session.write_all_for_stream_benchmark(
+    outputs,
+    options={"cache_mode": "auto"},
+    execution_profile=True,
+    ranked_profile=RankedProfileConfig(
+        "target/profiles/write-all-stream.profile.html",
+        sample_hz=1000,
+        artifact_path="target/profiles/write-all-stream.dfprofile",
+    ),
+)
+```
+
+The benchmark drains every output batch and retains row counts, schema checks,
+cache materialization, exact profiles, and the operation-scoped ranked profile.
+It skips SQL Server lifecycle work, target validation, bulk encoding, writes,
+and cleanup. Produced counts are reported through `output_row_count` and
+`batch_shaping`; `write_stats` remains zero because no rows are written. Use
+regular `write_all` when measuring end-to-end behavior.
 
 ## Combine exact and ranked profiling
 

@@ -506,6 +506,16 @@ impl MssqlWriteLoopPhaseTimings {
         ]
     }
 
+    fn stream_benchmark_completed(&self) -> Vec<PhaseTimingReport> {
+        vec![
+            PhaseTimingReport::completed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
+            self.validate_batch_schema_completed_or_not_started(),
+            self.write_batch_completed_or_not_started(),
+            PhaseTimingReport::not_started(FINALIZE_PHASE, ReportReasonCode::NotExecuted),
+            PhaseTimingReport::not_started(VALIDATION_PHASE, ReportReasonCode::NotExecuted),
+        ]
+    }
+
     fn poll_batch_stream_failed(&self) -> Vec<PhaseTimingReport> {
         vec![
             PhaseTimingReport::failed(POLL_BATCH_STREAM_PHASE, self.poll_batch_stream),
@@ -876,7 +886,6 @@ where
     let mut shaped_rows = 0_u64;
     let mut shaped_batches = 0_u64;
     let cleanup = MssqlTargetCleanupStatus::NotApplicable;
-    let started_at = Instant::now();
     let mut phase_timings = MssqlWriteLoopPhaseTimings::default();
     pin_mut!(batches);
     observability::datafusion_batch_stream_started(
@@ -909,11 +918,7 @@ where
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     batch_shaping,
-                    MssqlWriteProgress::new(
-                        shaped_rows,
-                        shaped_batches,
-                        elapsed_ms_since(started_at),
-                    ),
+                    MssqlWriteProgress::zero(),
                     false,
                     cleanup,
                 )
@@ -948,11 +953,7 @@ where
                 write_failure_report_metrics(
                     RowCount::partial(input_rows),
                     batch_shaping,
-                    MssqlWriteProgress::new(
-                        shaped_rows,
-                        shaped_batches,
-                        elapsed_ms_since(started_at),
-                    ),
+                    MssqlWriteProgress::zero(),
                     false,
                     cleanup,
                 )
@@ -974,11 +975,11 @@ where
         write_report_metrics(
             RowCount::exact(input_rows),
             batch_shaping,
-            MssqlWriteProgress::new(shaped_rows, shaped_batches, elapsed_ms_since(started_at)),
+            MssqlWriteProgress::zero(),
             false,
             cleanup,
         )
-        .with_phase_timings(phase_timings.completed(Duration::ZERO)),
+        .with_phase_timings(phase_timings.stream_benchmark_completed()),
     ))
 }
 
@@ -1877,7 +1878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_benchmark_drain_counts_rows_without_writing_batches()
+    async fn stream_benchmark_drain_counts_rows_and_reports_zero_writes()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
         let first = orders_batch(vec![1, 2], vec![Some("open"), Some("closed")])?;
@@ -1887,8 +1888,9 @@ mod tests {
         let report = drain_mssql_batches_for_stream_benchmark(&output_plan, batches).await?;
 
         assert_eq!(report.output_name(), "orders_output");
-        assert_eq!(report.stats().rows_written(), 3);
-        assert_eq!(report.stats().batches_written(), 2);
+        assert_eq!(report.stats().rows_written(), 0);
+        assert_eq!(report.stats().batches_written(), 0);
+        assert_eq!(report.stats().elapsed_ms(), 0);
         assert_eq!(report.output_row_count(), RowCount::exact(3));
         assert_batch_shaping(report.batch_shaping(), PhaseStatus::completed(), 2, 3, 2, 3);
         assert_phase_timing(
@@ -1909,7 +1911,7 @@ mod tests {
         assert_phase_timing(
             report.phase_timings(),
             FINALIZE_PHASE,
-            PhaseStatus::completed(),
+            PhaseStatus::not_started(ReportReasonCode::NotExecuted),
         )?;
         Ok(())
     }

@@ -11,7 +11,6 @@ const selectsDiagnostics = (file) =>
 for (const file of [
   "crates/delta-funnel/src/sql_server/execution/sink.rs",
   "crates/delta-funnel/src/table_formats/delta/read.rs",
-  "crates/delta-funnel-python/src/session.rs",
   "crates/delta-funnel-python/src/logging.rs",
   "crates/delta-funnel/src/query_engine/datafusion.rs",
   "crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs",
@@ -37,6 +36,7 @@ for (const file of [
   "crates/delta-funnel-python/src/perfetto_diagnostics.rs",
   "crates/delta-funnel-python/src/profiler.rs",
   "crates/delta-funnel-python/src/profiler/capture.rs",
+  "crates/delta-funnel-python/src/session.rs",
   "tools/perfetto/delta-funnel-standard.pbtx",
   ".github/workflows/testpypi-diagnostics-build.yml",
 ]) {
