@@ -320,7 +320,10 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                         source_name: &self.scan_plan.source_name,
                         snapshot_version: self.scan_plan.snapshot_version,
                         engine_context: Arc::clone(self.scan_plan.engine_context()),
-                    });
+                    })
+                    .with_parquet_metadata_size_hint(
+                        self.execution_options.parquet_metadata_size_hint,
+                    );
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
                     file_reader,
                     read_schema,

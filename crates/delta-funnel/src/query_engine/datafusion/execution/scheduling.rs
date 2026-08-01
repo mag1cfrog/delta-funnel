@@ -70,6 +70,14 @@ pub struct DeltaProviderScanExecutionOptions {
     /// current file is still producing batches. This setting is internal
     /// hardening and benchmark surface; the official-kernel backend ignores it.
     pub native_async_prefetch_file_count_per_partition: usize,
+
+    /// Optional Parquet file-tail prefetch size in bytes for footer metadata.
+    ///
+    /// A sufficiently large value lets the native async reader load the footer
+    /// trailer and metadata in one object-store request. The reader safely
+    /// performs another metadata request when the hint is too small. The
+    /// official-kernel backend ignores this setting.
+    pub parquet_metadata_size_hint: Option<usize>,
 }
 
 /// Sync fallback limiter for provider-scheduled file work in one Delta scan.
@@ -399,6 +407,7 @@ impl Default for DeltaProviderScanExecutionOptions {
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition:
                 NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION,
+            parquet_metadata_size_hint: None,
         }
     }
 }
@@ -433,6 +442,7 @@ impl DeltaProviderScanExecutionOptions {
             max_concurrent_file_reads_per_partition,
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition,
+            parquet_metadata_size_hint: None,
         };
         options.validate()?;
         Ok(options)
@@ -502,6 +512,9 @@ impl DeltaProviderScanExecutionOptions {
             "output_buffer_capacity_per_partition",
             self.output_buffer_capacity_per_partition,
         )?;
+        if let Some(parquet_metadata_size_hint) = self.parquet_metadata_size_hint {
+            validate_positive("parquet_metadata_size_hint", parquet_metadata_size_hint)?;
+        }
         Ok(())
     }
 }
@@ -574,6 +587,7 @@ mod tests {
             options.native_async_prefetch_file_count_per_partition,
             NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION
         );
+        assert_eq!(options.parquet_metadata_size_hint, None);
         options.validate()?;
 
         Ok(())
@@ -738,6 +752,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "configuration error: max_concurrent_file_reads_per_scan must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn execution_options_reject_zero_parquet_metadata_size_hint() {
+        let error = DeltaProviderScanExecutionOptions {
+            parquet_metadata_size_hint: Some(0),
+            ..DeltaProviderScanExecutionOptions::default()
+        }
+        .validate()
+        .expect_err("zero parquet_metadata_size_hint must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: parquet_metadata_size_hint must be greater than zero"
         );
     }
 

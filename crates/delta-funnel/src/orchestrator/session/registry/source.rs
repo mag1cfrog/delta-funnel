@@ -822,12 +822,15 @@ mod tests {
     fn source_registration_honors_configured_provider_options()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("configured-provider")?;
-        let provider_scan_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-            DeltaProviderReaderBackend::OfficialKernel,
-            2,
-            1,
-        )?
-        .with_output_buffer_capacity_per_partition(3)?;
+        let provider_scan_options = DeltaProviderScanExecutionOptions {
+            parquet_metadata_size_hint: Some(16_384),
+            ..DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                DeltaProviderReaderBackend::OfficialKernel,
+                2,
+                1,
+            )?
+            .with_output_buffer_capacity_per_partition(3)?
+        };
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new()
                 .with_query_options(QueryOptions {
@@ -856,6 +859,7 @@ mod tests {
             scheduling.native_async_prefetch_file_count_per_partition(),
             0
         );
+        assert_eq!(scheduling.parquet_metadata_size_hint(), Some(16_384));
         Ok(())
     }
 }

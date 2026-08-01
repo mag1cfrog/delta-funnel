@@ -62,6 +62,7 @@ pub struct DeltaProviderSchedulingReport {
     max_concurrent_file_reads_per_partition: u64,
     output_buffer_capacity_per_partition: u64,
     native_async_prefetch_file_count_per_partition: u64,
+    parquet_metadata_size_hint: Option<u64>,
 }
 
 impl DeltaProviderSchedulingReport {
@@ -86,6 +87,9 @@ impl DeltaProviderSchedulingReport {
             native_async_prefetch_file_count_per_partition: crate::usize_to_u64_saturating(
                 scan_options.native_async_prefetch_file_count_per_partition,
             ),
+            parquet_metadata_size_hint: scan_options
+                .parquet_metadata_size_hint
+                .map(crate::usize_to_u64_saturating),
         }
     }
 
@@ -126,6 +130,12 @@ impl DeltaProviderSchedulingReport {
     #[must_use]
     pub const fn native_async_prefetch_file_count_per_partition(&self) -> u64 {
         self.native_async_prefetch_file_count_per_partition
+    }
+
+    /// Returns the configured Parquet file-tail prefetch size in bytes.
+    #[must_use]
+    pub const fn parquet_metadata_size_hint(&self) -> Option<u64> {
+        self.parquet_metadata_size_hint
     }
 }
 

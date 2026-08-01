@@ -193,6 +193,7 @@ impl DeltaSourceReport {
                 "max_concurrent_file_reads_per_partition": scheduling.max_concurrent_file_reads_per_partition(),
                 "output_buffer_capacity_per_partition": scheduling.output_buffer_capacity_per_partition(),
                 "native_async_prefetch_file_count_per_partition": scheduling.native_async_prefetch_file_count_per_partition(),
+                "parquet_metadata_size_hint": scheduling.parquet_metadata_size_hint(),
             },
             "file_count": count_with_reason_value(
                 self.file_count().kind().as_str(),
