@@ -409,7 +409,11 @@ fn data_type_without_metadata(data_type: &DataType) -> DataType {
             field_without_metadata(run_ends),
             field_without_metadata(values),
         ),
-        _ => data_type.clone(),
+        Null | Boolean | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        | Float16 | Float32 | Float64 | Timestamp(..) | Date32 | Date64 | Time32(_) | Time64(_)
+        | Duration(_) | Interval(_) | Binary | FixedSizeBinary(_) | LargeBinary | BinaryView
+        | Utf8 | LargeUtf8 | Utf8View | Decimal32(..) | Decimal64(..) | Decimal128(..)
+        | Decimal256(..) => data_type.clone(),
     }
 }
 
@@ -510,33 +514,23 @@ mod tests {
             )]),
         );
 
+        let diagnostic = describe_schema_mismatch(&expected, &replanned);
+        assert_eq!(
+            diagnostic,
+            concat!(
+                "field count expected=1 replanned=2; ",
+                "field[0] expected={name=\"expected_name\", data_type=Utf8, nullable=false} ",
+                "replanned={name=\"replanned_name\", data_type=LargeUtf8, nullable=true}; ",
+                "field metadata keys=[\"field_added\":added, \"field_changed\":changed, ",
+                "\"field_removed\":removed]; ",
+                "field[1] expected=<missing> replanned={name=\"extra\", data_type=Boolean, ",
+                "nullable=false}; schema metadata keys=[\"schema_key\":changed]"
+            )
+        );
+
         let error = validate_replanned_output_schema("output", &replanned, &expected)
             .expect_err("mismatched schemas should fail");
         let message = error.to_string();
-
-        for detail in [
-            "field count expected=1 replanned=2",
-            "field[0]",
-            "expected_name",
-            "replanned_name",
-            "data_type=Utf8, nullable=false",
-            "data_type=LargeUtf8, nullable=true",
-            "field metadata keys=[",
-            "field_changed",
-            "field_removed",
-            "field_added",
-            "field[1] expected=<missing>",
-            "schema metadata keys=[",
-            "schema_key",
-            ":removed",
-            ":added",
-            ":changed]",
-        ] {
-            assert!(
-                message.contains(detail),
-                "missing `{detail}` in `{message}`"
-            );
-        }
         for secret in [
             "hidden-field-expected",
             "hidden-field-replanned",
@@ -980,9 +974,11 @@ mod tests {
                     DeltaFunnelError::MssqlWorkflowPlanning { message }
                         if message.contains("cached output stream setup failed for `west_output`")
                             && message.contains("replanned output schema does not match")
-                            && message.contains("field[0]")
-                            && message.contains("expected_field")
-                            && message.contains("marker")
+                            && message.contains(concat!(
+                                r#"field[0] expected={name=\"expected_field\", "#,
+                                "data_type=Utf8, nullable=false} ",
+                                r#"replanned={name=\"marker\", data_type=Utf8, nullable=false}"#
+                            ))
                 )
         ));
         replacement.restore()?;
