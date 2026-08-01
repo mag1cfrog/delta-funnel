@@ -466,6 +466,10 @@ mod tests {
             secret_connection, stream_setup_failing_marker_region_provider,
         },
     };
+    use super::super::cached_stream::{
+        MAX_REPORTED_SCHEMA_DIFFERENCES, MAX_SCHEMA_DIAGNOSTIC_BYTES,
+        TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX,
+    };
     use super::super::{WriteAllCacheMode, WriteAllOptions};
     use super::{
         CACHE_PLANNING_PHASE, OUTPUT_PLANNING_PHASE, SOURCE_REPORTING_PHASE,
@@ -2964,11 +2968,20 @@ mod tests {
                 .iter_mut()
                 .find(|pending| pending.table.id() == west.id())
                 .ok_or("expected pending west table")?;
-            pending_west.schema = Arc::new(Schema::new(vec![Field::new(
-                "different_marker",
-                DataType::Utf8,
-                false,
-            )]));
+            // Stay below SQL Server's 128-character identifier limit while
+            // forcing every display sanitization layer to expand the diagnostic.
+            let escape_heavy_suffix = "\\".repeat(110);
+            pending_west.schema = Arc::new(Schema::new(
+                (0..MAX_REPORTED_SCHEMA_DIFFERENCES)
+                    .map(|index| {
+                        Field::new(
+                            format!("field_{index}_{escape_heavy_suffix}"),
+                            DataType::Utf8,
+                            false,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ));
             let big_output = execute_output_request(
                 big.clone(),
                 "big_output",
@@ -2989,10 +3002,26 @@ mod tests {
             )?;
             let writer = FakeWorkflowWriter::default();
             let calls = writer.calls();
+            let capture = TracingCapture::start();
 
             let report = session
                 .write_all_with_writer(&[big_output, west_output, east_output], writer)
                 .await?;
+            let assert_bounded_diagnostic = |message: &str| {
+                let (_, diagnostic) = message
+                    .rsplit_once("incompatible with the planned SQL Server output: ")
+                    .expect("cache replay diagnostic is missing");
+                assert!(
+                    diagnostic.len()
+                        <= MAX_SCHEMA_DIAGNOSTIC_BYTES + TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX.len(),
+                    "cache replay diagnostic exceeded its bound: {} bytes",
+                    diagnostic.len()
+                );
+                assert!(
+                    diagnostic.ends_with(TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX),
+                    "cache replay diagnostic did not report truncation"
+                );
+            };
             {
                 let calls = calls
                     .lock()
@@ -3020,9 +3049,25 @@ mod tests {
                     "replanned output schema is incompatible with the planned ",
                     "SQL Server output"
                 )));
+                assert_bounded_diagnostic(failure_message);
                 assert!(report.outputs()[2].is_skipped());
                 assert_eq!(report.outputs()[2].output_name(), "east_output");
             }
+            let output_failed = capture
+                .captured()
+                .events()
+                .into_iter()
+                .find(|event| {
+                    event.fields.get("telemetry_event").map(String::as_str) == Some("output.failed")
+                        && event.fields.get("output_name").map(String::as_str)
+                            == Some("west_output")
+                })
+                .ok_or("expected west output failure event")?;
+            let logged_error = output_failed
+                .fields
+                .get("error_summary")
+                .ok_or("west output failure event omitted error_summary")?;
+            assert_bounded_diagnostic(logged_error);
             let WriteAllCacheReport::CacheAliases {
                 aliases,
                 skipped_candidates,

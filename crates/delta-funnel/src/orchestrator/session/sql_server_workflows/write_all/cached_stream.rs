@@ -306,11 +306,12 @@ fn validate_replanned_output_schema(
     ))
 }
 
-const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
-const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
-const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
-// Cached setup storage, workflow error display, and query-phase error display.
-const CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS: usize = 3;
+pub(super) const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
+pub(super) const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+pub(super) const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
+// Cached setup storage, workflow and query-phase displays, write-all failure
+// report storage, and output-failure observability.
+const CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS: usize = 5;
 
 fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     let mut differences = Vec::new();
@@ -588,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn replanned_schema_validation_bounds_and_redacts_final_error()
+    fn replanned_schema_validation_bounds_and_redacts_query_phase_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let metadata_secret = "hidden-metadata-value";
         let expected = Arc::new(Schema::new_with_metadata(
