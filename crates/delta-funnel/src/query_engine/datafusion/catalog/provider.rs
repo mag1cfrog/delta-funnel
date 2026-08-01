@@ -20,7 +20,7 @@ use crate::{
     error::{DeltaScanConstructionSnafu, DeltaScanFilterSnafu},
     table_formats::{
         DeltaKernelPredicate, ProjectedDeltaScan, build_projected_predicated_delta_scan,
-        build_projected_predicated_stats_delta_scan, delta_source_arrow_schema,
+        delta_source_arrow_schema,
     },
 };
 
@@ -200,7 +200,6 @@ impl DeltaTableProvider {
         let kernel_scan = self.build_kernel_scan(
             kernel_projected_column_names.as_deref(),
             kernel_partition_predicate.clone(),
-            pushed_filter_plan.has_data_stats_filter(),
         )?;
 
         Ok(ProviderScanPlan::from_parts(ProviderScanPlanParts {
@@ -341,7 +340,7 @@ impl DeltaTableProvider {
         };
 
         let physical_predicate = self
-            .build_kernel_scan(projected_column_names, Some(predicate), false)?
+            .build_kernel_scan(projected_column_names, Some(predicate))?
             .physical_predicate();
         if physical_predicate.is_none() {
             return DeltaScanFilterSnafu {
@@ -393,30 +392,17 @@ impl DeltaTableProvider {
         &self,
         projected_column_names: Option<&[String]>,
         kernel_partition_predicate: Option<DeltaKernelPredicate>,
-        include_stats_columns: bool,
     ) -> Result<ProjectedDeltaScan, DeltaFunnelError> {
         profile_query_planning_sync_result(
             "Delta Kernel scan construction",
             "delta_kernel_scan_construction",
             || {
-                let kernel_projected_column_names =
-                    projected_column_names.map(|names| names.to_vec());
-
-                let result = if include_stats_columns {
-                    build_projected_predicated_stats_delta_scan(
-                        &self.source,
-                        kernel_projected_column_names.as_deref(),
-                        kernel_partition_predicate,
-                    )
-                } else {
-                    build_projected_predicated_delta_scan(
-                        &self.source,
-                        kernel_projected_column_names.as_deref(),
-                        kernel_partition_predicate,
-                    )
-                };
-
-                result.context(DeltaScanConstructionSnafu {
+                build_projected_predicated_delta_scan(
+                    &self.source,
+                    projected_column_names,
+                    kernel_partition_predicate,
+                )
+                .context(DeltaScanConstructionSnafu {
                     source_name: self.source_name().to_owned(),
                     table_uri: self.source.table_uri().to_owned(),
                 })

@@ -127,8 +127,8 @@ pub(crate) fn build_projected_scan(
 
 /// Builds kernel scan state for selected logical Delta columns and an optional predicate.
 ///
-/// This helper intentionally leaves parsed stats output disabled. A later
-/// scan-metadata slice should request parsed file stats when it needs them.
+/// Requests only the JSON stats representation from Delta Kernel; predicate-scoped parsed
+/// statistics may still be used internally for pruning.
 #[allow(dead_code)]
 pub(crate) fn build_projected_predicated_scan(
     snapshot: &SnapshotRef,
@@ -139,16 +139,22 @@ pub(crate) fn build_projected_predicated_scan(
         Some(names) => snapshot.schema().project(names)?,
         None => snapshot.schema(),
     };
+    // `ScanFile` currently obtains `numRecords` by deserializing JSON. JSON-only avoids
+    // emitting the full unused typed stats tree but retains that round trip; predicate-scoped
+    // parsed fields may remain for pruning. Prefer a direct typed row count when a future
+    // Delta Kernel API exposes one through `ScanFile`.
     let scan = Arc::clone(snapshot)
         .scan_builder()
         .with_schema(Arc::clone(&schema))
         .with_predicate(predicate.map(DeltaKernelPredicate::into_inner))
+        .with_stats(StatsOptions::json_only())
         .build()?;
 
     Ok((scan, schema))
 }
 
 /// Builds scan state with parsed file statistics exposed in scan metadata.
+#[cfg(test)]
 pub(crate) fn build_projected_predicated_stats_scan(
     snapshot: &SnapshotRef,
     projected_column_names: Option<&[String]>,

@@ -171,16 +171,6 @@ impl DeltaFilterPushdownPlan {
     }
 
     #[must_use]
-    pub(crate) fn has_data_stats_filter(&self) -> bool {
-        self.decisions.iter().any(|decision| {
-            decision
-                .kernel_scan_filter
-                .as_ref()
-                .is_some_and(|filter| filter.kind == KernelScanFilterKind::DataStats)
-        })
-    }
-
-    #[must_use]
     pub(crate) fn has_provider_enforced_row_predicate(&self) -> bool {
         self.decisions.iter().any(|decision| {
             decision.outcome == DeltaFilterPushdownOutcome::Exact

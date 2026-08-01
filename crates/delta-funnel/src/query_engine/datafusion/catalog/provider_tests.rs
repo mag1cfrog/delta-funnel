@@ -675,7 +675,6 @@ fn native_async_mixed_data_filter_remains_inexact_metadata_pruning()
     assert_eq!(plan.exact_count, 0);
     assert_eq!(plan.inexact_count, 1);
     assert_eq!(plan.residual_filter_count, 1);
-    assert!(plan.has_data_stats_filter());
     assert!(!plan.has_provider_enforced_row_predicate());
 
     Ok(())
