@@ -309,9 +309,10 @@ fn validate_replanned_output_schema(
 pub(super) const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
 pub(super) const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 pub(super) const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
-// Cached setup storage, workflow and query-phase displays, write-all failure
-// report storage, and output-failure observability.
-const CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS: usize = 5;
+// Budget the worst case: cached setup storage; workflow and query-phase
+// displays; write-all failure report; output-failure observability; and its
+// additional URI-token sanitizer.
+const CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS: usize = 6;
 
 fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     let mut differences = Vec::new();

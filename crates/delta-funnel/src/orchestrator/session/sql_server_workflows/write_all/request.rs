@@ -2969,8 +2969,9 @@ mod tests {
                 .find(|pending| pending.table.id() == west.id())
                 .ok_or("expected pending west table")?;
             // Stay below SQL Server's 128-character identifier limit while
-            // forcing every display sanitization layer to expand the diagnostic.
-            let escape_heavy_suffix = "\\".repeat(110);
+            // forcing every display sanitization layer, including observability's
+            // URI-token pass, to expand the diagnostic.
+            let escape_heavy_suffix = format!("x://{}", "\\".repeat(110));
             pending_west.schema = Arc::new(Schema::new(
                 (0..MAX_REPORTED_SCHEMA_DIFFERENCES)
                     .map(|index| {
