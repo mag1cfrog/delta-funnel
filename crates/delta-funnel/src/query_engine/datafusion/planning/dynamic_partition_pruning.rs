@@ -279,8 +279,7 @@ fn boolean_array_decision(array: &dyn Array) -> DeltaDynamicPartitionPruningDeci
 /// literal true placeholder installed by #183. Literal false is not a
 /// placeholder and remains a valid pruning proof.
 fn is_literal_true(expr: &dyn datafusion::physical_plan::PhysicalExpr) -> bool {
-    expr.as_any()
-        .downcast_ref::<Literal>()
+    expr.downcast_ref::<Literal>()
         .is_some_and(|literal| matches!(literal.value(), ScalarValue::Boolean(Some(true))))
 }
 

@@ -958,7 +958,6 @@ pub(super) fn write_all_cache_failure(
 #[cfg(test)]
 mod tests {
     use std::{
-        any::Any,
         collections::HashMap,
         sync::{
             Arc, Mutex, MutexGuard,
@@ -1035,10 +1034,6 @@ mod tests {
             "MismatchedBatchExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<PlanProperties> {
             self.0.properties()
         }
@@ -1070,10 +1065,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for MismatchedBatchProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.declared_schema)
         }
@@ -1127,10 +1118,6 @@ mod tests {
 
     #[async_trait]
     impl SchemaProvider for FailOnceSchema {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn table_names(&self) -> Vec<String> {
             self.tables().keys().cloned().collect()
         }
@@ -1252,7 +1239,6 @@ mod tests {
         provider: &Arc<dyn TableProvider>,
     ) -> Result<Vec<Vec<RecordBatch>>, Box<dyn std::error::Error>> {
         let table = provider
-            .as_any()
             .downcast_ref::<MemTable>()
             .ok_or("expected MemTable cache provider")?;
         let mut partitions = Vec::with_capacity(table.batches.len());

@@ -84,10 +84,7 @@ fn collect_delta_provider_read_stats_handles_into(
     plan: &dyn ExecutionPlan,
     found: &mut Vec<DeltaProviderReadStatsHandle>,
 ) {
-    if let Some(scan) = plan
-        .as_any()
-        .downcast_ref::<execution::DeltaScanPlanningExec>()
-    {
+    if let Some(scan) = plan.downcast_ref::<execution::DeltaScanPlanningExec>() {
         let handle = scan.read_stats_handle();
         if !found.iter().any(|found| Arc::ptr_eq(found, &handle)) {
             found.push(handle);
@@ -159,7 +156,7 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
 pub(super) fn prepare_datafusion_query_output(
     plan: Arc<dyn ExecutionPlan>,
 ) -> (Arc<dyn ExecutionPlan>, bool) {
-    // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
+    // Keep these branches in sync with DataFusion's `execute_stream`.
     match plan.properties().output_partitioning().partition_count() {
         // DataFusion returns an empty stream without executing a partition, but
         // profiling still needs the real planned root.
@@ -202,7 +199,6 @@ pub(super) fn execute_datafusion_query_output(
 pub(crate) mod test_support {
     #![allow(missing_docs)]
 
-    use std::any::Any;
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -410,7 +406,7 @@ pub(crate) mod test_support {
         plan: &'a dyn ExecutionPlan,
         found: &mut Vec<&'a DeltaScanPlanningExec>,
     ) {
-        if let Some(scan) = plan.as_any().downcast_ref::<DeltaScanPlanningExec>() {
+        if let Some(scan) = plan.downcast_ref::<DeltaScanPlanningExec>() {
             found.push(scan);
         }
         for child in plan.children() {
@@ -438,10 +434,6 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl SchemaProvider for FailsOnCustomersSchemaProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn table_names(&self) -> Vec<String> {
             self.tables().keys().cloned().collect()
         }
@@ -488,10 +480,6 @@ pub(crate) mod test_support {
     }
 
     impl CatalogProvider for SingleSchemaCatalogProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema_names(&self) -> Vec<String> {
             vec!["public".to_owned()]
         }
@@ -606,7 +594,6 @@ mod tests {
             } else {
                 let effective_root = output
                     .effective_profile_root
-                    .as_any()
                     .downcast_ref::<CoalescePartitionsExec>()
                     .ok_or("expected CoalescePartitionsExec")?;
                 assert!(Arc::ptr_eq(effective_root.input(), &plan));

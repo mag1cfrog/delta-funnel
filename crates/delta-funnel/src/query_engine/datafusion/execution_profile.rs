@@ -180,7 +180,7 @@ fn provider_snapshot(
     fallback_snapshots: &mut HashMap<usize, DeltaProviderReadStatsSnapshot>,
 ) -> Option<DeltaProviderReadStatsSnapshot> {
     let plan = unprofiled_execution_plan(plan);
-    let scan = plan.as_any().downcast_ref::<DeltaScanPlanningExec>()?;
+    let scan = plan.downcast_ref::<DeltaScanPlanningExec>()?;
     let handle = scan.read_stats_handle();
     let identity = handle_identity(&handle);
 
@@ -251,8 +251,8 @@ fn convert_metric(metric: &Metric, aggregated: bool) -> QueryExecutionMetric {
     QueryExecutionMetric::new(
         metric.value().name(),
         match metric.metric_type() {
-            MetricType::SUMMARY => QueryExecutionMetricCategory::Summary,
-            MetricType::DEV => QueryExecutionMetricCategory::Dev,
+            MetricType::Summary => QueryExecutionMetricCategory::Summary,
+            MetricType::Dev => QueryExecutionMetricCategory::Dev,
         },
         if aggregated {
             None
@@ -519,10 +519,6 @@ mod tests {
     impl ExecutionPlan for ProfileTestExec {
         fn name(&self) -> &str {
             self.name
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {
@@ -961,7 +957,7 @@ mod tests {
         ];
         let mut metrics = MetricsSet::new();
         for (partition, value) in values.into_iter().enumerate() {
-            metrics.push(metric(value, Some(partition), MetricType::DEV, Vec::new()));
+            metrics.push(metric(value, Some(partition), MetricType::Dev, Vec::new()));
         }
 
         let (_, raw) = collect_query_execution_metrics(&metrics);
@@ -1045,7 +1041,7 @@ mod tests {
                 count: count(usize::MAX),
             },
             Some(usize::MAX),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             vec![
                 Label::new("outputPartition", u64::MAX.to_string()),
                 Label::new("filename", "/secret/path/file.parquet"),
@@ -1059,7 +1055,7 @@ mod tests {
                 count: count(1),
             },
             None,
-            MetricType::DEV,
+            MetricType::Dev,
             vec![Label::new("outputPartition", "001")],
         ));
         for (index, value) in ["", "+1", "-1", " 1", "1.0", "18446744073709551616"]
@@ -1072,7 +1068,7 @@ mod tests {
                     count: count(index),
                 },
                 Some(index),
-                MetricType::DEV,
+                MetricType::Dev,
                 vec![Label::new("outputPartition", value.to_owned())],
             ));
         }
@@ -1136,7 +1132,7 @@ mod tests {
                 count: count(2),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             vec![Label::new("outputPartition", "4")],
         ));
         metrics.push(metric(
@@ -1145,7 +1141,7 @@ mod tests {
                 count: count(1),
             },
             Some(0),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             vec![Label::new("outputPartition", "3")],
         ));
         metrics.push(metric(
@@ -1154,7 +1150,7 @@ mod tests {
                 gauge: gauge(5),
             },
             Some(2),
-            MetricType::DEV,
+            MetricType::Dev,
             Vec::new(),
         ));
 
@@ -1198,7 +1194,7 @@ mod tests {
                 count: count(2),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
@@ -1207,7 +1203,7 @@ mod tests {
                 count: count(1),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
@@ -1216,13 +1212,13 @@ mod tests {
                 count: count(9),
             },
             None,
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
             MetricValue::OutputBytes(count(5)),
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
@@ -1231,7 +1227,7 @@ mod tests {
                 pruning_metrics: pruning(2, 0, 0),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
@@ -1240,7 +1236,7 @@ mod tests {
                 pruning_metrics: pruning(1, 9, 9),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
@@ -1249,7 +1245,7 @@ mod tests {
                 ratio_metrics: ratio(1, 2),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             Vec::new(),
         ));
         metrics.push(metric(
@@ -1258,7 +1254,7 @@ mod tests {
                 count: count(0),
             },
             Some(1),
-            MetricType::SUMMARY,
+            MetricType::Summary,
             vec![Label::new("outputPartition", "3")],
         ));
 

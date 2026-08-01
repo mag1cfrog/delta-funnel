@@ -201,7 +201,7 @@ fn rejected(reason: DeltaDynamicFilterRejectionReason) -> DeltaDynamicFilterDeci
 /// without trying to prove full predicate semantics. Semantic evaluation remains
 /// out of scope for this issue.
 fn contains_dynamic_filter(expr: &dyn PhysicalExpr) -> bool {
-    expr.as_any().is::<DynamicFilterPhysicalExpr>()
+    expr.is::<DynamicFilterPhysicalExpr>()
         || expr
             .children()
             .into_iter()
@@ -232,7 +232,7 @@ fn collect_column_references_into(
     provider_schema: &SchemaRef,
     references: &mut ColumnReferences,
 ) {
-    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+    if let Some(column) = expr.downcast_ref::<Column>() {
         collect_column_reference(column, provider_schema, references);
     }
 

@@ -1,7 +1,6 @@
 //! Wall-clock activity spans for finalized DataFusion physical plans.
 
 use std::{
-    any::Any,
     cell::RefCell,
     collections::HashMap,
     fmt,
@@ -508,7 +507,7 @@ fn instrument_query_execution_node(
     let inner = plan.with_new_children(children)?;
     // Instrument only the provider-owned output boundary. Name matching could
     // accidentally include an unrelated third-party plan with the same label.
-    let records_delta_scan_output_wait = inner.as_any().is::<DeltaScanPlanningExec>();
+    let records_delta_scan_output_wait = inner.is::<DeltaScanPlanningExec>();
     let operator_name = Arc::<str>::from(inner.name());
     let plan: Arc<dyn ExecutionPlan> = Arc::new(ProfiledOperatorExec {
         inner,
@@ -527,8 +526,7 @@ fn plan_identity(plan: &Arc<dyn ExecutionPlan>) -> usize {
 }
 
 pub(super) fn unprofiled_execution_plan(plan: &dyn ExecutionPlan) -> &dyn ExecutionPlan {
-    plan.as_any()
-        .downcast_ref::<ProfiledOperatorExec>()
+    plan.downcast_ref::<ProfiledOperatorExec>()
         .map_or(plan, |profiled| profiled.inner.as_ref())
 }
 
@@ -555,10 +553,6 @@ impl DisplayAs for ProfiledOperatorExec {
 impl ExecutionPlan for ProfiledOperatorExec {
     fn name(&self) -> &str {
         &self.operator_name
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

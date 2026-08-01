@@ -98,7 +98,7 @@ Each metric has this envelope:
 }
 ```
 
-DataFusion 53.1 values map as follows:
+DataFusion 54.1 values map as follows:
 
 | DataFusion value | Profile value |
 | --- | --- |

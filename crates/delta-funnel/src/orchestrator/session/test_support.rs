@@ -1,5 +1,4 @@
 use std::{
-    any::Any,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -64,10 +63,6 @@ impl DisplayAs for StreamSetupFailingPlan {
 impl ExecutionPlan for StreamSetupFailingPlan {
     fn name(&self) -> &str {
         "StreamSetupFailingPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -348,10 +343,6 @@ type PlanLifetimeTrackedProvider = (Arc<dyn TableProvider>, PlanLifetimeMarker);
 
 #[async_trait]
 impl TableProvider for ScanCountingProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table.schema()
     }
@@ -374,10 +365,6 @@ impl TableProvider for ScanCountingProvider {
 
 #[async_trait]
 impl TableProvider for FailingScanProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -402,10 +389,6 @@ impl TableProvider for FailingScanProvider {
 
 #[async_trait]
 impl TableProvider for StreamSetupFailingProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.child.schema()
     }
@@ -428,10 +411,6 @@ impl TableProvider for StreamSetupFailingProvider {
 
 #[async_trait]
 impl TableProvider for BlockingProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.plan.schema()
     }
@@ -464,10 +443,6 @@ impl DisplayAs for BlockingPlan {
 impl ExecutionPlan for BlockingPlan {
     fn name(&self) -> &str {
         "BlockingPlan"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -514,10 +489,6 @@ impl ExecutionPlan for PlanLifetimeTrackingExec {
         "PlanLifetimeTrackingExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         self.child.properties()
     }
@@ -552,10 +523,6 @@ impl ExecutionPlan for PlanLifetimeTrackingExec {
 
 #[async_trait]
 impl TableProvider for PlanLifetimeTrackingProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.child.schema()
     }
