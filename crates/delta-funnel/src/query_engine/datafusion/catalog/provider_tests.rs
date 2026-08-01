@@ -872,7 +872,6 @@ async fn table_provider_scan_returns_projected_non_reading_plan()
         .scan(&state, Some(&projection), &[], Some(10))
         .await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -904,7 +903,6 @@ async fn table_provider_scan_retains_partition_columns() -> Result<(), Box<dyn s
 
     let plan = provider.scan(&state, None, &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -929,7 +927,6 @@ async fn table_provider_scan_without_projection_returns_full_non_reading_plan()
 
     let plan = provider.scan(&state, None, &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -968,7 +965,6 @@ async fn table_provider_scan_records_session_target_but_uses_auto_file_task_grou
 
     let plan = provider.scan(&state, None, &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1036,7 +1032,6 @@ async fn table_provider_scan_uses_explicit_delta_target_override()
 
     let plan = provider.scan(&state, None, &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1135,7 +1130,6 @@ async fn table_provider_scan_does_not_create_empty_partitions_when_target_exceed
 
     let plan = provider.scan(&state, None, &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1174,7 +1168,6 @@ async fn table_provider_scan_with_no_active_files_reports_zero_partitions()
 
     let plan = provider.scan(&state, None, &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let plan_display = datafusion::physical_plan::displayable(plan.as_ref())
@@ -1214,7 +1207,6 @@ async fn table_provider_scan_exec_carries_direct_partition_execution_handoff()
 
     let plan = provider.scan(&state, Some(&projection), &[], None).await?;
     let delta_plan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let scan_plan = delta_plan.scan_plan();
@@ -1361,7 +1353,6 @@ async fn table_provider_scan_accepts_exact_partition_equality_filter()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1411,7 +1402,6 @@ async fn table_provider_scan_accepts_exact_partition_in_filter()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1469,7 +1459,6 @@ async fn table_provider_scan_accepts_inexact_integer_data_stats_filter()
         .scan(&state, Some(&vec![0]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1563,7 +1552,6 @@ async fn table_provider_scan_combines_exact_partition_and_integer_data_stats_fil
         )
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1621,7 +1609,6 @@ async fn table_provider_scan_uses_top_level_and_partition_and_integer_data_stats
         .scan(&state, Some(&vec![0, 1]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1677,7 +1664,6 @@ async fn table_provider_scan_uses_top_level_and_integer_data_stats_with_data_res
         .scan(&state, Some(&vec![0, 1]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1811,7 +1797,6 @@ async fn table_provider_scan_uses_integer_stats_pruning_for_supported_operators(
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1870,7 +1855,6 @@ async fn table_provider_scan_uses_integer_stats_pruning_for_not_equals_null_boun
         .scan(&state, Some(&vec![0]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1974,7 +1958,6 @@ async fn table_provider_scan_uses_decimal_stats_pruning_for_supported_operators(
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2053,7 +2036,6 @@ async fn table_provider_scan_uses_decimal_null_count_stats_pruning()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2167,7 +2149,6 @@ async fn table_provider_scan_uses_string_stats_pruning_for_supported_operators()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2246,7 +2227,6 @@ async fn table_provider_scan_uses_string_null_count_stats_pruning()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2377,7 +2357,6 @@ async fn table_provider_scan_uses_floating_stats_pruning_for_supported_operators
             .scan(&state, Some(&vec![0, 1, 2]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2456,7 +2435,6 @@ async fn table_provider_scan_uses_floating_null_count_stats_pruning()
             .scan(&state, Some(&vec![0, 1, 2]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2575,7 +2553,6 @@ async fn table_provider_scan_accepts_projected_floating_data_stats_when_residual
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2652,7 +2629,6 @@ async fn table_provider_scan_uses_top_level_and_partition_and_floating_data_stat
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2708,7 +2684,6 @@ async fn table_provider_scan_keeps_partial_string_bounds_uncertain()
         .scan(&state, Some(&vec![0, 1]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2789,7 +2764,6 @@ async fn table_provider_scan_accepts_projected_string_data_stats_when_residual_c
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2847,7 +2821,6 @@ async fn table_provider_scan_uses_top_level_and_partition_and_string_data_stats_
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2997,7 +2970,6 @@ async fn table_provider_scan_accepts_projected_decimal_data_stats_when_residual_
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3053,7 +3025,6 @@ async fn table_provider_scan_uses_top_level_and_partition_and_decimal_data_stats
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3134,7 +3105,6 @@ async fn table_provider_scan_uses_boolean_null_count_stats_pruning()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3189,7 +3159,6 @@ async fn table_provider_scan_keeps_missing_boolean_null_count_uncertain()
         .scan(&state, Some(&vec![0, 1]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3265,7 +3234,6 @@ async fn table_provider_scan_uses_binary_null_count_stats_pruning()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3518,7 +3486,6 @@ async fn table_provider_scan_accepts_projected_boolean_data_stats_when_residual_
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3573,7 +3540,6 @@ async fn table_provider_scan_uses_top_level_and_partition_and_boolean_data_stats
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3660,7 +3626,6 @@ async fn table_provider_scan_uses_date_stats_pruning_for_supported_operators()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3766,7 +3731,6 @@ async fn table_provider_scan_uses_timestamp_stats_pruning_for_supported_operator
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3873,7 +3837,6 @@ async fn table_provider_scan_uses_timestamp_ntz_stats_pruning_for_supported_oper
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3952,7 +3915,6 @@ async fn table_provider_scan_uses_temporal_null_count_stats_pruning()
             .scan(&state, Some(&vec![0, 1]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4075,7 +4037,6 @@ async fn table_provider_scan_uses_top_level_and_partition_and_temporal_data_stat
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4155,7 +4116,6 @@ async fn table_provider_scan_accepts_projected_temporal_data_stats_when_residual
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4230,7 +4190,6 @@ async fn table_provider_scan_keeps_partial_integer_stats_uncertain()
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4287,7 +4246,6 @@ async fn table_provider_scan_keeps_invalid_integer_stats_uncertain()
         .scan(&state, Some(&vec![0]), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4535,7 +4493,6 @@ async fn exact_string_partition_predicates_use_kernel_pruning()
             .scan(&state, None, std::slice::from_ref(&filter), None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4614,7 +4571,6 @@ async fn table_provider_scan_mixed_string_null_and_empty_terms_use_kernel_prunin
             .scan(&state, None, std::slice::from_ref(&filter), None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4923,7 +4879,6 @@ async fn table_provider_scan_handles_mixed_boolean_partition_filters()
             MixedBooleanExpectation::Inexact { paths } => {
                 let plan = result?;
                 let scan = plan
-                    .as_any()
                     .downcast_ref::<DeltaScanPlanningExec>()
                     .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -4986,7 +4941,6 @@ async fn table_provider_scan_accepts_qualified_exact_partition_filter()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -5104,7 +5058,6 @@ async fn table_provider_scan_accepts_inexact_mixed_partition_filter()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -5156,7 +5109,6 @@ async fn table_provider_scan_combines_mixed_and_exact_kernel_filters()
         .scan(&state, None, &[mixed_filter, exact_filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -5233,7 +5185,6 @@ async fn table_provider_scan_accepts_projected_mixed_partition_filter_when_resid
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -5283,11 +5234,9 @@ async fn table_provider_scan_limit_does_not_change_scan_planning_contract()
         .scan(&state, Some(&projection), &[filter], None)
         .await?;
     let with_limit_scan = with_limit
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let without_limit_scan = without_limit
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -6530,7 +6479,7 @@ async fn sql_partition_in_edge_variants_document_rewrite_boundary()
         (
             "wrong literal type",
             "select id from orders where region in (1)",
-            ExpectedInProbe::ExactAfterRewrite,
+            ExpectedInProbe::ResidualFilter,
         ),
         (
             "data column item",
@@ -7913,7 +7862,6 @@ async fn binary_partition_null_checks_are_exact_at_scan_boundary()
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8006,7 +7954,6 @@ async fn binary_partition_equality_and_membership_are_exact_at_scan_boundary()
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8113,7 +8060,6 @@ async fn binary_partition_boolean_composition_and_projection_are_exact_at_scan_b
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8464,7 +8410,6 @@ async fn timestamp_partition_equality_and_membership_are_exact_at_scan_boundary(
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8562,7 +8507,6 @@ async fn timestamp_ntz_partition_equality_and_membership_are_exact_at_scan_bound
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8704,7 +8648,6 @@ async fn timestamp_partition_comparisons_and_between_are_exact_at_scan_boundary(
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8839,7 +8782,6 @@ async fn timestamp_ntz_partition_comparisons_and_between_are_exact_at_scan_bound
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -8957,7 +8899,6 @@ async fn timestamp_partition_boolean_composition_and_projection_are_exact_at_sca
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -9067,7 +9008,6 @@ async fn timestamp_ntz_partition_boolean_composition_and_projection_are_exact_at
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -9139,7 +9079,6 @@ async fn timestamp_partition_null_checks_are_exact_at_scan_boundary()
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -9212,7 +9151,6 @@ async fn timestamp_ntz_partition_null_checks_are_exact_at_scan_boundary()
             .scan(&state, Some(&vec![0]), &[filter], None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -10447,7 +10385,6 @@ async fn floating_partition_exact_filters_prune_files_through_kernel_scan_plan()
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -10512,7 +10449,6 @@ async fn floating_partition_mixed_and_filter_uses_kernel_pruning()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let scan_plan = scan.scan_plan();
@@ -10571,7 +10507,6 @@ async fn timestamp_partition_mixed_and_filter_uses_kernel_pruning()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let scan_plan = scan.scan_plan();
@@ -10628,7 +10563,6 @@ async fn timestamp_ntz_partition_mixed_and_filter_uses_kernel_pruning()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let scan_plan = scan.scan_plan();
@@ -10681,7 +10615,6 @@ async fn binary_partition_mixed_and_filter_uses_kernel_pruning()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let scan_plan = scan.scan_plan();
@@ -11645,7 +11578,6 @@ async fn decimal_partition_exact_filters_prune_files_through_kernel_scan_plan()
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -11709,7 +11641,6 @@ async fn decimal_partition_mixed_and_filter_uses_kernel_pruning()
 
     let plan = provider.scan(&state, None, &[filter], None).await?;
     let scan = plan
-        .as_any()
         .downcast_ref::<DeltaScanPlanningExec>()
         .ok_or("expected DeltaScanPlanningExec")?;
     let scan_plan = scan.scan_plan();
@@ -12111,7 +12042,6 @@ async fn date_partition_exact_filters_prune_files_through_kernel_scan_plan()
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -12285,7 +12215,6 @@ async fn boolean_partition_exact_filters_prune_files_through_kernel_scan_plan()
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -12821,7 +12750,6 @@ async fn integer_partition_exact_filters_prune_files_through_kernel_scan_plan()
             .scan(&state, Some(&vec![0]), &filters, None)
             .await?;
         let scan = plan
-            .as_any()
             .downcast_ref::<DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let scan_plan = scan.scan_plan();
@@ -13633,74 +13561,6 @@ async fn sql_date_partition_equality_and_membership_are_exact_kernel_pushdown()
 }
 
 #[tokio::test]
-async fn sql_decimal_partition_unsafe_literal_filters_keep_residual_filter()
--> Result<(), Box<dyn std::error::Error>> {
-    let ctx = SessionContext::new();
-    let table = DeltaLogTable::new_with_schema_and_adds(
-        "sql-decimal-partition-unsafe-literal-residuals",
-        DECIMAL_PARTITION_SCHEMA_FIELDS_JSON,
-        r#"["amount"]"#,
-        &[
-            r#""partitionValues":{"amount":"123.45"}"#,
-            r#""partitionValues":{"amount":"0.00"}"#,
-            r#""partitionValues":{"amount":"-1.23"}"#,
-            r#""partitionValues":{"amount":null}"#,
-            r#""partitionValues":{"amount":""}"#,
-            r#""partitionValues":{"amount":"999.99"}"#,
-            r#""partitionValues":{}"#,
-        ],
-    )?;
-    let source = load_delta_source(DeltaSourceConfig {
-        name: "orders".to_owned(),
-        table_uri: table.path().to_string_lossy().to_string(),
-        version: None,
-        storage_options: Default::default(),
-    })?;
-    let preflight = preflight_delta_protocol(&source)?;
-    register_delta_sources(
-        &ctx,
-        vec![DeltaTableProviderConfig {
-            source,
-            protocol: preflight,
-            scan_target_partitions: None,
-        }],
-    )?;
-
-    let cases = [(
-        "string literal equality casts column to utf8",
-        "select id from orders where amount = '123.45'",
-    )];
-
-    for (name, sql) in cases {
-        let dataframe = ctx.sql(sql).await?;
-        let physical_plan = dataframe.create_physical_plan().await?;
-        let plan_display = datafusion::physical_plan::displayable(physical_plan.as_ref())
-            .indent(true)
-            .to_string();
-        let mut scans = Vec::new();
-        find_delta_scan_plans(physical_plan.as_ref(), &mut scans);
-
-        assert!(
-            plan_display.contains("FilterExec"),
-            "{name} unexpectedly became exact:\n{plan_display}"
-        );
-        assert_eq!(scans.len(), 1, "{name}: {plan_display}");
-        assert_eq!(
-            scans[0].scan_plan().pushed_filter_plan.exact_count,
-            0,
-            "{name}: {plan_display}"
-        );
-        assert_eq!(
-            scans[0].scan_plan().pushed_filter_plan.pushed_filter_count,
-            0,
-            "{name}: {plan_display}"
-        );
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn sql_decimal_partition_comparisons_are_exact_kernel_pushdown()
 -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
@@ -13830,6 +13690,10 @@ async fn sql_decimal_partition_equality_and_membership_are_exact_kernel_pushdown
     )?;
 
     let cases = [
+        (
+            "string literal equality",
+            "select id from orders where amount = '123.45'",
+        ),
         (
             "decimal literal equality",
             "select id from orders where amount = DECIMAL '123.45'",

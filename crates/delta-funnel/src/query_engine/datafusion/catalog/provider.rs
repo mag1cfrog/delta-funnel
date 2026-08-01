@@ -1,6 +1,5 @@
 //! DataFusion table provider for one Delta source.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -499,10 +498,6 @@ impl fmt::Debug for DeltaTableProvider {
 
 #[async_trait]
 impl TableProvider for DeltaTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

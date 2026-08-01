@@ -1,6 +1,5 @@
 //! DataFusion physical execution plan for Delta scans.
 
-use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
@@ -238,10 +237,6 @@ impl DisplayAs for DeltaScanPlanningExec {
 impl ExecutionPlan for DeltaScanPlanningExec {
     fn name(&self) -> &str {
         "DeltaScanPlanningExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1334,7 +1329,6 @@ mod tests {
             .as_ref()
             .ok_or("expected updated DeltaScanPlanningExec")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1379,7 +1373,6 @@ mod tests {
             .as_ref()
             .ok_or("expected updated DeltaScanPlanningExec")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let stats = updated_scan.read_stats_snapshot();
@@ -1543,7 +1536,6 @@ mod tests {
         )))?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1610,7 +1602,6 @@ mod tests {
         )))?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -1713,7 +1704,6 @@ mod tests {
         dynamic.update(physical_lit("not a boolean result"))?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2069,7 +2059,6 @@ mod tests {
         dynamic.update(physical_lit(false))?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2161,7 +2150,6 @@ mod tests {
         )))?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2263,7 +2251,6 @@ mod tests {
         )))?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2350,7 +2337,6 @@ mod tests {
         dynamic.update(is_null(physical_column("region", 2))?)?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2445,7 +2431,6 @@ mod tests {
         )?)?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2538,7 +2523,6 @@ mod tests {
         dynamic.update(is_not_null(physical_column("region", 2))?)?;
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2614,7 +2598,6 @@ mod tests {
             .as_ref()
             .ok_or("expected updated DeltaScanPlanningExec")?;
         let updated_scan = updated_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -2788,12 +2771,10 @@ mod tests {
         let updated_node = result.updated_node.ok_or("expected updated scan")?;
         let rebuilt_node = Arc::clone(&updated_node).with_new_children(Vec::new())?;
         let rebuilt_scan = rebuilt_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
         let reset_node = updated_node.reset_state()?;
         let reset_scan = reset_node
-            .as_any()
             .downcast_ref::<super::DeltaScanPlanningExec>()
             .ok_or("expected DeltaScanPlanningExec")?;
 
@@ -3209,6 +3190,7 @@ mod tests {
         drop(scans);
         drop(physical_plan);
         assert!(weak_context.upgrade().is_some());
+        drop(dataframe);
         drop(ctx);
         for _ in 0..1000 {
             if weak_context.upgrade().is_none() {
