@@ -5,6 +5,7 @@ use std::{
 
 use datafusion::{
     arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef},
+    common::DFSchema,
     prelude::SessionContext,
 };
 
@@ -282,7 +283,7 @@ fn validate_replanned_output_schema(
     replanned_schema: &datafusion::arrow::datatypes::Schema,
     expected_schema: &SchemaRef,
 ) -> Result<(), DeltaFunnelError> {
-    if replanned_schema == expected_schema.as_ref() {
+    if schemas_match_for_replan(expected_schema, replanned_schema) {
         return Ok(());
     }
 
@@ -298,6 +299,68 @@ fn validate_replanned_output_schema(
 const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
 const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
+
+fn schemas_match_for_replan(expected: &Schema, replanned: &Schema) -> bool {
+    expected.metadata() == replanned.metadata()
+        && expected.fields().len() == replanned.fields().len()
+        && expected
+            .fields()
+            .iter()
+            .zip(replanned.fields())
+            .all(|(expected, replanned)| fields_match_for_replan(expected, replanned))
+}
+
+fn fields_match_for_replan(expected: &FieldRef, replanned: &FieldRef) -> bool {
+    expected.name() == replanned.name()
+        && expected.is_nullable() == replanned.is_nullable()
+        && expected.metadata() == replanned.metadata()
+        && DFSchema::datatype_is_logically_equal(expected.data_type(), replanned.data_type())
+        && nested_fields_match_for_replan(expected.data_type(), replanned.data_type())
+}
+
+fn nested_fields_match_for_replan(expected: &DataType, replanned: &DataType) -> bool {
+    match (expected, replanned) {
+        (DataType::Dictionary(_, expected), DataType::Dictionary(_, replanned)) => {
+            nested_fields_match_for_replan(expected, replanned)
+        }
+        (DataType::Dictionary(_, expected), replanned)
+        | (replanned, DataType::Dictionary(_, expected)) => {
+            nested_fields_match_for_replan(expected, replanned)
+        }
+        (DataType::List(expected), DataType::List(replanned))
+        | (DataType::ListView(expected), DataType::ListView(replanned))
+        | (DataType::FixedSizeList(expected, _), DataType::FixedSizeList(replanned, _))
+        | (DataType::LargeList(expected), DataType::LargeList(replanned))
+        | (DataType::LargeListView(expected), DataType::LargeListView(replanned))
+        | (DataType::Map(expected, _), DataType::Map(replanned, _)) => {
+            fields_match_for_replan(expected, replanned)
+        }
+        (DataType::Struct(expected), DataType::Struct(replanned)) => {
+            expected.len() == replanned.len()
+                && expected
+                    .iter()
+                    .zip(replanned)
+                    .all(|(expected, replanned)| fields_match_for_replan(expected, replanned))
+        }
+        (DataType::Union(expected, _), DataType::Union(replanned, _)) => {
+            expected.len() == replanned.len()
+                && expected
+                    .iter()
+                    .zip(replanned.iter())
+                    .all(|((_, expected), (_, replanned))| {
+                        fields_match_for_replan(expected, replanned)
+                    })
+        }
+        (
+            DataType::RunEndEncoded(expected_ends, expected_values),
+            DataType::RunEndEncoded(replanned_ends, replanned_values),
+        ) => {
+            fields_match_for_replan(expected_ends, replanned_ends)
+                && fields_match_for_replan(expected_values, replanned_values)
+        }
+        _ => true,
+    }
+}
 
 fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     let mut differences = Vec::new();
@@ -315,7 +378,10 @@ fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     for index in 0..field_count {
         let expected_field = expected.fields().get(index);
         let replanned_field = replanned.fields().get(index);
-        if expected_field == replanned_field {
+        if matches!((expected_field, replanned_field),
+            (Some(expected), Some(replanned))
+                if fields_match_for_replan(expected, replanned)
+        ) {
             continue;
         }
         if reported_field_differences >= MAX_REPORTED_SCHEMA_DIFFERENCES {
@@ -477,6 +543,32 @@ mod tests {
         MAX_SCHEMA_DIAGNOSTIC_BYTES, TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX, describe_schema_mismatch,
         validate_replanned_output_schema,
     };
+
+    #[test]
+    fn replanned_schema_validation_accepts_logically_equivalent_data_types_only() {
+        let expected = Arc::new(Schema::new(vec![Field::new(
+            "source_level",
+            DataType::Utf8,
+            true,
+        )]));
+        let replanned = Schema::new(vec![Field::new("source_level", DataType::Utf8View, true)]);
+
+        validate_replanned_output_schema("output", &replanned, &expected)
+            .expect("logically equivalent string types should preserve the output contract");
+
+        let replanned = Schema::new(vec![
+            Field::new("source_level", DataType::Utf8View, true).with_metadata(HashMap::from([(
+                "comment".to_owned(),
+                "display text".to_owned(),
+            )])),
+        ]);
+        validate_replanned_output_schema("output", &replanned, &expected)
+            .expect_err("field metadata should remain strict");
+
+        let replanned = Schema::new(vec![Field::new("source_level", DataType::LargeUtf8, true)]);
+        validate_replanned_output_schema("output", &replanned, &expected)
+            .expect_err("logically different data types should remain strict");
+    }
 
     #[test]
     fn replanned_schema_mismatch_reports_every_schema_dimension() {
