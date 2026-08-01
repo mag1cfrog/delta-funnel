@@ -156,7 +156,7 @@ pub(crate) fn datafusion_query_output_stream_with_effective_root(
 pub(super) fn prepare_datafusion_query_output(
     plan: Arc<dyn ExecutionPlan>,
 ) -> (Arc<dyn ExecutionPlan>, bool) {
-    // Keep these branches in sync with DataFusion 53.1's `execute_stream`.
+    // Keep these branches in sync with DataFusion's `execute_stream`.
     match plan.properties().output_partitioning().partition_count() {
         // DataFusion returns an empty stream without executing a partition, but
         // profiling still needs the real planned root.
