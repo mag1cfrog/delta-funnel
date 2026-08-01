@@ -42,7 +42,10 @@ buffers used by provider execution:
   setup prefetch depth per partition. A value of `0` is fully lazy.
 - `parquet_metadata_size_hint`: optional size of the Parquet file tail fetched
   by the native async reader while loading footer metadata. When the footer
-  exceeds the hint, parquet-rs safely performs another metadata request.
+  exceeds the hint, parquet-rs safely performs another metadata request. An
+  oversized hint increases transferred bytes and per-open memory, including a
+  whole-file fetch during metadata loading when the hint is at least the file
+  size.
 
 The active-read and output-buffer values must be greater than zero. The native
 async backend defaults to per-partition file-read capacity 3, prefetch depth 2,

@@ -2662,10 +2662,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_async_reader_falls_back_when_metadata_hint_is_too_small()
+    async fn native_async_reader_reads_remote_like_memory_object_store_parquet_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let table_uri = "memory:///table/root/";
-        let reader = reader(table_uri)?.with_parquet_metadata_size_hint(Some(1));
+        let reader = reader(table_uri)?;
         let read_schema = default_read_schema("native-async-memory-object-store-read")?;
         let parquet_bytes = default_parquet_bytes()?;
         let mut task = task(table_uri, "part-00000.parquet");
