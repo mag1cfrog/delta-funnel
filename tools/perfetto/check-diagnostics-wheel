@@ -995,6 +995,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
     ptrace_target = temp.joinpath("ptrace-target")
     ptrace_result = temp.joinpath("ptrace-result")
     unrelated_ptrace_result = temp.joinpath("unrelated-ptrace-result")
+    # Capture setup may be slow, so the parent bounds this probe after capture ends.
     unrelated_ptrace_probe = subprocess.Popen(
         [
             sys.executable,
@@ -1003,14 +1004,16 @@ with tempfile.TemporaryDirectory() as temp_dir:
                 "import os, time\n"
                 "from pathlib import Path\n"
                 f"target = Path({str(ptrace_target)!r})\n"
-                "deadline = time.monotonic() + 10\n"
-                "while not target.exists() and time.monotonic() < deadline:\n"
-                "    time.sleep(0.01)\n"
-                "if not target.exists():\n"
-                "    raise SystemExit(93)\n"
+                "while True:\n"
+                "    try:\n"
+                "        target_pid = int(target.read_text())\n"
+                "    except (FileNotFoundError, ValueError):\n"
+                "        time.sleep(0.01)\n"
+                "    else:\n"
+                "        break\n"
                 "try:\n"
                 "    descriptor = os.open("
-                "f'/proc/{int(target.read_text())}/mem', os.O_RDONLY)\n"
+                "f'/proc/{target_pid}/mem', os.O_RDONLY)\n"
                 "except OSError as error:\n"
                 "    outcome = f'denied:{error.errno}\\n'\n"
                 "else:\n"
@@ -1020,6 +1023,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
             ),
         ]
     )
+    unrelated_ptrace_probe_timed_out = False
     try:
         ptrace_capture, trace, report, status = run_capture(
             "scoped-ptrace",
@@ -1042,19 +1046,40 @@ with tempfile.TemporaryDirectory() as temp_dir:
             DELTA_FUNNEL_TEST_PTRACE_RESULT_FILE=str(ptrace_result),
         )
     finally:
-        unrelated_ptrace_probe.wait(timeout=10)
+        try:
+            unrelated_ptrace_probe.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            unrelated_ptrace_probe_timed_out = True
+            unrelated_ptrace_probe.kill()
+            unrelated_ptrace_probe.wait()
+    managed_ptrace_outcome = (
+        ptrace_result.read_text() if ptrace_result.is_file() else "missing"
+    )
+    unrelated_ptrace_outcome = (
+        unrelated_ptrace_result.read_text()
+        if unrelated_ptrace_result.is_file()
+        else "missing"
+    )
     if (
         ptrace_capture.returncode != 0
-        or status["workload_status"] != "0"
-        or ptrace_result.read_text() != "authorized\n"
+        or status.get("workload_status") != "0"
+        or managed_ptrace_outcome != "authorized\n"
         or unrelated_ptrace_probe.returncode != 0
     ):
-        raise SystemExit("managed tracebox did not receive scoped ptrace access")
+        raise SystemExit(
+            "scoped ptrace smoke test failed: "
+            f"capture_returncode={ptrace_capture.returncode}, status={status!r}, "
+            f"managed_result={managed_ptrace_outcome!r}, "
+            f"unrelated_result={unrelated_ptrace_outcome!r}, "
+            f"unrelated_returncode={unrelated_ptrace_probe.returncode}, "
+            f"unrelated_timed_out={unrelated_ptrace_probe_timed_out}, "
+            f"stdout={ptrace_capture.stdout!r}, stderr={ptrace_capture.stderr!r}"
+        )
     ptrace_scope = Path("/proc/sys/kernel/yama/ptrace_scope")
     if (
         ptrace_scope.is_file()
         and ptrace_scope.read_text().strip() == "1"
-        and not unrelated_ptrace_result.read_text().startswith("denied:")
+        and not unrelated_ptrace_outcome.startswith("denied:")
     ):
         raise SystemExit("scoped ptrace authorization leaked to an unrelated process")
 
