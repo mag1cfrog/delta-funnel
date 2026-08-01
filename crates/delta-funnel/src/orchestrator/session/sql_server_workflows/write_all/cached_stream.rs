@@ -289,10 +289,13 @@ fn validate_replanned_output_schema(
     let Err(validation_error) = validate_mssql_output_schema(output_plan, replanned_schema) else {
         return Ok(());
     };
-    let diagnostic = truncate_schema_diagnostic(format!(
-        "{validation_error}; schema differences: {}",
-        describe_schema_mismatch(expected_schema, replanned_schema)
-    ));
+    let diagnostic = truncate_schema_diagnostic(
+        format!(
+            "{validation_error}; schema differences: {}",
+            describe_schema_mismatch(expected_schema, replanned_schema)
+        ),
+        CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS,
+    );
 
     Err(cached_output_stream_setup_error(
         output_name,
@@ -306,6 +309,8 @@ fn validate_replanned_output_schema(
 const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
 const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
+// Cached setup storage, workflow error display, and query-phase error display.
+const CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS: usize = 3;
 
 fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     let mut differences = Vec::new();
@@ -356,21 +361,38 @@ fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
         differences.push(format!("schema metadata keys=[{changes}]"));
     }
 
-    truncate_schema_diagnostic(differences.join("; "))
+    truncate_schema_diagnostic(differences.join("; "), 0)
 }
 
-fn truncate_schema_diagnostic(mut diagnostic: String) -> String {
-    if diagnostic.len() <= MAX_SCHEMA_DIAGNOSTIC_BYTES {
+fn truncate_schema_diagnostic(mut diagnostic: String, sanitization_layers: usize) -> String {
+    let mut display_bytes = 0;
+    let end = diagnostic.char_indices().find_map(|(index, character)| {
+        let escaped_bytes = sanitized_display_len(character, sanitization_layers);
+        if display_bytes + escaped_bytes > MAX_SCHEMA_DIAGNOSTIC_BYTES {
+            Some(index)
+        } else {
+            display_bytes += escaped_bytes;
+            None
+        }
+    });
+    let Some(end) = end else {
         return diagnostic;
-    }
+    };
 
-    let mut end = MAX_SCHEMA_DIAGNOSTIC_BYTES;
-    while !diagnostic.is_char_boundary(end) {
-        end -= 1;
-    }
     diagnostic.truncate(end);
     diagnostic.push_str(TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX);
     diagnostic
+}
+
+fn sanitized_display_len(character: char, remaining_layers: usize) -> usize {
+    if remaining_layers == 0 {
+        return character.len_utf8();
+    }
+
+    character
+        .escape_default()
+        .map(|escaped| sanitized_display_len(escaped, remaining_layers - 1))
+        .sum()
 }
 
 fn describe_schema_field(field: Option<&FieldRef>) -> String {
@@ -472,8 +494,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     use crate::{
-        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetConfig, MssqlTargetTable,
-        plan_mssql_target_for_output,
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetCleanupStatus, MssqlTargetConfig,
+        MssqlTargetTable, MssqlWriteFailureContext, MssqlWritePhase, plan_mssql_target_for_output,
     };
 
     use super::super::super::super::{
@@ -561,6 +583,83 @@ mod tests {
             validate_replanned_output_schema("output", &output_plan, &replanned, &expected)
                 .expect_err("semantic type changes must not preserve the output contract");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn replanned_schema_validation_bounds_and_redacts_final_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metadata_secret = "hidden-metadata-value";
+        let expected = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("source_level", DataType::Utf8, false).with_metadata(HashMap::from([(
+                    "comment".to_owned(),
+                    metadata_secret.to_owned(),
+                )])),
+            ],
+            HashMap::from([("comment".to_owned(), metadata_secret.to_owned())]),
+        ));
+        let connection = secret_connection()?;
+        let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "output")?)
+            .with_load_mode(LoadMode::AppendExisting);
+        let output_plan = plan_mssql_target_for_output(
+            &expected,
+            "output",
+            &target,
+            Some(&connection),
+            Default::default(),
+        )?;
+
+        let replanned = Schema::new_with_metadata(
+            vec![
+                Field::new("renamed", DataType::Utf8, false).with_metadata(HashMap::from([(
+                    "comment".to_owned(),
+                    metadata_secret.to_owned(),
+                )])),
+            ],
+            HashMap::from([("comment".to_owned(), metadata_secret.to_owned())]),
+        );
+        let error = validate_replanned_output_schema("output", &output_plan, &replanned, &expected)
+            .expect_err("renamed field should fail the planned output contract");
+        assert!(
+            !error.to_string().contains(metadata_secret),
+            "final validation error exposed metadata"
+        );
+
+        let replanned = Schema::new(vec![Field::new(
+            "\\\"".repeat(MAX_SCHEMA_DIAGNOSTIC_BYTES * 2),
+            DataType::Utf8,
+            false,
+        )]);
+        let error = validate_replanned_output_schema("output", &output_plan, &replanned, &expected)
+            .expect_err("long renamed field should fail the planned output contract");
+        let error = DeltaFunnelError::MssqlQueryPhase {
+            context: Box::new(MssqlWriteFailureContext::from_output_plan(
+                &output_plan,
+                MssqlWritePhase::QueryDataFramePlanning,
+                0,
+                0,
+                0,
+                false,
+                MssqlTargetCleanupStatus::NotApplicable,
+            )),
+            source: Box::new(error),
+        };
+        let rendered = error.to_string();
+        let (_, rendered_diagnostic) = rendered
+            .rsplit_once("incompatible with the planned SQL Server output: ")
+            .ok_or("rendered error omitted the cache replay diagnostic")?;
+        assert!(
+            rendered_diagnostic.len()
+                <= MAX_SCHEMA_DIAGNOSTIC_BYTES + TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX.len(),
+            "rendered validation diagnostic exceeded its bound: {} bytes",
+            rendered_diagnostic.len()
+        );
+        assert!(
+            rendered_diagnostic.ends_with(TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX),
+            "rendered validation diagnostic did not report truncation"
+        );
 
         Ok(())
     }
