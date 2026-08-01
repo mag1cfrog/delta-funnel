@@ -5,7 +5,6 @@ use std::{
 
 use datafusion::{
     arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef},
-    common::DFSchema,
     prelude::SessionContext,
 };
 
@@ -13,10 +12,11 @@ use datafusion::{
 use crate::MssqlOutputBatchStreamFactory;
 use crate::{
     DeltaFunnelError, ExecutionProfileMode, MssqlOutputQueryError, MssqlOutputQueryExecution,
-    MssqlOutputQueryFuture, MssqlWritePhase,
+    MssqlOutputQueryFuture, MssqlTargetOutputPlan, MssqlWritePhase,
     profiling::{OperationStageContext, OperationTraceContext},
     progress::ProgressReporter,
     report::PhaseTimer,
+    validate_mssql_output_schema,
 };
 
 use super::super::super::{
@@ -86,6 +86,7 @@ async fn create_cached_output_query_execution_from_retained_sql(
     };
     if let Err(error) = validate_replanned_output_schema(
         output_name,
+        planned.output_plan(),
         dataframe.schema().as_arrow(),
         &expected_schema,
     ) {
@@ -280,18 +281,24 @@ impl DeltaFunnelSession {
 
 fn validate_replanned_output_schema(
     output_name: &str,
-    replanned_schema: &datafusion::arrow::datatypes::Schema,
+    output_plan: &MssqlTargetOutputPlan,
+    replanned_schema: &Schema,
     expected_schema: &SchemaRef,
 ) -> Result<(), DeltaFunnelError> {
-    if schemas_match_for_replan(expected_schema, replanned_schema) {
+    // The writer plan owns compatibility. The Arrow schema diff below is diagnostic only.
+    let Err(validation_error) = validate_mssql_output_schema(output_plan, replanned_schema) else {
         return Ok(());
-    }
+    };
+    let diagnostic = truncate_schema_diagnostic(format!(
+        "{validation_error}; schema differences: {}",
+        describe_schema_mismatch(expected_schema, replanned_schema)
+    ));
 
     Err(cached_output_stream_setup_error(
         output_name,
         format!(
-            "replanned output schema does not match the original output schema: {}",
-            describe_schema_mismatch(expected_schema, replanned_schema)
+            "replanned output schema is incompatible with the planned SQL Server output: \
+             {diagnostic}"
         ),
     ))
 }
@@ -299,68 +306,6 @@ fn validate_replanned_output_schema(
 const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
 const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
-
-fn schemas_match_for_replan(expected: &Schema, replanned: &Schema) -> bool {
-    expected.metadata() == replanned.metadata()
-        && expected.fields().len() == replanned.fields().len()
-        && expected
-            .fields()
-            .iter()
-            .zip(replanned.fields())
-            .all(|(expected, replanned)| fields_match_for_replan(expected, replanned))
-}
-
-fn fields_match_for_replan(expected: &FieldRef, replanned: &FieldRef) -> bool {
-    expected.name() == replanned.name()
-        && expected.is_nullable() == replanned.is_nullable()
-        && expected.metadata() == replanned.metadata()
-        && DFSchema::datatype_is_logically_equal(expected.data_type(), replanned.data_type())
-        && nested_fields_match_for_replan(expected.data_type(), replanned.data_type())
-}
-
-fn nested_fields_match_for_replan(expected: &DataType, replanned: &DataType) -> bool {
-    match (expected, replanned) {
-        (DataType::Dictionary(_, expected), DataType::Dictionary(_, replanned)) => {
-            nested_fields_match_for_replan(expected, replanned)
-        }
-        (DataType::Dictionary(_, expected), replanned)
-        | (replanned, DataType::Dictionary(_, expected)) => {
-            nested_fields_match_for_replan(expected, replanned)
-        }
-        (DataType::List(expected), DataType::List(replanned))
-        | (DataType::ListView(expected), DataType::ListView(replanned))
-        | (DataType::FixedSizeList(expected, _), DataType::FixedSizeList(replanned, _))
-        | (DataType::LargeList(expected), DataType::LargeList(replanned))
-        | (DataType::LargeListView(expected), DataType::LargeListView(replanned))
-        | (DataType::Map(expected, _), DataType::Map(replanned, _)) => {
-            fields_match_for_replan(expected, replanned)
-        }
-        (DataType::Struct(expected), DataType::Struct(replanned)) => {
-            expected.len() == replanned.len()
-                && expected
-                    .iter()
-                    .zip(replanned)
-                    .all(|(expected, replanned)| fields_match_for_replan(expected, replanned))
-        }
-        (DataType::Union(expected, _), DataType::Union(replanned, _)) => {
-            expected.len() == replanned.len()
-                && expected
-                    .iter()
-                    .zip(replanned.iter())
-                    .all(|((_, expected), (_, replanned))| {
-                        fields_match_for_replan(expected, replanned)
-                    })
-        }
-        (
-            DataType::RunEndEncoded(expected_ends, expected_values),
-            DataType::RunEndEncoded(replanned_ends, replanned_values),
-        ) => {
-            fields_match_for_replan(expected_ends, replanned_ends)
-                && fields_match_for_replan(expected_values, replanned_values)
-        }
-        _ => true,
-    }
-}
 
 fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     let mut differences = Vec::new();
@@ -378,10 +323,7 @@ fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     for index in 0..field_count {
         let expected_field = expected.fields().get(index);
         let replanned_field = replanned.fields().get(index);
-        if matches!((expected_field, replanned_field),
-            (Some(expected), Some(replanned))
-                if fields_match_for_replan(expected, replanned)
-        ) {
+        if expected_field == replanned_field {
             continue;
         }
         if reported_field_differences >= MAX_REPORTED_SCHEMA_DIFFERENCES {
@@ -527,9 +469,12 @@ mod tests {
         sync::{Arc, atomic::Ordering},
     };
 
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
-    use crate::{DeltaFunnelError, DeltaSourceConfig, LoadMode};
+    use crate::{
+        DeltaFunnelError, DeltaSourceConfig, LoadMode, MssqlTargetConfig, MssqlTargetTable,
+        plan_mssql_target_for_output,
+    };
 
     use super::super::super::super::{
         DeltaFunnelSession, LazyTable, LazyTableKind, SessionOptions,
@@ -545,29 +490,79 @@ mod tests {
     };
 
     #[test]
-    fn replanned_schema_validation_accepts_logically_equivalent_data_types_only() {
-        let expected = Arc::new(Schema::new(vec![Field::new(
-            "source_level",
-            DataType::Utf8,
-            true,
-        )]));
-        let replanned = Schema::new(vec![Field::new("source_level", DataType::Utf8View, true)]);
+    fn replanned_schema_validation_uses_mssql_output_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = Arc::new(Schema::new(vec![
+            Field::new("source_level", DataType::Utf8, true),
+            Field::new("payload", DataType::Binary, true),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let connection = secret_connection()?;
+        let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "output")?)
+            .with_load_mode(LoadMode::AppendExisting);
+        let output_plan = plan_mssql_target_for_output(
+            &expected,
+            "output",
+            &target,
+            Some(&connection),
+            Default::default(),
+        )?;
 
-        validate_replanned_output_schema("output", &replanned, &expected)
-            .expect("logically equivalent string types should preserve the output contract");
+        for (string_type, binary_type) in [
+            (DataType::Utf8View, DataType::BinaryView),
+            (DataType::LargeUtf8, DataType::LargeBinary),
+        ] {
+            let replanned = Schema::new_with_metadata(
+                vec![
+                    Field::new("source_level", string_type, true).with_metadata(HashMap::from([(
+                        "comment".to_owned(),
+                        "display text".to_owned(),
+                    )])),
+                    Field::new("payload", binary_type, true),
+                    Field::new("amount", DataType::Decimal128(10, 2), true),
+                    Field::new(
+                        "event_time",
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        true,
+                    ),
+                ],
+                HashMap::from([("comment".to_owned(), "schema text".to_owned())]),
+            );
 
-        let replanned = Schema::new(vec![
-            Field::new("source_level", DataType::Utf8View, true).with_metadata(HashMap::from([(
-                "comment".to_owned(),
-                "display text".to_owned(),
-            )])),
-        ]);
-        validate_replanned_output_schema("output", &replanned, &expected)
-            .expect_err("field metadata should remain strict");
+            validate_replanned_output_schema("output", &output_plan, &replanned, &expected)?;
+        }
 
-        let replanned = Schema::new(vec![Field::new("source_level", DataType::LargeUtf8, true)]);
-        validate_replanned_output_schema("output", &replanned, &expected)
-            .expect_err("logically different data types should remain strict");
+        for (decimal_type, timestamp_type) in [
+            (
+                DataType::Decimal128(10, 3),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                DataType::Decimal128(10, 2),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                DataType::Decimal128(10, 2),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+        ] {
+            let replanned = Schema::new(vec![
+                Field::new("source_level", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("amount", decimal_type, true),
+                Field::new("event_time", timestamp_type, true),
+            ]);
+
+            validate_replanned_output_schema("output", &output_plan, &replanned, &expected)
+                .expect_err("semantic type changes must not preserve the output contract");
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -620,9 +615,6 @@ mod tests {
             )
         );
 
-        let error = validate_replanned_output_schema("output", &replanned, &expected)
-            .expect_err("mismatched schemas should fail");
-        let message = error.to_string();
         for secret in [
             "hidden-field-expected",
             "hidden-field-replanned",
@@ -632,8 +624,8 @@ mod tests {
             "hidden-schema-replanned",
         ] {
             assert!(
-                !message.contains(secret),
-                "leaked `{secret}` in `{message}`"
+                !diagnostic.contains(secret),
+                "leaked `{secret}` in `{diagnostic}`"
             );
         }
     }
@@ -647,21 +639,19 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        let error = validate_replanned_output_schema("output", &replanned, &expected)
-            .expect_err("mismatched schemas should fail");
-        let message = error.to_string();
+        let diagnostic = describe_schema_mismatch(&expected, &replanned);
 
         assert!(
-            message.contains("field[15]"),
-            "missing last reported field in `{message}`"
+            diagnostic.contains("field[15]"),
+            "missing last reported field in `{diagnostic}`"
         );
         assert!(
-            message.contains("2 additional field differences omitted"),
-            "missing omitted count in `{message}`"
+            diagnostic.contains("2 additional field differences omitted"),
+            "missing omitted count in `{diagnostic}`"
         );
         assert!(
-            !message.contains("field[16]"),
-            "reported too many fields in `{message}`"
+            !diagnostic.contains("field[16]"),
+            "reported too many fields in `{diagnostic}`"
         );
 
         let long_name = "x".repeat(MAX_SCHEMA_DIAGNOSTIC_BYTES * 2);
@@ -696,19 +686,17 @@ mod tests {
         let expected = Arc::new(Schema::new(vec![nested_field("hidden-nested-expected")]));
         let replanned = Schema::new(vec![nested_field("hidden-nested-replanned")]);
 
-        let error = validate_replanned_output_schema("output", &replanned, &expected)
-            .expect_err("mismatched nested metadata should fail");
-        let message = error.to_string();
+        let diagnostic = describe_schema_mismatch(&expected, &replanned);
 
         assert!(
-            message.contains("data_type=List(Utf8)")
-                && message.contains("nested_metadata=redacted"),
-            "missing safe nested type details in `{message}`"
+            diagnostic.contains("data_type=List(Utf8)")
+                && diagnostic.contains("nested_metadata=redacted"),
+            "missing safe nested type details in `{diagnostic}`"
         );
         assert!(
-            !message.contains("hidden-nested-expected")
-                && !message.contains("hidden-nested-replanned"),
-            "leaked nested metadata in `{message}`"
+            !diagnostic.contains("hidden-nested-expected")
+                && !diagnostic.contains("hidden-nested-replanned"),
+            "leaked nested metadata in `{diagnostic}`"
         );
     }
 
@@ -1065,7 +1053,10 @@ mod tests {
                     &*source,
                     DeltaFunnelError::MssqlWorkflowPlanning { message }
                         if message.contains("cached output stream setup failed for `west_output`")
-                            && message.contains("replanned output schema does not match")
+                            && message.contains(concat!(
+                                "replanned output schema is incompatible with the planned ",
+                                "SQL Server output"
+                            ))
                             && message.contains(concat!(
                                 r#"field[0] expected={name=\"expected_field\", "#,
                                 "data_type=Utf8, nullable=false} ",

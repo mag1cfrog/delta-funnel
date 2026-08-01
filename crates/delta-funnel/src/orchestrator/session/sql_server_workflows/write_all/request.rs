@@ -3016,7 +3016,10 @@ mod tests {
                 assert!(
                     failure_message.contains("cached output stream setup failed for `west_output`")
                 );
-                assert!(failure_message.contains("replanned output schema does not match"));
+                assert!(failure_message.contains(concat!(
+                    "replanned output schema is incompatible with the planned ",
+                    "SQL Server output"
+                )));
                 assert!(report.outputs()[2].is_skipped());
                 assert_eq!(report.outputs()[2].output_name(), "east_output");
             }
