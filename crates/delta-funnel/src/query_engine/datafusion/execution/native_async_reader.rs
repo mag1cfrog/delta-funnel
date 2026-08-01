@@ -73,6 +73,7 @@ pub(crate) struct DeltaNativeAsyncFileReader {
     engine_context: Arc<DeltaKernelEngineContext>,
     data_file_reader: Arc<KernelDataFileReader>,
     deletion_vector_reader: Arc<KernelDeletionVectorReader>,
+    parquet_metadata_size_hint: Option<usize>,
 }
 
 /// Object-store input for a single native async Parquet file read.
@@ -153,7 +154,17 @@ impl DeltaNativeAsyncFileReader {
             engine_context: config.engine_context,
             data_file_reader,
             deletion_vector_reader,
+            parquet_metadata_size_hint: None,
         }
+    }
+
+    /// Applies the optional Parquet footer metadata prefetch size.
+    pub(crate) const fn with_parquet_metadata_size_hint(
+        mut self,
+        parquet_metadata_size_hint: Option<usize>,
+    ) -> Self {
+        self.parquet_metadata_size_hint = parquet_metadata_size_hint;
+        self
     }
 
     /// Meters only the store supplied to Parquet data-file readers.
@@ -256,6 +267,10 @@ impl DeltaNativeAsyncFileReader {
         let object = self.parquet_object_for_task(request.task)?;
         let reader =
             ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
+        let reader = match self.parquet_metadata_size_hint {
+            Some(hint) => reader.with_footer_size_hint(hint),
+            None => reader,
+        };
         let arrow_schema: SchemaRef = request
             .read_schema
             .physical_schema()

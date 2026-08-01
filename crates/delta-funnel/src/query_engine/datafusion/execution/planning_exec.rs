@@ -320,7 +320,10 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                         source_name: &self.scan_plan.source_name,
                         snapshot_version: self.scan_plan.snapshot_version,
                         engine_context: Arc::clone(self.scan_plan.engine_context()),
-                    });
+                    })
+                    .with_parquet_metadata_size_hint(
+                        self.execution_options.parquet_metadata_size_hint,
+                    );
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
                     file_reader,
                     read_schema,
@@ -1130,6 +1133,17 @@ mod tests {
         sql: &str,
     ) -> Result<(Vec<RecordBatch>, DeltaProviderReadStatsSnapshot), Box<dyn std::error::Error>>
     {
+        let execution_options =
+            DeltaProviderScanExecutionOptions::try_new_with_reader_backend(reader_backend, 1, 1)?;
+        collect_batches_with_execution_options_and_stats(table_uri, execution_options, sql).await
+    }
+
+    async fn collect_batches_with_execution_options_and_stats(
+        table_uri: &str,
+        execution_options: DeltaProviderScanExecutionOptions,
+        sql: &str,
+    ) -> Result<(Vec<RecordBatch>, DeltaProviderReadStatsSnapshot), Box<dyn std::error::Error>>
+    {
         let ctx = SessionContext::new();
         let source = load_delta_source(DeltaSourceConfig {
             name: "orders".to_owned(),
@@ -1138,8 +1152,6 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
-        let execution_options =
-            DeltaProviderScanExecutionOptions::try_new_with_reader_backend(reader_backend, 1, 1)?;
         register_delta_sources_with_scan_execution_options(
             &ctx,
             vec![DeltaTableProviderConfig {
@@ -1157,8 +1169,12 @@ mod tests {
 
         assert_eq!(scans.len(), 1);
         assert_eq!(
+            scans[0].execution_options().parquet_metadata_size_hint,
+            execution_options.parquet_metadata_size_hint
+        );
+        assert_eq!(
             scans[0].read_stats_snapshot().reader_backend,
-            reader_backend
+            execution_options.reader_backend
         );
 
         let result =
@@ -3438,6 +3454,64 @@ mod tests {
             read_stats.parquet_data_file_opened_bytes,
             read_stats.estimated_bytes
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_async_parquet_metadata_hint_reduces_requests_and_falls_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table =
+            RealParquetDeltaTable::new_with_two_large_files("parquet-metadata-hint", 20_000)?;
+        let table_uri = table.path().to_string_lossy();
+        let sql = "select count(*) as row_count, sum(id) as id_sum from orders";
+        let control_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+            DeltaProviderReaderBackend::NativeAsync,
+            1,
+            1,
+        )?;
+        let hinted_options = DeltaProviderScanExecutionOptions {
+            parquet_metadata_size_hint: Some(16_384),
+            ..control_options
+        };
+        let undersized_options = DeltaProviderScanExecutionOptions {
+            parquet_metadata_size_hint: Some(9),
+            ..control_options
+        };
+
+        let (control, control_stats) =
+            collect_batches_with_execution_options_and_stats(&table_uri, control_options, sql)
+                .await?;
+        let (hinted, hinted_stats) =
+            collect_batches_with_execution_options_and_stats(&table_uri, hinted_options, sql)
+                .await?;
+        let (fallback, fallback_stats) =
+            collect_batches_with_execution_options_and_stats(&table_uri, undersized_options, sql)
+                .await?;
+        let control = pretty_format_batches(&control)?.to_string();
+        let hinted = pretty_format_batches(&hinted)?.to_string();
+        let fallback = pretty_format_batches(&fallback)?.to_string();
+
+        assert_eq!(hinted, control);
+        assert_eq!(fallback, control);
+        assert_eq!(control_stats.files_started, 2);
+        assert_eq!(hinted_stats.files_started, control_stats.files_started);
+        assert_eq!(fallback_stats.files_started, control_stats.files_started);
+        let control_requests = control_stats
+            .parquet_data_file_range_get_operations
+            .ok_or("expected control range GET count")?;
+        let hinted_requests = hinted_stats
+            .parquet_data_file_range_get_operations
+            .ok_or("expected hinted range GET count")?;
+        let fallback_requests = fallback_stats
+            .parquet_data_file_range_get_operations
+            .ok_or("expected fallback range GET count")?;
+
+        assert_eq!(
+            control_requests.checked_sub(hinted_requests),
+            Some(control_stats.files_started)
+        );
+        assert_eq!(fallback_requests, control_requests);
 
         Ok(())
     }

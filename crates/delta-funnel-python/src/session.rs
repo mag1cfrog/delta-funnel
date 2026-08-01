@@ -720,6 +720,9 @@ fn parse_provider_scan_options(
                 options.native_async_prefetch_file_count_per_partition =
                     usize_option(py, &value, key.as_str())?;
             }
+            "parquet_metadata_size_hint" => {
+                options.parquet_metadata_size_hint = Some(usize_option(py, &value, key.as_str())?);
+            }
             _ => {
                 return Err(unknown_option_error(py, "provider scan", key.as_str()));
             }
@@ -3826,6 +3829,7 @@ union all select cast(902 as bigint) as order_id",),
             provider_scan_options.set_item("max_concurrent_file_reads_per_partition", 2)?;
             provider_scan_options.set_item("output_buffer_capacity_per_partition", 4)?;
             provider_scan_options.set_item("native_async_prefetch_file_count_per_partition", 1)?;
+            provider_scan_options.set_item("parquet_metadata_size_hint", 16_384)?;
 
             let session = PySession::new(
                 py,
@@ -3844,6 +3848,7 @@ union all select cast(902 as bigint) as order_id",),
                     max_concurrent_file_reads_per_partition: 2,
                     output_buffer_capacity_per_partition: 4,
                     native_async_prefetch_file_count_per_partition: 1,
+                    parquet_metadata_size_hint: Some(16_384),
                     ..DeltaProviderScanExecutionOptions::default()
                 }
             );
@@ -3897,6 +3902,7 @@ union all select cast(902 as bigint) as order_id",),
                 ("max_concurrent_file_reads_per_scan", 0),
                 ("max_concurrent_file_reads_per_partition", 0),
                 ("output_buffer_capacity_per_partition", 0),
+                ("parquet_metadata_size_hint", 0),
             ];
 
             for (key, value) in cases {
