@@ -1,6 +1,12 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
-use datafusion::{arrow::datatypes::SchemaRef, prelude::SessionContext};
+use datafusion::{
+    arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef},
+    prelude::SessionContext,
+};
 
 #[cfg(test)]
 use crate::MssqlOutputBatchStreamFactory;
@@ -282,13 +288,178 @@ fn validate_replanned_output_schema(
 
     Err(cached_output_stream_setup_error(
         output_name,
-        "replanned output schema does not match the original output schema",
+        format!(
+            "replanned output schema does not match the original output schema: {}",
+            describe_schema_mismatch(expected_schema, replanned_schema)
+        ),
     ))
+}
+
+const MAX_REPORTED_SCHEMA_DIFFERENCES: usize = 16;
+const MAX_SCHEMA_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional details truncated";
+
+fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
+    let mut differences = Vec::new();
+    if expected.fields().len() != replanned.fields().len() {
+        differences.push(format!(
+            "field count expected={} replanned={}",
+            expected.fields().len(),
+            replanned.fields().len()
+        ));
+    }
+
+    let field_count = expected.fields().len().max(replanned.fields().len());
+    let mut reported_field_differences = 0;
+    let mut omitted_field_differences = 0;
+    for index in 0..field_count {
+        let expected_field = expected.fields().get(index);
+        let replanned_field = replanned.fields().get(index);
+        if expected_field == replanned_field {
+            continue;
+        }
+        if reported_field_differences >= MAX_REPORTED_SCHEMA_DIFFERENCES {
+            omitted_field_differences += 1;
+            continue;
+        }
+        let metadata_changes = match (expected_field, replanned_field) {
+            (Some(expected), Some(replanned)) => {
+                describe_metadata_changes(expected.metadata(), replanned.metadata())
+                    .map(|changes| format!("; field metadata keys=[{changes}]"))
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        differences.push(format!(
+            "field[{index}] expected={} replanned={}{}",
+            describe_schema_field(expected_field),
+            describe_schema_field(replanned_field),
+            metadata_changes
+        ));
+        reported_field_differences += 1;
+    }
+    if omitted_field_differences > 0 {
+        differences.push(format!(
+            "{omitted_field_differences} additional field differences omitted"
+        ));
+    }
+
+    if let Some(changes) = describe_metadata_changes(expected.metadata(), replanned.metadata()) {
+        differences.push(format!("schema metadata keys=[{changes}]"));
+    }
+
+    truncate_schema_diagnostic(differences.join("; "))
+}
+
+fn truncate_schema_diagnostic(mut diagnostic: String) -> String {
+    if diagnostic.len() <= MAX_SCHEMA_DIAGNOSTIC_BYTES {
+        return diagnostic;
+    }
+
+    let mut end = MAX_SCHEMA_DIAGNOSTIC_BYTES;
+    while !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostic.truncate(end);
+    diagnostic.push_str(TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX);
+    diagnostic
+}
+
+fn describe_schema_field(field: Option<&FieldRef>) -> String {
+    field.map_or_else(
+        || "<missing>".to_owned(),
+        |field| {
+            let data_type = data_type_without_metadata(field.data_type());
+            let nested_metadata =
+                (data_type != *field.data_type()).then_some(", nested_metadata=redacted");
+            format!(
+                "{{name={:?}, data_type={}, nullable={}{}}}",
+                field.name(),
+                data_type,
+                field.is_nullable(),
+                nested_metadata.unwrap_or_default()
+            )
+        },
+    )
+}
+
+fn data_type_without_metadata(data_type: &DataType) -> DataType {
+    use DataType::*;
+
+    match data_type {
+        List(field) => List(field_without_metadata(field)),
+        ListView(field) => ListView(field_without_metadata(field)),
+        FixedSizeList(field, size) => FixedSizeList(field_without_metadata(field), *size),
+        LargeList(field) => LargeList(field_without_metadata(field)),
+        LargeListView(field) => LargeListView(field_without_metadata(field)),
+        Struct(fields) => Struct(fields.iter().map(field_without_metadata).collect()),
+        Union(fields, mode) => Union(
+            fields
+                .iter()
+                .map(|(id, field)| (id, field_without_metadata(field)))
+                .collect(),
+            *mode,
+        ),
+        Dictionary(key, value) => Dictionary(
+            Box::new(data_type_without_metadata(key)),
+            Box::new(data_type_without_metadata(value)),
+        ),
+        Map(field, sorted) => Map(field_without_metadata(field), *sorted),
+        RunEndEncoded(run_ends, values) => RunEndEncoded(
+            field_without_metadata(run_ends),
+            field_without_metadata(values),
+        ),
+        Null | Boolean | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        | Float16 | Float32 | Float64 | Timestamp(..) | Date32 | Date64 | Time32(_) | Time64(_)
+        | Duration(_) | Interval(_) | Binary | FixedSizeBinary(_) | LargeBinary | BinaryView
+        | Utf8 | LargeUtf8 | Utf8View | Decimal32(..) | Decimal64(..) | Decimal128(..)
+        | Decimal256(..) => data_type.clone(),
+    }
+}
+
+fn field_without_metadata(field: &FieldRef) -> FieldRef {
+    let mut field = field.as_ref().clone();
+    field.set_data_type(data_type_without_metadata(field.data_type()));
+    field.metadata_mut().clear();
+    Arc::new(field)
+}
+
+fn describe_metadata_changes(
+    expected: &HashMap<String, String>,
+    replanned: &HashMap<String, String>,
+) -> Option<String> {
+    let keys = expected
+        .keys()
+        .chain(replanned.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut changes = Vec::new();
+    let mut omitted = 0;
+    for key in keys {
+        let change = match (expected.get(key), replanned.get(key)) {
+            (Some(expected), Some(replanned)) if expected != replanned => "changed",
+            (Some(_), None) => "removed",
+            (None, Some(_)) => "added",
+            _ => continue,
+        };
+        if changes.len() < MAX_REPORTED_SCHEMA_DIFFERENCES {
+            changes.push(format!("{key:?}:{change}"));
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        changes.push(format!("{omitted} additional changes omitted"));
+    }
+    (!changes.is_empty()).then(|| changes.join(", "))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, atomic::Ordering},
+    };
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
@@ -302,6 +473,152 @@ mod tests {
         },
     };
     use super::super::{MssqlDerivedCacheAliasPlan, MssqlOutputCacheDecision};
+    use super::{
+        MAX_SCHEMA_DIAGNOSTIC_BYTES, TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX, describe_schema_mismatch,
+        validate_replanned_output_schema,
+    };
+
+    #[test]
+    fn replanned_schema_mismatch_reports_every_schema_dimension() {
+        let expected = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("expected_name", DataType::Utf8, false).with_metadata(HashMap::from([
+                    (
+                        "field_changed".to_owned(),
+                        "hidden-field-expected".to_owned(),
+                    ),
+                    (
+                        "field_removed".to_owned(),
+                        "hidden-field-removed".to_owned(),
+                    ),
+                ])),
+            ],
+            HashMap::from([("schema_key".to_owned(), "hidden-schema-expected".to_owned())]),
+        ));
+        let replanned = Schema::new_with_metadata(
+            vec![
+                Field::new("replanned_name", DataType::LargeUtf8, true).with_metadata(
+                    HashMap::from([
+                        (
+                            "field_changed".to_owned(),
+                            "hidden-field-replanned".to_owned(),
+                        ),
+                        ("field_added".to_owned(), "hidden-field-added".to_owned()),
+                    ]),
+                ),
+                Field::new("extra", DataType::Boolean, false),
+            ],
+            HashMap::from([(
+                "schema_key".to_owned(),
+                "hidden-schema-replanned".to_owned(),
+            )]),
+        );
+
+        let diagnostic = describe_schema_mismatch(&expected, &replanned);
+        assert_eq!(
+            diagnostic,
+            concat!(
+                "field count expected=1 replanned=2; ",
+                "field[0] expected={name=\"expected_name\", data_type=Utf8, nullable=false} ",
+                "replanned={name=\"replanned_name\", data_type=LargeUtf8, nullable=true}; ",
+                "field metadata keys=[\"field_added\":added, \"field_changed\":changed, ",
+                "\"field_removed\":removed]; ",
+                "field[1] expected=<missing> replanned={name=\"extra\", data_type=Boolean, ",
+                "nullable=false}; schema metadata keys=[\"schema_key\":changed]"
+            )
+        );
+
+        let error = validate_replanned_output_schema("output", &replanned, &expected)
+            .expect_err("mismatched schemas should fail");
+        let message = error.to_string();
+        for secret in [
+            "hidden-field-expected",
+            "hidden-field-replanned",
+            "hidden-field-removed",
+            "hidden-field-added",
+            "hidden-schema-expected",
+            "hidden-schema-replanned",
+        ] {
+            assert!(
+                !message.contains(secret),
+                "leaked `{secret}` in `{message}`"
+            );
+        }
+    }
+
+    #[test]
+    fn replanned_schema_mismatch_bounds_field_details() {
+        let expected = Arc::new(Schema::empty());
+        let replanned = Schema::new(
+            (0..18)
+                .map(|index| Field::new(format!("field_{index}"), DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        );
+
+        let error = validate_replanned_output_schema("output", &replanned, &expected)
+            .expect_err("mismatched schemas should fail");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("field[15]"),
+            "missing last reported field in `{message}`"
+        );
+        assert!(
+            message.contains("2 additional field differences omitted"),
+            "missing omitted count in `{message}`"
+        );
+        assert!(
+            !message.contains("field[16]"),
+            "reported too many fields in `{message}`"
+        );
+
+        let long_name = "x".repeat(MAX_SCHEMA_DIAGNOSTIC_BYTES * 2);
+        let expected = Schema::new(vec![Field::new(long_name, DataType::Utf8, false)]);
+        let replanned = Schema::new(vec![Field::new("short", DataType::Utf8, false)]);
+        let diagnostic = describe_schema_mismatch(&expected, &replanned);
+        assert!(
+            diagnostic.len()
+                <= MAX_SCHEMA_DIAGNOSTIC_BYTES + TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX.len(),
+            "schema diagnostic exceeded its bound"
+        );
+        assert!(
+            diagnostic.ends_with(TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX),
+            "schema diagnostic did not report truncation"
+        );
+    }
+
+    #[test]
+    fn replanned_schema_mismatch_redacts_nested_field_metadata() {
+        let nested_field = |metadata_value: &str| {
+            Field::new(
+                "items",
+                DataType::List(Arc::new(
+                    Field::new("item", DataType::Utf8, true).with_metadata(HashMap::from([(
+                        "nested_key".to_owned(),
+                        metadata_value.to_owned(),
+                    )])),
+                )),
+                false,
+            )
+        };
+        let expected = Arc::new(Schema::new(vec![nested_field("hidden-nested-expected")]));
+        let replanned = Schema::new(vec![nested_field("hidden-nested-replanned")]);
+
+        let error = validate_replanned_output_schema("output", &replanned, &expected)
+            .expect_err("mismatched nested metadata should fail");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("data_type=List(Utf8)")
+                && message.contains("nested_metadata=redacted"),
+            "missing safe nested type details in `{message}`"
+        );
+        assert!(
+            !message.contains("hidden-nested-expected")
+                && !message.contains("hidden-nested-replanned"),
+            "leaked nested metadata in `{message}`"
+        );
+    }
 
     #[tokio::test]
     async fn output_requires_cache_replan_classifies_direct_dependent_and_unrelated_outputs()
@@ -638,7 +955,7 @@ mod tests {
             .find(|pending| pending.table.id() == west.id())
             .ok_or("expected pending west table")?;
         pending_west.schema = Arc::new(Schema::new(vec![Field::new(
-            "different_marker",
+            "expected_field",
             DataType::Utf8,
             false,
         )]));
@@ -657,6 +974,11 @@ mod tests {
                     DeltaFunnelError::MssqlWorkflowPlanning { message }
                         if message.contains("cached output stream setup failed for `west_output`")
                             && message.contains("replanned output schema does not match")
+                            && message.contains(concat!(
+                                r#"field[0] expected={name=\"expected_field\", "#,
+                                "data_type=Utf8, nullable=false} ",
+                                r#"replanned={name=\"marker\", data_type=Utf8, nullable=false}"#
+                            ))
                 )
         ));
         replacement.restore()?;
