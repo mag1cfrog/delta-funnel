@@ -25,7 +25,7 @@ use crate::query_engine::datafusion::test_support::{
 };
 use crate::{
     DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol,
-    table_formats::RealParquetDeltaTable,
+    table_formats::{KernelColumnName, RealParquetDeltaTable},
 };
 
 const INTEGER_PARTITION_SCHEMA_FIELDS_JSON: &str = r#"[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"byte_part\",\"type\":\"byte\",\"nullable\":true,\"metadata\":{}},{\"name\":\"short_part\",\"type\":\"short\",\"nullable\":true,\"metadata\":{}},{\"name\":\"int_part\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]"#;
@@ -1469,6 +1469,145 @@ async fn table_provider_scan_accepts_inexact_integer_data_stats_filter()
         scan_file_paths(scan)?,
         vec!["part-00001.parquet", "part-00002.parquet"]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_data_stats_filter_avoids_unrelated_parsed_stats()
+-> Result<(), Box<dyn std::error::Error>> {
+    let impossible_stats = id_stats_add_json(7, 1, 50, 0);
+    let possible_stats = id_stats_add_json(11, 101, 150, 0);
+    let table = DeltaLogTable::new_with_schema_and_adds(
+        "table-provider-json-only-stats",
+        DEFAULT_SCHEMA_FIELDS_JSON,
+        r#"[]"#,
+        &[impossible_stats.as_str(), possible_stats.as_str()],
+    )?;
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table.path().to_string_lossy().to_string(),
+        version: None,
+        storage_options: Default::default(),
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(100_i32));
+
+    let plan = provider
+        .scan(&state, Some(&vec![0]), &[filter], None)
+        .await?;
+    let scan = plan
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+    let partition_plan = scan.partition_plan();
+    let estimates = partition_plan
+        .partitions
+        .iter()
+        .flat_map(|partition| partition.file_tasks.iter())
+        .map(|task| task.estimated_rows)
+        .collect::<Vec<_>>();
+
+    assert_eq!(scan_file_paths(scan)?, vec!["part-00001.parquet"]);
+    assert_eq!(partition_plan.estimated_rows, Some(11));
+    assert_eq!(estimates, vec![Some(11)]);
+
+    let kernel_scan = scan.scan_plan().kernel_scan();
+    let unrelated_stats_column =
+        KernelColumnName::new(["stats_parsed", "minValues", "customer_name"]);
+    let mut saw_metadata_batch = false;
+    for scan_metadata in kernel_scan
+        .kernel_scan()
+        .scan_metadata(kernel_scan.engine_context().as_kernel_engine())?
+    {
+        let scan_metadata = scan_metadata?;
+        saw_metadata_batch = true;
+        let scan_files = scan_metadata.scan_files.data();
+        // Kernel may retain predicate-scoped parsed fields for pruning; the provider should
+        // not request the full parsed tree containing unrelated table columns.
+        assert!(
+            !scan_files.has_field(&unrelated_stats_column),
+            "provider scan should not expose parsed stats unrelated to its predicate"
+        );
+    }
+    assert!(saw_metadata_batch, "expected at least one metadata batch");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_provider_json_only_stats_prunes_struct_only_checkpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let table_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("v1-single-part-struct-stats-only");
+    let source = load_delta_source(DeltaSourceConfig {
+        name: "orders".to_owned(),
+        table_uri: table_path.to_string_lossy().into_owned(),
+        version: None,
+        storage_options: Default::default(),
+    })?;
+    let preflight = preflight_delta_protocol(&source)?;
+    let provider = DeltaTableProvider::try_new(source, preflight)?;
+    let state = SessionContext::new().state();
+    let filter = datafusion::logical_expr::col("id").gt(datafusion::logical_expr::lit(3_i64));
+
+    let plan = provider
+        .scan(&state, Some(&vec![0]), &[filter], None)
+        .await?;
+    let scan = plan
+        .downcast_ref::<DeltaScanPlanningExec>()
+        .ok_or("expected DeltaScanPlanningExec")?;
+    let partition_plan = scan.partition_plan();
+    let mut files = partition_plan
+        .partitions
+        .iter()
+        .flat_map(|partition| partition.file_tasks.iter())
+        .map(|task| (task.path.as_str(), task.estimated_rows))
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+
+    assert_eq!(
+        files,
+        vec![
+            (
+                "test%25file%25prefix-part-00000-1b98908c-7430-4b7c-af27-ac1452047ed1-c000.snappy.parquet",
+                Some(1),
+            ),
+            (
+                "test%25file%25prefix-part-00000-f993c7d8-518a-4056-a77c-7f0d06a6e07e-c000.snappy.parquet",
+                Some(1),
+            ),
+        ]
+    );
+    assert_eq!(partition_plan.estimated_rows, Some(2));
+
+    let kernel_scan = scan.scan_plan().kernel_scan();
+    let predicate_stats_column = KernelColumnName::new(["stats_parsed", "maxValues", "id"]);
+    let unrelated_stats_columns = ["minValues", "maxValues", "nullCount"]
+        .map(|field| KernelColumnName::new(["stats_parsed", field, "value"]));
+    let mut saw_metadata_batch = false;
+    for scan_metadata in kernel_scan
+        .kernel_scan()
+        .scan_metadata(kernel_scan.engine_context().as_kernel_engine())?
+    {
+        let scan_metadata = scan_metadata?;
+        saw_metadata_batch = true;
+        let scan_files = scan_metadata.scan_files.data();
+        assert!(
+            scan_files.has_field(&predicate_stats_column),
+            "provider scan should retain parsed stats needed by its predicate"
+        );
+        for unrelated_stats_column in &unrelated_stats_columns {
+            assert!(
+                !scan_files.has_field(unrelated_stats_column),
+                "provider scan should not expose parsed stats unrelated to its predicate"
+            );
+        }
+    }
+    assert!(saw_metadata_batch, "expected at least one metadata batch");
 
     Ok(())
 }
