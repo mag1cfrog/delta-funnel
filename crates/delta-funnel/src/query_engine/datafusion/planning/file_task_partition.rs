@@ -58,7 +58,7 @@ pub(crate) struct DeltaScanFileTaskPartitionPlan {
 /// One provider scan partition containing whole Delta file tasks.
 #[allow(dead_code)]
 pub(crate) struct DeltaScanFileTaskPartition {
-    /// Whole physical Delta file tasks assigned to this partition in scan order.
+    /// Whole physical Delta file tasks assigned to this partition in read order.
     pub(crate) file_tasks: Vec<DeltaScanFileTask>,
     /// Partition byte estimate when every task in this partition has known bytes.
     pub(crate) estimated_bytes: Option<u64>,
@@ -93,10 +93,10 @@ impl DeltaScanFileTaskPartitionPlan {
     /// Groups Delta-aware file tasks into metadata-only provider scan partitions.
     ///
     /// The policy is deterministic and never splits a physical file. When every
-    /// file task has a byte estimate, partitions are formed in scan order around
-    /// a target byte budget. If any byte estimate is unknown, or if all selected
-    /// files have zero estimated bytes, planning falls back to deterministic
-    /// file-count balancing.
+    /// file task has a byte estimate, longest files are assigned first to the
+    /// currently lightest partition. If any byte estimate is unknown, or if all
+    /// selected files have zero estimated bytes, planning falls back to
+    /// deterministic file-count balancing.
     #[allow(dead_code)]
     pub(crate) fn try_new(
         request: DeltaScanFileTaskPartitionPlanRequest,
@@ -233,11 +233,11 @@ fn validate_file_task_context(
     Ok(())
 }
 
-/// Groups known-size file tasks by a target byte budget without splitting files.
+/// Groups known-size file tasks by estimated bytes without splitting files.
 ///
-/// The policy preserves scan order and emits at most `target_partitions`
-/// non-empty partitions. A single oversized physical file stays whole and may
-/// exceed the computed target bytes for its partition.
+/// Longest-file-first assignment keeps each next task on the currently lightest
+/// partition. A single oversized physical file stays whole and may dominate its
+/// partition.
 fn group_by_estimated_bytes(
     source_name: &str,
     table_uri: &str,
@@ -246,25 +246,26 @@ fn group_by_estimated_bytes(
     target_partitions: usize,
 ) -> Result<Vec<DeltaScanFileTaskPartition>, DeltaFunnelError> {
     let output_limit = target_partitions.min(file_tasks.len());
-    let Some(total_bytes) = sum_task_estimate(
+    let estimated_bytes = sum_task_estimate(
         source_name,
         table_uri,
         snapshot_version,
         "estimated bytes",
         file_tasks.iter().map(|file_task| file_task.estimated_bytes),
-    )?
-    else {
+    )?;
+    if estimated_bytes.is_none() {
         return partition_planning_error(
             source_name,
             table_uri,
             snapshot_version,
             "known-size grouping requires every file task to have estimated bytes",
         );
-    };
-    let target_bytes = total_bytes.div_ceil(output_limit as u64);
-    let mut partitions = Vec::new();
-    let mut current_file_tasks = Vec::new();
-    let mut current_bytes = 0_u64;
+    }
+    let mut file_tasks = file_tasks;
+    file_tasks.sort_by_key(|file_task| std::cmp::Reverse(file_task.estimated_bytes));
+    let mut partition_tasks = (0..output_limit)
+        .map(|_| (0_u64, Vec::new()))
+        .collect::<Vec<_>>();
 
     for file_task in file_tasks {
         let Some(file_bytes) = file_task.estimated_bytes else {
@@ -275,25 +276,18 @@ fn group_by_estimated_bytes(
                 "known-size grouping requires every file task to have estimated bytes",
             );
         };
-        // Keep scan order stable and only start a new partition before adding a
-        // file that would exceed the byte budget. Large files stay whole, so a
-        // single oversized file may exceed the target by itself.
-        let can_start_next_partition = !current_file_tasks.is_empty()
-            && partitions.len() + 1 < output_limit
-            && current_bytes.saturating_add(file_bytes) > target_bytes;
-
-        if can_start_next_partition {
-            partitions.push(build_partition(
+        let Some((partition_bytes, file_tasks)) = partition_tasks
+            .iter_mut()
+            .min_by_key(|(estimated_bytes, _)| *estimated_bytes)
+        else {
+            return partition_planning_error(
                 source_name,
                 table_uri,
                 snapshot_version,
-                current_file_tasks,
-            )?);
-            current_file_tasks = Vec::new();
-            current_bytes = 0;
-        }
-
-        current_bytes = match current_bytes.checked_add(file_bytes) {
+                "known-size grouping requires at least one output partition",
+            );
+        };
+        *partition_bytes = match partition_bytes.checked_add(file_bytes) {
             Some(bytes) => bytes,
             None => {
                 return partition_planning_error(
@@ -304,19 +298,15 @@ fn group_by_estimated_bytes(
                 );
             }
         };
-        current_file_tasks.push(file_task);
+        file_tasks.push(file_task);
     }
 
-    if !current_file_tasks.is_empty() {
-        partitions.push(build_partition(
-            source_name,
-            table_uri,
-            snapshot_version,
-            current_file_tasks,
-        )?);
-    }
-
-    Ok(partitions)
+    partition_tasks
+        .into_iter()
+        .map(|(_, file_tasks)| {
+            build_partition(source_name, table_uri, snapshot_version, file_tasks)
+        })
+        .collect()
 }
 
 /// Groups file tasks by deterministic file-count balancing.
@@ -649,6 +639,32 @@ mod tests {
     }
 
     #[test]
+    fn known_size_files_do_not_accumulate_slack_in_the_last_partition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = DeltaScanFileTaskPartitionPlan::try_new(plan_request(
+            vec![
+                file_task("part-0.parquet", Some(6), Some(1))?,
+                file_task("part-1.parquet", Some(6), Some(1))?,
+                file_task("part-2.parquet", Some(6), Some(1))?,
+                file_task("part-3.parquet", Some(6), Some(1))?,
+                file_task("part-4.parquet", Some(4), Some(1))?,
+                file_task("part-5.parquet", Some(4), Some(1))?,
+            ],
+            2,
+        ))?;
+
+        assert_eq!(
+            plan.partitions
+                .iter()
+                .map(|partition| partition.estimated_bytes)
+                .collect::<Vec<_>>(),
+            vec![Some(16), Some(16)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn known_size_grouping_can_emit_fewer_partitions_than_requested()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = DeltaScanFileTaskPartitionPlan::try_new(plan_request(
@@ -734,12 +750,13 @@ mod tests {
             ],
             2,
         ))?;
-        let flattened_paths = plan
+        let mut flattened_paths = plan
             .partitions
             .iter()
             .flat_map(|partition| partition.file_tasks.iter())
             .map(|file_task| file_task.path.as_str())
             .collect::<Vec<_>>();
+        flattened_paths.sort_unstable();
 
         assert_eq!(
             flattened_paths,
