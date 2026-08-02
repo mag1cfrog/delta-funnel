@@ -1309,6 +1309,11 @@ mod tests {
                     "missing_sql_orders",
                     WriteAllCacheCandidateSkipReason::MissingSqlText,
                 ),
+                WriteAllCacheCandidateSkip::new(
+                    10,
+                    "unselected_orders",
+                    WriteAllCacheCandidateSkipReason::NotExplicitlySelected,
+                ),
             ],
         }
         .to_json_value();
@@ -1330,6 +1335,10 @@ mod tests {
         assert_eq!(
             value["skipped_candidates"][1]["reason"],
             json!({"kind": "missing_sql_text"})
+        );
+        assert_eq!(
+            value["skipped_candidates"][2]["reason"],
+            json!({"kind": "not_explicitly_selected"})
         );
         assert_json_safe(&value)?;
         assert_no_secret_or_raw_sql_text(&value);

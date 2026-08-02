@@ -4,7 +4,24 @@ Use `Session.write_all(...)` when one workflow writes several related lazy
 tables to SQL Server. Shared lazy SQL dependencies can be cached so common
 upstream work is not repeated for every output.
 
-The examples below assume `west` and `east` are lazy tables created from SQL.
+The example below assumes `session` has a registered Delta source named
+`orders`. Build and register the shared dependency chain before creating its
+outputs:
+
+```python
+prepared_orders = session.table_from_sql(
+    "select order_id, region from orders where active = true"
+).alias("prepared_orders")
+classified_orders = session.table_from_sql(
+    "select order_id, region from prepared_orders"
+).alias("classified_orders")
+west = session.table_from_sql(
+    "select order_id from classified_orders where region = 'west'"
+)
+east = session.table_from_sql(
+    "select order_id from classified_orders where region = 'east'"
+)
+```
 
 ## Define the outputs
 
@@ -63,7 +80,8 @@ Explicit mode validates every selected alias before execution, then
 materializes the aliases in dependency order. `cache_mode="explicit"` and
 `cache_aliases` must be supplied together. The selection must be replay-closed:
 do not skip a registered derived alias between a selected alias and a later
-selected alias or output.
+selected alias or output. An eligible alias has retained SQL and complete
+lineage, and is used by at least two selected outputs.
 
 Use the baseline path when shared caching is not wanted:
 
