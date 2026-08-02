@@ -5,13 +5,14 @@ from typing import Literal, Mapping, Sequence, TypeAlias, TypedDict, overload
 __version__: str
 
 LoadMode: TypeAlias = Literal["append_existing", "create_and_load", "replace"]
-WriteAllCacheMode: TypeAlias = Literal["auto", "disabled"]
+WriteAllCacheMode: TypeAlias = Literal["auto", "explicit", "disabled"]
 Report: TypeAlias = dict[str, object]
 Options: TypeAlias = Mapping[str, object]
 
 
 class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
+    cache_aliases: Sequence[str]
 
 
 def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...

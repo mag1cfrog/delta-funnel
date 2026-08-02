@@ -314,6 +314,16 @@ pub(super) const TRUNCATED_SCHEMA_DIAGNOSTIC_SUFFIX: &str = "; additional detail
 // additional URI-token sanitizer.
 const CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS: usize = 6;
 
+pub(super) fn bounded_schema_mismatch_for_nested_error(
+    expected: &Schema,
+    replanned: &Schema,
+) -> String {
+    truncate_schema_diagnostic(
+        describe_schema_mismatch(expected, replanned),
+        CACHE_REPLAY_DIAGNOSTIC_SANITIZATION_LAYERS,
+    )
+}
+
 fn describe_schema_mismatch(expected: &Schema, replanned: &Schema) -> String {
     let mut differences = Vec::new();
     if expected.fields().len() != replanned.fields().len() {
@@ -415,7 +425,7 @@ fn describe_schema_field(field: Option<&FieldRef>) -> String {
     )
 }
 
-fn data_type_without_metadata(data_type: &DataType) -> DataType {
+pub(super) fn data_type_without_metadata(data_type: &DataType) -> DataType {
     use DataType::*;
 
     match data_type {

@@ -1,7 +1,7 @@
 //! Python session wrapper.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods};
+use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyString};
 
 use crate::exception::{delta_funnel_error_to_py, delta_funnel_py_error};
 use crate::json::json_value_to_py;
@@ -140,7 +140,8 @@ impl PySession {
     /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept the
-    /// `cache_mode` option. Pass
+    /// `cache_mode` option. Explicit caching requires both
+    /// `cache_mode="explicit"` and `cache_aliases=[...]`. Pass
     /// `execution_profile=True` to attach an exact execution profile to each
     /// attempted output and executed cache alias.
     /// Cache profiles are under
@@ -777,16 +778,19 @@ fn parse_write_all_options(
     py: Python<'_>,
     write_all_options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<delta_funnel::WriteAllOptions> {
-    let mut options = delta_funnel::WriteAllOptions::default();
     let Some(write_all_options) = write_all_options else {
-        return Ok(options);
+        return Ok(delta_funnel::WriteAllOptions::default());
     };
 
+    let mut cache_mode = None;
+    let mut cache_aliases = None;
     for (key, value) in option_entries(py, write_all_options)? {
         match key.as_str() {
             "cache_mode" => {
-                options =
-                    options.with_cache_mode(parse_write_all_cache_mode(py, &value, key.as_str())?);
+                cache_mode = Some(parse_write_all_cache_mode(py, &value, key.as_str())?);
+            }
+            "cache_aliases" => {
+                cache_aliases = Some(parse_write_all_cache_aliases(py, &value, key.as_str())?);
             }
             _ => {
                 return Err(unknown_option_error(py, "write_all", key.as_str()));
@@ -794,7 +798,45 @@ fn parse_write_all_options(
         }
     }
 
+    let options = match (cache_mode, cache_aliases) {
+        (None, None) => delta_funnel::WriteAllOptions::default(),
+        (Some(mode), None) if mode != delta_funnel::WriteAllCacheMode::Explicit => {
+            delta_funnel::WriteAllOptions::new().with_cache_mode(mode)
+        }
+        (Some(delta_funnel::WriteAllCacheMode::Explicit), Some(aliases)) => {
+            delta_funnel::WriteAllOptions::new().with_explicit_cache_aliases(aliases)
+        }
+        _ => {
+            return Err(config_py_error(
+                py,
+                "invalid_option_combination",
+                "`cache_mode=explicit` and `cache_aliases` must be supplied together".to_owned(),
+            ));
+        }
+    };
     Ok(options)
+}
+
+fn parse_write_all_cache_aliases(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    option_name: &str,
+) -> PyResult<Vec<String>> {
+    let invalid = || {
+        config_py_error(
+            py,
+            "invalid_option_value",
+            format!("`{option_name}` must be a non-empty sequence of non-empty strings"),
+        )
+    };
+    if value.is_instance_of::<PyString>() {
+        return Err(invalid());
+    }
+    let aliases = value.extract::<Vec<String>>().map_err(|_| invalid())?;
+    if aliases.is_empty() || aliases.iter().any(|alias| alias.trim().is_empty()) {
+        return Err(invalid());
+    }
+    Ok(aliases)
 }
 
 fn parse_schema_options(
@@ -872,6 +914,7 @@ fn parse_write_all_cache_mode(
 ) -> PyResult<delta_funnel::WriteAllCacheMode> {
     match option_string(py, value, option_name)?.as_str() {
         "auto" => Ok(delta_funnel::WriteAllCacheMode::Auto),
+        "explicit" => Ok(delta_funnel::WriteAllCacheMode::Explicit),
         "disabled" => Ok(delta_funnel::WriteAllCacheMode::Disabled),
         _ => Err(config_py_error(
             py,
@@ -1245,7 +1288,9 @@ mod tests {
     };
     use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
-    use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule};
+    use pyo3::types::{
+        PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyModule, PyString,
+    };
     use std::{
         env,
         error::Error,
@@ -1336,8 +1381,12 @@ mod tests {
     fn pyi_stub_exposes_write_all_execution_options() {
         let stub = include_str!("../deltafunnel.pyi");
         assert!(stub.contains(
+            "WriteAllCacheMode: TypeAlias = Literal[\"auto\", \"explicit\", \"disabled\"]"
+        ));
+        assert!(stub.contains(
             "class WriteAllExecutionOptions(TypedDict, total=False):\n    cache_mode: WriteAllCacheMode"
         ));
+        assert!(stub.contains("    cache_aliases: Sequence[str]"));
 
         let signature = stub
             .split_once("def write_all(")
@@ -3520,6 +3569,43 @@ union all select cast(902 as bigint) as order_id",),
                 parse_write_all_options(py, None)?.execution_profile_mode(),
                 ExecutionProfileMode::Disabled
             );
+            let explicit = PyDict::new(py);
+            explicit.set_item("cache_mode", "explicit")?;
+            explicit.set_item("cache_aliases", ["filtered", "big"])?;
+            assert_eq!(
+                parse_write_all_options(py, Some(&explicit))?.cache_mode(),
+                delta_funnel::WriteAllCacheMode::Explicit
+            );
+            assert_eq!(
+                parse_write_all_options(py, Some(&explicit))?.cache_aliases(),
+                Some(["filtered".to_owned(), "big".to_owned()].as_slice())
+            );
+
+            for invalid in [
+                PyList::empty(py).as_any(),
+                PyString::new(py, "big").as_any(),
+            ] {
+                let invalid_options = PyDict::new(py);
+                invalid_options.set_item("cache_aliases", invalid)?;
+                let error = parse_write_all_options(py, Some(&invalid_options)).unwrap_err();
+                assert_config_error(py, &error, "invalid_option_value")?;
+            }
+
+            let conflicting = PyDict::new(py);
+            conflicting.set_item("cache_mode", "disabled")?;
+            conflicting.set_item("cache_aliases", ["big"])?;
+            let error = parse_write_all_options(py, Some(&conflicting)).unwrap_err();
+            assert_config_error(py, &error, "invalid_option_combination")?;
+
+            let incomplete = PyDict::new(py);
+            incomplete.set_item("cache_mode", "explicit")?;
+            let error = parse_write_all_options(py, Some(&incomplete)).unwrap_err();
+            assert_config_error(py, &error, "invalid_option_combination")?;
+
+            let incomplete = PyDict::new(py);
+            incomplete.set_item("cache_aliases", ["big"])?;
+            let error = parse_write_all_options(py, Some(&incomplete)).unwrap_err();
+            assert_config_error(py, &error, "invalid_option_combination")?;
 
             let session = Py::new(py, PySession::new(py, None, None, None, None, None, None)?)?;
             let outputs = PyList::empty(py);

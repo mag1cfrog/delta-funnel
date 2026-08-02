@@ -107,9 +107,9 @@ impl WriteAllReport {
 
 /// Cache metadata for one `write_all` call.
 ///
-/// This report describes the conservative cache decision for calls that reached
-/// the sequential output workflow. Cache materialization failures occur before
-/// the workflow can start, so they are returned as errors instead of as
+/// This report describes the cache decision for calls that reached the
+/// sequential output workflow. Cache materialization failures occur before the
+/// workflow can start, so they are returned as errors instead of as
 /// `WriteAllCacheReport` values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteAllCacheReport {
@@ -119,14 +119,14 @@ pub enum WriteAllCacheReport {
     NoCache {
         /// Conservative reason no cache aliases were selected.
         reason: WriteAllNoCacheReason,
-        /// Registered derived aliases skipped by conservative cache planning.
+        /// Registered derived aliases skipped during cache planning.
         skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
     },
     /// Cache planning selected registered derived aliases for this call.
     CacheAliases {
         /// Selected registered derived aliases in deterministic planner order.
         aliases: Vec<WriteAllCacheAliasReport>,
-        /// Registered derived aliases skipped by conservative cache planning.
+        /// Registered derived aliases skipped during cache planning.
         skipped_candidates: Vec<WriteAllCacheCandidateSkip>,
     },
 }
@@ -171,8 +171,9 @@ pub enum WriteAllNoCacheReason {
 /// Selected registered derived alias cache metadata.
 ///
 /// `output_indexes` uses caller-provided `write_all` request indexes. It
-/// includes direct writes of the selected alias and dependent outputs whose
-/// retained SQL was replanned against the active cached alias.
+/// includes outputs that use the selected alias directly or transitively. In an
+/// explicit cache chain, an upstream alias can serve an output through a later
+/// cached alias instead of through that output's retained SQL directly.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WriteAllCacheAliasReport {
     table_id: u64,
@@ -379,7 +380,7 @@ impl fmt::Display for WriteAllCacheAliasStatus {
     }
 }
 
-/// Registered derived alias skipped during conservative cache selection.
+/// Registered derived alias skipped during cache selection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WriteAllCacheCandidateSkip {
     table_id: u64,
@@ -430,7 +431,7 @@ impl fmt::Debug for WriteAllCacheCandidateSkip {
     }
 }
 
-/// Reason a cache candidate was skipped by conservative `write_all` planning.
+/// Reason a cache candidate was skipped during `write_all` cache planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteAllCacheCandidateSkipReason {
     /// Fewer than two selected outputs use this candidate.
@@ -449,4 +450,6 @@ pub enum WriteAllCacheCandidateSkipReason {
     },
     /// The candidate's relative depth could not be ordered deterministically.
     AmbiguousDepth,
+    /// The candidate was eligible but absent from the explicit selection.
+    NotExplicitlySelected,
 }

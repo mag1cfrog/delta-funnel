@@ -45,12 +45,13 @@ recorded in
 __version__: str
 
 LoadMode: TypeAlias = Literal["append_existing", "create_and_load", "replace"]
-WriteAllCacheMode: TypeAlias = Literal["auto", "disabled"]
+WriteAllCacheMode: TypeAlias = Literal["auto", "explicit", "disabled"]
 Report: TypeAlias = dict[str, object]
 Options: TypeAlias = Mapping[str, object]
 
 class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
+    cache_aliases: Sequence[str]
 ```
 
 Reports are JSON-compatible Python dictionaries. See
@@ -295,6 +296,10 @@ report. Every spec must come from the same session.
 - `dry_run=True` plans without writing and rejects `options`,
   `execution_profile`, and `ranked_profile`.
 - `options={"cache_mode": "auto"}` enables eligible shared-work caching.
+- `options={"cache_mode": "explicit", "cache_aliases": ["prepared", "export"]}`
+  caches exactly those registered derived aliases in dependency order. The two
+  keys must be supplied together, and the selection must not skip a registered
+  derived alias between a selected alias and a later selected alias or output.
 - `options={"cache_mode": "disabled"}` disables shared-work caching.
 - `execution_profile=True` attaches exact profiles to attempted outputs and executed
   cache aliases.

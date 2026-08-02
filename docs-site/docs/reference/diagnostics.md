@@ -123,7 +123,7 @@ must admit DEBUG records.
 
 ## Inspect returned write-all cache diagnostics
 
-Auto-cached `write_all` calls record cache lifecycle timings whether exact
+Cache-enabled `write_all` calls record cache lifecycle timings whether exact
 execution operator profiling is enabled or disabled. On success, read the
 executed alias reports under `report["cache"]["aliases"]`. Each attempted alias
 has one of these statuses:
@@ -140,7 +140,7 @@ Every attempted alias has these eight timings in order:
 
 | Phase | Boundary |
 | --- | --- |
-| `cache_alias_dataframe_resolution` | Resolve the selected registered alias with `SessionContext::table`. |
+| `cache_alias_dataframe_resolution` | Resolve an alias with `SessionContext::table`, or, when it depends on an earlier active cache, replan its retained SQL against the active caches. |
 | `cache_alias_physical_planning` | Create one DataFusion physical plan for the alias. |
 | `cache_alias_stream_setup` | Create every partition stream and install progress and terminal observation. It does not poll the streams. |
 | `cache_alias_execute_collect` | Poll and collect the partition streams concurrently, restore partition order, and complete deterministic task cancellation cleanup after an error. |
@@ -165,7 +165,7 @@ On a materialization failure, both the causal leaf and
 `completed` or `failed` only when attempted. No elapsed time is invented for
 an unstarted phase.
 
-Progress and no-progress calls use the same explicit default cache path. It
+Progress and no-progress calls use the same built-in cache implementation. It
 preserves the physical plan schema, partition count, partition order, and
 batches produced by DataFusion's default memory cache. A configured custom
 DataFusion cache factory is not silently bypassed. The call fails with a
