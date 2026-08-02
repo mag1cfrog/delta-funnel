@@ -46,6 +46,23 @@ Execute all outputs with the default `auto` cache mode:
 report = session.write_all(outputs)
 ```
 
+To cache a known dependency chain, explicitly select its registered derived
+aliases:
+
+```python
+report = session.write_all(
+    outputs,
+    options={
+        "cache_mode": "explicit",
+        "cache_aliases": ["prepared_orders", "classified_orders"],
+    },
+)
+```
+
+Explicit mode validates every selected alias before execution, then
+materializes the aliases in dependency order. `cache_mode="explicit"` and
+`cache_aliases` must be supplied together.
+
 Use the baseline path when shared caching is not wanted:
 
 ```python

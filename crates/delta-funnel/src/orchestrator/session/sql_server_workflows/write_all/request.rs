@@ -365,9 +365,11 @@ impl DeltaFunnelSession {
 
     /// Writes multiple selected lazy tables to SQL Server sequentially with explicit options.
     ///
-    /// `WriteAllCacheMode::Disabled` uses the uncached path. The
-    /// default `Auto` mode performs conservative shared-cache planning and
-    /// reports the selected or skipped cache decision.
+    /// `WriteAllCacheMode::Disabled` uses the uncached path. The default
+    /// `Auto` mode performs conservative shared-cache planning.
+    /// `WriteAllCacheMode::Explicit` materializes the registered derived aliases
+    /// selected through [`WriteAllOptions::with_explicit_cache_aliases`] in
+    /// dependency order. Every mode reports its selected or skipped cache decision.
     ///
     /// # Errors
     ///

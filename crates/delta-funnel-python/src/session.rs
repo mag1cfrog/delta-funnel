@@ -140,7 +140,8 @@ impl PySession {
     /// Writes multiple SQL Server outputs, or runs a dry-run plan when requested.
     ///
     /// Pass `dry_run=True` to plan without writing. Execute calls accept the
-    /// `cache_mode` option. Pass
+    /// `cache_mode` option. Explicit caching requires both
+    /// `cache_mode="explicit"` and `cache_aliases=[...]`. Pass
     /// `execution_profile=True` to attach an exact execution profile to each
     /// attempted output and executed cache alias.
     /// Cache profiles are under
