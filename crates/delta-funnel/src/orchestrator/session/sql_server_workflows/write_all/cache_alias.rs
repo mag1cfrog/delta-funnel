@@ -1,7 +1,7 @@
 use std::{fmt, panic::resume_unwind, sync::Arc};
 
 use datafusion::{
-    arrow::datatypes::{DataType, Schema},
+    arrow::datatypes::{DataType, FieldRef, Schema},
     arrow::record_batch::RecordBatch,
     datasource::{MemTable, TableProvider},
     execution::TaskContext,
@@ -757,16 +757,46 @@ fn data_types_compatible_for_cache_alias_replan(expected: &DataType, replanned: 
     // Metadata is not part of the provider's value contract. String offset/view
     // width and variable-binary storage are representation details. Everything
     // else, including nested names and decimal/timestamp parameters, stays exact.
-    data_type_without_metadata(expected) == data_type_without_metadata(replanned)
-        || (expected.is_string() && replanned.is_string())
-        || (is_variable_binary(expected) && is_variable_binary(replanned))
+    normalized_cache_replan_data_type(&data_type_without_metadata(expected))
+        == normalized_cache_replan_data_type(&data_type_without_metadata(replanned))
 }
 
-const fn is_variable_binary(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-    )
+fn normalized_cache_replan_data_type(data_type: &DataType) -> DataType {
+    use DataType::*;
+
+    match data_type {
+        Utf8 | LargeUtf8 | Utf8View => Utf8,
+        Binary | LargeBinary | BinaryView => Binary,
+        List(field) => List(normalized_cache_replan_field(field)),
+        ListView(field) => ListView(normalized_cache_replan_field(field)),
+        FixedSizeList(field, size) => FixedSizeList(normalized_cache_replan_field(field), *size),
+        LargeList(field) => LargeList(normalized_cache_replan_field(field)),
+        LargeListView(field) => LargeListView(normalized_cache_replan_field(field)),
+        Struct(fields) => Struct(fields.iter().map(normalized_cache_replan_field).collect()),
+        Union(fields, mode) => Union(
+            fields
+                .iter()
+                .map(|(id, field)| (id, normalized_cache_replan_field(field)))
+                .collect(),
+            *mode,
+        ),
+        Dictionary(key, value) => Dictionary(
+            Box::new(normalized_cache_replan_data_type(key)),
+            Box::new(normalized_cache_replan_data_type(value)),
+        ),
+        Map(field, sorted) => Map(normalized_cache_replan_field(field), *sorted),
+        RunEndEncoded(run_ends, values) => RunEndEncoded(
+            normalized_cache_replan_field(run_ends),
+            normalized_cache_replan_field(values),
+        ),
+        _ => data_type.clone(),
+    }
+}
+
+fn normalized_cache_replan_field(field: &FieldRef) -> FieldRef {
+    let mut field = field.as_ref().clone();
+    field.set_data_type(normalized_cache_replan_data_type(field.data_type()));
+    Arc::new(field)
 }
 
 fn start_cache_alias_span(
@@ -1207,24 +1237,35 @@ mod tests {
             ));
         }
 
-        let nested = |name: &str, metadata: &str| {
+        let nested = |name: &str, data_type: DataType, metadata: &str| {
             DataType::Struct(
                 vec![Arc::new(
-                    Field::new(name, DataType::Utf8, false).with_metadata(HashMap::from([(
-                        "comment".to_owned(),
-                        metadata.to_owned(),
-                    )])),
+                    Field::new(
+                        name,
+                        DataType::List(Arc::new(
+                            Field::new("item", data_type, true).with_metadata(HashMap::from([(
+                                "comment".to_owned(),
+                                metadata.to_owned(),
+                            )])),
+                        )),
+                        false,
+                    )
+                    .with_metadata(HashMap::from([("comment".to_owned(), metadata.to_owned())])),
                 )]
                 .into(),
             )
         };
         assert!(data_types_compatible_for_cache_alias_replan(
-            &nested("code", "original"),
-            &nested("code", "replanned")
+            &nested("code", DataType::Utf8, "original"),
+            &nested("code", DataType::Utf8View, "replanned")
+        ));
+        assert!(data_types_compatible_for_cache_alias_replan(
+            &nested("payload", DataType::Binary, "original"),
+            &nested("payload", DataType::BinaryView, "replanned")
         ));
         assert!(!data_types_compatible_for_cache_alias_replan(
-            &nested("code", "original"),
-            &nested("renamed", "replanned")
+            &nested("code", DataType::Utf8, "original"),
+            &nested("renamed", DataType::Utf8View, "replanned")
         ));
     }
 

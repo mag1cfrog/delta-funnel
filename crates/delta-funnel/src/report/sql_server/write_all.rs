@@ -171,8 +171,9 @@ pub enum WriteAllNoCacheReason {
 /// Selected registered derived alias cache metadata.
 ///
 /// `output_indexes` uses caller-provided `write_all` request indexes. It
-/// includes direct writes of the selected alias and dependent outputs whose
-/// retained SQL was replanned against the active cached alias.
+/// includes outputs that use the selected alias directly or transitively. In an
+/// explicit cache chain, an upstream alias can serve an output through a later
+/// cached alias instead of through that output's retained SQL directly.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WriteAllCacheAliasReport {
     table_id: u64,

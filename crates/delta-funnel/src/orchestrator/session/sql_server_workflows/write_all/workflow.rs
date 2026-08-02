@@ -173,7 +173,7 @@ impl DeltaFunnelSession {
         write_mssql_outputs_with_writer(jobs, self.options.mssql_workflow_options(), writer).await
     }
 
-    /// Runs the auto-cache path with an injected writer, optionally collecting
+    /// Runs the cached path with an injected writer, optionally collecting
     /// provider statistics and reporting progress.
     #[cfg(test)]
     pub(super) async fn write_all_cached_with_writer<W>(

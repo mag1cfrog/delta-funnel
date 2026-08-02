@@ -140,7 +140,7 @@ Every attempted alias has these eight timings in order:
 
 | Phase | Boundary |
 | --- | --- |
-| `cache_alias_dataframe_resolution` | Resolve the first selected registered alias with `SessionContext::table`, or replan a later explicit alias from retained SQL against earlier active caches. |
+| `cache_alias_dataframe_resolution` | Resolve an alias with `SessionContext::table`, or, when it depends on an earlier active cache, replan its retained SQL against the active caches. |
 | `cache_alias_physical_planning` | Create one DataFusion physical plan for the alias. |
 | `cache_alias_stream_setup` | Create every partition stream and install progress and terminal observation. It does not poll the streams. |
 | `cache_alias_execute_collect` | Poll and collect the partition streams concurrently, restore partition order, and complete deterministic task cancellation cleanup after an error. |

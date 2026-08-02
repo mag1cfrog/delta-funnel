@@ -62,8 +62,8 @@ pub(crate) enum MssqlOutputCacheDecision {
     NoCache { reason: MssqlNoCacheReason },
     /// Registered derived aliases that should be cached for selected outputs.
     ///
-    /// This vector represents the cache frontier: eligible shared derived
-    /// aliases that are not covered by any deeper eligible shared alias.
+    /// Automatic selection returns a cache frontier. Explicit selection returns
+    /// the requested replay-closed aliases in dependency order.
     CacheAliases(Vec<MssqlDerivedCacheAliasPlan>),
 }
 
