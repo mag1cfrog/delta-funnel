@@ -2366,6 +2366,88 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn write_all_explicit_cache_aliases_reject_unselected_intermediate_aliases()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+            session
+                .context()
+                .register_table("big_source", source_provider)?;
+            let pending_big = session
+                .table_from_sql("select marker, region from big_source")
+                .await?;
+            session.register_alias("big", &pending_big)?;
+            let pending_middle = session
+                .table_from_sql("select marker, region from big")
+                .await?;
+            session.register_alias("middle", &pending_middle)?;
+            let pending_filtered = session
+                .table_from_sql("select marker, region from middle where marker = 'shared'")
+                .await?;
+            session.register_alias("filtered", &pending_filtered)?;
+            let west = session
+                .table_from_sql("select marker from filtered where region = 'west'")
+                .await?;
+            let east = session
+                .table_from_sql("select marker from filtered where region = 'east'")
+                .await?;
+            let requests = [
+                execute_output_request(
+                    west,
+                    "west_output",
+                    "west_orders",
+                    LoadMode::AppendExisting,
+                )?,
+                execute_output_request(
+                    east,
+                    "east_output",
+                    "east_orders",
+                    LoadMode::AppendExisting,
+                )?,
+            ];
+
+            for (aliases, expected_consumer, expected_intermediate) in [
+                (
+                    vec!["big".to_owned(), "filtered".to_owned()],
+                    "cache alias `filtered`",
+                    "middle",
+                ),
+                (vec!["big".to_owned()], "output `west_output`", "filtered"),
+            ] {
+                let writer = FakeWorkflowWriter::default();
+                let calls = writer.calls();
+                let error = session
+                    .write_all_with_options_and_writer(
+                        &requests,
+                        WriteAllOptions::new().with_explicit_cache_aliases(aliases),
+                        writer,
+                    )
+                    .await
+                    .err()
+                    .ok_or("expected replay-closure planning failure")?;
+
+                assert!(
+                    calls
+                        .lock()
+                        .map_err(|_| "fake workflow call lock poisoned")?
+                        .is_empty()
+                );
+                let DeltaFunnelError::MssqlWorkflowPlanning { message } = error else {
+                    return Err("expected workflow planning error".into());
+                };
+                assert!(message.contains("explicit cache alias `big`"), "{message}");
+                assert!(message.contains(expected_consumer), "{message}");
+                assert!(message.contains(expected_intermediate), "{message}");
+                assert!(message.contains("replay-closed"), "{message}");
+            }
+
+            assert_eq!(source_scans.load(Ordering::SeqCst), 0);
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn downstream_cache_replan_schema_failure_restores_upstream_and_reports_both_aliases()
         -> Result<(), Box<dyn std::error::Error>> {
             let mut session = DeltaFunnelSession::new(

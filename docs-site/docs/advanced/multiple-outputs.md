@@ -61,7 +61,9 @@ report = session.write_all(
 
 Explicit mode validates every selected alias before execution, then
 materializes the aliases in dependency order. `cache_mode="explicit"` and
-`cache_aliases` must be supplied together.
+`cache_aliases` must be supplied together. The selection must be replay-closed:
+do not skip a registered derived alias between a selected alias and a later
+selected alias or output.
 
 Use the baseline path when shared caching is not wanted:
 

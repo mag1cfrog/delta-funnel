@@ -298,7 +298,8 @@ report. Every spec must come from the same session.
 - `options={"cache_mode": "auto"}` enables eligible shared-work caching.
 - `options={"cache_mode": "explicit", "cache_aliases": ["prepared", "export"]}`
   caches exactly those registered derived aliases in dependency order. The two
-  keys must be supplied together.
+  keys must be supplied together, and the selection must not skip a registered
+  derived alias between a selected alias and a later selected alias or output.
 - `options={"cache_mode": "disabled"}` disables shared-work caching.
 - `execution_profile=True` attaches exact profiles to attempted outputs and executed
   cache aliases.

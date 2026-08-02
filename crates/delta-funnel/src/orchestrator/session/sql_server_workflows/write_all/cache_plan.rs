@@ -342,6 +342,8 @@ impl DeltaFunnelSession {
             requested_table_ids.insert(derived.table().id());
         }
 
+        self.validate_explicit_cache_replay_closure(requests, &requested_table_ids)?;
+
         // Registered aliases are stored in registration order. A downstream
         // alias can only reference an upstream alias that was already registered.
         let (selected_aliases, unselected_aliases): (Vec<_>, Vec<_>) = shared_candidates
@@ -361,6 +363,88 @@ impl DeltaFunnelSession {
             MssqlOutputCacheDecision::CacheAliases(selected_aliases),
             skipped_candidates,
         ))
+    }
+
+    fn validate_explicit_cache_replay_closure(
+        &self,
+        requests: &[OutputWritePlan],
+        selected_table_ids: &BTreeSet<u64>,
+    ) -> Result<(), DeltaFunnelError> {
+        for derived in self
+            .derived_tables
+            .iter()
+            .filter(|derived| selected_table_ids.contains(&derived.table().id()))
+        {
+            self.validate_explicit_cache_replay_root(
+                derived.table(),
+                "cache alias",
+                derived.name(),
+                selected_table_ids,
+            )?;
+        }
+
+        for request in requests.iter().filter(|request| {
+            request.table().kind() == LazyTableKind::DerivedSql
+                && !selected_table_ids.contains(&request.table().id())
+        }) {
+            self.validate_explicit_cache_replay_root(
+                request.table(),
+                "output",
+                request.target().output_name(),
+                selected_table_ids,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_explicit_cache_replay_root(
+        &self,
+        table: &LazyTable,
+        consumer_kind: &str,
+        consumer_name: &str,
+        selected_table_ids: &BTreeSet<u64>,
+    ) -> Result<(), DeltaFunnelError> {
+        for dependency in self.lineage_for_derived_table(table)?.direct_dependencies() {
+            let DerivedTableDependency::RegisteredDerived { table_id, name } = dependency else {
+                continue;
+            };
+            if selected_table_ids.contains(table_id) {
+                continue;
+            }
+            let intermediate = self
+                .registered_derived_table_by_id(*table_id)
+                .ok_or_else(|| DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "write_all could not resolve registered cache dependency `{}`",
+                        sanitize_text_for_display(name)
+                    ),
+                })?;
+            let selected_alias = self
+                .transitive_registered_derived_dependencies(intermediate.table())?
+                .into_iter()
+                .find_map(|dependency| match dependency {
+                    DerivedTableDependency::RegisteredDerived { table_id, name }
+                        if selected_table_ids.contains(&table_id) =>
+                    {
+                        Some(name)
+                    }
+                    _ => None,
+                });
+            if let Some(selected_alias) = selected_alias {
+                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "write_all explicit cache alias `{}` is hidden from replanned {} `{}` by unselected intermediate alias `{}`; explicit cache aliases must form a replay-closed dependency chain",
+                        sanitize_text_for_display(&selected_alias),
+                        consumer_kind,
+                        sanitize_text_for_display(consumer_name),
+                        sanitize_text_for_display(name),
+                    ),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn shared_mssql_output_cache_candidates(

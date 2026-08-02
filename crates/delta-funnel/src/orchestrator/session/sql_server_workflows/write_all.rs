@@ -62,7 +62,9 @@ impl WriteAllOptions {
     /// Selects the registered derived aliases to cache for this call.
     ///
     /// The planner validates eligibility and materializes selected aliases in
-    /// dependency order.
+    /// dependency order. Selections must be replay-closed: no unselected
+    /// registered derived alias may sit between a selected alias and a later
+    /// selected alias or output.
     #[must_use]
     pub fn with_explicit_cache_aliases(mut self, aliases: Vec<String>) -> Self {
         self.cache_mode = WriteAllCacheMode::Explicit;
