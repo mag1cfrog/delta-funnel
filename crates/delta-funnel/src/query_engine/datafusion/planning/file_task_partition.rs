@@ -6,6 +6,8 @@
 //! tasks by bytes or file count. Each task remains whole, preserving per-file
 //! Delta correctness metadata for read execution.
 
+use std::{cmp::Reverse, collections::BinaryHeap};
+
 use crate::{DeltaFunnelError, error::DeltaScanFileTaskPartitionPlanningSnafu};
 
 use super::file_task::DeltaScanFileTask;
@@ -262,10 +264,31 @@ fn group_by_estimated_bytes(
         );
     }
     let mut file_tasks = file_tasks;
-    file_tasks.sort_by_key(|file_task| std::cmp::Reverse(file_task.estimated_bytes));
-    let mut partition_tasks = (0..output_limit)
-        .map(|_| (0_u64, Vec::new()))
-        .collect::<Vec<_>>();
+    file_tasks.sort_by_key(|file_task| Reverse(file_task.estimated_bytes));
+    let mut file_tasks = file_tasks.into_iter();
+    let mut partition_tasks = Vec::with_capacity(output_limit);
+    let mut partition_loads = BinaryHeap::with_capacity(output_limit);
+
+    for partition_index in 0..output_limit {
+        let Some(file_task) = file_tasks.next() else {
+            return partition_planning_error(
+                source_name,
+                table_uri,
+                snapshot_version,
+                "known-size grouping exhausted file tasks unexpectedly",
+            );
+        };
+        let Some(file_bytes) = file_task.estimated_bytes else {
+            return partition_planning_error(
+                source_name,
+                table_uri,
+                snapshot_version,
+                "known-size grouping requires every file task to have estimated bytes",
+            );
+        };
+        partition_tasks.push(vec![file_task]);
+        partition_loads.push(Reverse((file_bytes, partition_index)));
+    }
 
     for file_task in file_tasks {
         let Some(file_bytes) = file_task.estimated_bytes else {
@@ -276,10 +299,7 @@ fn group_by_estimated_bytes(
                 "known-size grouping requires every file task to have estimated bytes",
             );
         };
-        let Some((partition_bytes, file_tasks)) = partition_tasks
-            .iter_mut()
-            .min_by_key(|(estimated_bytes, _)| *estimated_bytes)
-        else {
+        let Some(Reverse((partition_bytes, partition_index))) = partition_loads.pop() else {
             return partition_planning_error(
                 source_name,
                 table_uri,
@@ -287,7 +307,7 @@ fn group_by_estimated_bytes(
                 "known-size grouping requires at least one output partition",
             );
         };
-        *partition_bytes = match partition_bytes.checked_add(file_bytes) {
+        let partition_bytes = match partition_bytes.checked_add(file_bytes) {
             Some(bytes) => bytes,
             None => {
                 return partition_planning_error(
@@ -298,14 +318,13 @@ fn group_by_estimated_bytes(
                 );
             }
         };
-        file_tasks.push(file_task);
+        partition_tasks[partition_index].push(file_task);
+        partition_loads.push(Reverse((partition_bytes, partition_index)));
     }
 
     partition_tasks
         .into_iter()
-        .map(|(_, file_tasks)| {
-            build_partition(source_name, table_uri, snapshot_version, file_tasks)
-        })
+        .map(|file_tasks| build_partition(source_name, table_uri, snapshot_version, file_tasks))
         .collect()
 }
 
@@ -659,6 +678,29 @@ mod tests {
                 .map(|partition| partition.estimated_bytes)
                 .collect::<Vec<_>>(),
             vec![Some(16), Some(16)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_zero_byte_files_keep_partitions_non_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let plan = DeltaScanFileTaskPartitionPlan::try_new(plan_request(
+            vec![
+                file_task("non-zero.parquet", Some(10), Some(1))?,
+                file_task("zero-0.parquet", Some(0), Some(0))?,
+                file_task("zero-1.parquet", Some(0), Some(0))?,
+            ],
+            3,
+        ))?;
+
+        assert_eq!(
+            plan_partition_paths(&plan),
+            vec![
+                vec!["non-zero.parquet"],
+                vec!["zero-0.parquet"],
+                vec!["zero-1.parquet"],
+            ]
         );
 
         Ok(())
