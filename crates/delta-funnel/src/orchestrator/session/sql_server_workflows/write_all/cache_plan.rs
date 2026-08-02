@@ -38,7 +38,7 @@ impl MssqlOutputCachePlan {
         &self.decision
     }
 
-    /// Returns candidates skipped for explicit conservative reasons.
+    /// Returns candidates skipped during cache selection.
     #[must_use]
     pub(crate) fn skipped_candidates(&self) -> &[MssqlCacheCandidateSkip] {
         &self.skipped_candidates
@@ -137,7 +137,7 @@ impl fmt::Debug for MssqlDerivedCacheAliasPlan {
     }
 }
 
-/// Candidate skipped during conservative cache selection.
+/// Candidate skipped during cache selection.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MssqlCacheCandidateSkip {
     table_id: u64,

@@ -18,10 +18,10 @@ pub enum WriteAllCacheMode {
     /// Select and materialize conservative shared derived aliases when safe.
     #[default]
     Auto,
-    /// Materialize only explicitly selected eligible aliases.
-    Explicit,
     /// Use the baseline sequential workflow without cache planning or materialization.
     Disabled,
+    /// Materialize only explicitly selected eligible aliases.
+    Explicit,
 }
 
 /// Execution options for one multi-output `write_all` call.

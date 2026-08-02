@@ -165,7 +165,7 @@ On a materialization failure, both the causal leaf and
 `completed` or `failed` only when attempted. No elapsed time is invented for
 an unstarted phase.
 
-Progress and no-progress calls use the same explicit default cache path. It
+Progress and no-progress calls use the same built-in cache implementation. It
 preserves the physical plan schema, partition count, partition order, and
 batches produced by DataFusion's default memory cache. A configured custom
 DataFusion cache factory is not silently bypassed. The call fails with a

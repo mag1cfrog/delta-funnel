@@ -789,7 +789,10 @@ fn normalized_cache_replan_data_type(data_type: &DataType) -> DataType {
             normalized_cache_replan_field(run_ends),
             normalized_cache_replan_field(values),
         ),
-        _ => data_type.clone(),
+        Null | Boolean | Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+        | Float16 | Float32 | Float64 | Timestamp(..) | Date32 | Date64 | Time32(_) | Time64(_)
+        | Duration(_) | Interval(_) | FixedSizeBinary(_) | Decimal32(..) | Decimal64(..)
+        | Decimal128(..) | Decimal256(..) => data_type.clone(),
     }
 }
 
