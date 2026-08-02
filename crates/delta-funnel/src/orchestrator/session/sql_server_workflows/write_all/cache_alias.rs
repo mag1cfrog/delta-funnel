@@ -1,6 +1,7 @@
 use std::{fmt, panic::resume_unwind, sync::Arc};
 
 use datafusion::{
+    arrow::datatypes::{DataType, Schema},
     arrow::record_batch::RecordBatch,
     datasource::{MemTable, TableProvider},
     execution::TaskContext,
@@ -36,7 +37,10 @@ use super::super::super::{
     },
     registry::{DerivedTableDependency, read_only_sql_options},
 };
-use super::MssqlDerivedCacheAliasPlan;
+use super::{
+    MssqlDerivedCacheAliasPlan,
+    cached_stream::{bounded_schema_mismatch_for_nested_error, data_type_without_metadata},
+};
 
 const CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE: &str = "cache_alias_dataframe_resolution";
 const CACHE_ALIAS_PHYSICAL_PLANNING_PHASE: &str = "cache_alias_physical_planning";
@@ -257,6 +261,9 @@ impl DeltaFunnelSession {
             .registered_derived_for_scoped_cache_alias(table)
             .map_err(CacheAliasReplacementFailure::before_attempt)?;
         let alias_name = registered.name().to_owned();
+        let expected_replan_schema = retained_sql
+            .is_some()
+            .then(|| Arc::clone(registered.schema()));
         if self.context.state_ref().read().cache_factory().is_some() {
             return Err(CacheAliasReplacementFailure::before_attempt(
                 DeltaFunnelError::MssqlWorkflowPlanning {
@@ -282,6 +289,7 @@ impl DeltaFunnelSession {
                 reporter,
                 profile_mode,
                 retained_sql,
+                expected_replan_schema.as_deref(),
                 trace_context.as_ref(),
             )
             .await
@@ -429,6 +437,7 @@ impl DeltaFunnelSession {
             reporter,
             profile_mode,
             None,
+            None,
             trace_context,
         )
         .await
@@ -440,6 +449,7 @@ impl DeltaFunnelSession {
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
         retained_sql: Option<&str>,
+        expected_replan_schema: Option<&Schema>,
         trace_context: Option<&OperationTraceContext>,
     ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
         let materialization_timer = PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE);
@@ -468,6 +478,29 @@ impl DeltaFunnelSession {
                 ));
             }
         };
+        if let Some(expected_schema) = expected_replan_schema {
+            let replanned_schema = dataframe.schema().as_arrow();
+            if !schemas_compatible_for_cache_alias_replan(expected_schema, replanned_schema) {
+                fail_cache_alias_span(resolution_span);
+                return Err(cache_alias_materialization_failure(
+                    mssql_scoped_cache_alias_error(
+                        "resolve",
+                        alias_name,
+                        format!(
+                            "replanned cache alias schema is incompatible with the registered schema: {}",
+                            bounded_schema_mismatch_for_nested_error(
+                                expected_schema,
+                                replanned_schema
+                            )
+                        ),
+                    ),
+                    phase_timings,
+                    resolution_timer,
+                    materialization_timer,
+                    None,
+                ));
+            }
+        }
         complete_cache_alias_span(resolution_span);
         phase_timings.push(resolution_timer.completed());
 
@@ -702,6 +735,38 @@ impl DeltaFunnelSession {
             restore_timing: Some(restore_timing),
         }
     }
+}
+
+fn schemas_compatible_for_cache_alias_replan(expected: &Schema, replanned: &Schema) -> bool {
+    expected.fields().len() == replanned.fields().len()
+        && expected
+            .fields()
+            .iter()
+            .zip(replanned.fields())
+            .all(|(expected, replanned)| {
+                expected.name() == replanned.name()
+                    && expected.is_nullable() == replanned.is_nullable()
+                    && data_types_compatible_for_cache_alias_replan(
+                        expected.data_type(),
+                        replanned.data_type(),
+                    )
+            })
+}
+
+fn data_types_compatible_for_cache_alias_replan(expected: &DataType, replanned: &DataType) -> bool {
+    // Metadata is not part of the provider's value contract. String offset/view
+    // width and variable-binary storage are representation details. Everything
+    // else, including nested names and decimal/timestamp parameters, stays exact.
+    data_type_without_metadata(expected) == data_type_without_metadata(replanned)
+        || (expected.is_string() && replanned.is_string())
+        || (is_variable_binary(expected) && is_variable_binary(replanned))
+}
+
+const fn is_variable_binary(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    )
 }
 
 fn start_cache_alias_span(
@@ -1024,7 +1089,7 @@ mod tests {
     use datafusion::{
         arrow::{
             array::{ArrayRef, StringArray},
-            datatypes::{DataType, Field, Schema, SchemaRef},
+            datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
             record_batch::RecordBatch,
         },
         catalog::SchemaProvider,
@@ -1057,6 +1122,111 @@ mod tests {
         table_formats::RealParquetDeltaTable,
     };
     use tracing::Level;
+
+    #[test]
+    fn cache_alias_replan_schema_compatibility_is_narrow() {
+        let expected = Schema::new_with_metadata(
+            vec![
+                Field::new("text", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("amount", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ],
+            HashMap::from([("comment".to_owned(), "original".to_owned())]),
+        );
+        let compatible = Schema::new_with_metadata(
+            vec![
+                Field::new("text", DataType::Utf8View, true).with_metadata(HashMap::from([(
+                    "comment".to_owned(),
+                    "replanned".to_owned(),
+                )])),
+                Field::new("payload", DataType::BinaryView, true),
+                Field::new("amount", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ],
+            HashMap::from([("comment".to_owned(), "replanned".to_owned())]),
+        );
+        assert!(schemas_compatible_for_cache_alias_replan(
+            &expected,
+            &compatible
+        ));
+
+        for incompatible in [
+            Schema::new(vec![
+                Field::new("renamed", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("amount", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ]),
+            Schema::new(vec![
+                Field::new("text", DataType::Utf8, false),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("amount", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ]),
+            Schema::new(vec![
+                Field::new("text", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("amount", DataType::Decimal128(10, 3), true),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    true,
+                ),
+            ]),
+            Schema::new(vec![
+                Field::new("text", DataType::Utf8, true),
+                Field::new("payload", DataType::Binary, true),
+                Field::new("amount", DataType::Decimal128(10, 2), true),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    true,
+                ),
+            ]),
+        ] {
+            assert!(!schemas_compatible_for_cache_alias_replan(
+                &expected,
+                &incompatible
+            ));
+        }
+
+        let nested = |name: &str, metadata: &str| {
+            DataType::Struct(
+                vec![Arc::new(
+                    Field::new(name, DataType::Utf8, false).with_metadata(HashMap::from([(
+                        "comment".to_owned(),
+                        metadata.to_owned(),
+                    )])),
+                )]
+                .into(),
+            )
+        };
+        assert!(data_types_compatible_for_cache_alias_replan(
+            &nested("code", "original"),
+            &nested("code", "replanned")
+        ));
+        assert!(!data_types_compatible_for_cache_alias_replan(
+            &nested("code", "original"),
+            &nested("renamed", "replanned")
+        ));
+    }
 
     #[derive(Debug)]
     struct RecordingCacheFactory {
