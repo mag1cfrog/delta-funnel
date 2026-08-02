@@ -937,6 +937,9 @@ fn cache_candidate_skip_reason(reason: &WriteAllCacheCandidateSkipReason) -> Val
         WriteAllCacheCandidateSkipReason::AmbiguousDepth => json!({
             "kind": "ambiguous_depth",
         }),
+        WriteAllCacheCandidateSkipReason::NotExplicitlySelected => json!({
+            "kind": "not_explicitly_selected",
+        }),
     }
 }
 

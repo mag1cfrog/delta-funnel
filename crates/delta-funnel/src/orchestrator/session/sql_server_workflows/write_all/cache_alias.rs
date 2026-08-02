@@ -34,6 +34,7 @@ use super::super::super::{
         DeltaFileProgressSampler, clone_terminal_execution_profile,
         finalize_tracked_query_execution, track_partitioned_query_execution_completion,
     },
+    registry::{DerivedTableDependency, read_only_sql_options},
 };
 use super::MssqlDerivedCacheAliasPlan;
 
@@ -238,6 +239,7 @@ impl DeltaFunnelSession {
             reporter,
             profile_mode,
             None,
+            None,
         )
         .await
     }
@@ -248,6 +250,7 @@ impl DeltaFunnelSession {
         output_indexes: Vec<usize>,
         reporter: Option<&ProgressReporter>,
         profile_mode: ExecutionProfileMode,
+        retained_sql: Option<&str>,
         trace_context: Option<OperationTraceContext>,
     ) -> Result<MssqlScopedCacheAliasReplacement<'_>, CacheAliasReplacementFailure> {
         let registered = self
@@ -274,10 +277,11 @@ impl DeltaFunnelSession {
             mut phase_timings,
             execution_profile,
         } = self
-            .materialize_cache_with_trace_context(
+            .materialize_cache_from_sql_with_trace_context(
                 alias_name.as_str(),
                 reporter,
                 profile_mode,
+                retained_sql,
                 trace_context.as_ref(),
             )
             .await
@@ -335,7 +339,7 @@ impl DeltaFunnelSession {
         profile_mode: ExecutionProfileMode,
         trace_context: Option<OperationTraceContext>,
     ) -> Result<Vec<MssqlScopedCacheAliasReplacement<'_>>, DeltaFunnelError> {
-        let mut replacements = Vec::new();
+        let mut replacements: Vec<MssqlScopedCacheAliasReplacement<'_>> = Vec::new();
 
         for cache_alias in cache_aliases {
             let Some(registered) = self.registered_derived_table_by_id(cache_alias.table_id())
@@ -348,6 +352,27 @@ impl DeltaFunnelSession {
                 ));
             };
             let table = registered.table().clone();
+            let dependencies = match self.transitive_registered_derived_dependencies(&table) {
+                Ok(dependencies) => dependencies,
+                Err(error) => {
+                    return Err(restore_cache_aliases_after_failure(
+                        error,
+                        replacements,
+                        None,
+                        reporter,
+                    ));
+                }
+            };
+            let retained_sql = dependencies
+                .iter()
+                .any(|dependency| {
+                    matches!(
+                        dependency,
+                        DerivedTableDependency::RegisteredDerived { table_id, .. }
+                            if replacements.iter().any(|replacement| replacement.table_id == *table_id)
+                    )
+                })
+                .then(|| registered.sql_text().to_owned());
 
             match self
                 .replace_registered_derived_alias_with_cache_attempt_and_trace_context(
@@ -355,6 +380,7 @@ impl DeltaFunnelSession {
                     cache_alias.output_indexes().to_vec(),
                     reporter,
                     profile_mode,
+                    retained_sql.as_deref(),
                     trace_context.clone(),
                 )
                 .await
@@ -390,6 +416,7 @@ impl DeltaFunnelSession {
             .await
     }
 
+    #[cfg(test)]
     async fn materialize_cache_with_trace_context(
         &self,
         alias_name: &str,
@@ -397,12 +424,38 @@ impl DeltaFunnelSession {
         profile_mode: ExecutionProfileMode,
         trace_context: Option<&OperationTraceContext>,
     ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
+        self.materialize_cache_from_sql_with_trace_context(
+            alias_name,
+            reporter,
+            profile_mode,
+            None,
+            trace_context,
+        )
+        .await
+    }
+
+    async fn materialize_cache_from_sql_with_trace_context(
+        &self,
+        alias_name: &str,
+        reporter: Option<&ProgressReporter>,
+        profile_mode: ExecutionProfileMode,
+        retained_sql: Option<&str>,
+        trace_context: Option<&OperationTraceContext>,
+    ) -> Result<MaterializedCache, CacheAliasPhaseFailure> {
         let materialization_timer = PhaseTimer::start(CACHE_ALIAS_MATERIALIZATION_TOTAL_PHASE);
         let mut phase_timings = Vec::with_capacity(8);
 
         let resolution_timer = PhaseTimer::start(CACHE_ALIAS_DATAFRAME_RESOLUTION_PHASE);
         let resolution_span = start_cache_alias_span(trace_context, "Resolve cache DataFrame");
-        let dataframe = match self.context.table(alias_name).await {
+        let dataframe_result = match retained_sql {
+            Some(sql) => {
+                self.context
+                    .sql_with_options(sql, read_only_sql_options())
+                    .await
+            }
+            None => self.context.table(alias_name).await,
+        };
+        let dataframe = match dataframe_result {
             Ok(dataframe) => dataframe,
             Err(error) => {
                 fail_cache_alias_span(resolution_span);

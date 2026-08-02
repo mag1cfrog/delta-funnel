@@ -18,14 +18,17 @@ pub enum WriteAllCacheMode {
     /// Select and materialize conservative shared derived aliases when safe.
     #[default]
     Auto,
+    /// Materialize only explicitly selected eligible aliases.
+    Explicit,
     /// Use the baseline sequential workflow without cache planning or materialization.
     Disabled,
 }
 
 /// Execution options for one multi-output `write_all` call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteAllOptions {
     cache_mode: WriteAllCacheMode,
+    cache_aliases: Option<Vec<String>>,
     execution_profile_mode: ExecutionProfileMode,
 }
 
@@ -35,11 +38,15 @@ impl WriteAllOptions {
     pub const fn new() -> Self {
         Self {
             cache_mode: WriteAllCacheMode::Auto,
+            cache_aliases: None,
             execution_profile_mode: ExecutionProfileMode::Disabled,
         }
     }
 
     /// Sets the cache policy for this `write_all` call.
+    ///
+    /// Configure [`WriteAllCacheMode::Explicit`] through
+    /// [`Self::with_explicit_cache_aliases`] so the required aliases are present.
     #[must_use]
     pub const fn with_cache_mode(mut self, cache_mode: WriteAllCacheMode) -> Self {
         self.cache_mode = cache_mode;
@@ -50,6 +57,23 @@ impl WriteAllOptions {
     #[must_use]
     pub const fn cache_mode(&self) -> WriteAllCacheMode {
         self.cache_mode
+    }
+
+    /// Selects the registered derived aliases to cache for this call.
+    ///
+    /// The planner validates eligibility and materializes selected aliases in
+    /// dependency order.
+    #[must_use]
+    pub fn with_explicit_cache_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.cache_mode = WriteAllCacheMode::Explicit;
+        self.cache_aliases = Some(aliases);
+        self
+    }
+
+    /// Returns the explicitly selected cache aliases, when configured.
+    #[must_use]
+    pub fn cache_aliases(&self) -> Option<&[String]> {
+        self.cache_aliases.as_deref()
     }
 
     /// Sets detailed execution profiling for each attempted output and cache materialization.
@@ -76,6 +100,7 @@ mod tests {
         let options = WriteAllOptions::default();
 
         assert_eq!(options.cache_mode(), WriteAllCacheMode::Auto);
+        assert_eq!(options.cache_aliases(), None);
         assert_eq!(
             options.execution_profile_mode(),
             ExecutionProfileMode::Disabled
@@ -97,5 +122,13 @@ mod tests {
                 );
             }
         }
+
+        let options = WriteAllOptions::new()
+            .with_explicit_cache_aliases(vec!["upstream".to_owned(), "downstream".to_owned()]);
+        assert_eq!(options.cache_mode(), WriteAllCacheMode::Explicit);
+        assert_eq!(
+            options.cache_aliases(),
+            Some(["upstream".to_owned(), "downstream".to_owned()].as_slice())
+        );
     }
 }

@@ -93,6 +93,7 @@ impl DeltaFunnelSession {
     where
         W: MssqlWorkflowOutputWriter,
     {
+        validate_write_all_options(&options)?;
         validate_write_all_requests(requests)?;
         let active_reporter = if requests.is_empty() { None } else { reporter };
         let trace_context = OperationTraceContext::start(OperationTraceKind::WriteAll);
@@ -126,23 +127,40 @@ impl DeltaFunnelSession {
 
             // Cache planning selects the execution route. Disabled mode records
             // the skipped phase so reports keep the same phase structure.
-            let automatic_cache_plan = match options.cache_mode() {
-                WriteAllCacheMode::Auto => {
+            let cache_plan = match (options.cache_mode(), options.cache_aliases()) {
+                (WriteAllCacheMode::Auto, None) | (WriteAllCacheMode::Explicit, Some(_)) => {
                     let cache_timer = PhaseTimer::start(CACHE_PLANNING_PHASE);
                     let cache_span =
                         stage_context.start("Plan caches", "delta_funnel.write_all.planning");
-                    let cache_plan = self.plan_mssql_output_cache(requests);
-                    complete_write_all_span(cache_span);
-                    phase_timings.push(cache_timer.completed());
-                    Some(cache_plan)
+                    let planned = match (options.cache_mode(), options.cache_aliases()) {
+                        (WriteAllCacheMode::Auto, None) => {
+                            Ok(self.plan_mssql_output_cache(requests))
+                        }
+                        (WriteAllCacheMode::Explicit, Some(aliases)) => {
+                            self.plan_mssql_output_cache_explicit(requests, aliases)
+                        }
+                        _ => unreachable!(),
+                    };
+                    match planned {
+                        Ok(plan) => {
+                            complete_write_all_span(cache_span);
+                            phase_timings.push(cache_timer.completed());
+                            Some(plan)
+                        }
+                        Err(error) => {
+                            fail_write_all_span(cache_span);
+                            return Err(error);
+                        }
+                    }
                 }
-                WriteAllCacheMode::Disabled => {
+                (WriteAllCacheMode::Disabled, None) => {
                     phase_timings.push(PhaseTimingReport::skipped(
                         CACHE_PLANNING_PHASE,
                         ReportReasonCode::NotExecuted,
                     ));
                     None
                 }
+                _ => unreachable!(),
             };
 
             // Run exactly one route while all outputs share the same source
@@ -154,7 +172,7 @@ impl DeltaFunnelSession {
                 "Execute output workflow",
                 "delta_funnel.write_all.execution",
             );
-            let workflow_result = match automatic_cache_plan.as_ref() {
+            let workflow_result = match cache_plan.as_ref() {
                 Some(cache_plan) => match cache_plan.decision() {
                     MssqlOutputCacheDecision::NoCache { .. } => self
                         .write_all_uncached_with_writer_and_trace_context(
@@ -430,6 +448,32 @@ fn validate_write_all_requests(requests: &[OutputWritePlan]) -> Result<(), Delta
     Ok(())
 }
 
+fn validate_write_all_options(options: &WriteAllOptions) -> Result<(), DeltaFunnelError> {
+    if options.cache_aliases().is_some_and(<[String]>::is_empty) {
+        return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "write_all cache_aliases must not be empty".to_owned(),
+        });
+    }
+    match (options.cache_mode(), options.cache_aliases()) {
+        (WriteAllCacheMode::Explicit, None) => Err(DeltaFunnelError::MssqlWorkflowPlanning {
+            message: "write_all explicit caching requires cache_aliases".to_owned(),
+        }),
+        (WriteAllCacheMode::Auto | WriteAllCacheMode::Disabled, Some(_)) => {
+            Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: format!(
+                    "write_all cache_aliases cannot be combined with {} caching",
+                    match options.cache_mode() {
+                        WriteAllCacheMode::Auto => "automatic",
+                        WriteAllCacheMode::Disabled => "disabled",
+                        WriteAllCacheMode::Explicit => unreachable!(),
+                    }
+                ),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn ensure_unique_write_all_output_names(
     requests: &[OutputWritePlan],
 ) -> Result<(), DeltaFunnelError> {
@@ -473,7 +517,7 @@ mod tests {
     use super::super::{WriteAllCacheMode, WriteAllOptions};
     use super::{
         CACHE_PLANNING_PHASE, OUTPUT_PLANNING_PHASE, SOURCE_REPORTING_PHASE,
-        WORKFLOW_EXECUTION_PHASE,
+        WORKFLOW_EXECUTION_PHASE, validate_write_all_options,
     };
     use crate::{
         DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, LoadMode,
@@ -528,6 +572,40 @@ mod tests {
             }
         });
         (reporter, events)
+    }
+
+    #[test]
+    fn write_all_options_reject_invalid_explicit_cache_combinations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (options, expected) in [
+            (
+                WriteAllOptions::new().with_explicit_cache_aliases(Vec::new()),
+                "must not be empty",
+            ),
+            (
+                WriteAllOptions::new().with_cache_mode(WriteAllCacheMode::Explicit),
+                "requires cache_aliases",
+            ),
+            (
+                WriteAllOptions::new()
+                    .with_explicit_cache_aliases(vec!["big".to_owned()])
+                    .with_cache_mode(WriteAllCacheMode::Disabled),
+                "cannot be combined",
+            ),
+            (
+                WriteAllOptions::new()
+                    .with_explicit_cache_aliases(vec!["big".to_owned()])
+                    .with_cache_mode(WriteAllCacheMode::Auto),
+                "cannot be combined",
+            ),
+        ] {
+            let error = validate_write_all_options(&options).unwrap_err();
+            let DeltaFunnelError::MssqlWorkflowPlanning { message } = error else {
+                return Err("expected workflow planning error".into());
+            };
+            assert!(message.contains(expected), "{message}");
+        }
+        Ok(())
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1153,13 +1231,11 @@ mod tests {
                 "orders",
                 LoadMode::AppendExisting,
             )?;
-            let options = detailed_uncached_write_all_options();
-
             let capture = TracingCapture::start();
             let without_progress = session
                 .write_all_with_options_and_writer(
                     std::slice::from_ref(&output),
-                    options,
+                    detailed_uncached_write_all_options(),
                     FakeWorkflowWriter::default(),
                 )
                 .await?;
@@ -1171,7 +1247,7 @@ mod tests {
             let with_progress = session
                 .write_all_with_progress_and_writer(
                     &[output],
-                    options,
+                    detailed_uncached_write_all_options(),
                     reporter,
                     FakeWorkflowWriter::default(),
                 )
@@ -2187,6 +2263,96 @@ mod tests {
             let restored_big_rows = collect_stream_row_count(restored_big_factory().await?).await?;
             assert_eq!(restored_big_rows, 2);
             assert_eq!(source_scans.load(Ordering::SeqCst), 2);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn write_all_explicit_cache_aliases_replan_downstream_against_upstream_cache()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let (source_provider, source_scans) = scan_counting_marker_region_provider("shared")?;
+            session
+                .context()
+                .register_table("big_source", source_provider)?;
+            let pending_big = session
+                .table_from_sql("select marker, region from big_source")
+                .await?;
+            let big = session.register_alias("big", &pending_big)?;
+            let pending_filtered = session
+                .table_from_sql("select marker, region from big where marker = 'shared'")
+                .await?;
+            let filtered = session.register_alias("filtered", &pending_filtered)?;
+            let west = session
+                .table_from_sql("select marker from filtered where region = 'west'")
+                .await?;
+            let east = session
+                .table_from_sql("select marker from filtered where region = 'east'")
+                .await?;
+            let west_output = execute_output_request(
+                west,
+                "west_output",
+                "west_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let east_output = execute_output_request(
+                east,
+                "east_output",
+                "east_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let writer = FakeWorkflowWriter::default();
+            let calls = writer.calls();
+
+            let report = session
+                .write_all_with_options_and_writer(
+                    &[west_output, east_output],
+                    WriteAllOptions::new()
+                        .with_explicit_cache_aliases(vec!["filtered".to_owned(), "big".to_owned()]),
+                    writer,
+                )
+                .await?;
+
+            let calls = calls
+                .lock()
+                .map_err(|_| "fake workflow call lock poisoned")?;
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| (call.output_name.as_str(), call.rows))
+                    .collect::<Vec<_>>(),
+                vec![("west_output", 1), ("east_output", 1)]
+            );
+            assert_eq!(source_scans.load(Ordering::SeqCst), 1);
+            let WriteAllCacheReport::CacheAliases {
+                aliases,
+                skipped_candidates,
+            } = report.cache()
+            else {
+                return Err(
+                    format!("expected cache aliases report, got {:?}", report.cache()).into(),
+                );
+            };
+            assert!(skipped_candidates.is_empty());
+            assert_eq!(
+                aliases
+                    .iter()
+                    .map(|alias| (alias.table_id(), alias.alias(), alias.status()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        big.id(),
+                        "big",
+                        WriteAllCacheAliasStatus::MaterializedAndRestored,
+                    ),
+                    (
+                        filtered.id(),
+                        "filtered",
+                        WriteAllCacheAliasStatus::MaterializedAndRestored,
+                    ),
+                ]
+            );
             Ok(())
         }
 

@@ -104,5 +104,8 @@ fn candidate_skip_reason_report(
         MssqlCacheCandidateSkipReason::AmbiguousDepth => {
             WriteAllCacheCandidateSkipReason::AmbiguousDepth
         }
+        MssqlCacheCandidateSkipReason::NotExplicitlySelected => {
+            WriteAllCacheCandidateSkipReason::NotExplicitlySelected
+        }
     }
 }

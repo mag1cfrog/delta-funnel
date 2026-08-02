@@ -449,4 +449,6 @@ pub enum WriteAllCacheCandidateSkipReason {
     },
     /// The candidate's relative depth could not be ordered deterministically.
     AmbiguousDepth,
+    /// The candidate was eligible but absent from the explicit selection.
+    NotExplicitlySelected,
 }

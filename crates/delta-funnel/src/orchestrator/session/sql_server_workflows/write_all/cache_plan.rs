@@ -1,10 +1,10 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use crate::support::sanitize_text_for_display;
 
 use super::super::super::{
-    DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan, RegisteredDerivedTable,
-    registry::DerivedTableDependency,
+    DeltaFunnelError, DeltaFunnelSession, LazyTable, LazyTableKind, OutputWritePlan,
+    RegisteredDerivedTable, registry::DerivedTableDependency,
 };
 
 /// Planner output for one `write_all` cache-selection pass.
@@ -187,7 +187,7 @@ impl fmt::Debug for MssqlCacheCandidateSkip {
     }
 }
 
-/// Reason a candidate was not eligible for cache selection.
+/// Reason a candidate was skipped during cache selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MssqlCacheCandidateSkipReason {
     /// Fewer than two selected outputs use this candidate.
@@ -200,6 +200,8 @@ pub(crate) enum MssqlCacheCandidateSkipReason {
     CoveredByDeeperSharedAlias { selected_table_id: u64 },
     /// The candidate's relative depth could not be ordered deterministically.
     AmbiguousDepth,
+    /// The candidate was eligible but absent from the explicit selection.
+    NotExplicitlySelected,
 }
 
 // Result of selecting the cache frontier from already eligible shared
@@ -233,47 +235,8 @@ impl DeltaFunnelSession {
         if requests.len() < 2 {
             return MssqlOutputCachePlan::no_cache(MssqlNoCacheReason::FewerThanTwoOutputs);
         }
-
-        let mut shared_candidates = Vec::new();
-        let mut skipped_candidates = Vec::new();
-        for derived in &self.derived_tables {
-            if derived.sql_text().trim().is_empty() {
-                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
-                    derived,
-                    MssqlCacheCandidateSkipReason::MissingSqlText,
-                ));
-                continue;
-            }
-            if !derived.lineage().is_complete() {
-                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
-                    derived,
-                    MssqlCacheCandidateSkipReason::IncompleteLineage,
-                ));
-                continue;
-            }
-
-            let output_indexes = requests
-                .iter()
-                .enumerate()
-                .filter_map(|(index, request)| {
-                    self.cache_output_uses_registered_derived(request.table(), derived)
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            if output_indexes.len() >= 2 {
-                shared_candidates.push(MssqlDerivedCacheAliasPlan::from_registered(
-                    derived,
-                    output_indexes,
-                ));
-            } else {
-                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
-                    derived,
-                    MssqlCacheCandidateSkipReason::NotShared {
-                        output_count: output_indexes.len(),
-                    },
-                ));
-            }
-        }
+        let (mut shared_candidates, mut skipped_candidates) =
+            self.shared_mssql_output_cache_candidates(requests);
 
         if shared_candidates.len() == 1 {
             return MssqlOutputCachePlan::new(
@@ -331,6 +294,123 @@ impl DeltaFunnelSession {
             },
             skipped_candidates,
         )
+    }
+
+    pub(crate) fn plan_mssql_output_cache_explicit(
+        &self,
+        requests: &[OutputWritePlan],
+        aliases: &[String],
+    ) -> Result<MssqlOutputCachePlan, DeltaFunnelError> {
+        if aliases.is_empty() {
+            return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                message: "write_all cache_aliases must not be empty".to_owned(),
+            });
+        }
+
+        let (shared_candidates, mut skipped_candidates) =
+            self.shared_mssql_output_cache_candidates(requests);
+        let mut requested_names = BTreeSet::new();
+        let mut requested_table_ids = BTreeSet::new();
+        for alias in aliases {
+            if !requested_names.insert(alias.to_ascii_lowercase()) {
+                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "write_all cache_aliases contains duplicate alias `{}`",
+                        sanitize_text_for_display(alias)
+                    ),
+                });
+            }
+            let Some(derived) = self.registered_derived_table(alias) else {
+                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "write_all cache_aliases contains unknown registered alias `{}`",
+                        sanitize_text_for_display(alias)
+                    ),
+                });
+            };
+            if !shared_candidates
+                .iter()
+                .any(|candidate| candidate.table_id() == derived.table().id())
+            {
+                return Err(DeltaFunnelError::MssqlWorkflowPlanning {
+                    message: format!(
+                        "write_all cache alias `{}` is not eligible for the selected outputs",
+                        sanitize_text_for_display(alias)
+                    ),
+                });
+            }
+            requested_table_ids.insert(derived.table().id());
+        }
+
+        // Registered aliases are stored in registration order. A downstream
+        // alias can only reference an upstream alias that was already registered.
+        let (selected_aliases, unselected_aliases): (Vec<_>, Vec<_>) = shared_candidates
+            .into_iter()
+            .partition(|candidate| requested_table_ids.contains(&candidate.table_id()));
+        skipped_candidates.extend(unselected_aliases.into_iter().filter_map(|candidate| {
+            self.registered_derived_table_by_id(candidate.table_id())
+                .map(|derived| {
+                    MssqlCacheCandidateSkip::from_registered(
+                        derived,
+                        MssqlCacheCandidateSkipReason::NotExplicitlySelected,
+                    )
+                })
+        }));
+
+        Ok(MssqlOutputCachePlan::new(
+            MssqlOutputCacheDecision::CacheAliases(selected_aliases),
+            skipped_candidates,
+        ))
+    }
+
+    fn shared_mssql_output_cache_candidates(
+        &self,
+        requests: &[OutputWritePlan],
+    ) -> (
+        Vec<MssqlDerivedCacheAliasPlan>,
+        Vec<MssqlCacheCandidateSkip>,
+    ) {
+        let mut shared_candidates = Vec::new();
+        let mut skipped_candidates = Vec::new();
+        for derived in &self.derived_tables {
+            if derived.sql_text().trim().is_empty() {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::MissingSqlText,
+                ));
+                continue;
+            }
+            if !derived.lineage().is_complete() {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::IncompleteLineage,
+                ));
+                continue;
+            }
+
+            let output_indexes = requests
+                .iter()
+                .enumerate()
+                .filter_map(|(index, request)| {
+                    self.cache_output_uses_registered_derived(request.table(), derived)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if output_indexes.len() >= 2 {
+                shared_candidates.push(MssqlDerivedCacheAliasPlan::from_registered(
+                    derived,
+                    output_indexes,
+                ));
+            } else {
+                skipped_candidates.push(MssqlCacheCandidateSkip::from_registered(
+                    derived,
+                    MssqlCacheCandidateSkipReason::NotShared {
+                        output_count: output_indexes.len(),
+                    },
+                ));
+            }
+        }
+        (shared_candidates, skipped_candidates)
     }
 
     /// Returns whether a selected output uses a registered derived candidate.
@@ -708,6 +788,111 @@ mod tests {
             &MssqlCacheCandidateSkipReason::CoveredByDeeperSharedAlias {
                 selected_table_id: filtered_big.id(),
             }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_cache_plan_orders_selected_upstream_and_downstream_aliases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_filtered = session
+            .table_from_sql("select id, customer_name from big where id > 0")
+            .await?;
+        let filtered_big = session.register_alias("filtered_big", &pending_filtered)?;
+        let west = session
+            .table_from_sql("select id from filtered_big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from filtered_big where customer_name = 'bob'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+
+        let plan = session.plan_mssql_output_cache_explicit(
+            &[west, east],
+            &["filtered_big".to_owned(), "big".to_owned()],
+        )?;
+
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert_eq!(
+            caches
+                .iter()
+                .map(|cache| (cache.table_id(), cache.alias()))
+                .collect::<Vec<_>>(),
+            vec![(big.id(), "big"), (filtered_big.id(), "filtered_big")]
+        );
+        assert!(plan.skipped_candidates().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_cache_plan_rejects_invalid_selection_and_reports_unselected_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("orders")?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let pending_big = session
+            .table_from_sql("select id, customer_name from orders")
+            .await?;
+        let big = session.register_alias("big", &pending_big)?;
+        let pending_filtered = session
+            .table_from_sql("select id, customer_name from big where id > 0")
+            .await?;
+        let filtered_big = session.register_alias("filtered_big", &pending_filtered)?;
+        let pending_unused = session.table_from_sql("select id from orders").await?;
+        session.register_alias("unused", &pending_unused)?;
+        let west = session
+            .table_from_sql("select id from filtered_big where customer_name = 'alice'")
+            .await?;
+        let east = session
+            .table_from_sql("select id from filtered_big where customer_name = 'bob'")
+            .await?;
+        let west = output_request(west, "west_output", "west_orders", LoadMode::AppendExisting)?;
+        let east = output_request(east, "east_output", "east_orders", LoadMode::AppendExisting)?;
+        let requests = [west, east];
+
+        for (aliases, expected) in [
+            (Vec::new(), "must not be empty"),
+            (vec!["missing".to_owned()], "unknown registered alias"),
+            (
+                vec!["big".to_owned(), "BIG".to_owned()],
+                "contains duplicate alias",
+            ),
+            (vec!["unused".to_owned()], "is not eligible"),
+        ] {
+            let error = session
+                .plan_mssql_output_cache_explicit(&requests, &aliases)
+                .unwrap_err();
+            let DeltaFunnelError::MssqlWorkflowPlanning { message } = error else {
+                return Err("expected workflow planning error".into());
+            };
+            assert!(message.contains(expected), "{message}");
+        }
+
+        let plan =
+            session.plan_mssql_output_cache_explicit(&requests, &["filtered_big".to_owned()])?;
+        let MssqlOutputCacheDecision::CacheAliases(caches) = plan.decision() else {
+            return Err("expected cache aliases decision".into());
+        };
+        assert_eq!(caches.len(), 1);
+        assert_eq!(caches[0].table_id(), filtered_big.id());
+        let skipped = plan
+            .skipped_candidates()
+            .iter()
+            .find(|candidate| candidate.table_id() == big.id())
+            .ok_or("expected unselected upstream candidate")?;
+        assert_eq!(
+            skipped.reason(),
+            &MssqlCacheCandidateSkipReason::NotExplicitlySelected
         );
         Ok(())
     }
