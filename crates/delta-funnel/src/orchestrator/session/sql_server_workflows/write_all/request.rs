@@ -498,7 +498,14 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::Ordering};
 
     use async_trait::async_trait;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::{
+        arrow::{
+            array::{Int32Array, Int64Array},
+            datatypes::{DataType, Field, Schema, SchemaRef},
+            record_batch::RecordBatch,
+        },
+        datasource::{MemTable, TableProvider},
+    };
     use futures_util::StreamExt;
 
     use super::super::super::super::{
@@ -2352,6 +2359,160 @@ mod tests {
                         WriteAllCacheAliasStatus::MaterializedAndRestored,
                     ),
                 ]
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn downstream_cache_replan_schema_failure_restores_upstream_and_reports_both_aliases()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_default_mssql_connection(secret_connection()?),
+            )?;
+            let source_schema =
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let source_batch = RecordBatch::try_new(
+                Arc::clone(&source_schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )?;
+            session.context().register_table(
+                "big_source",
+                Arc::new(MemTable::try_new(
+                    Arc::clone(&source_schema),
+                    vec![vec![source_batch]],
+                )?),
+            )?;
+            let pending_big = session.table_from_sql("select id from big_source").await?;
+            let big = session.register_alias("big", &pending_big)?;
+            let pending_filtered = session
+                .table_from_sql("select id from big where id > 0")
+                .await?;
+            let filtered = session.register_alias("filtered", &pending_filtered)?;
+            let west = session
+                .table_from_sql("select id from filtered where id = 1")
+                .await?;
+            let east = session
+                .table_from_sql("select id from filtered where id = 2")
+                .await?;
+            let west_output = execute_output_request(
+                west,
+                "west_output",
+                "west_orders",
+                LoadMode::AppendExisting,
+            )?;
+            let east_output = execute_output_request(
+                east,
+                "east_output",
+                "east_orders",
+                LoadMode::AppendExisting,
+            )?;
+
+            let original_big_provider = session
+                .context()
+                .deregister_table("big")?
+                .ok_or("expected original big provider")?;
+            let injected_schema =
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let injected_batch = RecordBatch::try_new(
+                Arc::clone(&injected_schema),
+                vec![Arc::new(Int64Array::from(vec![1, 2]))],
+            )?;
+            let injected_big_provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(
+                injected_schema,
+                vec![vec![injected_batch]],
+            )?);
+            session
+                .context()
+                .register_table("big", Arc::clone(&injected_big_provider))?;
+            let writer = FakeWorkflowWriter::default();
+            let calls = writer.calls();
+
+            let error = session
+                .write_all_with_options_and_writer(
+                    &[west_output, east_output],
+                    WriteAllOptions::new()
+                        .with_explicit_cache_aliases(vec!["big".to_owned(), "filtered".to_owned()]),
+                    writer,
+                )
+                .await
+                .err()
+                .ok_or("expected downstream cache replan schema failure")?;
+
+            assert!(
+                calls
+                    .lock()
+                    .map_err(|_| "fake workflow call lock poisoned")?
+                    .is_empty()
+            );
+            let DeltaFunnelError::WriteAllCache { failure, source } = error else {
+                return Err("expected structured write_all cache failure".into());
+            };
+            assert_eq!(failure.primary_failed_alias_table_id(), Some(filtered.id()));
+            assert_eq!(failure.workflow(), None);
+            assert_eq!(failure.aliases().len(), 2);
+            let upstream = &failure.aliases()[0];
+            assert_eq!(upstream.table_id(), big.id());
+            assert_eq!(upstream.alias(), "big");
+            assert_eq!(upstream.output_indexes(), &[0, 1]);
+            assert_eq!(
+                upstream.status(),
+                WriteAllCacheAliasStatus::MaterializedAndRestored
+            );
+            assert!(
+                upstream
+                    .phase_timings()
+                    .iter()
+                    .all(|timing| timing.status() == PhaseStatus::completed())
+            );
+            let downstream = &failure.aliases()[1];
+            assert_eq!(downstream.table_id(), filtered.id());
+            assert_eq!(downstream.alias(), "filtered");
+            assert_eq!(downstream.output_indexes(), &[0, 1]);
+            assert_eq!(downstream.status(), WriteAllCacheAliasStatus::Failed);
+            assert_eq!(
+                downstream.failed_phase(),
+                Some("cache_alias_dataframe_resolution")
+            );
+            assert_eq!(downstream.phase_timings().len(), 8);
+            assert_eq!(
+                downstream.phase_timings()[0].status(),
+                PhaseStatus::failed()
+            );
+            assert_eq!(
+                downstream.phase_timings()[5].status(),
+                PhaseStatus::failed()
+            );
+            assert!(downstream.phase_timings()[1..5].iter().all(|timing| {
+                timing.status() == PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+            }));
+            assert!(downstream.phase_timings()[6..].iter().all(|timing| {
+                timing.status() == PhaseStatus::not_started(ReportReasonCode::PriorFailure)
+            }));
+            assert!(matches!(
+                source.as_ref(),
+                DeltaFunnelError::MssqlWorkflowPlanning { message }
+                    if message.contains("replanned cache alias schema is incompatible")
+                        && message.contains("Int32")
+                        && message.contains("Int64")
+            ));
+
+            let restored_big_provider = session
+                .context()
+                .deregister_table("big")?
+                .ok_or("expected restored big provider")?;
+            assert!(Arc::ptr_eq(&restored_big_provider, &injected_big_provider));
+            session
+                .context()
+                .register_table("big", original_big_provider)?;
+            assert_eq!(
+                session
+                    .context()
+                    .table("filtered")
+                    .await?
+                    .schema()
+                    .field(0)
+                    .data_type(),
+                &DataType::Int32
             );
             Ok(())
         }
