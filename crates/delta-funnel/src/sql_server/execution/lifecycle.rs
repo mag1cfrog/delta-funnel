@@ -4,7 +4,7 @@
 //! target before writer construction. Actual SQL Server probes and DDL
 //! execution land in later slices.
 
-use arrow_tiberius::{SqlExecutionOutcome, TableName, create_table_sql_from_mappings};
+use arrow_sql_server::{SqlExecutionOutcome, TableName, create_table_sql_from_mappings};
 use async_trait::async_trait;
 
 use crate::DeltaFunnelError;
@@ -20,24 +20,26 @@ use super::{
 #[async_trait]
 pub(crate) trait MssqlTargetLifecycleClient: Send {
     /// Returns whether the target table exists in SQL Server metadata.
-    async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool>;
+    async fn table_exists(&mut self, table: &TableName) -> arrow_sql_server::Result<bool>;
 
     /// Executes one prepared lifecycle SQL statement.
-    async fn execute_statement(&mut self, sql: &str)
-    -> arrow_tiberius::Result<SqlExecutionOutcome>;
+    async fn execute_statement(
+        &mut self,
+        sql: &str,
+    ) -> arrow_sql_server::Result<SqlExecutionOutcome>;
 }
 
 #[async_trait]
-impl MssqlTargetLifecycleClient for arrow_tiberius::ConnectedMssqlClient {
-    async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
-        arrow_tiberius::ConnectedMssqlClient::table_exists(self, table).await
+impl MssqlTargetLifecycleClient for arrow_sql_server::ConnectedMssqlClient {
+    async fn table_exists(&mut self, table: &TableName) -> arrow_sql_server::Result<bool> {
+        arrow_sql_server::ConnectedMssqlClient::table_exists(self, table).await
     }
 
     async fn execute_statement(
         &mut self,
         sql: &str,
-    ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
-        arrow_tiberius::ConnectedMssqlClient::execute_statement(self, sql).await
+    ) -> arrow_sql_server::Result<SqlExecutionOutcome> {
+        arrow_sql_server::ConnectedMssqlClient::execute_statement(self, sql).await
     }
 }
 
@@ -45,15 +47,15 @@ impl MssqlTargetLifecycleClient for arrow_tiberius::ConnectedMssqlClient {
 #[allow(dead_code)]
 pub(crate) struct MssqlConnectedLifecycleClient<'client> {
     output_plan: &'client MssqlTargetOutputPlan,
-    client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+    client: &'client mut arrow_sql_server::ConnectedMssqlClient,
 }
 
 impl<'client> MssqlConnectedLifecycleClient<'client> {
-    /// Pairs a connected arrow-tiberius client with its redacted output plan.
+    /// Pairs a connected arrow-sql-server client with its redacted output plan.
     #[must_use]
     pub(crate) fn new(
         output_plan: &'client MssqlTargetOutputPlan,
-        client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+        client: &'client mut arrow_sql_server::ConnectedMssqlClient,
     ) -> Self {
         Self {
             output_plan,
@@ -71,14 +73,14 @@ impl<'client> MssqlConnectedLifecycleClient<'client> {
 
 #[async_trait]
 impl MssqlTargetLifecycleClient for MssqlConnectedLifecycleClient<'_> {
-    async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
+    async fn table_exists(&mut self, table: &TableName) -> arrow_sql_server::Result<bool> {
         MssqlTargetLifecycleClient::table_exists(self.client, table).await
     }
 
     async fn execute_statement(
         &mut self,
         sql: &str,
-    ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
+    ) -> arrow_sql_server::Result<SqlExecutionOutcome> {
         MssqlTargetLifecycleClient::execute_statement(self.client, sql).await
     }
 }
@@ -422,7 +424,7 @@ impl MssqlPreparedTarget {
         Ok(Self { table_name, report })
     }
 
-    /// Returns the arrow-tiberius target table identity.
+    /// Returns the arrow-sql-server target table identity.
     #[must_use]
     pub const fn table_name(&self) -> &TableName {
         &self.table_name
@@ -819,7 +821,7 @@ fn sql_nvarchar_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::PlanOptions;
+    use arrow_sql_server::PlanOptions;
     use async_trait::async_trait;
 
     use super::*;
@@ -885,10 +887,10 @@ mod tests {
 
     #[async_trait]
     impl MssqlTargetLifecycleClient for RecordingLifecycleClient {
-        async fn table_exists(&mut self, table: &TableName) -> arrow_tiberius::Result<bool> {
+        async fn table_exists(&mut self, table: &TableName) -> arrow_sql_server::Result<bool> {
             self.calls.push(format!("probe {}", table.quoted_sql()));
             if let Some(reason) = self.table_exists_error.take() {
-                return Err(arrow_tiberius::Error::TableExistsUnexpectedResult { reason });
+                return Err(arrow_sql_server::Error::TableExistsUnexpectedResult { reason });
             }
 
             if !self.existence_results.is_empty() {
@@ -901,10 +903,10 @@ mod tests {
         async fn execute_statement(
             &mut self,
             sql: &str,
-        ) -> arrow_tiberius::Result<SqlExecutionOutcome> {
+        ) -> arrow_sql_server::Result<SqlExecutionOutcome> {
             self.calls.push(format!("execute {sql}"));
             if let Some(reason) = self.execute_statement_error.take() {
-                return Err(arrow_tiberius::Error::InvalidIdentifier { reason });
+                return Err(arrow_sql_server::Error::InvalidIdentifier { reason });
             }
 
             Ok(SqlExecutionOutcome {
@@ -914,14 +916,14 @@ mod tests {
     }
 
     #[test]
-    fn connected_arrow_tiberius_client_implements_lifecycle_client_boundary() {
+    fn connected_arrow_sql_server_client_implements_lifecycle_client_boundary() {
         fn assert_lifecycle_client<C: MssqlTargetLifecycleClient>() {}
 
-        assert_lifecycle_client::<arrow_tiberius::ConnectedMssqlClient>();
+        assert_lifecycle_client::<arrow_sql_server::ConnectedMssqlClient>();
     }
 
     #[tokio::test]
-    async fn lifecycle_client_boundary_is_fakeable() -> arrow_tiberius::Result<()> {
+    async fn lifecycle_client_boundary_is_fakeable() -> arrow_sql_server::Result<()> {
         let table = TableName::new("dbo", "orders")?;
         let mut client = RecordingLifecycleClient {
             exists: true,
@@ -1583,8 +1585,8 @@ mod tests {
     }
 
     #[test]
-    fn qualified_target_table_converts_to_arrow_tiberius_table_name() -> Result<(), DeltaFunnelError>
-    {
+    fn qualified_target_table_converts_to_arrow_sql_server_table_name()
+    -> Result<(), DeltaFunnelError> {
         let table = MssqlTargetTable::new("dbo", "orders")?;
 
         let table_name = table_name_from_target("orders_output", &table)?;
@@ -1604,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn special_target_identifiers_use_arrow_tiberius_escaping() -> Result<(), DeltaFunnelError> {
+    fn special_target_identifiers_use_arrow_sql_server_escaping() -> Result<(), DeltaFunnelError> {
         let table = MssqlTargetTable::new("dbo.part", "target]part")?;
 
         let table_name = table_name_from_target("orders_output", &table)?;

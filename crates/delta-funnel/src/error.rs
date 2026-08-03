@@ -453,17 +453,17 @@ pub enum DeltaFunnelError {
         duplicate_index: usize,
     },
 
-    /// SQL Server schema planning failed with structured arrow-tiberius diagnostics.
+    /// SQL Server schema planning failed with structured arrow-sql-server diagnostics.
     #[snafu(display(
-        "MSSQL schema planning error for output `{}`: arrow-tiberius returned {} diagnostic(s)",
+        "MSSQL schema planning error for output `{}`: arrow-sql-server returned {} diagnostic(s)",
         sanitize_text_for_display(output_name),
         diagnostics.len()
     ))]
     MssqlSchemaPlanning {
         /// Selected output name associated with the schema.
         output_name: String,
-        /// Structured diagnostics returned by arrow-tiberius.
-        diagnostics: arrow_tiberius::DiagnosticSet,
+        /// Structured diagnostics returned by arrow-sql-server.
+        diagnostics: arrow_sql_server::DiagnosticSet,
     },
 
     /// SQL Server schema planning failed before producing diagnostics.
@@ -475,8 +475,8 @@ pub enum DeltaFunnelError {
     MssqlSchemaPlanningFailed {
         /// Selected output name associated with the schema.
         output_name: String,
-        /// Underlying arrow-tiberius planning failure.
-        source: arrow_tiberius::Error,
+        /// Underlying arrow-sql-server planning failure.
+        source: arrow_sql_server::Error,
     },
 
     /// SQL Server DDL planning failed because a target identifier was invalid.
@@ -488,8 +488,8 @@ pub enum DeltaFunnelError {
     MssqlDdlTargetIdentifier {
         /// Selected output name associated with the target.
         output_name: String,
-        /// Underlying arrow-tiberius identifier validation failure.
-        source: arrow_tiberius::Error,
+        /// Underlying arrow-sql-server identifier validation failure.
+        source: arrow_sql_server::Error,
     },
 
     /// SQL Server DDL planning failed for a DeltaFunnel-owned lifecycle reason.
@@ -525,7 +525,7 @@ pub enum DeltaFunnelError {
     ))]
     MssqlWrite {
         /// Underlying Arrow-to-TDS or Tiberius writer failure.
-        source: arrow_tiberius::Error,
+        source: arrow_sql_server::Error,
     },
 
     /// SQL Server write execution failed during a known phase.
@@ -566,8 +566,8 @@ pub enum DeltaFunnelError {
     MssqlBatchSchemaValidation {
         /// Structured, redacted failure context.
         context: Box<crate::MssqlWriteFailureContext>,
-        /// Underlying arrow-tiberius schema validation failure.
-        source: arrow_tiberius::Error,
+        /// Underlying arrow-sql-server schema validation failure.
+        source: arrow_sql_server::Error,
     },
 
     /// SQL Server multi-output workflow planning failed before output writes.
@@ -696,8 +696,8 @@ mod tests {
     #[test]
     fn mssql_write_error_has_sanitized_display() {
         let error = DeltaFunnelError::MssqlWrite {
-            source: arrow_tiberius::Error::BackendUnavailable {
-                backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+            source: arrow_sql_server::Error::BackendUnavailable {
+                backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                 reason: "not available\nfor test".to_owned(),
             },
         };
@@ -726,7 +726,7 @@ mod tests {
             "orders_output",
             &target_config,
             Some(&connection),
-            arrow_tiberius::PlanOptions::default(),
+            arrow_sql_server::PlanOptions::default(),
         )?;
         let context = crate::MssqlWriteFailureContext::from_output_plan(
             &output_plan,
@@ -782,7 +782,7 @@ mod tests {
             "orders_output",
             &target_config,
             Some(&connection),
-            arrow_tiberius::PlanOptions::default(),
+            arrow_sql_server::PlanOptions::default(),
         )?;
         let context = crate::MssqlWriteFailureContext::from_output_plan(
             &output_plan,
@@ -796,8 +796,8 @@ mod tests {
 
         let error = DeltaFunnelError::MssqlBatchSchemaValidation {
             context: Box::new(context),
-            source: arrow_tiberius::Error::BackendUnavailable {
-                backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+            source: arrow_sql_server::Error::BackendUnavailable {
+                backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                 reason: "schema mismatch\nfor test".to_owned(),
             },
         };
@@ -821,7 +821,7 @@ mod tests {
         assert!(!context.partial_write_possible());
         assert!(matches!(
             source,
-            arrow_tiberius::Error::BackendUnavailable { .. }
+            arrow_sql_server::Error::BackendUnavailable { .. }
         ));
         Ok(())
     }

@@ -1,7 +1,7 @@
 //! SQL Server target output planning.
 
 use arrow_schema::Schema;
-use arrow_tiberius::{PlannedSchema, SchemaMapping};
+use arrow_sql_server::{PlannedSchema, SchemaMapping};
 
 use crate::DeltaFunnelError;
 
@@ -70,7 +70,7 @@ impl MssqlTargetOutputPlan {
         self.schema_plan.plan_options()
     }
 
-    /// Returns the profile-bound schema plan passed to arrow-tiberius writers.
+    /// Returns the profile-bound schema plan passed to arrow-sql-server writers.
     #[must_use]
     pub fn planned_schema(&self) -> &PlannedSchema {
         self.schema_plan.planned_schema()
@@ -163,7 +163,7 @@ pub fn plan_mssql_target_output(
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::{DiagnosticCode, DiagnosticSeverity, PlanOptions};
+    use arrow_sql_server::{DiagnosticCode, DiagnosticSeverity, PlanOptions};
 
     use super::*;
     use crate::{
@@ -341,7 +341,7 @@ mod tests {
         let default_connection = secret_connection()?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders")?);
         let options = PlanOptions {
-            string_policy: arrow_tiberius::StringPolicy::NVarChar(128),
+            string_policy: arrow_sql_server::StringPolicy::NVarChar(128),
             ..PlanOptions::default()
         };
 

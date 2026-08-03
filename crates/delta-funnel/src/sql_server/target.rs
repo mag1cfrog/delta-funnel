@@ -128,7 +128,7 @@ impl fmt::Display for MssqlConnectionSummary {
     }
 }
 
-/// SQL Server table identity before arrow-tiberius identifier validation.
+/// SQL Server table identity before arrow-sql-server identifier validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlTargetTable {
     schema: Option<String>,
@@ -138,7 +138,7 @@ pub struct MssqlTargetTable {
 impl MssqlTargetTable {
     /// Creates a schema-qualified target table identity.
     ///
-    /// Full SQL Server identifier validation is delegated to `arrow-tiberius`
+    /// Full SQL Server identifier validation is delegated to `arrow-sql-server`
     /// in the later DDL planning slice. This constructor only rejects empty
     /// config fields so target identity cannot collapse into an ambiguous string.
     pub fn new(

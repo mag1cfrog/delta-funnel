@@ -763,47 +763,47 @@ fn write_diagnostic_value(
     })
 }
 
-fn diagnostic_severity(severity: arrow_tiberius::DiagnosticSeverity) -> &'static str {
+fn diagnostic_severity(severity: arrow_sql_server::DiagnosticSeverity) -> &'static str {
     match severity {
-        arrow_tiberius::DiagnosticSeverity::Warning => "warning",
-        arrow_tiberius::DiagnosticSeverity::Error => "error",
+        arrow_sql_server::DiagnosticSeverity::Warning => "warning",
+        arrow_sql_server::DiagnosticSeverity::Error => "error",
     }
 }
 
-fn diagnostic_code(code: arrow_tiberius::DiagnosticCode) -> &'static str {
+fn diagnostic_code(code: arrow_sql_server::DiagnosticCode) -> &'static str {
     match code {
-        arrow_tiberius::DiagnosticCode::UnsupportedArrowType => "unsupported_arrow_type",
-        arrow_tiberius::DiagnosticCode::LossyConversionRequiresPolicy => {
+        arrow_sql_server::DiagnosticCode::UnsupportedArrowType => "unsupported_arrow_type",
+        arrow_sql_server::DiagnosticCode::LossyConversionRequiresPolicy => {
             "lossy_conversion_requires_policy"
         }
-        arrow_tiberius::DiagnosticCode::PolicyApplied => "policy_applied",
-        arrow_tiberius::DiagnosticCode::IdentifierInvalid => "identifier_invalid",
-        arrow_tiberius::DiagnosticCode::IdentifierTooLong => "identifier_too_long",
-        arrow_tiberius::DiagnosticCode::DecimalOutOfRange => "decimal_out_of_range",
-        arrow_tiberius::DiagnosticCode::IntegerOutOfRange => "integer_out_of_range",
-        arrow_tiberius::DiagnosticCode::TimestampOutOfRange => "timestamp_out_of_range",
-        arrow_tiberius::DiagnosticCode::TimezoneUnsupported => "timezone_unsupported",
-        arrow_tiberius::DiagnosticCode::SchemaMismatch => "schema_mismatch",
-        arrow_tiberius::DiagnosticCode::BackendUnavailable => "backend_unavailable",
-        arrow_tiberius::DiagnosticCode::ProfileDependentConversion => {
+        arrow_sql_server::DiagnosticCode::PolicyApplied => "policy_applied",
+        arrow_sql_server::DiagnosticCode::IdentifierInvalid => "identifier_invalid",
+        arrow_sql_server::DiagnosticCode::IdentifierTooLong => "identifier_too_long",
+        arrow_sql_server::DiagnosticCode::DecimalOutOfRange => "decimal_out_of_range",
+        arrow_sql_server::DiagnosticCode::IntegerOutOfRange => "integer_out_of_range",
+        arrow_sql_server::DiagnosticCode::TimestampOutOfRange => "timestamp_out_of_range",
+        arrow_sql_server::DiagnosticCode::TimezoneUnsupported => "timezone_unsupported",
+        arrow_sql_server::DiagnosticCode::SchemaMismatch => "schema_mismatch",
+        arrow_sql_server::DiagnosticCode::BackendUnavailable => "backend_unavailable",
+        arrow_sql_server::DiagnosticCode::ProfileDependentConversion => {
             "profile_dependent_conversion"
         }
-        arrow_tiberius::DiagnosticCode::ObservedDataRequired => "observed_data_required",
-        arrow_tiberius::DiagnosticCode::ValueConversionUnsupported => {
+        arrow_sql_server::DiagnosticCode::ObservedDataRequired => "observed_data_required",
+        arrow_sql_server::DiagnosticCode::ValueConversionUnsupported => {
             "value_conversion_unsupported"
         }
-        arrow_tiberius::DiagnosticCode::ValueTypeMismatch => "value_type_mismatch",
-        arrow_tiberius::DiagnosticCode::NullInNonNullableColumn => "null_in_non_nullable_column",
-        arrow_tiberius::DiagnosticCode::NonFiniteFloat => "non_finite_float",
-        arrow_tiberius::DiagnosticCode::ValueTooLong => "value_too_long",
-        arrow_tiberius::DiagnosticCode::RowIndexOutOfBounds => "row_index_out_of_bounds",
-        arrow_tiberius::DiagnosticCode::DirectEncodingInvalidPayload => {
+        arrow_sql_server::DiagnosticCode::ValueTypeMismatch => "value_type_mismatch",
+        arrow_sql_server::DiagnosticCode::NullInNonNullableColumn => "null_in_non_nullable_column",
+        arrow_sql_server::DiagnosticCode::NonFiniteFloat => "non_finite_float",
+        arrow_sql_server::DiagnosticCode::ValueTooLong => "value_too_long",
+        arrow_sql_server::DiagnosticCode::RowIndexOutOfBounds => "row_index_out_of_bounds",
+        arrow_sql_server::DiagnosticCode::DirectEncodingInvalidPayload => {
             "direct_encoding_invalid_payload"
         }
-        arrow_tiberius::DiagnosticCode::DirectEncodingUnsupportedMapping => {
+        arrow_sql_server::DiagnosticCode::DirectEncodingUnsupportedMapping => {
             "direct_encoding_unsupported_mapping"
         }
-        arrow_tiberius::DiagnosticCode::DirectEncodingUnsupportedBatch => {
+        arrow_sql_server::DiagnosticCode::DirectEncodingUnsupportedBatch => {
             "direct_encoding_unsupported_batch"
         }
         _ => "unknown",
@@ -961,7 +961,7 @@ mod tests {
         ValidationOptions, plan_mssql_target_for_output, write_mssql_outputs_with_writer,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use arrow_tiberius::PlanOptions;
+    use arrow_sql_server::PlanOptions;
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 

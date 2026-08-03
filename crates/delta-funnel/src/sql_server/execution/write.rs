@@ -1,6 +1,6 @@
 //! SQL Server write execution.
 //!
-//! This module owns Delta Funnel write defaults around `arrow-tiberius`.
+//! This module owns Delta Funnel write defaults around `arrow-sql-server`.
 
 use std::{
     fmt,
@@ -46,40 +46,40 @@ pub(crate) trait MssqlBulkLoadWriter: Sized + Send {
     async fn write_batch(
         &mut self,
         batch: &RecordBatch,
-    ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error>;
+    ) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error>;
 
-    /// Finalizes the writer and consumes it, matching `arrow-tiberius`.
-    async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error>;
+    /// Finalizes the writer and consumes it, matching `arrow-sql-server`.
+    async fn finish(self) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error>;
 }
 
 #[async_trait]
-impl<'client, S> MssqlBulkLoadWriter for arrow_tiberius::BulkWriter<'client, S>
+impl<'client, S> MssqlBulkLoadWriter for arrow_sql_server::BulkWriter<'client, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn write_batch(
         &mut self,
         batch: &RecordBatch,
-    ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
-        arrow_tiberius::BulkWriter::write_batch(self, batch).await
+    ) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
+        arrow_sql_server::BulkWriter::write_batch(self, batch).await
     }
 
-    async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
-        arrow_tiberius::BulkWriter::finish(self).await
+    async fn finish(self) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
+        arrow_sql_server::BulkWriter::finish(self).await
     }
 }
 
 #[async_trait]
-impl MssqlBulkLoadWriter for arrow_tiberius::ConnectedBulkWriter<'_> {
+impl MssqlBulkLoadWriter for arrow_sql_server::ConnectedBulkWriter<'_> {
     async fn write_batch(
         &mut self,
         batch: &RecordBatch,
-    ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
-        arrow_tiberius::ConnectedBulkWriter::write_batch(self, batch).await
+    ) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
+        arrow_sql_server::ConnectedBulkWriter::write_batch(self, batch).await
     }
 
-    async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
-        arrow_tiberius::ConnectedBulkWriter::finish(self).await
+    async fn finish(self) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
+        arrow_sql_server::ConnectedBulkWriter::finish(self).await
     }
 }
 
@@ -94,31 +94,31 @@ pub(crate) trait MssqlBulkWriterFactory: Send {
     async fn initialize(
         self,
         request: MssqlBulkWriterInitializationRequest,
-    ) -> Result<Self::Writer, arrow_tiberius::Error>;
+    ) -> Result<Self::Writer, arrow_sql_server::Error>;
 }
 
 /// Production bulk writer factory for an already connected SQL Server client.
 #[allow(dead_code)]
 pub(crate) struct MssqlConnectedBulkWriterFactory<'client> {
-    client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+    client: &'client mut arrow_sql_server::ConnectedMssqlClient,
 }
 
 impl<'client> MssqlConnectedBulkWriterFactory<'client> {
     /// Wraps the already connected SQL Server client used for lifecycle work.
     #[must_use]
-    pub(crate) const fn new(client: &'client mut arrow_tiberius::ConnectedMssqlClient) -> Self {
+    pub(crate) const fn new(client: &'client mut arrow_sql_server::ConnectedMssqlClient) -> Self {
         Self { client }
     }
 }
 
 #[async_trait]
 impl<'client> MssqlBulkWriterFactory for MssqlConnectedBulkWriterFactory<'client> {
-    type Writer = arrow_tiberius::ConnectedBulkWriter<'client>;
+    type Writer = arrow_sql_server::ConnectedBulkWriter<'client>;
 
     async fn initialize(
         self,
         request: MssqlBulkWriterInitializationRequest,
-    ) -> Result<Self::Writer, arrow_tiberius::Error> {
+    ) -> Result<Self::Writer, arrow_sql_server::Error> {
         let MssqlBulkWriterInitializationRequest {
             table,
             planned_schema,
@@ -136,8 +136,8 @@ impl<'client> MssqlBulkWriterFactory for MssqlConnectedBulkWriterFactory<'client
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MssqlBulkWriterInitializationRequest {
     output_name: String,
-    table: arrow_tiberius::TableName,
-    planned_schema: arrow_tiberius::PlannedSchema,
+    table: arrow_sql_server::TableName,
+    planned_schema: arrow_sql_server::PlannedSchema,
     backend: MssqlWriteBackend,
     prepared_action: MssqlPreparedTargetAction,
     cleanup: MssqlTargetCleanupStatus,
@@ -171,13 +171,13 @@ impl MssqlBulkWriterInitializationRequest {
 
     /// Returns the prepared SQL Server table identity.
     #[must_use]
-    pub(crate) const fn table(&self) -> &arrow_tiberius::TableName {
+    pub(crate) const fn table(&self) -> &arrow_sql_server::TableName {
         &self.table
     }
 
     /// Returns the planned schema mappings passed to the writer.
     #[must_use]
-    pub(crate) fn mappings(&self) -> &[arrow_tiberius::SchemaMapping] {
+    pub(crate) fn mappings(&self) -> &[arrow_sql_server::SchemaMapping] {
         self.planned_schema.mappings()
     }
 
@@ -265,7 +265,7 @@ pub enum MssqlWriteBackend {
     DirectRawBulk,
 }
 
-impl From<MssqlWriteBackend> for arrow_tiberius::WriteBackend {
+impl From<MssqlWriteBackend> for arrow_sql_server::WriteBackend {
     fn from(backend: MssqlWriteBackend) -> Self {
         match backend {
             MssqlWriteBackend::Auto => Self::Auto,
@@ -276,7 +276,7 @@ impl From<MssqlWriteBackend> for arrow_tiberius::WriteBackend {
     }
 }
 
-impl From<MssqlWriteBackend> for arrow_tiberius::WriteOptions {
+impl From<MssqlWriteBackend> for arrow_sql_server::WriteOptions {
     fn from(backend: MssqlWriteBackend) -> Self {
         Self {
             backend: backend.into(),
@@ -302,11 +302,11 @@ pub fn mssql_write_backend_for_output_plan(
 /// Initializes one SQL Server bulk writer after target lifecycle preparation.
 #[allow(dead_code)]
 pub(crate) async fn initialize_mssql_bulk_writer<'client>(
-    client: &'client mut arrow_tiberius::ConnectedMssqlClient,
+    client: &'client mut arrow_sql_server::ConnectedMssqlClient,
     output_plan: &MssqlTargetOutputPlan,
     prepared_target: &MssqlPreparedTarget,
     options: MssqlWriteBackend,
-) -> Result<arrow_tiberius::ConnectedBulkWriter<'client>, DeltaFunnelError> {
+) -> Result<arrow_sql_server::ConnectedBulkWriter<'client>, DeltaFunnelError> {
     initialize_mssql_bulk_writer_with_factory(
         output_plan,
         prepared_target,
@@ -336,7 +336,7 @@ where
     let prepared_action = request.prepared_action();
 
     factory.initialize(request).await.map_err(|source| {
-        mssql_arrow_tiberius_writer_initialization_error(
+        mssql_arrow_sql_server_writer_initialization_error(
             output_plan,
             prepared_action,
             cleanup,
@@ -348,25 +348,25 @@ where
 /// Validates a runtime Arrow schema against a planned SQL Server output.
 ///
 /// Delta Funnel owns the output context and redacted report shape, while the
-/// schema contract comparison is delegated to `arrow-tiberius`.
+/// schema contract comparison is delegated to `arrow-sql-server`.
 pub fn validate_mssql_output_schema(
     output_plan: &MssqlTargetOutputPlan,
     schema: &Schema,
 ) -> Result<MssqlOutputBatchValidationReport, DeltaFunnelError> {
-    arrow_tiberius::validate_arrow_schema_against_mappings(schema, output_plan.schema_mappings())
+    arrow_sql_server::validate_arrow_schema_against_mappings(schema, output_plan.schema_mappings())
         .map_err(|source| {
-        mssql_batch_schema_validation_error(
-            output_plan,
-            source,
-            write_report_metrics(
-                RowCount::unavailable(),
-                MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
-                MssqlWriteProgress::zero(),
-                false,
-                MssqlTargetCleanupStatus::NotApplicable,
-            ),
-        )
-    })?;
+            mssql_batch_schema_validation_error(
+                output_plan,
+                source,
+                write_report_metrics(
+                    RowCount::unavailable(),
+                    MssqlBatchShapingReport::not_started(ReportReasonCode::NotExecuted),
+                    MssqlWriteProgress::zero(),
+                    false,
+                    MssqlTargetCleanupStatus::NotApplicable,
+                ),
+            )
+        })?;
 
     Ok(MssqlOutputBatchValidationReport::from_output_plan(
         output_plan,
@@ -381,7 +381,7 @@ pub fn validate_mssql_output_record_batch(
     output_plan: &MssqlTargetOutputPlan,
     batch: &RecordBatch,
 ) -> Result<MssqlOutputBatchValidationReport, DeltaFunnelError> {
-    arrow_tiberius::validate_record_batch_schema_against_mappings(
+    arrow_sql_server::validate_record_batch_schema_against_mappings(
         batch,
         output_plan.schema_mappings(),
     )
@@ -406,7 +406,7 @@ pub fn validate_mssql_output_record_batch(
 
 fn mssql_batch_schema_validation_error(
     output_plan: &MssqlTargetOutputPlan,
-    source: arrow_tiberius::Error,
+    source: arrow_sql_server::Error,
     metrics: MssqlWriteReportMetrics,
 ) -> DeltaFunnelError {
     let diagnostics = batch_validation_diagnostics(&source);
@@ -423,12 +423,12 @@ fn mssql_batch_schema_validation_error(
     }
 }
 
-fn batch_validation_diagnostics(source: &arrow_tiberius::Error) -> Vec<MssqlWriteDiagnostic> {
+fn batch_validation_diagnostics(source: &arrow_sql_server::Error) -> Vec<MssqlWriteDiagnostic> {
     match source {
-        arrow_tiberius::Error::ValueConversion { diagnostics } => diagnostics
+        arrow_sql_server::Error::ValueConversion { diagnostics } => diagnostics
             .all()
             .iter()
-            .map(MssqlWriteDiagnostic::from_arrow_tiberius)
+            .map(MssqlWriteDiagnostic::from_arrow_sql_server)
             .collect(),
         _ => Vec::new(),
     }
@@ -699,7 +699,7 @@ where
             "Validate batch schema",
             "delta_funnel.write.batch",
         );
-        let validation_result = arrow_tiberius::validate_record_batch_schema_against_mappings(
+        let validation_result = arrow_sql_server::validate_record_batch_schema_against_mappings(
             &batch,
             output_plan.schema_mappings(),
         );
@@ -758,7 +758,7 @@ where
                     shaped_rows,
                 ),
             );
-            mssql_arrow_tiberius_write_phase_error(
+            mssql_arrow_sql_server_write_phase_error(
                 output_plan,
                 MssqlWritePhase::WriteBatch,
                 write_failure_report_metrics(
@@ -816,7 +816,7 @@ where
                 shaped_rows,
             ),
         );
-        mssql_arrow_tiberius_write_phase_error(
+        mssql_arrow_sql_server_write_phase_error(
             output_plan,
             MssqlWritePhase::Finalize,
             write_failure_report_metrics(
@@ -932,7 +932,7 @@ where
         input_batches = input_batches.saturating_add(1);
 
         let validation_started_at = Instant::now();
-        let validation_result = arrow_tiberius::validate_record_batch_schema_against_mappings(
+        let validation_result = arrow_sql_server::validate_record_batch_schema_against_mappings(
             &batch,
             output_plan.schema_mappings(),
         );
@@ -1012,18 +1012,18 @@ fn mssql_write_phase_error(
     }
 }
 
-fn mssql_arrow_tiberius_write_phase_error(
+fn mssql_arrow_sql_server_write_phase_error(
     output_plan: &MssqlTargetOutputPlan,
     phase: MssqlWritePhase,
     metrics: MssqlWriteReportMetrics,
-    source: &arrow_tiberius::Error,
+    source: &arrow_sql_server::Error,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlWritePhase {
         context: Box::new(
             MssqlWriteFailureContext::from_output_plan_with_metrics(output_plan, phase, metrics)
-                .with_diagnostics(arrow_tiberius_write_diagnostics(source)),
+                .with_diagnostics(arrow_sql_server_write_diagnostics(source)),
         ),
-        message: arrow_tiberius_safe_error_message(source),
+        message: arrow_sql_server_safe_error_message(source),
     }
 }
 
@@ -1047,11 +1047,11 @@ fn mssql_writer_initialization_error(
     )
 }
 
-fn mssql_arrow_tiberius_writer_initialization_error(
+fn mssql_arrow_sql_server_writer_initialization_error(
     output_plan: &MssqlTargetOutputPlan,
     prepared_action: MssqlPreparedTargetAction,
     cleanup: MssqlTargetCleanupStatus,
-    source: &arrow_tiberius::Error,
+    source: &arrow_sql_server::Error,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlWritePhase {
         context: Box::new(
@@ -1066,30 +1066,36 @@ fn mssql_arrow_tiberius_writer_initialization_error(
                     cleanup,
                 ),
             )
-            .with_diagnostics(arrow_tiberius_write_diagnostics(source)),
+            .with_diagnostics(arrow_sql_server_write_diagnostics(source)),
         ),
         message: format!(
             "prepared target action {prepared_action:?}: {}",
-            arrow_tiberius_safe_error_message(source)
+            arrow_sql_server_safe_error_message(source)
         ),
     }
 }
 
-fn arrow_tiberius_safe_error_message(source: &arrow_tiberius::Error) -> String {
+fn arrow_sql_server_safe_error_message(source: &arrow_sql_server::Error) -> String {
     let info = source.safe_error_info();
     let phase = info.phase().map(|phase| phase.as_str());
 
     match phase {
         Some(phase) => format!(
-            "arrow-tiberius {phase} failed: {} ({})",
+            "arrow-sql-server {phase} failed: {} ({})",
             info.summary(),
             info.kind()
         ),
-        None => format!("arrow-tiberius error: {} ({})", info.summary(), info.kind()),
+        None => format!(
+            "arrow-sql-server error: {} ({})",
+            info.summary(),
+            info.kind()
+        ),
     }
 }
 
-fn arrow_tiberius_write_diagnostics(source: &arrow_tiberius::Error) -> Vec<MssqlWriteDiagnostic> {
+fn arrow_sql_server_write_diagnostics(
+    source: &arrow_sql_server::Error,
+) -> Vec<MssqlWriteDiagnostic> {
     source
         .safe_error_info()
         .diagnostics()
@@ -1097,7 +1103,7 @@ fn arrow_tiberius_write_diagnostics(source: &arrow_tiberius::Error) -> Vec<Mssql
             diagnostics
                 .all()
                 .iter()
-                .map(MssqlWriteDiagnostic::from_arrow_tiberius)
+                .map(MssqlWriteDiagnostic::from_arrow_sql_server)
                 .collect()
         })
         .unwrap_or_default()
@@ -1185,7 +1191,7 @@ mod tests {
     };
 
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::{
+    use arrow_sql_server::{
         Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, PlanOptions, StringPolicy,
         WritePhase,
     };
@@ -1285,13 +1291,13 @@ mod tests {
         async fn write_batch(
             &mut self,
             batch: &RecordBatch,
-        ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        ) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
             let row_count = batch.num_rows();
             self.batch_rows.push(row_count);
             if let Some(log) = &self.log {
                 let Ok(mut log) = log.lock() else {
-                    return Err(arrow_tiberius::Error::BackendUnavailable {
-                        backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    return Err(arrow_sql_server::Error::BackendUnavailable {
+                        backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                         reason: "fake writer log mutex was poisoned".to_owned(),
                     });
                 };
@@ -1302,38 +1308,38 @@ mod tests {
             }
             let write_batch_call = self.accepted_batches.saturating_add(1);
             if self.fail_on_write_batch == Some(write_batch_call) {
-                return Err(arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                return Err(arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason: format!("fake writer failed on batch {write_batch_call}"),
                 });
             }
             self.accepted_rows = self.accepted_rows.saturating_add(row_count as u64);
             self.accepted_batches = self.accepted_batches.saturating_add(1);
 
-            Ok(arrow_tiberius::WriteStats {
+            Ok(arrow_sql_server::WriteStats {
                 rows_written: self.accepted_rows,
                 batches_written: self.accepted_batches,
             })
         }
 
-        async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        async fn finish(self) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
             if let Some(log) = &self.log {
                 let Ok(mut log) = log.lock() else {
-                    return Err(arrow_tiberius::Error::BackendUnavailable {
-                        backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                    return Err(arrow_sql_server::Error::BackendUnavailable {
+                        backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                         reason: "fake writer log mutex was poisoned".to_owned(),
                     });
                 };
                 log.finish_count = log.finish_count.saturating_add(1);
             }
             if self.fail_on_finish {
-                return Err(arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                return Err(arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason: "fake writer failed on finish".to_owned(),
                 });
             }
 
-            Ok(arrow_tiberius::WriteStats {
+            Ok(arrow_sql_server::WriteStats {
                 rows_written: self.accepted_rows,
                 batches_written: self.accepted_batches,
             })
@@ -1347,18 +1353,18 @@ mod tests {
         async fn initialize(
             self,
             request: MssqlBulkWriterInitializationRequest,
-        ) -> Result<Self::Writer, arrow_tiberius::Error> {
+        ) -> Result<Self::Writer, arrow_sql_server::Error> {
             let Ok(mut request_log) = self.request.lock() else {
-                return Err(arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                return Err(arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason: "fake initializer request log mutex was poisoned".to_owned(),
                 });
             };
             *request_log = Some(request);
 
             if let Some(reason) = self.error {
-                return Err(arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                return Err(arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason,
                 });
             }
@@ -1476,9 +1482,9 @@ mod tests {
         assert_eq!(context.load_mode(), LoadMode::AppendExisting);
         assert!(!context.partial_write_possible());
 
-        let arrow_tiberius::Error::ValueConversion { diagnostics } = source else {
+        let arrow_sql_server::Error::ValueConversion { diagnostics } = source else {
             return Err(DeltaFunnelError::Config {
-                message: "expected arrow-tiberius value conversion error".to_owned(),
+                message: "expected arrow-sql-server value conversion error".to_owned(),
             });
         };
         assert_eq!(diagnostics.len(), 1);
@@ -1603,7 +1609,7 @@ mod tests {
     fn connected_bulk_writer_adapts_to_bulk_load_writer_trait() {
         fn assert_bulk_load_writer<W: MssqlBulkLoadWriter>() {}
 
-        assert_bulk_load_writer::<arrow_tiberius::ConnectedBulkWriter<'static>>();
+        assert_bulk_load_writer::<arrow_sql_server::ConnectedBulkWriter<'static>>();
     }
 
     #[tokio::test]
@@ -1685,22 +1691,22 @@ mod tests {
     }
 
     #[test]
-    fn arrow_tiberius_writer_errors_use_safe_message_and_structured_diagnostics()
+    fn arrow_sql_server_writer_errors_use_safe_message_and_structured_diagnostics()
     -> Result<(), DeltaFunnelError> {
         let output_plan = output_plan_for_orders_schema()?;
-        let source = arrow_tiberius::Error::DirectEncoding {
+        let source = arrow_sql_server::Error::DirectEncoding {
             diagnostics: DiagnosticSet::from(vec![
                 Diagnostic::error(
                     DiagnosticCode::DirectEncodingUnsupportedBatch,
                     "direct encoder rejected test batch\nwith detail",
                 )
-                .with_field(arrow_tiberius::FieldRef::new(1, "status"))
+                .with_field(arrow_sql_server::FieldRef::new(1, "status"))
                 .with_row(7),
             ]),
         }
         .with_write_phase(WritePhase::DirectEncoding);
 
-        let error = mssql_arrow_tiberius_write_phase_error(
+        let error = mssql_arrow_sql_server_write_phase_error(
             &output_plan,
             MssqlWritePhase::Finalize,
             write_failure_report_metrics(
@@ -1721,7 +1727,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "arrow-tiberius direct_encoding failed: direct encoding failed with diagnostics (DirectEncoding)"
+            "arrow-sql-server direct_encoding failed: direct encoding failed with diagnostics (DirectEncoding)"
         );
         assert_eq!(context.phase(), MssqlWritePhase::Finalize);
         assert_eq!(context.diagnostics().len(), 1);
@@ -2623,13 +2629,13 @@ mod tests {
     }
 
     #[test]
-    fn write_backend_conversion_preserves_arrow_tiberius_schema_check_default() {
+    fn write_backend_conversion_preserves_arrow_sql_server_schema_check_default() {
         let backend = default_mssql_write_backend();
-        let arrow_options = arrow_tiberius::WriteOptions::from(backend);
+        let arrow_options = arrow_sql_server::WriteOptions::from(backend);
 
         assert_eq!(
             arrow_options.schema_check,
-            arrow_tiberius::SchemaCheck::Strict
+            arrow_sql_server::SchemaCheck::Strict
         );
     }
 

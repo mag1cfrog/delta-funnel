@@ -295,7 +295,7 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
 #[async_trait]
 impl MssqlOneOutputSinkConnection for MssqlConnectedOutputClient {
     type Writer<'connection>
-        = arrow_tiberius::ConnectedBulkWriter<'connection>
+        = arrow_sql_server::ConnectedBulkWriter<'connection>
     where
         Self: 'connection;
 
@@ -1471,11 +1471,11 @@ mod tests {
     }
 
     impl FakeSinkWriter {
-        fn record(&self, event: impl Into<String>) -> Result<(), arrow_tiberius::Error> {
+        fn record(&self, event: impl Into<String>) -> Result<(), arrow_sql_server::Error> {
             self.log
                 .lock()
-                .map_err(|_| arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                .map_err(|_| arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason: "fake sink log mutex was poisoned".to_owned(),
                 })?
                 .push(event.into());
@@ -1591,31 +1591,31 @@ mod tests {
         async fn write_batch(
             &mut self,
             batch: &RecordBatch,
-        ) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        ) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
             self.record(format!("write {}", batch.num_rows()))?;
             if self.fail_write {
-                return Err(arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                return Err(arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason: "fake sink writer failed on write".to_owned(),
                 });
             }
 
-            Ok(arrow_tiberius::WriteStats {
+            Ok(arrow_sql_server::WriteStats {
                 rows_written: u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
                 batches_written: 1,
             })
         }
 
-        async fn finish(self) -> Result<arrow_tiberius::WriteStats, arrow_tiberius::Error> {
+        async fn finish(self) -> Result<arrow_sql_server::WriteStats, arrow_sql_server::Error> {
             self.record("finish")?;
             if self.fail_finish {
-                return Err(arrow_tiberius::Error::BackendUnavailable {
-                    backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+                return Err(arrow_sql_server::Error::BackendUnavailable {
+                    backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                     reason: "fake sink writer failed on finish".to_owned(),
                 });
             }
 
-            Ok(arrow_tiberius::WriteStats {
+            Ok(arrow_sql_server::WriteStats {
                 rows_written: 0,
                 batches_written: 0,
             })
@@ -1652,7 +1652,7 @@ mod tests {
             "orders_output",
             &target,
             Some(&connection),
-            arrow_tiberius::PlanOptions::default(),
+            arrow_sql_server::PlanOptions::default(),
         )
     }
 

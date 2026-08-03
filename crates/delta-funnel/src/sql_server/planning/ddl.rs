@@ -1,6 +1,6 @@
-//! SQL Server create-table DDL planning through arrow-tiberius.
+//! SQL Server create-table DDL planning through arrow-sql-server.
 
-use arrow_tiberius::create_table_sql_from_mappings;
+use arrow_sql_server::create_table_sql_from_mappings;
 
 use crate::DeltaFunnelError;
 
@@ -40,7 +40,7 @@ impl MssqlDdlPlan {
 /// Plans optional create-table DDL for one selected output schema plan.
 ///
 /// This function is side-effect free. It validates target identifiers through
-/// arrow-tiberius and delegates SQL rendering to arrow-tiberius.
+/// arrow-sql-server and delegates SQL rendering to arrow-sql-server.
 pub fn plan_mssql_create_table_ddl(
     schema_plan: &MssqlSchemaPlan,
 ) -> Result<MssqlDdlPlan, DeltaFunnelError> {
@@ -87,7 +87,7 @@ pub fn plan_mssql_create_table_ddl(
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::PlanOptions;
+    use arrow_sql_server::PlanOptions;
 
     use super::*;
     use crate::{
@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_load_produces_create_table_sql_through_arrow_tiberius()
+    fn create_and_load_produces_create_table_sql_through_arrow_sql_server()
     -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             LoadMode::CreateAndLoad,
@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_target_table_is_quoted_by_arrow_tiberius() -> Result<(), DeltaFunnelError> {
+    fn unqualified_target_table_is_quoted_by_arrow_sql_server() -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             LoadMode::CreateAndLoad,
             MssqlTargetTable::unqualified("orders")?,
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_and_special_identifiers_follow_arrow_tiberius_quoting()
+    fn reserved_and_special_identifiers_follow_arrow_sql_server_quoting()
     -> Result<(), DeltaFunnelError> {
         let schema_plan = schema_plan(
             LoadMode::CreateAndLoad,

@@ -58,7 +58,7 @@ impl BatchHandoffOutcome {
 /// Terminal failure from a query-output handoff.
 ///
 /// Upstream errors come from the DataFusion stream. Downstream errors come from
-/// the batch consumer, which will later be backed by `arrow-tiberius`.
+/// the batch consumer, which will later be backed by `arrow-sql-server`.
 #[derive(Debug, Snafu)]
 pub enum BatchHandoffError {
     /// The selected DataFusion query output could not be exposed as a stream.
@@ -105,7 +105,7 @@ impl BatchHandoffError {
 /// DataFusion and the downstream writer.
 ///
 /// Consumers that need a separate finalization step, such as
-/// `arrow_tiberius::BulkWriter::finish`, keep owning that step. The handoff only
+/// `arrow_sql_server::BulkWriter::finish`, keep owning that step. The handoff only
 /// drives per-batch writes so callers can decide whether and when finalization
 /// is appropriate after success or failure.
 #[async_trait]
@@ -115,7 +115,7 @@ pub trait RecordBatchConsumer: Send {
 }
 
 #[async_trait]
-impl<'client, S> RecordBatchConsumer for arrow_tiberius::BulkWriter<'client, S>
+impl<'client, S> RecordBatchConsumer for arrow_sql_server::BulkWriter<'client, S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -357,10 +357,10 @@ mod tests {
     }
 
     #[test]
-    fn arrow_tiberius_bulk_writer_is_a_record_batch_consumer() {
+    fn arrow_sql_server_bulk_writer_is_a_record_batch_consumer() {
         fn assert_consumer<C: RecordBatchConsumer>() {}
 
-        assert_consumer::<arrow_tiberius::BulkWriter<'static, AllowStdIo<Cursor<Vec<u8>>>>>();
+        assert_consumer::<arrow_sql_server::BulkWriter<'static, AllowStdIo<Cursor<Vec<u8>>>>>();
     }
 
     #[tokio::test]

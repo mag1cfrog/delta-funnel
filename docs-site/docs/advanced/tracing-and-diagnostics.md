@@ -71,7 +71,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 fmt()
     .with_env_filter(EnvFilter::new(
-        "delta_funnel=info,arrow_tiberius=info,tiberius_raw_bulk::protocol=info",
+        "delta_funnel=info,arrow_sql_server=info,tiberius_raw_bulk::protocol=info",
     ))
     .init();
 ```
@@ -80,7 +80,7 @@ Use `debug` only when the extra volume is needed and the logs will stay in a
 restricted location:
 
 ```text
-delta_funnel=debug,arrow_tiberius=debug,tiberius_raw_bulk::protocol=debug
+delta_funnel=debug,arrow_sql_server=debug,tiberius_raw_bulk::protocol=debug
 ```
 
 The tracing targets are:
@@ -88,7 +88,7 @@ The tracing targets are:
 - `delta_funnel` for Delta Funnel workflow, source, output, validation, and
   DataFusion batch-stream events
 - `object_store` for object-store builder and credential-provider debug events
-- `arrow_tiberius` for Arrow-to-SQL Server writer lifecycle events
+- `arrow_sql_server` for Arrow-to-SQL Server writer lifecycle events
 - `tiberius_raw_bulk::protocol` for sanitized raw bulk protocol events
 
 ## Profiling and diagnostics reference
@@ -142,7 +142,7 @@ Include the smallest safe set of facts that explains where the workload failed:
 - `phase_timings` for the workflow and failed output
 - `batch_shaping`, `write_stats`, `validation_status`, `partial_write_possible`,
   and `cleanup` for SQL Server write failures
-- tracing logs for `delta_funnel`, `arrow_tiberius`, and
+- tracing logs for `delta_funnel`, `arrow_sql_server`, and
   `tiberius_raw_bulk::protocol`
 
 For SQL Server engine analysis, use SQL Server tooling such as DMVs, Extended

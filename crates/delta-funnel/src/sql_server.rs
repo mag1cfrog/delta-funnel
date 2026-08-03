@@ -2,13 +2,13 @@
 //!
 //! This module owns Delta Funnel configuration and reporting shapes around SQL
 //! Server targets. Schema mapping, identifier quoting, DDL rendering, and
-//! Arrow-to-TDS writing remain owned by `arrow-tiberius`.
+//! Arrow-to-TDS writing remain owned by `arrow-sql-server`.
 
 mod execution;
 mod planning;
 mod target;
 
-pub use arrow_tiberius::{TableName as MssqlTableName, connect_mssql_client_from_ado_string};
+pub use arrow_sql_server::{TableName as MssqlTableName, connect_mssql_client_from_ado_string};
 pub(crate) use execution::MssqlBulkLoadWriter;
 pub(crate) use execution::table_name_from_target;
 pub use execution::{

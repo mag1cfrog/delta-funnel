@@ -1643,7 +1643,7 @@ mod tests {
             let _output_guard = output_span.enter();
 
             tracing::info!(
-                target: "arrow_tiberius",
+                target: "arrow_sql_server",
                 telemetry_event = "batch_write.completed",
                 "batch_write.completed"
             );
@@ -1651,7 +1651,7 @@ mod tests {
 
         let events = events.events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].target, "arrow_tiberius");
+        assert_eq!(events[0].target, "arrow_sql_server");
         assert_eq!(events[0].span_names, vec![WORKFLOW_SPAN, OUTPUT_SPAN]);
         Ok(())
     }

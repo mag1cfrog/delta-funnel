@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - configure the per-operation ranked-profile activity span limit from Python
 - scale the ranked-profile semantic buffer for higher activity span limits
 
+### Changed
+
+- [**breaking**] replace the `arrow-tiberius` dependency with `arrow-sql-server`; Rust integrations and custom tracing filters that name the dependency should use `arrow_sql_server` instead of `arrow_tiberius`
+
 ### Fixed
 
 - authorize operation-scoped diagnostics captures on Linux hosts using Yama restricted ptrace

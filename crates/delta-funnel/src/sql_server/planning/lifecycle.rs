@@ -248,7 +248,7 @@ fn lifecycle_error(target: &MssqlTargetSummary, message: impl Into<String>) -> D
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::PlanOptions;
+    use arrow_sql_server::PlanOptions;
 
     use super::*;
     use crate::{
