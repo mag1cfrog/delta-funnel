@@ -192,7 +192,7 @@ All option mappings reject unknown keys.
 | `max_concurrent_file_reads_per_partition` | Positive integer | `3` |
 | `output_buffer_capacity_per_partition` | Positive integer | `1` |
 | `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
-| `parquet_metadata_size_hint` | Positive Parquet file-tail size in bytes; omitted disables footer metadata prefetch | Disabled |
+| `parquet_metadata_size_hint` | Positive Parquet file-tail size in bytes; `None` disables footer metadata prefetch | `65536` (64 KiB) |
 
 See [Provider read scheduling](../internals/provider-read-scheduling.md#execution-options)
 for the execution boundaries controlled by these values.

@@ -40,17 +40,18 @@ buffers used by provider execution:
   handoff queue for each execution partition.
 - `native_async_prefetch_file_count_per_partition`: native async file stream
   setup prefetch depth per partition. A value of `0` is fully lazy.
-- `parquet_metadata_size_hint`: optional size of the Parquet file tail fetched
-  by the native async reader while loading footer metadata. When the footer
-  exceeds the hint, parquet-rs safely performs another metadata request. An
-  oversized hint increases transferred bytes and per-open memory, including a
-  whole-file fetch during metadata loading when the hint is at least the file
-  size.
+- `parquet_metadata_size_hint`: size of the Parquet file tail fetched by the
+  native async reader while loading footer metadata. It defaults to 64 KiB;
+  `None` disables prefetching. When the footer exceeds the hint, parquet-rs
+  safely performs another metadata request. An oversized hint increases
+  transferred bytes and per-open memory, including a whole-file fetch during
+  metadata loading when the hint is at least the file size.
 
 The active-read and output-buffer values must be greater than zero. The native
 async backend defaults to per-partition file-read capacity 3, prefetch depth 2,
-and output buffer capacity 1. Production registration resolves the native async
-scan-wide cap after partition planning as `target_partitions * 3`.
+output buffer capacity 1, and a 64 KiB Parquet metadata size hint. Production
+registration resolves the native async scan-wide cap after partition planning
+as `target_partitions * 3`.
 Configured Parquet metadata size hints must also be greater than zero.
 
 The official-kernel backend keeps native async prefetch disabled and uses the

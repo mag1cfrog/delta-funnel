@@ -12,6 +12,9 @@ pub const NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION: usize = 2;
 /// Native async per-partition file-read capacity selected by benchmark evidence.
 pub const NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION: usize = 3;
 
+/// Native async Parquet file-tail prefetch selected by benchmark evidence.
+pub const NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT: usize = 64 * 1024;
+
 /// Provider file-reader backend selected for Delta scan execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaProviderReaderBackend {
@@ -71,12 +74,13 @@ pub struct DeltaProviderScanExecutionOptions {
     /// hardening and benchmark surface; the official-kernel backend ignores it.
     pub native_async_prefetch_file_count_per_partition: usize,
 
-    /// Optional Parquet file-tail prefetch size in bytes for footer metadata.
+    /// Parquet file-tail prefetch size in bytes for footer metadata.
     ///
     /// A sufficiently large value lets the native async reader load the footer
     /// trailer and metadata in one object-store request. The reader safely
     /// performs another metadata request when the hint is too small. The
-    /// official-kernel backend ignores this setting.
+    /// native async backend defaults to 64 KiB; `None` disables prefetching.
+    /// The official-kernel backend ignores this setting.
     pub parquet_metadata_size_hint: Option<usize>,
 }
 
@@ -407,7 +411,7 @@ impl Default for DeltaProviderScanExecutionOptions {
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition:
                 NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION,
-            parquet_metadata_size_hint: None,
+            parquet_metadata_size_hint: Some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT),
         }
     }
 }
@@ -442,7 +446,8 @@ impl DeltaProviderScanExecutionOptions {
             max_concurrent_file_reads_per_partition,
             output_buffer_capacity_per_partition: 1,
             native_async_prefetch_file_count_per_partition,
-            parquet_metadata_size_hint: None,
+            parquet_metadata_size_hint: (reader_backend == DeltaProviderReaderBackend::NativeAsync)
+                .then_some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT),
         };
         options.validate()?;
         Ok(options)
@@ -558,6 +563,7 @@ mod tests {
         DeltaProviderAsyncReadLimiter, DeltaProviderReaderBackend,
         DeltaProviderScanExecutionOptions, DeltaProviderSyncReadLimiter,
         NATIVE_ASYNC_DEFAULT_FILE_READS_PER_PARTITION,
+        NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT,
         NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION,
     };
 
@@ -587,7 +593,10 @@ mod tests {
             options.native_async_prefetch_file_count_per_partition,
             NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION
         );
-        assert_eq!(options.parquet_metadata_size_hint, None);
+        assert_eq!(
+            options.parquet_metadata_size_hint,
+            Some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT)
+        );
         options.validate()?;
 
         Ok(())
@@ -610,6 +619,7 @@ mod tests {
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
         assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
+        assert_eq!(options.parquet_metadata_size_hint, None);
 
         Ok(())
     }
@@ -631,6 +641,10 @@ mod tests {
         assert_eq!(options.max_concurrent_file_reads_per_partition, 1);
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
         assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
+        assert_eq!(
+            options.parquet_metadata_size_hint,
+            Some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT)
+        );
 
         Ok(())
     }
