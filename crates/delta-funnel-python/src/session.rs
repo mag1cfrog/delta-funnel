@@ -722,7 +722,7 @@ fn parse_provider_scan_options(
                     usize_option(py, &value, key.as_str())?;
             }
             "parquet_metadata_size_hint" => {
-                options.parquet_metadata_size_hint = Some(usize_option(py, &value, key.as_str())?);
+                options.parquet_metadata_size_hint = optional_usize_arg(&value, key.as_str())?;
             }
             _ => {
                 return Err(unknown_option_error(py, "provider scan", key.as_str()));
@@ -3974,6 +3974,35 @@ union all select cast(902 as bigint) as order_id",),
                     .provider_scan_options()
                     .max_concurrent_file_reads_per_scan
                     .is_none()
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn session_can_disable_parquet_metadata_prefetch() -> PyResult<()> {
+        Python::attach(|py| {
+            let provider_scan_options = PyDict::new(py);
+            provider_scan_options.set_item("parquet_metadata_size_hint", py.None())?;
+
+            let session = PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            )?;
+
+            assert_eq!(
+                session
+                    .inner
+                    .options()
+                    .provider_scan_options()
+                    .parquet_metadata_size_hint,
+                None
             );
 
             Ok(())

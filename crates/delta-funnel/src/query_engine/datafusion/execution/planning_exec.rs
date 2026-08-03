@@ -3388,11 +3388,14 @@ mod tests {
             storage_options: Default::default(),
         })?;
         let preflight = preflight_delta_protocol(&source)?;
-        let execution_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-            DeltaProviderReaderBackend::NativeAsync,
-            1,
-            1,
-        )?;
+        let execution_options = DeltaProviderScanExecutionOptions {
+            parquet_metadata_size_hint: None,
+            ..DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+                DeltaProviderReaderBackend::NativeAsync,
+                1,
+                1,
+            )?
+        };
         register_delta_sources_with_scan_execution_options(
             &ctx,
             vec![DeltaTableProviderConfig {
@@ -3465,14 +3468,14 @@ mod tests {
             RealParquetDeltaTable::new_with_two_large_files("parquet-metadata-hint", 20_000)?;
         let table_uri = table.path().to_string_lossy();
         let sql = "select count(*) as row_count, sum(id) as id_sum from orders";
-        let control_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
+        let hinted_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
             DeltaProviderReaderBackend::NativeAsync,
             1,
             1,
         )?;
-        let hinted_options = DeltaProviderScanExecutionOptions {
-            parquet_metadata_size_hint: Some(16_384),
-            ..control_options
+        let control_options = DeltaProviderScanExecutionOptions {
+            parquet_metadata_size_hint: None,
+            ..hinted_options
         };
         let undersized_options = DeltaProviderScanExecutionOptions {
             parquet_metadata_size_hint: Some(9),
