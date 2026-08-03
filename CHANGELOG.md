@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- replace the `arrow-tiberius` dependency with `arrow-sql-server`; custom tracing filters should use `arrow_sql_server` instead of `arrow_tiberius`
+- [**breaking**] replace the `arrow-tiberius` dependency with `arrow-sql-server`; Rust integrations and custom tracing filters that name the dependency should use `arrow_sql_server` instead of `arrow_tiberius`
 
 ### Fixed
 
