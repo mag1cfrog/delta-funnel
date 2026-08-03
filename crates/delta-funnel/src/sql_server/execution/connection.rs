@@ -1,4 +1,4 @@
-//! SQL Server connection request planning through arrow-tiberius.
+//! SQL Server connection request planning through arrow-sql-server.
 
 use std::fmt;
 
@@ -65,7 +65,7 @@ impl fmt::Debug for MssqlOutputConnectionRequest {
 #[derive(Debug)]
 pub(crate) struct MssqlConnectedOutputClient {
     output_plan: MssqlTargetOutputPlan,
-    client: arrow_tiberius::ConnectedMssqlClient,
+    client: arrow_sql_server::ConnectedMssqlClient,
     phase_timings: Vec<PhaseTimingReport>,
 }
 
@@ -76,9 +76,9 @@ impl MssqlConnectedOutputClient {
         &self.output_plan
     }
 
-    /// Returns the connected arrow-tiberius client.
+    /// Returns the connected arrow-sql-server client.
     #[must_use]
-    pub(crate) fn client(&mut self) -> &mut arrow_tiberius::ConnectedMssqlClient {
+    pub(crate) fn client(&mut self) -> &mut arrow_sql_server::ConnectedMssqlClient {
         &mut self.client
     }
 
@@ -93,7 +93,7 @@ impl MssqlConnectedOutputClient {
         MssqlConnectedLifecycleClient::new(&self.output_plan, &mut self.client)
     }
 
-    /// Counts rows in a prepared target through the arrow-tiberius connection boundary.
+    /// Counts rows in a prepared target through the arrow-sql-server connection boundary.
     pub(crate) async fn target_row_count(
         &mut self,
         prepared_target: &MssqlPreparedTarget,
@@ -101,7 +101,7 @@ impl MssqlConnectedOutputClient {
         self.client
             .target_row_count(prepared_target.table_name())
             .await
-            .map_err(MssqlTargetRowCountFailure::from_arrow_tiberius)
+            .map_err(MssqlTargetRowCountFailure::from_arrow_sql_server)
     }
 
     /// Initializes the bulk writer after target lifecycle preparation.
@@ -109,7 +109,7 @@ impl MssqlConnectedOutputClient {
         &mut self,
         prepared_target: &MssqlPreparedTarget,
         options: MssqlWriteBackend,
-    ) -> Result<arrow_tiberius::ConnectedBulkWriter<'_>, DeltaFunnelError> {
+    ) -> Result<arrow_sql_server::ConnectedBulkWriter<'_>, DeltaFunnelError> {
         initialize_mssql_bulk_writer(
             &mut self.client,
             &self.output_plan,
@@ -136,13 +136,13 @@ pub(crate) fn plan_mssql_output_connection_request(
     })
 }
 
-/// Connects one planned SQL Server output through arrow-tiberius.
+/// Connects one planned SQL Server output through arrow-sql-server.
 pub(crate) async fn connect_mssql_output_client(
     request: MssqlOutputConnectionRequest,
 ) -> Result<MssqlConnectedOutputClient, DeltaFunnelError> {
     let cleanup = request.cleanup_before_target_creation();
     let connect_timer = PhaseTimer::start(SQL_SERVER_CONNECTION_PHASE);
-    let connect_result = arrow_tiberius::connect_mssql_client_from_ado_string(
+    let connect_result = arrow_sql_server::connect_mssql_client_from_ado_string(
         request.connection.connection_string(),
     )
     .await;
@@ -191,12 +191,12 @@ impl MssqlTargetRowCountFailure {
         &self.message
     }
 
-    fn from_arrow_tiberius(error: arrow_tiberius::Error) -> Self {
+    fn from_arrow_sql_server(error: arrow_sql_server::Error) -> Self {
         let reason = match error {
-            arrow_tiberius::Error::TargetRowCountQuery { .. } => {
+            arrow_sql_server::Error::TargetRowCountQuery { .. } => {
                 ReportReasonCode::PermissionUnavailable
             }
-            arrow_tiberius::Error::TargetRowCountUnexpectedResult { .. } => {
+            arrow_sql_server::Error::TargetRowCountUnexpectedResult { .. } => {
                 ReportReasonCode::CapabilityUnavailable
             }
             _ => ReportReasonCode::CapabilityUnavailable,
@@ -210,7 +210,7 @@ fn connect_error(
     request: &MssqlOutputConnectionRequest,
     cleanup: MssqlTargetCleanupStatus,
     timing: PhaseTimingReport,
-    source: arrow_tiberius::Error,
+    source: arrow_sql_server::Error,
 ) -> DeltaFunnelError {
     DeltaFunnelError::MssqlWritePhase {
         context: Box::new(
@@ -232,7 +232,7 @@ fn connect_error(
 #[cfg(test)]
 mod tests {
     use arrow_schema::{DataType, Field, Schema};
-    use arrow_tiberius::PlanOptions;
+    use arrow_sql_server::PlanOptions;
 
     use super::*;
     use crate::{
@@ -301,22 +301,22 @@ mod tests {
     }
 
     #[test]
-    fn compatible_arrow_tiberius_connection_api_is_available() {
-        let _connect = arrow_tiberius::connect_mssql_client_from_ado_string;
-        let client_type = std::any::type_name::<arrow_tiberius::ConnectedMssqlClient>();
+    fn compatible_arrow_sql_server_connection_api_is_available() {
+        let _connect = arrow_sql_server::connect_mssql_client_from_ado_string;
+        let client_type = std::any::type_name::<arrow_sql_server::ConnectedMssqlClient>();
 
         assert!(client_type.contains("ConnectedMssqlClient"));
     }
 
     #[test]
-    fn mssql_connection_uses_arrow_tiberius_without_direct_transport_dependencies() {
+    fn mssql_connection_uses_arrow_sql_server_without_direct_transport_dependencies() {
         let manifest = include_str!("../../../Cargo.toml");
         let dependencies = direct_manifest_dependency_names(manifest);
 
-        assert!(dependencies.contains(&"arrow-tiberius"));
+        assert!(dependencies.contains(&"arrow-sql-server"));
         assert_eq!(
-            direct_manifest_dependency_version(manifest, "arrow-tiberius"),
-            Some("0.2.1")
+            direct_manifest_dependency_version(manifest, "arrow-sql-server"),
+            Some("0.3.1")
         );
         assert!(!dependencies.contains(&"tiberius"));
         assert!(!dependencies.contains(&"tiberius-raw-bulk"));
@@ -350,18 +350,18 @@ mod tests {
 
     #[test]
     fn connected_output_client_exposes_target_row_count_boundary() {
-        let _target_row_count = arrow_tiberius::ConnectedMssqlClient::target_row_count;
+        let _target_row_count = arrow_sql_server::ConnectedMssqlClient::target_row_count;
         let source = include_str!("connection.rs");
 
         assert!(source.contains("target_row_count"));
         assert!(source.contains("prepared_target.table_name()"));
-        assert!(source.contains("MssqlTargetRowCountFailure::from_arrow_tiberius"));
+        assert!(source.contains("MssqlTargetRowCountFailure::from_arrow_sql_server"));
     }
 
     #[test]
     fn target_row_count_errors_are_classified_and_sanitized() {
-        let unexpected = MssqlTargetRowCountFailure::from_arrow_tiberius(
-            arrow_tiberius::Error::TargetRowCountUnexpectedResult {
+        let unexpected = MssqlTargetRowCountFailure::from_arrow_sql_server(
+            arrow_sql_server::Error::TargetRowCountUnexpectedResult {
                 reason: "target row count query returned NULL".to_owned(),
             },
         );
@@ -536,7 +536,7 @@ mod tests {
             &request,
             request.cleanup_before_target_creation(),
             PhaseTimingReport::failed(SQL_SERVER_CONNECTION_PHASE, std::time::Duration::ZERO),
-            arrow_tiberius::Error::ConnectionTcpConnect {
+            arrow_sql_server::Error::ConnectionTcpConnect {
                 source: std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     "connection refused",

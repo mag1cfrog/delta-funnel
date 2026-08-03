@@ -30,13 +30,13 @@ Pass a tracing filter on the first call when you need more detail:
 
 ```python
 deltafunnel.init_logging(
-    "delta_funnel=debug,delta_kernel=debug,object_store=debug,arrow_tiberius=debug"
+    "delta_funnel=debug,delta_kernel=debug,object_store=debug,arrow_sql_server=debug"
 )
 ```
 
 You can also set the `DELTAFUNNEL_LOG` environment variable instead of passing
 a filter. An explicit filter argument takes precedence. When neither is set,
-Delta Funnel uses `delta_funnel=info,arrow_tiberius=info`.
+Delta Funnel uses `delta_funnel=info,arrow_sql_server=info`.
 
 DEBUG events must pass both the Rust tracing filter and Python logging levels.
 For example, this configuration enables terminal Parquet I/O and execution

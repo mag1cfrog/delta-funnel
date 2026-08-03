@@ -14,7 +14,7 @@ use tracing_subscriber::{Registry, prelude::*};
 use crate::exception::delta_funnel_py_error;
 
 pub(super) const DEFAULT_LOGGER: &str = "deltafunnel";
-pub(super) const DEFAULT_FILTER: &str = "delta_funnel=info,arrow_tiberius=info";
+pub(super) const DEFAULT_FILTER: &str = "delta_funnel=info,arrow_sql_server=info";
 pub(super) const LOG_FILTER_ENV: &str = "DELTAFUNNEL_LOG";
 
 pub(crate) fn add_logging(module: &Bound<'_, PyModule>) -> PyResult<()> {

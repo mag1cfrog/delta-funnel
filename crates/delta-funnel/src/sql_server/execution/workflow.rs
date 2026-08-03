@@ -1371,8 +1371,8 @@ mod tests {
         );
         let failure = DeltaFunnelError::MssqlBatchSchemaValidation {
             context: Box::new(context),
-            source: arrow_tiberius::Error::BackendUnavailable {
-                backend: arrow_tiberius::WriteBackend::DirectRawBulk,
+            source: arrow_sql_server::Error::BackendUnavailable {
+                backend: arrow_sql_server::WriteBackend::DirectRawBulk,
                 reason: "schema mismatch".to_owned(),
             },
         };

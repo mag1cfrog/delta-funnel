@@ -16,7 +16,7 @@ pub struct MssqlDryRunOutputFieldReport {
 }
 
 impl MssqlDryRunOutputFieldReport {
-    pub(crate) fn from_mapping(mapping: &arrow_tiberius::SchemaMapping) -> Self {
+    pub(crate) fn from_mapping(mapping: &arrow_sql_server::SchemaMapping) -> Self {
         Self {
             index: crate::usize_to_u64_saturating(mapping.arrow().index()),
             name: mapping.arrow().name().to_owned(),

@@ -581,7 +581,7 @@ mod tests {
         Version, scan_builder_with_predicate_and_stats_symbol, scan_builder_with_predicate_symbol,
         store_from_url_opts, transform_to_logical, try_parse_uri,
     };
-    use arrow_tiberius::{MssqlProfile, PlanOptions, plan_arrow_schema_to_mssql_schema};
+    use arrow_sql_server::{MssqlProfile, PlanOptions, plan_arrow_schema_to_mssql_schema};
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{Expr, cast, col, lit};
     use delta_kernel::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_tiberius_accepts_delta_kernel_arrow_schema() -> arrow_tiberius::Result<()> {
+    fn arrow_sql_server_accepts_delta_kernel_arrow_schema() -> arrow_sql_server::Result<()> {
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let outcome = plan_arrow_schema_to_mssql_schema(
             &schema,

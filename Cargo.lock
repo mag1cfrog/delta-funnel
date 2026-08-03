@@ -282,6 +282,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-sql-server"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "822c0f7e1d5ad14a07808963901c36d6d7ad45280d3bb2e43a9f3e76aeec5da3"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "chrono",
+ "futures-util",
+ "snafu",
+ "tiberius-raw-bulk",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "arrow-string"
 version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -296,24 +314,6 @@ dependencies = [
  "num-traits",
  "regex",
  "regex-syntax",
-]
-
-[[package]]
-name = "arrow-tiberius"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2197315736145964f9785f9d2e427ec89e011843cf2952fb9127722d40b483ac"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-schema",
- "chrono",
- "futures-util",
- "snafu",
- "tiberius-raw-bulk",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -1324,7 +1324,7 @@ name = "delta-funnel"
 version = "0.4.1"
 dependencies = [
  "arrow-schema",
- "arrow-tiberius",
+ "arrow-sql-server",
  "async-trait",
  "chrono",
  "clap",

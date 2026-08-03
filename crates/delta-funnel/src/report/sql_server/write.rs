@@ -68,7 +68,7 @@ pub struct MssqlOutputFieldReport {
 }
 
 impl MssqlOutputFieldReport {
-    pub(crate) fn from_mapping(mapping: &arrow_tiberius::SchemaMapping) -> Self {
+    pub(crate) fn from_mapping(mapping: &arrow_sql_server::SchemaMapping) -> Self {
         Self {
             index: crate::usize_to_u64_saturating(mapping.arrow().index()),
             name: mapping.arrow().name().to_owned(),
@@ -109,7 +109,7 @@ pub(crate) struct MssqlWriteDiagnosticField {
 }
 
 impl MssqlWriteDiagnosticField {
-    fn from_arrow_tiberius(field: &arrow_tiberius::FieldRef) -> Self {
+    fn from_arrow_sql_server(field: &arrow_sql_server::FieldRef) -> Self {
         Self {
             index: crate::usize_to_u64_saturating(field.index()),
             name: field.name().to_owned(),
@@ -127,31 +127,31 @@ impl MssqlWriteDiagnosticField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MssqlWriteDiagnostic {
-    severity: arrow_tiberius::DiagnosticSeverity,
-    code: arrow_tiberius::DiagnosticCode,
+    severity: arrow_sql_server::DiagnosticSeverity,
+    code: arrow_sql_server::DiagnosticCode,
     message: String,
     field: Option<MssqlWriteDiagnosticField>,
     row: Option<u64>,
 }
 
 impl MssqlWriteDiagnostic {
-    pub(crate) fn from_arrow_tiberius(diagnostic: &arrow_tiberius::Diagnostic) -> Self {
+    pub(crate) fn from_arrow_sql_server(diagnostic: &arrow_sql_server::Diagnostic) -> Self {
         Self {
             severity: diagnostic.severity(),
             code: diagnostic.code(),
             message: sanitize_text_for_display(diagnostic.message()),
             field: diagnostic
                 .field()
-                .map(MssqlWriteDiagnosticField::from_arrow_tiberius),
+                .map(MssqlWriteDiagnosticField::from_arrow_sql_server),
             row: diagnostic.row().map(crate::usize_to_u64_saturating),
         }
     }
 
-    pub(crate) const fn severity(&self) -> arrow_tiberius::DiagnosticSeverity {
+    pub(crate) const fn severity(&self) -> arrow_sql_server::DiagnosticSeverity {
         self.severity
     }
 
-    pub(crate) const fn code(&self) -> arrow_tiberius::DiagnosticCode {
+    pub(crate) const fn code(&self) -> arrow_sql_server::DiagnosticCode {
         self.code
     }
 

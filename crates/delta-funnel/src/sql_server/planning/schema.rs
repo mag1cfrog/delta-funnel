@@ -1,14 +1,14 @@
-//! SQL Server schema planning through arrow-tiberius.
+//! SQL Server schema planning through arrow-sql-server.
 
 use std::collections::{HashMap, hash_map::Entry};
 
 use arrow_schema::Schema;
-use arrow_tiberius::{
+use arrow_sql_server::{
     Diagnostic, DiagnosticCode, DiagnosticSet, DiagnosticSeverity, MssqlProfile, PlannedSchema,
     SchemaMapping, plan_arrow_schema_to_mssql_schema,
 };
 
-pub use arrow_tiberius::{
+pub use arrow_sql_server::{
     BinaryPolicy as MssqlBinaryPolicy, Date64Policy as MssqlDate64Policy,
     Decimal256Policy as MssqlDecimal256Policy, DecimalPolicy as MssqlDecimalPolicy,
     FloatPolicy as MssqlFloatPolicy, NanosecondPolicy as MssqlNanosecondPolicy,
@@ -48,7 +48,7 @@ impl MssqlSchemaPlan {
         self.planned_schema.plan_options()
     }
 
-    /// Returns the profile-bound schema plan passed to arrow-tiberius writers.
+    /// Returns the profile-bound schema plan passed to arrow-sql-server writers.
     #[must_use]
     pub const fn planned_schema(&self) -> &PlannedSchema {
         &self.planned_schema
@@ -60,7 +60,7 @@ impl MssqlSchemaPlan {
         self.planned_schema.mappings()
     }
 
-    /// Returns non-fatal diagnostics returned by arrow-tiberius.
+    /// Returns non-fatal diagnostics returned by arrow-sql-server.
     #[must_use]
     pub fn diagnostics(&self) -> &DiagnosticSet {
         &self.diagnostics
@@ -85,7 +85,7 @@ pub struct MssqlSchemaDiagnostic {
 }
 
 impl MssqlSchemaDiagnostic {
-    fn from_arrow_tiberius(output_name: &str, diagnostic: &Diagnostic) -> Self {
+    fn from_arrow_sql_server(output_name: &str, diagnostic: &Diagnostic) -> Self {
         Self {
             output_name: output_name.to_owned(),
             severity: diagnostic.severity(),
@@ -114,7 +114,7 @@ impl MssqlSchemaDiagnostic {
         self.code
     }
 
-    /// Returns the diagnostic message from arrow-tiberius.
+    /// Returns the diagnostic message from arrow-sql-server.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -154,8 +154,8 @@ impl MssqlSchemaDiagnosticField {
     }
 }
 
-impl From<&arrow_tiberius::FieldRef> for MssqlSchemaDiagnosticField {
-    fn from(field: &arrow_tiberius::FieldRef) -> Self {
+impl From<&arrow_sql_server::FieldRef> for MssqlSchemaDiagnosticField {
+    fn from(field: &arrow_sql_server::FieldRef) -> Self {
         Self {
             index: field.index(),
             name: field.name().to_owned(),
@@ -166,7 +166,7 @@ impl From<&arrow_tiberius::FieldRef> for MssqlSchemaDiagnosticField {
 /// Plans one selected output Arrow schema for the resolved SQL Server target.
 ///
 /// This function owns DeltaFunnel orchestration concerns only. Arrow-to-MSSQL
-/// type mapping and identifier validation are delegated to arrow-tiberius.
+/// type mapping and identifier validation are delegated to arrow-sql-server.
 /// Callers may pass an Arrow `Schema`, `SchemaRef`, or borrowed schema.
 pub fn plan_mssql_output_schema(
     schema: impl AsRef<Schema>,
@@ -183,7 +183,7 @@ pub fn plan_mssql_output_schema(
         options,
     )
     .map_err(|source| match source {
-        arrow_tiberius::Error::Planning { diagnostics } => MssqlSchemaPlanningSnafu {
+        arrow_sql_server::Error::Planning { diagnostics } => MssqlSchemaPlanningSnafu {
             output_name: target.output_name().to_owned(),
             diagnostics,
         }
@@ -205,7 +205,7 @@ pub fn plan_mssql_output_schema(
     })
 }
 
-/// Converts arrow-tiberius diagnostics into DeltaFunnel-owned report entries.
+/// Converts arrow-sql-server diagnostics into DeltaFunnel-owned report entries.
 #[must_use]
 pub fn mssql_schema_diagnostic_reports(
     output_name: &str,
@@ -214,7 +214,7 @@ pub fn mssql_schema_diagnostic_reports(
     diagnostics
         .all()
         .iter()
-        .map(|diagnostic| MssqlSchemaDiagnostic::from_arrow_tiberius(output_name, diagnostic))
+        .map(|diagnostic| MssqlSchemaDiagnostic::from_arrow_sql_server(output_name, diagnostic))
         .collect()
 }
 
@@ -261,7 +261,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-    use arrow_tiberius::{
+    use arrow_sql_server::{
         DiagnosticCode, DiagnosticSeverity, MssqlType, MssqlTypeLength, PlanOptions,
     };
 
@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_output_field_names_fail_before_arrow_tiberius() -> Result<(), DeltaFunnelError> {
+    fn duplicate_output_field_names_fail_before_arrow_sql_server() -> Result<(), DeltaFunnelError> {
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("id", DataType::Utf8, true),
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_output_identity_fails_before_arrow_tiberius() -> Result<(), DeltaFunnelError> {
+    fn missing_output_identity_fails_before_arrow_sql_server() -> Result<(), DeltaFunnelError> {
         let connection = MssqlConnectionConfig::new(
             "server=tcp:sql.example.com;database=warehouse;user=admin;password=secret-token",
         )?;
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_sensitive_options_are_passed_to_arrow_tiberius() -> Result<(), DeltaFunnelError> {
+    fn policy_sensitive_options_are_passed_to_arrow_sql_server() -> Result<(), DeltaFunnelError> {
         let schema = Schema::new(vec![Field::new("customer", DataType::Utf8, true)]);
         let target = resolved_target()?;
         let options = MssqlSchemaPlanOptions {

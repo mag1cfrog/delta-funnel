@@ -14,7 +14,7 @@ use std::{
 };
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use arrow_tiberius::{TableName, connect_mssql_client_from_ado_string};
+use arrow_sql_server::{TableName, connect_mssql_client_from_ado_string};
 use datafusion::arrow::{
     array::{
         ArrayRef, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampNanosecondArray,
@@ -544,7 +544,7 @@ union all select cast(103 as bigint) as order_id",
 }
 
 async fn create_append_existing_table(
-    client: &mut arrow_tiberius::ConnectedMssqlClient,
+    client: &mut arrow_sql_server::ConnectedMssqlClient,
     table: &TableName,
 ) -> TestResult<()> {
     client
@@ -561,7 +561,7 @@ INSERT INTO {} ([order_id]) VALUES (CAST(99 AS BIGINT));",
 }
 
 async fn assert_order_ids_persisted(
-    client: &mut arrow_tiberius::ConnectedMssqlClient,
+    client: &mut arrow_sql_server::ConnectedMssqlClient,
     table: &TableName,
     expected_order_ids: &[i64],
 ) -> TestResult<()> {
@@ -573,7 +573,7 @@ async fn assert_order_ids_persisted(
 }
 
 async fn assert_timestamp_ns_datetime_values_persisted(
-    client: &mut arrow_tiberius::ConnectedMssqlClient,
+    client: &mut arrow_sql_server::ConnectedMssqlClient,
     table: &TableName,
 ) -> TestResult<()> {
     client
@@ -584,7 +584,7 @@ async fn assert_timestamp_ns_datetime_values_persisted(
 }
 
 async fn drop_table_if_exists(
-    client: &mut arrow_tiberius::ConnectedMssqlClient,
+    client: &mut arrow_sql_server::ConnectedMssqlClient,
     table: &TableName,
 ) -> TestResult<()> {
     client
