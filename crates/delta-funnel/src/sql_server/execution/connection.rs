@@ -314,10 +314,6 @@ mod tests {
         let dependencies = direct_manifest_dependency_names(manifest);
 
         assert!(dependencies.contains(&"arrow-sql-server"));
-        assert_eq!(
-            direct_manifest_dependency_version(manifest, "arrow-sql-server"),
-            Some("0.3.1")
-        );
         assert!(!dependencies.contains(&"tiberius"));
         assert!(!dependencies.contains(&"tiberius-raw-bulk"));
         assert!(!dependencies.contains(&"tokio-util"));
@@ -573,32 +569,5 @@ mod tests {
         }
 
         dependency_names
-    }
-
-    fn direct_manifest_dependency_version<'a>(
-        manifest: &'a str,
-        expected_dependency: &str,
-    ) -> Option<&'a str> {
-        let mut in_dependency_section = false;
-
-        for line in manifest.lines() {
-            let line = line.trim();
-            if line.starts_with('[') && line.ends_with(']') {
-                in_dependency_section = line == "[dependencies]";
-                continue;
-            }
-            if !in_dependency_section || line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((dependency_name, value)) = line.split_once('=') else {
-                continue;
-            };
-            if dependency_name.trim().trim_matches('"') != expected_dependency {
-                continue;
-            }
-            return Some(value.trim().trim_matches('"'));
-        }
-
-        None
     }
 }

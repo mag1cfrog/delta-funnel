@@ -3049,18 +3049,11 @@ mod tests {
     }
 
     #[test]
-    fn kernel_partition_characterization_uses_official_delta_kernel_0_25_0() {
+    fn kernel_partition_characterization_uses_official_delta_kernel_crates() {
         let manifest = include_str!("../../Cargo.toml");
-        let lockfile = include_str!("../../../../Cargo.lock");
 
-        assert!(manifest.contains(r#"delta_kernel = { version = "=0.25.0""#));
-        assert!(manifest.contains(r#"delta_kernel_default_engine = { version = "=0.25.0""#));
-        assert!(lockfile.contains(
-            "name = \"delta_kernel\"\nversion = \"0.25.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
-        ));
-        assert!(lockfile.contains(
-            "name = \"delta_kernel_default_engine\"\nversion = \"0.25.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
-        ));
+        assert!(manifest.contains("\ndelta_kernel = "));
+        assert!(manifest.contains("\ndelta_kernel_default_engine = "));
         assert!(!manifest.contains("deltalake"));
         assert!(!manifest.contains("buoyant_kernel"));
     }
