@@ -41,6 +41,7 @@ const INITIALIZE_WRITER_PHASE: &str = "initialize_writer";
 const CLEANUP_PHASE: &str = "cleanup";
 const VALIDATION_PHASE: &str = "validation";
 const SWAP_TARGET_PHASE: &str = "swap_target";
+const BULK_LOAD_TABLE_LOCK_PERMISSION_DENIED_ERROR: u32 = 297;
 
 fn emit_progress_phase(
     reporter: Option<&ProgressReporter>,
@@ -201,6 +202,20 @@ pub(crate) trait MssqlOneOutputSinkConnection: Send {
         output_plan: &MssqlTargetOutputPlan,
     ) -> Result<MssqlPreparedTarget, DeltaFunnelError>;
 
+    /// Best-effort enables SQL Server's bulk-load table lock for a replace staging table.
+    async fn enable_bulk_load_table_lock(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: &MssqlPreparedTarget,
+    ) -> Result<bool, DeltaFunnelError>;
+
+    /// Disables a previously enabled bulk-load table lock before publishing the staging table.
+    async fn disable_bulk_load_table_lock(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: &MssqlPreparedTarget,
+    ) -> Result<(), DeltaFunnelError>;
+
     /// Initializes the writer after target lifecycle preparation succeeds.
     async fn initialize_writer<'connection>(
         &'connection mut self,
@@ -306,6 +321,51 @@ impl MssqlOneOutputSinkConnection for MssqlConnectedOutputClient {
         let mut lifecycle_client = self.lifecycle_client();
 
         prepare_mssql_target_lifecycle(output_plan, &mut lifecycle_client).await
+    }
+
+    async fn enable_bulk_load_table_lock(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: &MssqlPreparedTarget,
+    ) -> Result<bool, DeltaFunnelError> {
+        match self
+            .client()
+            .set_bulk_load_table_lock(prepared_target.table_name(), true)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(source) => {
+                let Some(error_code) = bulk_load_table_lock_nonfatal_error_code(&source) else {
+                    return Err(bulk_load_table_lock_error(
+                        output_plan,
+                        MssqlWritePhase::PrepareTargetLifecycle,
+                        source,
+                        false,
+                    ));
+                };
+                tracing::info!(
+                    target: observability::TRACING_TARGET,
+                    telemetry_event = "mssql_bulk_load_table_lock.unavailable",
+                    output_name = output_plan.output_name(),
+                    error_code,
+                    "mssql_bulk_load_table_lock.unavailable"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    async fn disable_bulk_load_table_lock(
+        &mut self,
+        output_plan: &MssqlTargetOutputPlan,
+        prepared_target: &MssqlPreparedTarget,
+    ) -> Result<(), DeltaFunnelError> {
+        self.client()
+            .set_bulk_load_table_lock(prepared_target.table_name(), false)
+            .await
+            .map_err(|source| {
+                bulk_load_table_lock_error(output_plan, MssqlWritePhase::SwapTarget, source, true)
+            })
     }
 
     async fn initialize_writer<'connection>(
@@ -526,16 +586,37 @@ where
     let prepare_span =
         stage_context.start("Prepare target lifecycle", "delta_funnel.write.sql_server");
     let prepared_target = match connection.prepare_target_lifecycle(&output_plan).await {
-        Ok(prepared_target) => {
-            complete_sink_span(prepare_span);
-            prepared_target
-        }
+        Ok(prepared_target) => prepared_target,
         Err(error) => {
             phase_timings.push(prepare_timer.failed());
             fail_sink_span(prepare_span);
             return Err(error_with_phase_timings(error, phase_timings));
         }
     };
+    let bulk_load_table_lock_enabled = if output_plan.load_mode() == LoadMode::Replace {
+        match connection
+            .enable_bulk_load_table_lock(&output_plan, &prepared_target)
+            .await
+        {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                phase_timings.push(prepare_timer.failed());
+                fail_sink_span(prepare_span);
+                return Err(cleanup_after_prepared_target_failure(
+                    &mut connection,
+                    &output_plan,
+                    &prepared_target,
+                    error_with_phase_timings(error, phase_timings),
+                    reporter,
+                    stage_context,
+                )
+                .await);
+            }
+        }
+    } else {
+        false
+    };
+    complete_sink_span(prepare_span);
     phase_timings.push(prepare_timer.completed());
 
     let pre_write_validation_span = (output_plan.load_mode() == LoadMode::AppendExisting
@@ -638,6 +719,7 @@ where
                         &output_plan,
                         &prepared_target,
                         report,
+                        bulk_load_table_lock_enabled,
                     )
                     .await;
                     if swap_result.is_ok() {
@@ -790,6 +872,7 @@ async fn swap_replace_target_after_validation<C>(
     output_plan: &MssqlTargetOutputPlan,
     prepared_target: &MssqlPreparedTarget,
     report: MssqlWriteReport,
+    bulk_load_table_lock_enabled: bool,
 ) -> Result<MssqlWriteReport, DeltaFunnelError>
 where
     C: MssqlOneOutputSinkConnection,
@@ -807,6 +890,16 @@ where
     }
 
     let swap_timer = PhaseTimer::start(SWAP_TARGET_PHASE);
+    if bulk_load_table_lock_enabled
+        && let Err(error) = connection
+            .disable_bulk_load_table_lock(output_plan, prepared_target)
+            .await
+    {
+        return Err(error_with_appended_phase_timings(
+            error_with_report_metrics(output_plan, error, MssqlWritePhase::SwapTarget, &report),
+            vec![swap_timer.failed()],
+        ));
+    }
     match connection
         .swap_prepared_replace_target(output_plan, prepared_target)
         .await
@@ -816,6 +909,38 @@ where
             error_with_report_metrics(output_plan, error, MssqlWritePhase::SwapTarget, &report),
             vec![swap_timer.failed()],
         )),
+    }
+}
+
+fn bulk_load_table_lock_nonfatal_error_code(error: &arrow_sql_server::Error) -> Option<u32> {
+    match error {
+        arrow_sql_server::Error::SqlExecution { source } => source.code(),
+        _ => None,
+    }
+    .filter(|code| bulk_load_table_lock_enable_error_is_nonfatal(*code))
+}
+
+const fn bulk_load_table_lock_enable_error_is_nonfatal(error_code: u32) -> bool {
+    error_code == BULK_LOAD_TABLE_LOCK_PERMISSION_DENIED_ERROR
+}
+
+fn bulk_load_table_lock_error(
+    output_plan: &MssqlTargetOutputPlan,
+    phase: MssqlWritePhase,
+    source: arrow_sql_server::Error,
+    partial_write_possible: bool,
+) -> DeltaFunnelError {
+    DeltaFunnelError::MssqlWritePhase {
+        context: Box::new(MssqlWriteFailureContext::from_output_plan(
+            output_plan,
+            phase,
+            0,
+            0,
+            0,
+            partial_write_possible,
+            MssqlTargetCleanupStatus::NotAttempted,
+        )),
+        message: source.to_string(),
     }
 }
 
@@ -1383,6 +1508,9 @@ mod tests {
     struct FakeSinkConnection {
         log: Arc<Mutex<Vec<String>>>,
         prepare_error: Option<DeltaFunnelError>,
+        enable_table_lock_error: Option<DeltaFunnelError>,
+        enable_table_lock_unavailable: bool,
+        disable_table_lock_error: Option<DeltaFunnelError>,
         initialize_error: Option<DeltaFunnelError>,
         cleanup_error: Option<DeltaFunnelError>,
         swap_error: Option<DeltaFunnelError>,
@@ -1413,6 +1541,21 @@ mod tests {
 
         fn fail_initialize(mut self, error: DeltaFunnelError) -> Self {
             self.initialize_error = Some(error);
+            self
+        }
+
+        fn fail_enable_table_lock(mut self, error: DeltaFunnelError) -> Self {
+            self.enable_table_lock_error = Some(error);
+            self
+        }
+
+        fn with_table_lock_unavailable(mut self) -> Self {
+            self.enable_table_lock_unavailable = true;
+            self
+        }
+
+        fn fail_disable_table_lock(mut self, error: DeltaFunnelError) -> Self {
+            self.disable_table_lock_error = Some(error);
             self
         }
 
@@ -1525,6 +1668,32 @@ mod tests {
                 fail_write: self.fail_write,
                 fail_finish: self.fail_finish,
             })
+        }
+
+        async fn enable_bulk_load_table_lock(
+            &mut self,
+            _output_plan: &MssqlTargetOutputPlan,
+            _prepared_target: &MssqlPreparedTarget,
+        ) -> Result<bool, DeltaFunnelError> {
+            self.record("enable table lock")?;
+            if let Some(error) = self.enable_table_lock_error.take() {
+                return Err(error);
+            }
+
+            Ok(!self.enable_table_lock_unavailable)
+        }
+
+        async fn disable_bulk_load_table_lock(
+            &mut self,
+            _output_plan: &MssqlTargetOutputPlan,
+            _prepared_target: &MssqlPreparedTarget,
+        ) -> Result<(), DeltaFunnelError> {
+            self.record("disable table lock")?;
+            if let Some(error) = self.disable_table_lock_error.take() {
+                return Err(error);
+            }
+
+            Ok(())
         }
 
         async fn cleanup_prepared_target(
@@ -1742,6 +1911,21 @@ mod tests {
             assert_eq!(timing.elapsed_micros(), None);
         }
         Ok(())
+    }
+
+    #[test]
+    fn bulk_load_table_lock_fallback_only_accepts_permission_denied() {
+        assert!(bulk_load_table_lock_enable_error_is_nonfatal(297));
+        assert!(!bulk_load_table_lock_enable_error_is_nonfatal(1205));
+
+        let non_sql_error = arrow_sql_server::Error::BackendUnavailable {
+            backend: arrow_sql_server::WriteBackend::DirectRawBulk,
+            reason: "test backend failure".to_owned(),
+        };
+        assert_eq!(
+            bulk_load_table_lock_nonfatal_error_code(&non_sql_error),
+            None
+        );
     }
 
     fn phase_error(
@@ -2017,11 +2201,13 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "enable table lock",
                 "initialize",
                 "write 2",
                 "write 1",
                 "finish",
                 "count target rows",
+                "disable table lock",
                 "swap"
             ]
         );
@@ -2108,10 +2294,165 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "enable table lock",
                 "initialize",
                 "finish",
                 "count target rows",
+                "disable table lock",
                 "swap"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_continues_when_bulk_load_table_lock_is_unavailable()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_table_lock_unavailable()
+            .with_target_row_count(3);
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_backend(),
+        )
+        .await?;
+
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "enable table lock",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "swap"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_bulk_load_table_lock_enable_failure_cleans_up_before_write()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection =
+            FakeSinkConnection::with_log(Arc::clone(&log)).fail_enable_table_lock(phase_error(
+                &output_plan,
+                MssqlWritePhase::PrepareTargetLifecycle,
+                "table lock enable failed",
+            ));
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_backend(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected table lock enable failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected prepare-target write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::PrepareTargetLifecycle);
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(!context.partial_write_possible());
+        assert!(message.contains("table lock enable failed"));
+        assert_phase_timing(
+            context.phase_timings(),
+            PREPARE_TARGET_LIFECYCLE_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "enable table lock",
+                "cleanup CreatedStagingTable"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_bulk_load_table_lock_disable_failure_prevents_swap_and_cleans_up()
+    -> Result<(), DeltaFunnelError> {
+        let output_plan = output_plan_with_load_mode(LoadMode::Replace)?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let connection = FakeSinkConnection::with_log(Arc::clone(&log))
+            .with_target_row_count(3)
+            .fail_disable_table_lock(phase_error_with_partial_write(
+                &output_plan,
+                MssqlWritePhase::SwapTarget,
+                "table lock disable failed",
+                true,
+            ));
+        let batches = stream::iter(vec![Ok(orders_batch(3)?)]);
+
+        let error = write_mssql_output_batches_on_connection(
+            output_plan,
+            connection,
+            batches,
+            default_mssql_write_backend(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| DeltaFunnelError::Config {
+            message: "expected table lock disable failure".to_owned(),
+        })?;
+
+        let DeltaFunnelError::MssqlWritePhase { context, message } = error else {
+            return Err(DeltaFunnelError::Config {
+                message: "expected swap-target write phase error".to_owned(),
+            });
+        };
+        assert_eq!(context.phase(), MssqlWritePhase::SwapTarget);
+        assert_eq!(context.output_row_count(), RowCount::exact(3));
+        assert_eq!(context.target_row_count(), RowCount::exact(3));
+        assert_eq!(context.validation_status(), ValidationStatus::passed());
+        assert_eq!(context.cleanup(), MssqlTargetCleanupStatus::Succeeded);
+        assert!(context.partial_write_possible());
+        assert!(message.contains("table lock disable failed"));
+        assert_phase_timing(
+            context.phase_timings(),
+            SWAP_TARGET_PHASE,
+            PhaseStatus::failed(),
+        )?;
+        assert_phase_timing(
+            context.phase_timings(),
+            CLEANUP_PHASE,
+            PhaseStatus::completed(),
+        )?;
+        assert_eq!(
+            logged_events(&log)?,
+            vec![
+                "prepare",
+                "enable table lock",
+                "initialize",
+                "write 3",
+                "finish",
+                "count target rows",
+                "disable table lock",
+                "cleanup CreatedStagingTable"
             ]
         );
         Ok(())
@@ -2166,6 +2507,7 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "enable table lock",
                 "initialize",
                 "write 3",
                 "finish",
@@ -2234,6 +2576,7 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "enable table lock",
                 "initialize",
                 "write 3",
                 "finish",
@@ -2296,6 +2639,7 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "enable table lock",
                 "initialize",
                 "write 3",
                 "finish",
@@ -2368,10 +2712,12 @@ mod tests {
             logged_events(&log)?,
             vec![
                 "prepare",
+                "enable table lock",
                 "initialize",
                 "write 3",
                 "finish",
                 "count target rows",
+                "disable table lock",
                 "swap",
                 "cleanup CreatedStagingTable"
             ]
