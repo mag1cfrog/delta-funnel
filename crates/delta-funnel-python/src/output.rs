@@ -963,8 +963,16 @@ IF NOT EXISTS (SELECT 1 FROM {table} WHERE [order_id] = {first_id})
 IF NOT EXISTS (SELECT 1 FROM {table} WHERE [order_id] = {second_id})
     THROW 51012, 'replace target second row missing', 1;
 IF EXISTS (SELECT 1 FROM {table} WHERE [order_id] NOT IN ({first_id}, {second_id}))
-    THROW 51013, 'replace target kept unexpected rows', 1;",
+    THROW 51013, 'replace target kept unexpected rows', 1;
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.tables
+    WHERE [object_id] = OBJECT_ID(N'{table_literal}')
+      AND [lock_on_bulk_load] = 0
+)
+    THROW 51014, 'replace target kept bulk-load table lock enabled', 1;",
                 table = table.quoted_sql(),
+                table_literal = table.quoted_sql().replace('\'', "''"),
             ))
             .await?;
 
