@@ -46,6 +46,9 @@ buffers used by provider execution:
   safely performs another metadata request. An oversized hint increases
   transferred bytes and per-open memory, including a whole-file fetch during
   metadata loading when the hint is at least the file size.
+- `parquet_full_file_read_threshold`: maximum Parquet file size in bytes that
+  the native async reader may fetch once and buffer for local range reads.
+  `None`, the default, keeps direct object-store range reads for every file.
 
 The active-read and output-buffer values must be greater than zero. The native
 async backend defaults to per-partition file-read capacity 3, prefetch depth 2,
@@ -53,6 +56,7 @@ output buffer capacity 1, and a 64 KiB Parquet metadata size hint. Production
 registration resolves the native async scan-wide cap after partition planning
 as `target_partitions * 3`.
 Configured Parquet metadata size hints must also be greater than zero.
+Configured full-file read thresholds must also be greater than zero.
 
 The official-kernel backend keeps native async prefetch disabled and uses the
 same active-read option names for compatibility. It does not maintain an extra
@@ -113,6 +117,32 @@ file admission. A precise too-late counter would also need to observe that a
 dynamic filter became newly useful only after a task had already been opened or
 prefetched; the current design intentionally avoids that producer-state
 coupling.
+
+## Buffered Full-File Reads
+
+Parquet normally reads a file in phases. It first loads footer metadata, then
+uses the decoded column and row-group offsets to request data ranges. For a
+small file and a broad projection, those remote ranges can overlap and can cost
+more requests and bytes than fetching the object once.
+
+When `parquet_full_file_read_threshold` is set and a Delta file's recorded size
+is at or below the threshold, the native async reader:
+
+1. performs one full GET through the configured object store
+2. places the returned compressed Parquet bytes in a per-file memory store
+3. gives parquet-rs its normal range-reading interface over that memory store
+
+The optimization does not change Parquet projection, row-group pruning,
+deletion-vector handling, or Arrow decoding. Files above the threshold continue
+to use the normal remote range-read path.
+
+The memory store belongs to one file stream. It is dropped after the stream
+reaches EOF or is cancelled, so files are not retained across scans or queries.
+The compressed-byte footprint scales with the threshold and the number of
+concurrently active file streams. Select a threshold from observed file sizes,
+remote request counts, transferred bytes, and memory measurements. Keep the
+option disabled when queries usually read narrow projections from otherwise
+small files.
 
 ## Parquet Data-File IO Metrics
 

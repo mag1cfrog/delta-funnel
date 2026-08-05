@@ -1412,6 +1412,14 @@ mod tests {
     }
 
     #[test]
+    fn pyi_stub_exposes_provider_scan_options() {
+        let stub = include_str!("../deltafunnel.pyi");
+        assert!(stub.contains("class ProviderScanOptions(TypedDict, total=False):"));
+        assert!(stub.contains("    parquet_full_file_read_threshold: int | None"));
+        assert!(stub.contains("        provider_scan_options: ProviderScanOptions | None = None,"));
+    }
+
+    #[test]
     fn pyi_stub_exposes_stream_benchmark_profiling_options() {
         let stub = include_str!("../deltafunnel.pyi");
         let signature = stub
