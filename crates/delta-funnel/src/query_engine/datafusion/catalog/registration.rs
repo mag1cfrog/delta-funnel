@@ -365,6 +365,7 @@ mod tests {
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 0,
                 parquet_metadata_size_hint: None,
+                parquet_full_file_read_threshold: None,
             },
         );
 
@@ -405,6 +406,7 @@ mod tests {
                 output_buffer_capacity_per_partition: 1,
                 native_async_prefetch_file_count_per_partition: 0,
                 parquet_metadata_size_hint: None,
+                parquet_full_file_read_threshold: None,
             },
         )?;
 

@@ -194,6 +194,7 @@ impl DeltaSourceReport {
                 "output_buffer_capacity_per_partition": scheduling.output_buffer_capacity_per_partition(),
                 "native_async_prefetch_file_count_per_partition": scheduling.native_async_prefetch_file_count_per_partition(),
                 "parquet_metadata_size_hint": scheduling.parquet_metadata_size_hint(),
+                "parquet_full_file_read_threshold": scheduling.parquet_full_file_read_threshold(),
             },
             "file_count": count_with_reason_value(
                 self.file_count().kind().as_str(),
@@ -1413,6 +1414,7 @@ mod tests {
                 },
                 DeltaProviderScanExecutionOptions {
                     parquet_metadata_size_hint: Some(16_384),
+                    parquet_full_file_read_threshold: Some(2_097_152),
                     ..DeltaProviderScanExecutionOptions::default()
                 },
             ),
@@ -1433,6 +1435,10 @@ mod tests {
         assert_eq!(value["provider_read_stats_available"], true);
         assert_eq!(value["provider_stats_reason"], Value::Null);
         assert_eq!(value["scheduling"]["parquet_metadata_size_hint"], 16_384);
+        assert_eq!(
+            value["scheduling"]["parquet_full_file_read_threshold"],
+            2_097_152
+        );
         assert_eq!(
             value["provider_read_stats"]["reader_backend"],
             "native_async"

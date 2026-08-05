@@ -17,7 +17,7 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use futures_util::StreamExt;
-use object_store::{ObjectStore, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::RowNumber;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, ArrowReaderOptions, RowFilter};
 use parquet::arrow::async_reader::{
@@ -37,6 +37,7 @@ use crate::{
         KernelPhysicalToLogicalTransform, KernelScanReadSchema, KernelSchemaRef, KernelStructField,
         ProviderDeletionVectorSelection, ProviderDeletionVectorSelectionContext,
     },
+    usize_to_u64_saturating,
 };
 
 use super::super::planning::file_task::DeltaScanFileTask;
@@ -74,6 +75,7 @@ pub(crate) struct DeltaNativeAsyncFileReader {
     data_file_reader: Arc<KernelDataFileReader>,
     deletion_vector_reader: Arc<KernelDeletionVectorReader>,
     parquet_metadata_size_hint: Option<usize>,
+    parquet_full_file_read_threshold: Option<usize>,
 }
 
 /// Object-store input for a single native async Parquet file read.
@@ -155,6 +157,7 @@ impl DeltaNativeAsyncFileReader {
             data_file_reader,
             deletion_vector_reader,
             parquet_metadata_size_hint: None,
+            parquet_full_file_read_threshold: None,
         }
     }
 
@@ -164,6 +167,15 @@ impl DeltaNativeAsyncFileReader {
         parquet_metadata_size_hint: Option<usize>,
     ) -> Self {
         self.parquet_metadata_size_hint = parquet_metadata_size_hint;
+        self
+    }
+
+    /// Applies the maximum Parquet file size eligible for one buffered full read.
+    pub(crate) const fn with_parquet_full_file_read_threshold(
+        mut self,
+        parquet_full_file_read_threshold: Option<usize>,
+    ) -> Self {
+        self.parquet_full_file_read_threshold = parquet_full_file_read_threshold;
         self
     }
 
@@ -221,6 +233,50 @@ impl DeltaNativeAsyncFileReader {
         })
     }
 
+    async fn buffer_small_parquet_object(
+        &self,
+        mut object: DeltaNativeAsyncParquetObject,
+        task_path: &str,
+    ) -> Result<DeltaNativeAsyncParquetObject, DeltaFunnelError> {
+        let should_buffer = self
+            .parquet_full_file_read_threshold
+            .is_some_and(|threshold| object.file_size <= usize_to_u64_saturating(threshold));
+        if !should_buffer {
+            return Ok(object);
+        }
+
+        let bytes = object
+            .store
+            .get(&object.path)
+            .await
+            .map_err(|error| self.parquet_read_setup_error(task_path, error))?
+            .bytes()
+            .await
+            .map_err(|error| self.parquet_read_setup_error(task_path, error))?;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(&object.path, bytes.into())
+            .await
+            .map_err(|error| self.parquet_read_setup_error(task_path, error))?;
+        object.store = store;
+        Ok(object)
+    }
+
+    fn parquet_read_setup_error(
+        &self,
+        path: &str,
+        source: object_store::Error,
+    ) -> DeltaFunnelError {
+        DeltaFunnelError::DeltaScanFileRead {
+            source_name: self.source_name.clone(),
+            table_uri: self.table_uri.clone(),
+            snapshot_version: self.snapshot_version,
+            path: path.to_owned(),
+            phase: DeltaScanFileReadPhase::ParquetReadSetup,
+            source: Box::new(source.into()),
+        }
+    }
+
     /// Opens one file task with parquet-rs async object-store reads.
     ///
     /// Tests use this path to exercise the native file reader without scheduler
@@ -265,6 +321,9 @@ impl DeltaNativeAsyncFileReader {
         let include_original_row_index =
             include_original_row_index || request.task.deletion_vector.is_present();
         let object = self.parquet_object_for_task(request.task)?;
+        let object = self
+            .buffer_small_parquet_object(object, &request.task.path)
+            .await?;
         let reader =
             ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
         let reader = match self.parquet_metadata_size_hint {
@@ -1802,6 +1861,11 @@ mod tests {
         query_engine::datafusion::{
             execution::file_reader::DeltaFileReadDeletionVectorStats,
             execution::native_async_row_group_pruning::native_async_pruned_row_groups,
+            execution::read_stats::{
+                DeltaProviderReadStats, DeltaProviderReadStatsConfig,
+                DeltaProviderReadStatsSnapshot,
+            },
+            execution::scheduling::DeltaProviderReaderBackend,
             planning::file_task::DeltaScanFileTask,
         },
         table_formats::{
@@ -2700,6 +2764,92 @@ mod tests {
         assert_eq!(names.value(0), "alice");
         assert_eq!(names.value(1), "bob");
         assert!(names.is_null(2));
+
+        Ok(())
+    }
+
+    async fn read_remote_like_file_with_threshold(
+        parquet_bytes: Vec<u8>,
+        threshold: Option<usize>,
+    ) -> Result<(Vec<RecordBatch>, DeltaProviderReadStatsSnapshot), Box<dyn std::error::Error>>
+    {
+        let table_uri = "memory:///table/root/";
+        let file_size = parquet_bytes.len();
+        let read_stats = Arc::new(DeltaProviderReadStats::new(DeltaProviderReadStatsConfig {
+            source_name: "orders".to_owned(),
+            snapshot_version: 42,
+            reader_backend: DeltaProviderReaderBackend::NativeAsync,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 1,
+            files_filtered_during_planning: Some(0),
+            estimated_rows: Some(3),
+            estimated_bytes: Some(u64::try_from(file_size)?),
+        }));
+        let reader = reader(table_uri)?
+            .with_metered_data_file_store(Arc::clone(&read_stats))
+            .with_parquet_full_file_read_threshold(threshold);
+        let read_schema = default_read_schema("native-async-buffered-object-store-read")?;
+        let mut task = task(table_uri, "part-00000.parquet");
+
+        task.estimated_bytes = Some(u64::try_from(file_size)?);
+        let object = reader.parquet_object_for_task(&task)?;
+        reader.store.put(&object.path, parquet_bytes.into()).await?;
+
+        let stream = reader
+            .open_file_stream(DeltaNativeAsyncFileReadRequest {
+                task: &task,
+                read_schema: &read_schema,
+                output_batch_size: None,
+            })
+            .await?;
+        let batches = collect_file_stream(stream).await?;
+
+        Ok((batches, read_stats.snapshot()))
+    }
+
+    #[tokio::test]
+    async fn native_async_reader_honors_full_file_read_threshold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parquet_bytes = default_parquet_bytes()?;
+        let file_size = parquet_bytes.len();
+        let (buffered_batches, buffered_stats) =
+            read_remote_like_file_with_threshold(parquet_bytes.clone(), Some(file_size)).await?;
+        let (ranged_batches, ranged_stats) =
+            read_remote_like_file_with_threshold(parquet_bytes, Some(file_size - 1)).await?;
+
+        assert_eq!(
+            buffered_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(
+            buffered_stats.parquet_data_file_full_get_operations,
+            Some(1)
+        );
+        assert_eq!(
+            buffered_stats.parquet_data_file_range_get_operations,
+            Some(0)
+        );
+        assert_eq!(
+            buffered_stats.parquet_data_file_bytes_received,
+            Some(u64::try_from(file_size)?)
+        );
+        assert_eq!(
+            ranged_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(ranged_stats.parquet_data_file_full_get_operations, Some(0));
+        assert!(
+            ranged_stats
+                .parquet_data_file_range_get_operations
+                .is_some_and(|operations| operations > 0)
+        );
 
         Ok(())
     }
