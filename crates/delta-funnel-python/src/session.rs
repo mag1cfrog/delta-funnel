@@ -17,6 +17,8 @@ use crate::table::PyTable;
 /// `Session()` uses Rust defaults unless options are supplied. Register Delta
 /// sources, build lazy SQL tables, and execute or dry-run SQL Server outputs
 /// from this object.
+/// Use `schema_options={"string_policy": {"ascii_varchar": n}}` only when
+/// every SQL Server-bound string value is guaranteed to be ASCII.
 #[pyclass(name = "Session", module = "deltafunnel")]
 pub(crate) struct PySession {
     inner: delta_funnel::DeltaFunnelSession,
@@ -947,8 +949,13 @@ fn parse_string_policy(
     option_name: &str,
 ) -> PyResult<delta_funnel::MssqlStringPolicy> {
     if let Ok(value) = value.cast::<PyDict>() {
-        return Ok(delta_funnel::MssqlStringPolicy::NVarChar(
-            single_positive_usize_entry(py, value, option_name, "nvarchar")?,
+        if value.get_item("nvarchar")?.is_some() {
+            return Ok(delta_funnel::MssqlStringPolicy::NVarChar(
+                single_positive_usize_entry(py, value, option_name, "nvarchar")?,
+            ));
+        }
+        return Ok(delta_funnel::MssqlStringPolicy::AsciiVarChar(
+            single_positive_usize_entry(py, value, option_name, "ascii_varchar")?,
         ));
     }
 
@@ -4205,15 +4212,21 @@ union all select cast(902 as bigint) as order_id",),
                 );
             }
 
-            let string_policy = PyDict::new(py);
-            string_policy.set_item("nvarchar", 128)?;
-            let schema_options = PyDict::new(py);
-            schema_options.set_item("string_policy", string_policy)?;
-            let session = PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
-            assert_eq!(
-                session.inner.options().mssql_schema_options().string_policy,
-                MssqlStringPolicy::NVarChar(128)
-            );
+            for (variant, expected) in [
+                ("nvarchar", MssqlStringPolicy::NVarChar(128)),
+                ("ascii_varchar", MssqlStringPolicy::AsciiVarChar(128)),
+            ] {
+                let string_policy = PyDict::new(py);
+                string_policy.set_item(variant, 128)?;
+                let schema_options = PyDict::new(py);
+                schema_options.set_item("string_policy", string_policy)?;
+                let session =
+                    PySession::new(py, None, None, None, None, None, Some(&schema_options))?;
+                assert_eq!(
+                    session.inner.options().mssql_schema_options().string_policy,
+                    expected
+                );
+            }
 
             let binary_policies = [
                 ("varbinary_max", MssqlBinaryPolicy::VarBinaryMax),

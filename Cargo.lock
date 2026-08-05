@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-sql-server"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94d8ec5272a7280566be826fbb671a82b865963a1e33052acec7b79973029167"
+checksum = "5a681a82df9858af09cc0ccbdd3b15593309b4afe08fadf214b06dd58f940df7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
