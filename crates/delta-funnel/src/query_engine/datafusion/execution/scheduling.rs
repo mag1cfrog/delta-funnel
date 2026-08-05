@@ -82,6 +82,14 @@ pub struct DeltaProviderScanExecutionOptions {
     /// native async backend defaults to 64 KiB; `None` disables prefetching.
     /// The official-kernel backend ignores this setting.
     pub parquet_metadata_size_hint: Option<usize>,
+
+    /// Maximum Parquet file size in bytes to fetch once and buffer in memory.
+    ///
+    /// The native async reader serves that file's later metadata and data range
+    /// reads from a temporary per-file memory store. `None` keeps direct object-
+    /// store range reads for every file. The official-kernel backend ignores
+    /// this setting.
+    pub parquet_full_file_read_threshold: Option<usize>,
 }
 
 /// Sync fallback limiter for provider-scheduled file work in one Delta scan.
@@ -412,6 +420,7 @@ impl Default for DeltaProviderScanExecutionOptions {
             native_async_prefetch_file_count_per_partition:
                 NATIVE_ASYNC_DEFAULT_PREFETCH_FILE_COUNT_PER_PARTITION,
             parquet_metadata_size_hint: Some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT),
+            parquet_full_file_read_threshold: None,
         }
     }
 }
@@ -448,6 +457,7 @@ impl DeltaProviderScanExecutionOptions {
             native_async_prefetch_file_count_per_partition,
             parquet_metadata_size_hint: (reader_backend == DeltaProviderReaderBackend::NativeAsync)
                 .then_some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT),
+            parquet_full_file_read_threshold: None,
         };
         options.validate()?;
         Ok(options)
@@ -519,6 +529,12 @@ impl DeltaProviderScanExecutionOptions {
         )?;
         if let Some(parquet_metadata_size_hint) = self.parquet_metadata_size_hint {
             validate_positive("parquet_metadata_size_hint", parquet_metadata_size_hint)?;
+        }
+        if let Some(parquet_full_file_read_threshold) = self.parquet_full_file_read_threshold {
+            validate_positive(
+                "parquet_full_file_read_threshold",
+                parquet_full_file_read_threshold,
+            )?;
         }
         Ok(())
     }
@@ -597,6 +613,7 @@ mod tests {
             options.parquet_metadata_size_hint,
             Some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT)
         );
+        assert_eq!(options.parquet_full_file_read_threshold, None);
         options.validate()?;
 
         Ok(())
@@ -620,6 +637,7 @@ mod tests {
         assert_eq!(options.output_buffer_capacity_per_partition, 1);
         assert_eq!(options.native_async_prefetch_file_count_per_partition, 0);
         assert_eq!(options.parquet_metadata_size_hint, None);
+        assert_eq!(options.parquet_full_file_read_threshold, None);
 
         Ok(())
     }
@@ -645,6 +663,7 @@ mod tests {
             options.parquet_metadata_size_hint,
             Some(NATIVE_ASYNC_DEFAULT_PARQUET_METADATA_SIZE_HINT)
         );
+        assert_eq!(options.parquet_full_file_read_threshold, None);
 
         Ok(())
     }
@@ -781,6 +800,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "configuration error: parquet_metadata_size_hint must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn execution_options_reject_zero_parquet_full_file_read_threshold() {
+        let error = DeltaProviderScanExecutionOptions {
+            parquet_full_file_read_threshold: Some(0),
+            ..DeltaProviderScanExecutionOptions::default()
+        }
+        .validate()
+        .expect_err("zero parquet_full_file_read_threshold must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "configuration error: parquet_full_file_read_threshold must be greater than zero"
         );
     }
 

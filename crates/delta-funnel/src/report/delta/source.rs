@@ -63,6 +63,7 @@ pub struct DeltaProviderSchedulingReport {
     output_buffer_capacity_per_partition: u64,
     native_async_prefetch_file_count_per_partition: u64,
     parquet_metadata_size_hint: Option<u64>,
+    parquet_full_file_read_threshold: Option<u64>,
 }
 
 impl DeltaProviderSchedulingReport {
@@ -89,6 +90,9 @@ impl DeltaProviderSchedulingReport {
             ),
             parquet_metadata_size_hint: scan_options
                 .parquet_metadata_size_hint
+                .map(crate::usize_to_u64_saturating),
+            parquet_full_file_read_threshold: scan_options
+                .parquet_full_file_read_threshold
                 .map(crate::usize_to_u64_saturating),
         }
     }
@@ -136,6 +140,12 @@ impl DeltaProviderSchedulingReport {
     #[must_use]
     pub const fn parquet_metadata_size_hint(&self) -> Option<u64> {
         self.parquet_metadata_size_hint
+    }
+
+    /// Returns the maximum Parquet file size eligible for one buffered full read.
+    #[must_use]
+    pub const fn parquet_full_file_read_threshold(&self) -> Option<u64> {
+        self.parquet_full_file_read_threshold
     }
 }
 

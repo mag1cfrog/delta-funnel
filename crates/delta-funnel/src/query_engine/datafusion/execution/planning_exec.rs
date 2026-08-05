@@ -323,6 +323,9 @@ impl ExecutionPlan for DeltaScanPlanningExec {
                     })
                     .with_parquet_metadata_size_hint(
                         self.execution_options.parquet_metadata_size_hint,
+                    )
+                    .with_parquet_full_file_read_threshold(
+                        self.execution_options.parquet_full_file_read_threshold,
                     );
                 let partition_reader = Arc::new(DeltaNativeAsyncPartitionFileReader::new(
                     file_reader,

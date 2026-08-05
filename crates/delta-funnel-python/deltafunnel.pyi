@@ -15,6 +15,15 @@ class WriteAllExecutionOptions(TypedDict, total=False):
     cache_aliases: Sequence[str]
 
 
+class ProviderScanOptions(TypedDict, total=False):
+    max_concurrent_file_reads_per_scan: int
+    max_concurrent_file_reads_per_partition: int
+    output_buffer_capacity_per_partition: int
+    native_async_prefetch_file_count_per_partition: int
+    parquet_metadata_size_hint: int | None
+    parquet_full_file_read_threshold: int | None
+
+
 def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...
 
 
@@ -55,7 +64,7 @@ class Session:
         default_mssql_connection_string: str | None = None,
         target_partitions: int | None = None,
         output_batch_size: int | None = None,
-        provider_scan_options: Options | None = None,
+        provider_scan_options: ProviderScanOptions | None = None,
         validation_options: Options | None = None,
         schema_options: Options | None = None,
     ) -> None: ...

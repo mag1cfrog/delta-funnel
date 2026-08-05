@@ -52,6 +52,14 @@ Options: TypeAlias = Mapping[str, object]
 class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
     cache_aliases: Sequence[str]
+
+class ProviderScanOptions(TypedDict, total=False):
+    max_concurrent_file_reads_per_scan: int
+    max_concurrent_file_reads_per_partition: int
+    output_buffer_capacity_per_partition: int
+    native_async_prefetch_file_count_per_partition: int
+    parquet_metadata_size_hint: int | None
+    parquet_full_file_read_threshold: int | None
 ```
 
 Reports are JSON-compatible Python dictionaries. See
@@ -162,7 +170,7 @@ class Session:
         default_mssql_connection_string: str | None = None,
         target_partitions: int | None = None,
         output_batch_size: int | None = None,
-        provider_scan_options: Options | None = None,
+        provider_scan_options: ProviderScanOptions | None = None,
         validation_options: Options | None = None,
         schema_options: Options | None = None,
     ) -> None
@@ -193,6 +201,24 @@ All option mappings reject unknown keys.
 | `output_buffer_capacity_per_partition` | Positive integer | `1` |
 | `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
 | `parquet_metadata_size_hint` | Positive Parquet file-tail size in bytes; `None` disables footer metadata prefetch | `65536` (64 KiB) |
+| `parquet_full_file_read_threshold` | Positive maximum Parquet file size in bytes; `None` disables buffered full-file reads | `None` |
+
+For an eligible file, the native async reader performs one full object-store
+GET and serves that file's later Parquet metadata and data range reads from a
+temporary in-memory store. The store is released when the file stream finishes
+or is dropped. Choose the threshold from measured file sizes and query access
+patterns. A higher threshold can reduce remote requests for small files that
+are read broadly, but it can transfer unnecessary bytes for narrow projections.
+
+For example, to buffer Parquet files up to 2 MiB for one measured workload:
+
+```python
+session = Session(
+    provider_scan_options={
+        "parquet_full_file_read_threshold": 2 * 1024 * 1024,
+    }
+)
+```
 
 See [Provider read scheduling](../internals/provider-read-scheduling.md#execution-options)
 for the execution boundaries controlled by these values.
