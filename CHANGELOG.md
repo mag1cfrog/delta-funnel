@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.4.1...delta-funnel-v0.5.0) - 2026-08-05
+
+### Added
+
+- expose bounded ASCII varchar output policy in Python ([#638](https://github.com/mag1cfrog/delta-funnel/pull/638))
+- support explicit dependency cache chains for multi-output writes ([#632](https://github.com/mag1cfrog/delta-funnel/pull/632))
+- add Parquet metadata size hint ([#631](https://github.com/mag1cfrog/delta-funnel/pull/631))
+- make ranked profile activity limit configurable ([#627](https://github.com/mag1cfrog/delta-funnel/pull/627))
+- expose stream-only write-all benchmark ([#626](https://github.com/mag1cfrog/delta-funnel/pull/626))
+
+### Fixed
+
+- validate cached replay schemas against output plans ([#630](https://github.com/mag1cfrog/delta-funnel/pull/630))
+- improve replanned schema mismatch diagnostics
+- authorize whole-workload Perfetto captures under Yama ([#625](https://github.com/mag1cfrog/delta-funnel/pull/625))
+- harden scoped Yama capture startup ([#624](https://github.com/mag1cfrog/delta-funnel/pull/624))
+- authorize operation-scoped Perfetto captures under Yama ([#622](https://github.com/mag1cfrog/delta-funnel/pull/622))
+
+### Other
+
+- reduce small Parquet read latency with optional full-file buffering ([#639](https://github.com/mag1cfrog/delta-funnel/pull/639))
+- speed up SQL Server replacement loads with safe bulk-load table locking ([#637](https://github.com/mag1cfrog/delta-funnel/pull/637))
+- use arrow-sql-server dependency ([#636](https://github.com/mag1cfrog/delta-funnel/pull/636))
+- reduce Parquet read latency with default metadata prefetch ([#635](https://github.com/mag1cfrog/delta-funnel/pull/635))
+- balance Delta scan file partitions ([#633](https://github.com/mag1cfrog/delta-funnel/pull/633))
+
 ### Added
 
 - configure the per-operation ranked-profile activity span limit from Python
