@@ -697,6 +697,10 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
     )?;
     writeln!(
         output,
+        "Use --provider-exec-parquet-metadata-size-hint and --provider-exec-parquet-full-file-read-threshold with <bytes|disabled> to control native Parquet reads."
+    )?;
+    writeln!(
+        output,
         "Use --provider-exec-workload, --provider-exec-query, --provider-exec-backend, and --provider-exec-scheduling-profile to run a focused provider-exec case."
     )?;
     writeln!(
@@ -742,6 +746,8 @@ struct ProviderExecConfig {
     default_case: bool,
     phase_aligned_workflow: bool,
     execution_profile_mode: ExecutionProfileMode,
+    parquet_metadata_size_hint: Option<usize>,
+    parquet_full_file_read_threshold: Option<usize>,
     workload_filter: Option<String>,
     query_filter: Option<String>,
     backend_filter: Option<String>,
@@ -1144,6 +1150,8 @@ impl BenchmarkRunnerConfig {
         let mut provider_exec = ProviderExecConfig::default();
         let mut mode_seen = false;
         let mut provider_exec_storage_profile_seen = false;
+        let mut provider_exec_parquet_metadata_size_hint_seen = false;
+        let mut provider_exec_parquet_full_file_read_threshold_seen = false;
         let mut seed = DEFAULT_BENCHMARK_SEED;
         let mut show_help = false;
         let mut args = args.into_iter().map(Into::into);
@@ -1249,6 +1257,32 @@ impl BenchmarkRunnerConfig {
                         value.to_string_lossy().into_owned(),
                     )
                 })?;
+            } else if arg == "--provider-exec-parquet-metadata-size-hint" {
+                let argument = "--provider-exec-parquet-metadata-size-hint";
+                let value = args.next().ok_or(
+                    BenchmarkRunnerConfigError::MissingProviderExecParquetBytes(argument),
+                )?;
+                if provider_exec_parquet_metadata_size_hint_seen {
+                    return Err(
+                        BenchmarkRunnerConfigError::DuplicateProviderExecParquetBytes(argument),
+                    );
+                }
+                provider_exec_parquet_metadata_size_hint_seen = true;
+                provider_exec.parquet_metadata_size_hint =
+                    parse_provider_exec_parquet_bytes(argument, &value.to_string_lossy())?;
+            } else if arg == "--provider-exec-parquet-full-file-read-threshold" {
+                let argument = "--provider-exec-parquet-full-file-read-threshold";
+                let value = args.next().ok_or(
+                    BenchmarkRunnerConfigError::MissingProviderExecParquetBytes(argument),
+                )?;
+                if provider_exec_parquet_full_file_read_threshold_seen {
+                    return Err(
+                        BenchmarkRunnerConfigError::DuplicateProviderExecParquetBytes(argument),
+                    );
+                }
+                provider_exec_parquet_full_file_read_threshold_seen = true;
+                provider_exec.parquet_full_file_read_threshold =
+                    parse_provider_exec_parquet_bytes(argument, &value.to_string_lossy())?;
             } else if arg == "--provider-exec-default-case" {
                 provider_exec.default_case = true;
             } else if arg == "--provider-exec-phase-aligned-workflow" {
@@ -1339,6 +1373,7 @@ impl Default for HostProbeLocalIoConfig {
 
 impl Default for ProviderExecConfig {
     fn default() -> Self {
+        let execution_options = DeltaProviderScanExecutionOptions::default();
         Self {
             repetitions: DEFAULT_PROVIDER_EXEC_REPETITIONS,
             temp_dir: None,
@@ -1346,12 +1381,32 @@ impl Default for ProviderExecConfig {
             default_case: false,
             phase_aligned_workflow: false,
             execution_profile_mode: ExecutionProfileMode::Disabled,
+            parquet_metadata_size_hint: execution_options.parquet_metadata_size_hint,
+            parquet_full_file_read_threshold: execution_options.parquet_full_file_read_threshold,
             workload_filter: None,
             query_filter: None,
             backend_filter: None,
             scheduling_profile_filter: None,
         }
     }
+}
+
+fn parse_provider_exec_parquet_bytes(
+    argument: &'static str,
+    value: &str,
+) -> Result<Option<usize>, BenchmarkRunnerConfigError> {
+    if value == "disabled" {
+        return Ok(None);
+    }
+
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            BenchmarkRunnerConfigError::InvalidProviderExecParquetBytes(argument, value.to_owned())
+        })
 }
 
 impl ProviderExecConfig {
@@ -1612,15 +1667,15 @@ impl ProviderExecWorkloadCase {
             .saturating_mul(self.deleted_row_indexes_per_file.len())
     }
 
-    fn query_cases(&self) -> [ProviderExecQueryCase; 3] {
+    fn query_cases(&self) -> Vec<ProviderExecQueryCase> {
         ProviderExecQueryCase::standard_cases_for_schema(self.schema_kind)
     }
 }
 
 impl ProviderExecQueryCase {
-    fn standard_cases_for_schema(schema_kind: ProviderExecSchemaKind) -> [Self; 3] {
+    fn standard_cases_for_schema(schema_kind: ProviderExecSchemaKind) -> Vec<Self> {
         match schema_kind {
-            ProviderExecSchemaKind::SimpleOrders => [
+            ProviderExecSchemaKind::SimpleOrders => vec![
                 Self {
                     name: "project_id",
                     sql: "select id from orders",
@@ -1633,8 +1688,12 @@ impl ProviderExecQueryCase {
                     name: "filter_tail_ids",
                     sql: "select id from orders where id > 4096",
                 },
+                Self {
+                    name: "full_rows",
+                    sql: "select * from orders",
+                },
             ],
-            ProviderExecSchemaKind::SyntheticPartitionedEventLog => [
+            ProviderExecSchemaKind::SyntheticPartitionedEventLog => vec![
                 Self {
                     name: "project_event_keys",
                     sql: "select primary_event_id, group_id, metric_x from orders",
@@ -1648,7 +1707,7 @@ impl ProviderExecQueryCase {
                     sql: "select primary_event_id, category_num from orders where event_year >= 2025",
                 },
             ],
-            ProviderExecSchemaKind::SyntheticWideEventExport => [
+            ProviderExecSchemaKind::SyntheticWideEventExport => vec![
                 Self {
                     name: "project_primary_export",
                     sql: wide_event_transform_sql!(
@@ -2405,8 +2464,15 @@ async fn run_provider_exec_benchmark_case(
     let mut measurements = Vec::with_capacity(config.repetitions);
     for repetition_index in 0..config.repetitions {
         measurements.push(
-            run_provider_exec_once(table, query, backend, scheduling_profile, repetition_index)
-                .await?,
+            run_provider_exec_once(
+                table,
+                query,
+                backend,
+                scheduling_profile,
+                config,
+                repetition_index,
+            )
+            .await?,
         );
     }
 
@@ -2428,7 +2494,7 @@ async fn run_provider_exec_write_workflow_case(
                 workload,
                 backend,
                 scheduling_profile,
-                config.execution_profile_mode,
+                config,
                 repetition_index,
             )
             .await?,
@@ -2443,11 +2509,12 @@ async fn run_provider_exec_write_workflow_once(
     workload: &ProviderExecWorkloadCase,
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
-    execution_profile_mode: ExecutionProfileMode,
+    config: &ProviderExecConfig,
     _repetition_index: usize,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let query_started = Instant::now();
-    let execution_options = provider_exec_scan_execution_options(backend, scheduling_profile)?;
+    let execution_options =
+        provider_exec_scan_execution_options(backend, scheduling_profile, config)?;
     let connection = MssqlConnectionConfig::new(
         "server=benchmark.invalid;database=delta_funnel_benchmark;user=benchmark;password=benchmark",
     )?
@@ -2481,7 +2548,7 @@ async fn run_provider_exec_write_workflow_once(
             &requests,
             WriteAllOptions::new()
                 .with_cache_mode(WriteAllCacheMode::Disabled)
-                .with_execution_profile_mode(execution_profile_mode),
+                .with_execution_profile_mode(config.execution_profile_mode),
         )
         .await?;
     if !report.workflow().all_succeeded() {
@@ -2601,6 +2668,7 @@ async fn run_provider_exec_once(
     query: ProviderExecQueryCase,
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
+    config: &ProviderExecConfig,
     repetition_index: usize,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let ctx = SessionContext::new();
@@ -2609,7 +2677,8 @@ async fn run_provider_exec_once(
             .with_storage_options(table.storage_options.clone()),
     )?;
     let protocol = preflight_delta_protocol_with_tracing(&source)?;
-    let execution_options = provider_exec_scan_execution_options(backend, scheduling_profile)?;
+    let execution_options =
+        provider_exec_scan_execution_options(backend, scheduling_profile, config)?;
     register_delta_sources_with_scan_execution_options(
         &ctx,
         vec![DeltaTableProviderConfig {
@@ -2738,20 +2807,19 @@ async fn run_provider_exec_once(
 fn provider_exec_scan_execution_options(
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
+    config: &ProviderExecConfig,
 ) -> Result<DeltaProviderScanExecutionOptions, Box<dyn Error>> {
-    if scheduling_profile.uses_default_execution_options {
-        return Ok(DeltaProviderScanExecutionOptions::default());
-    }
-
-    let max_concurrent_file_reads_per_scan = scheduling_profile
-        .max_concurrent_file_reads_per_scan
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider-exec scheduling profile is missing scan-wide capacity",
-            )
-        })?;
-    Ok(
+    let mut options = if scheduling_profile.uses_default_execution_options {
+        DeltaProviderScanExecutionOptions::default()
+    } else {
+        let max_concurrent_file_reads_per_scan = scheduling_profile
+            .max_concurrent_file_reads_per_scan
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider-exec scheduling profile is missing scan-wide capacity",
+                )
+            })?;
         DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
             backend,
             max_concurrent_file_reads_per_scan,
@@ -2762,8 +2830,12 @@ fn provider_exec_scan_execution_options(
         )?
         .with_native_async_prefetch_file_count_per_partition(
             scheduling_profile.native_async_prefetch_file_count_per_partition,
-        )?,
-    )
+        )?
+    };
+    options.parquet_metadata_size_hint = config.parquet_metadata_size_hint;
+    options.parquet_full_file_read_threshold = config.parquet_full_file_read_threshold;
+    options.validate()?;
+    Ok(options)
 }
 
 fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> ProviderExecSummary {
@@ -4101,6 +4173,9 @@ enum BenchmarkRunnerConfigError {
     MissingProviderExecStorageProfile,
     InvalidProviderExecStorageProfile(String),
     DuplicateProviderExecStorageProfile,
+    MissingProviderExecParquetBytes(&'static str),
+    InvalidProviderExecParquetBytes(&'static str, String),
+    DuplicateProviderExecParquetBytes(&'static str),
     MissingProviderExecWorkloadFilter,
     DuplicateProviderExecWorkloadFilter,
     MissingProviderExecQueryFilter,
@@ -4192,6 +4267,17 @@ impl fmt::Display for BenchmarkRunnerConfigError {
                 formatter,
                 "--provider-exec-storage-profile may be provided only once"
             ),
+            Self::MissingProviderExecParquetBytes(argument) => write!(
+                formatter,
+                "{argument} requires a positive byte count or `disabled`"
+            ),
+            Self::InvalidProviderExecParquetBytes(argument, value) => write!(
+                formatter,
+                "invalid {argument} value `{value}`; expected a positive byte count or `disabled`"
+            ),
+            Self::DuplicateProviderExecParquetBytes(argument) => {
+                write!(formatter, "{argument} may be provided only once")
+            }
             Self::MissingProviderExecWorkloadFilter => {
                 write!(
                     formatter,
@@ -6706,6 +6792,10 @@ mod tests {
             "5",
             "--provider-exec-storage-profile",
             "s3-normal",
+            "--provider-exec-parquet-metadata-size-hint",
+            "disabled",
+            "--provider-exec-parquet-full-file-read-threshold",
+            "1048576",
             "--provider-exec-phase-aligned-workflow",
             "--provider-exec-detailed-profile",
             "--provider-exec-workload",
@@ -6728,11 +6818,23 @@ mod tests {
                 default_case: false,
                 phase_aligned_workflow: true,
                 execution_profile_mode: ExecutionProfileMode::Detailed,
+                parquet_metadata_size_hint: None,
+                parquet_full_file_read_threshold: Some(1_048_576),
                 workload_filter: Some("provider_partitioned_event_log_12m".to_owned()),
                 query_filter: Some("count_events".to_owned()),
                 backend_filter: Some("native_async".to_owned()),
                 scheduling_profile_filter: Some("lazy_parallel_buffer_4".to_owned()),
             }
+        );
+        let execution_options = provider_exec_scan_execution_options(
+            DeltaProviderReaderBackend::NativeAsync,
+            ProviderExecSchedulingProfile::default_execution_case(),
+            &config.provider_exec,
+        )?;
+        assert_eq!(execution_options.parquet_metadata_size_hint, None);
+        assert_eq!(
+            execution_options.parquet_full_file_read_threshold,
+            Some(1_048_576)
         );
 
         Ok(())
@@ -6965,6 +7067,32 @@ mod tests {
             Err(BenchmarkRunnerConfigError::DuplicateProviderExecStorageProfile)
         );
         assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-parquet-metadata-size-hint"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecParquetBytes(
+                "--provider-exec-parquet-metadata-size-hint"
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-parquet-metadata-size-hint", "0"]),
+            Err(BenchmarkRunnerConfigError::InvalidProviderExecParquetBytes(
+                "--provider-exec-parquet-metadata-size-hint",
+                "0".to_owned()
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-parquet-full-file-read-threshold",
+                "disabled",
+                "--provider-exec-parquet-full-file-read-threshold",
+                "1024"
+            ]),
+            Err(
+                BenchmarkRunnerConfigError::DuplicateProviderExecParquetBytes(
+                    "--provider-exec-parquet-full-file-read-threshold"
+                )
+            )
+        );
+        assert_eq!(
             BenchmarkRunnerConfig::parse(["--provider-exec-workload"]),
             Err(BenchmarkRunnerConfigError::MissingProviderExecWorkloadFilter)
         );
@@ -7036,6 +7164,7 @@ mod tests {
         assert!(usage.contains("Use --host-probe-local-io"));
         assert!(usage.contains("Use --provider-exec-repetitions"));
         assert!(usage.contains("Use --provider-exec-storage-profile"));
+        assert!(usage.contains("Use --provider-exec-parquet-metadata-size-hint"));
         assert!(usage.contains("Use --provider-exec-workload"));
         assert!(usage.contains("Use --provider-exec-default-case"));
         assert!(usage.contains("Use --provider-exec-phase-aligned-workflow"));
@@ -8239,6 +8368,8 @@ mod tests {
         assert!(simple_query_names.contains(&"project_id"));
         assert!(simple_query_names.contains(&"count_rows"));
         assert!(simple_query_names.contains(&"filter_tail_ids"));
+        assert!(simple_query_names.contains(&"full_rows"));
+        assert_eq!(simple_query_cases[3].sql, "select * from orders");
         assert!(synthetic_query_names.contains(&"project_event_keys"));
         assert!(synthetic_query_names.contains(&"count_events"));
         assert!(synthetic_query_names.contains(&"filter_recent_events"));
@@ -8547,6 +8678,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let config = ProviderExecConfig::default();
 
         for backend in [
             DeltaProviderReaderBackend::OfficialKernel,
@@ -8557,6 +8689,7 @@ mod tests {
                 query,
                 backend,
                 scheduling_profile,
+                &config,
                 0,
             ))?;
             assert_eq!(measurement.produced_rows, 16);
@@ -8593,11 +8726,13 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let config = ProviderExecConfig::default();
         let measurement = runtime.block_on(run_provider_exec_once(
             &table,
             query,
             DeltaProviderScanExecutionOptions::default().reader_backend,
             ProviderExecSchedulingProfile::default_execution_case(),
+            &config,
             0,
         ))?;
 
@@ -8647,6 +8782,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let config = ProviderExecConfig::default();
 
         assert!(table.table_uri.starts_with("http://127.0.0.1:"));
         assert_eq!(
@@ -8662,6 +8798,7 @@ mod tests {
                 query,
                 backend,
                 scheduling_profile,
+                &config,
                 0,
             ))?;
             assert_eq!(measurement.produced_rows, 1);
