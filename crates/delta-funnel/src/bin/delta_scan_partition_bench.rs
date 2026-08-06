@@ -109,7 +109,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 21;
+const BENCHMARK_SCHEMA_VERSION: u32 = 22;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD: &str = "provider_partitioned_event_log_12m";
@@ -219,7 +219,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 73] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 80] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -293,6 +293,13 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 73] = [
     "execution_profile_operator_count_max",
     "execution_profile_metric_count_max",
     "execution_profile_mode",
+    "parquet_metadata_size_hint",
+    "parquet_full_file_read_threshold",
+    "provider_stats_parquet_data_file_range_get_operations_p50",
+    "provider_stats_parquet_data_file_full_get_operations_p50",
+    "provider_stats_parquet_data_file_bytes_received_p50",
+    "provider_stats_parquet_data_file_opened_bytes_p50",
+    "fixture_fingerprint",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -569,17 +576,24 @@ async fn write_provider_exec_benchmark_csv_async(
     writeln!(output, "{}", PROVIDER_EXEC_CSV_HEADER.join(","))?;
     for workload in &workloads {
         provider_exec_fixture_create_started(workload, config.storage_profile);
-        let table =
-            match ProviderExecDeltaTable::create(&temp_root, workload, config.storage_profile) {
-                Ok(table) => {
-                    provider_exec_fixture_create_completed(&table, workload);
-                    table
+        let table = match ProviderExecDeltaTable::create(
+            &temp_root,
+            workload,
+            config.storage_profile,
+            config.retain_fixtures,
+        ) {
+            Ok(table) => {
+                provider_exec_fixture_create_completed(&table, workload);
+                if config.retain_fixtures {
+                    eprintln!("retained provider-exec fixture: {}", table.path.display());
                 }
-                Err(error) => {
-                    provider_exec_fixture_create_failed(workload, config.storage_profile, &*error);
-                    return Err(error);
-                }
-            };
+                table
+            }
+            Err(error) => {
+                provider_exec_fixture_create_failed(workload, config.storage_profile, &*error);
+                return Err(error);
+            }
+        };
         let query_cases = workload
             .query_cases()
             .into_iter()
@@ -652,6 +666,9 @@ async fn write_provider_exec_benchmark_csv_async(
                             backend: *backend,
                             scheduling_profile: *scheduling_profile,
                             execution_profile_mode: config.execution_profile_mode,
+                            parquet_metadata_size_hint: config.parquet_metadata_size_hint,
+                            parquet_full_file_read_threshold: config
+                                .parquet_full_file_read_threshold,
                             summary: &summary,
                         })
                         .join(",")
@@ -694,6 +711,14 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
     writeln!(
         output,
         "Use --provider-exec-storage-profile <local|s3-normal|s3-high-latency|s3-throttled> to add provider-exec storage latency."
+    )?;
+    writeln!(
+        output,
+        "Use --provider-exec-parquet-metadata-size-hint and --provider-exec-parquet-full-file-read-threshold with <bytes|disabled> to control native Parquet reads."
+    )?;
+    writeln!(
+        output,
+        "Use --provider-exec-retain-fixtures to keep generated Delta tables beneath the provider-exec temp directory."
     )?;
     writeln!(
         output,
@@ -742,6 +767,9 @@ struct ProviderExecConfig {
     default_case: bool,
     phase_aligned_workflow: bool,
     execution_profile_mode: ExecutionProfileMode,
+    parquet_metadata_size_hint: Option<usize>,
+    parquet_full_file_read_threshold: Option<usize>,
+    retain_fixtures: bool,
     workload_filter: Option<String>,
     query_filter: Option<String>,
     backend_filter: Option<String>,
@@ -971,6 +999,8 @@ struct ProviderExecDeltaTable {
     file_count: usize,
     row_count: usize,
     data_file_bytes: u64,
+    fixture_fingerprint: String,
+    retain_fixture: bool,
     deletion_vector_file_count: usize,
     deletion_vector_deleted_rows: usize,
     deletion_vector_deleted_rows_per_file: usize,
@@ -992,7 +1022,9 @@ impl Drop for ProviderExecDeltaTable {
         if let Some(server) = &self.delayed_http_server {
             server.shutdown();
         }
-        let _ = fs::remove_dir_all(&self.path);
+        if !self.retain_fixture {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -1027,6 +1059,10 @@ struct ProviderExecReadStatsMeasurement {
     files_planned: u64,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
+    parquet_data_file_range_get_operations: Option<u64>,
+    parquet_data_file_full_get_operations: Option<u64>,
+    parquet_data_file_bytes_received: Option<u64>,
+    parquet_data_file_opened_bytes: Option<u64>,
     scan_partitions_started: u64,
     scan_partitions_completed: u64,
     files_started: u64,
@@ -1073,6 +1109,10 @@ struct ProviderExecReadStatsSummary {
     files_planned: u64,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
+    parquet_data_file_range_get_operations: Option<u64>,
+    parquet_data_file_full_get_operations: Option<u64>,
+    parquet_data_file_bytes_received: Option<u64>,
+    parquet_data_file_opened_bytes: Option<u64>,
     scan_partitions_started: u64,
     scan_partitions_completed: u64,
     files_started: u64,
@@ -1112,6 +1152,8 @@ struct ProviderExecCsvRowInput<'a> {
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     execution_profile_mode: ExecutionProfileMode,
+    parquet_metadata_size_hint: Option<usize>,
+    parquet_full_file_read_threshold: Option<usize>,
     summary: &'a ProviderExecSummary,
 }
 
@@ -1144,6 +1186,8 @@ impl BenchmarkRunnerConfig {
         let mut provider_exec = ProviderExecConfig::default();
         let mut mode_seen = false;
         let mut provider_exec_storage_profile_seen = false;
+        let mut provider_exec_parquet_metadata_size_hint_seen = false;
+        let mut provider_exec_parquet_full_file_read_threshold_seen = false;
         let mut seed = DEFAULT_BENCHMARK_SEED;
         let mut show_help = false;
         let mut args = args.into_iter().map(Into::into);
@@ -1249,6 +1293,34 @@ impl BenchmarkRunnerConfig {
                         value.to_string_lossy().into_owned(),
                     )
                 })?;
+            } else if arg == "--provider-exec-parquet-metadata-size-hint" {
+                let argument = "--provider-exec-parquet-metadata-size-hint";
+                let value = args.next().ok_or(
+                    BenchmarkRunnerConfigError::MissingProviderExecParquetBytes(argument),
+                )?;
+                if provider_exec_parquet_metadata_size_hint_seen {
+                    return Err(
+                        BenchmarkRunnerConfigError::DuplicateProviderExecParquetBytes(argument),
+                    );
+                }
+                provider_exec_parquet_metadata_size_hint_seen = true;
+                provider_exec.parquet_metadata_size_hint =
+                    parse_provider_exec_parquet_bytes(argument, &value.to_string_lossy())?;
+            } else if arg == "--provider-exec-parquet-full-file-read-threshold" {
+                let argument = "--provider-exec-parquet-full-file-read-threshold";
+                let value = args.next().ok_or(
+                    BenchmarkRunnerConfigError::MissingProviderExecParquetBytes(argument),
+                )?;
+                if provider_exec_parquet_full_file_read_threshold_seen {
+                    return Err(
+                        BenchmarkRunnerConfigError::DuplicateProviderExecParquetBytes(argument),
+                    );
+                }
+                provider_exec_parquet_full_file_read_threshold_seen = true;
+                provider_exec.parquet_full_file_read_threshold =
+                    parse_provider_exec_parquet_bytes(argument, &value.to_string_lossy())?;
+            } else if arg == "--provider-exec-retain-fixtures" {
+                provider_exec.retain_fixtures = true;
             } else if arg == "--provider-exec-default-case" {
                 provider_exec.default_case = true;
             } else if arg == "--provider-exec-phase-aligned-workflow" {
@@ -1339,6 +1411,7 @@ impl Default for HostProbeLocalIoConfig {
 
 impl Default for ProviderExecConfig {
     fn default() -> Self {
+        let execution_options = DeltaProviderScanExecutionOptions::default();
         Self {
             repetitions: DEFAULT_PROVIDER_EXEC_REPETITIONS,
             temp_dir: None,
@@ -1346,12 +1419,33 @@ impl Default for ProviderExecConfig {
             default_case: false,
             phase_aligned_workflow: false,
             execution_profile_mode: ExecutionProfileMode::Disabled,
+            parquet_metadata_size_hint: execution_options.parquet_metadata_size_hint,
+            parquet_full_file_read_threshold: execution_options.parquet_full_file_read_threshold,
+            retain_fixtures: false,
             workload_filter: None,
             query_filter: None,
             backend_filter: None,
             scheduling_profile_filter: None,
         }
     }
+}
+
+fn parse_provider_exec_parquet_bytes(
+    argument: &'static str,
+    value: &str,
+) -> Result<Option<usize>, BenchmarkRunnerConfigError> {
+    if value == "disabled" {
+        return Ok(None);
+    }
+
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            BenchmarkRunnerConfigError::InvalidProviderExecParquetBytes(argument, value.to_owned())
+        })
 }
 
 impl ProviderExecConfig {
@@ -1519,6 +1613,7 @@ impl ProviderExecWorkloadCase {
             ),
             Self::synthetic_partitioned_event_log()?,
             Self::synthetic_wide_event_export()?,
+            Self::many_unequal_simple_orders(),
         ])
     }
 
@@ -1541,6 +1636,27 @@ impl ProviderExecWorkloadCase {
             schema_kind: ProviderExecSchemaKind::SimpleOrders,
             file_specs,
             deleted_row_indexes_per_file,
+        }
+    }
+
+    fn many_unequal_simple_orders() -> Self {
+        let file_specs = (0_usize..64)
+            .map(|file_index| ProviderExecFileSpec {
+                path: format!("part-{file_index:05}.parquet"),
+                rows: if file_index >= 32 && file_index.is_multiple_of(4) {
+                    8_192
+                } else {
+                    128
+                },
+                partition_date: None,
+            })
+            .collect();
+
+        Self {
+            name: "provider_many_unequal_files",
+            schema_kind: ProviderExecSchemaKind::SimpleOrders,
+            file_specs,
+            deleted_row_indexes_per_file: &[],
         }
     }
 
@@ -1612,15 +1728,15 @@ impl ProviderExecWorkloadCase {
             .saturating_mul(self.deleted_row_indexes_per_file.len())
     }
 
-    fn query_cases(&self) -> [ProviderExecQueryCase; 3] {
+    fn query_cases(&self) -> Vec<ProviderExecQueryCase> {
         ProviderExecQueryCase::standard_cases_for_schema(self.schema_kind)
     }
 }
 
 impl ProviderExecQueryCase {
-    fn standard_cases_for_schema(schema_kind: ProviderExecSchemaKind) -> [Self; 3] {
+    fn standard_cases_for_schema(schema_kind: ProviderExecSchemaKind) -> Vec<Self> {
         match schema_kind {
-            ProviderExecSchemaKind::SimpleOrders => [
+            ProviderExecSchemaKind::SimpleOrders => vec![
                 Self {
                     name: "project_id",
                     sql: "select id from orders",
@@ -1633,8 +1749,12 @@ impl ProviderExecQueryCase {
                     name: "filter_tail_ids",
                     sql: "select id from orders where id > 4096",
                 },
+                Self {
+                    name: "full_rows",
+                    sql: "select * from orders",
+                },
             ],
-            ProviderExecSchemaKind::SyntheticPartitionedEventLog => [
+            ProviderExecSchemaKind::SyntheticPartitionedEventLog => vec![
                 Self {
                     name: "project_event_keys",
                     sql: "select primary_event_id, group_id, metric_x from orders",
@@ -1648,7 +1768,7 @@ impl ProviderExecQueryCase {
                     sql: "select primary_event_id, category_num from orders where event_year >= 2025",
                 },
             ],
-            ProviderExecSchemaKind::SyntheticWideEventExport => [
+            ProviderExecSchemaKind::SyntheticWideEventExport => vec![
                 Self {
                     name: "project_primary_export",
                     sql: wide_event_transform_sql!(
@@ -1775,6 +1895,7 @@ impl ProviderExecDeltaTable {
         temp_root: &std::path::Path,
         workload: &ProviderExecWorkloadCase,
         storage_profile: ProviderExecStorageProfile,
+        retain_fixture: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let path = temp_root.join(unique_benchmark_name(workload.name)?);
         let log_path = path.join("_delta_log");
@@ -1852,6 +1973,19 @@ impl ProviderExecDeltaTable {
             log_path.join("00000000000000000001.json"),
             format!("{}\n", add_actions.join("\n")),
         )?;
+        let mut fixture_files = workload
+            .file_specs
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        fixture_files.extend([
+            "_delta_log/00000000000000000000.json".to_owned(),
+            "_delta_log/00000000000000000001.json".to_owned(),
+        ]);
+        if workload.has_deletion_vectors() {
+            fixture_files.push(PROVIDER_EXEC_RELATIVE_DV_FILE.to_owned());
+        }
+        let fixture_fingerprint = provider_exec_fixture_fingerprint(&path, fixture_files)?;
         let delayed_http_server = if storage_profile.uses_delayed_http() {
             Some(ProviderExecDelayedHttpServer::start(
                 path.clone(),
@@ -1879,6 +2013,8 @@ impl ProviderExecDeltaTable {
             file_count: workload.file_count(),
             row_count: workload.row_count(),
             data_file_bytes,
+            fixture_fingerprint,
+            retain_fixture,
             deletion_vector_file_count: if workload.has_deletion_vectors() {
                 workload.file_count()
             } else {
@@ -1891,6 +2027,41 @@ impl ProviderExecDeltaTable {
 
     fn storage_profile_name(&self) -> &'static str {
         self.storage_profile.name
+    }
+}
+
+fn provider_exec_fixture_fingerprint(
+    root: &Path,
+    mut relative_paths: Vec<String>,
+) -> io::Result<String> {
+    relative_paths.sort_unstable();
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+
+    for relative_path in relative_paths {
+        let path_bytes = relative_path.as_bytes();
+        let path_len = u64::try_from(path_bytes.len()).map_err(io::Error::other)?;
+        fnv1a64_update(&mut hash, &path_len.to_le_bytes());
+        fnv1a64_update(&mut hash, path_bytes);
+
+        let mut file = File::open(root.join(&relative_path))?;
+        fnv1a64_update(&mut hash, &file.metadata()?.len().to_le_bytes());
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            fnv1a64_update(&mut hash, &buffer[..bytes_read]);
+        }
+    }
+
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn fnv1a64_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(1_099_511_628_211);
     }
 }
 
@@ -2405,8 +2576,15 @@ async fn run_provider_exec_benchmark_case(
     let mut measurements = Vec::with_capacity(config.repetitions);
     for repetition_index in 0..config.repetitions {
         measurements.push(
-            run_provider_exec_once(table, query, backend, scheduling_profile, repetition_index)
-                .await?,
+            run_provider_exec_once(
+                table,
+                query,
+                backend,
+                scheduling_profile,
+                config,
+                repetition_index,
+            )
+            .await?,
         );
     }
 
@@ -2428,7 +2606,7 @@ async fn run_provider_exec_write_workflow_case(
                 workload,
                 backend,
                 scheduling_profile,
-                config.execution_profile_mode,
+                config,
                 repetition_index,
             )
             .await?,
@@ -2443,11 +2621,12 @@ async fn run_provider_exec_write_workflow_once(
     workload: &ProviderExecWorkloadCase,
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
-    execution_profile_mode: ExecutionProfileMode,
+    config: &ProviderExecConfig,
     _repetition_index: usize,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let query_started = Instant::now();
-    let execution_options = provider_exec_scan_execution_options(backend, scheduling_profile)?;
+    let execution_options =
+        provider_exec_scan_execution_options(backend, scheduling_profile, config)?;
     let connection = MssqlConnectionConfig::new(
         "server=benchmark.invalid;database=delta_funnel_benchmark;user=benchmark;password=benchmark",
     )?
@@ -2481,7 +2660,7 @@ async fn run_provider_exec_write_workflow_once(
             &requests,
             WriteAllOptions::new()
                 .with_cache_mode(WriteAllCacheMode::Disabled)
-                .with_execution_profile_mode(execution_profile_mode),
+                .with_execution_profile_mode(config.execution_profile_mode),
         )
         .await?;
     if !report.workflow().all_succeeded() {
@@ -2601,6 +2780,7 @@ async fn run_provider_exec_once(
     query: ProviderExecQueryCase,
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
+    config: &ProviderExecConfig,
     repetition_index: usize,
 ) -> Result<ProviderExecRunMeasurement, Box<dyn Error>> {
     let ctx = SessionContext::new();
@@ -2609,7 +2789,8 @@ async fn run_provider_exec_once(
             .with_storage_options(table.storage_options.clone()),
     )?;
     let protocol = preflight_delta_protocol_with_tracing(&source)?;
-    let execution_options = provider_exec_scan_execution_options(backend, scheduling_profile)?;
+    let execution_options =
+        provider_exec_scan_execution_options(backend, scheduling_profile, config)?;
     register_delta_sources_with_scan_execution_options(
         &ctx,
         vec![DeltaTableProviderConfig {
@@ -2738,20 +2919,19 @@ async fn run_provider_exec_once(
 fn provider_exec_scan_execution_options(
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
+    config: &ProviderExecConfig,
 ) -> Result<DeltaProviderScanExecutionOptions, Box<dyn Error>> {
-    if scheduling_profile.uses_default_execution_options {
-        return Ok(DeltaProviderScanExecutionOptions::default());
-    }
-
-    let max_concurrent_file_reads_per_scan = scheduling_profile
-        .max_concurrent_file_reads_per_scan
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "provider-exec scheduling profile is missing scan-wide capacity",
-            )
-        })?;
-    Ok(
+    let mut options = if scheduling_profile.uses_default_execution_options {
+        DeltaProviderScanExecutionOptions::default()
+    } else {
+        let max_concurrent_file_reads_per_scan = scheduling_profile
+            .max_concurrent_file_reads_per_scan
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provider-exec scheduling profile is missing scan-wide capacity",
+                )
+            })?;
         DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
             backend,
             max_concurrent_file_reads_per_scan,
@@ -2762,8 +2942,12 @@ fn provider_exec_scan_execution_options(
         )?
         .with_native_async_prefetch_file_count_per_partition(
             scheduling_profile.native_async_prefetch_file_count_per_partition,
-        )?,
-    )
+        )?
+    };
+    options.parquet_metadata_size_hint = config.parquet_metadata_size_hint;
+    options.parquet_full_file_read_threshold = config.parquet_full_file_read_threshold;
+    options.validate()?;
+    Ok(options)
 }
 
 fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> ProviderExecSummary {
@@ -2857,6 +3041,26 @@ fn provider_exec_read_stats_measurement(
         ),
         estimated_bytes: sum_provider_exec_read_stats_optional(
             snapshots.iter().map(|snapshot| snapshot.estimated_bytes),
+        ),
+        parquet_data_file_range_get_operations: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_range_get_operations),
+        ),
+        parquet_data_file_full_get_operations: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_full_get_operations),
+        ),
+        parquet_data_file_bytes_received: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_bytes_received),
+        ),
+        parquet_data_file_opened_bytes: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_opened_bytes),
         ),
         scan_partitions_started: snapshots
             .iter()
@@ -2969,6 +3173,26 @@ fn provider_exec_read_stats_summary(
         ),
         estimated_bytes: provider_exec_read_stats_optional_max(
             stats.iter().map(|stats| stats.estimated_bytes),
+        ),
+        parquet_data_file_range_get_operations: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_range_get_operations),
+        ),
+        parquet_data_file_full_get_operations: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_full_get_operations),
+        ),
+        parquet_data_file_bytes_received: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_bytes_received),
+        ),
+        parquet_data_file_opened_bytes: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_opened_bytes),
         ),
         scan_partitions_started: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.scan_partitions_started
@@ -3108,6 +3332,15 @@ fn provider_exec_read_stats_optional_max(
     values.into_iter().flatten().max()
 }
 
+fn provider_exec_read_stats_optional_p50(
+    values: impl IntoIterator<Item = Option<u64>>,
+) -> Option<u64> {
+    Some(percentile(
+        &values.into_iter().collect::<Option<Vec<_>>>()?,
+        50,
+    ))
+}
+
 fn provider_exec_scan_metadata_exhausted_value(value: ProviderExecScanMetadataExhausted) -> String {
     match value {
         ProviderExecScanMetadataExhausted::True => "true",
@@ -3215,6 +3448,13 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         summary.execution_profile_operator_count_max.to_string(),
         summary.execution_profile_metric_count_max.to_string(),
         execution_profile_mode_name(input.execution_profile_mode).to_owned(),
+        optional_usize(input.parquet_metadata_size_hint),
+        optional_usize(input.parquet_full_file_read_threshold),
+        optional_u64(read_stats.parquet_data_file_range_get_operations),
+        optional_u64(read_stats.parquet_data_file_full_get_operations),
+        optional_u64(read_stats.parquet_data_file_bytes_received),
+        optional_u64(read_stats.parquet_data_file_opened_bytes),
+        input.table.fixture_fingerprint.clone(),
     ]
 }
 
@@ -3259,6 +3499,7 @@ fn provider_exec_fixture_create_completed(
         file_count = table.file_count,
         row_count = table.row_count,
         data_file_bytes = table.data_file_bytes,
+        fixture_fingerprint = table.fixture_fingerprint,
         message = PROVIDER_EXEC_FIXTURE_CREATE_COMPLETED_EVENT
     );
 }
@@ -4101,6 +4342,9 @@ enum BenchmarkRunnerConfigError {
     MissingProviderExecStorageProfile,
     InvalidProviderExecStorageProfile(String),
     DuplicateProviderExecStorageProfile,
+    MissingProviderExecParquetBytes(&'static str),
+    InvalidProviderExecParquetBytes(&'static str, String),
+    DuplicateProviderExecParquetBytes(&'static str),
     MissingProviderExecWorkloadFilter,
     DuplicateProviderExecWorkloadFilter,
     MissingProviderExecQueryFilter,
@@ -4192,6 +4436,17 @@ impl fmt::Display for BenchmarkRunnerConfigError {
                 formatter,
                 "--provider-exec-storage-profile may be provided only once"
             ),
+            Self::MissingProviderExecParquetBytes(argument) => write!(
+                formatter,
+                "{argument} requires a positive byte count or `disabled`"
+            ),
+            Self::InvalidProviderExecParquetBytes(argument, value) => write!(
+                formatter,
+                "invalid {argument} value `{value}`; expected a positive byte count or `disabled`"
+            ),
+            Self::DuplicateProviderExecParquetBytes(argument) => {
+                write!(formatter, "{argument} may be provided only once")
+            }
             Self::MissingProviderExecWorkloadFilter => {
                 write!(
                     formatter,
@@ -6088,23 +6343,11 @@ fn deterministic_file_hash(file: &SyntheticFile, seed: u64) -> u64 {
     let mut hash = 14_695_981_039_346_656_037_u64;
 
     if seed != DEFAULT_BENCHMARK_SEED {
-        for byte in seed.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(1_099_511_628_211);
-        }
+        fnv1a64_update(&mut hash, &seed.to_le_bytes());
     }
-    for byte in file.path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
-    for byte in file.rows.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
-    for byte in file.size_bytes.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
+    fnv1a64_update(&mut hash, file.path.as_bytes());
+    fnv1a64_update(&mut hash, &file.rows.to_le_bytes());
+    fnv1a64_update(&mut hash, &file.size_bytes.to_le_bytes());
 
     hash
 }
@@ -6706,6 +6949,11 @@ mod tests {
             "5",
             "--provider-exec-storage-profile",
             "s3-normal",
+            "--provider-exec-parquet-metadata-size-hint",
+            "disabled",
+            "--provider-exec-parquet-full-file-read-threshold",
+            "1048576",
+            "--provider-exec-retain-fixtures",
             "--provider-exec-phase-aligned-workflow",
             "--provider-exec-detailed-profile",
             "--provider-exec-workload",
@@ -6728,11 +6976,24 @@ mod tests {
                 default_case: false,
                 phase_aligned_workflow: true,
                 execution_profile_mode: ExecutionProfileMode::Detailed,
+                parquet_metadata_size_hint: None,
+                parquet_full_file_read_threshold: Some(1_048_576),
+                retain_fixtures: true,
                 workload_filter: Some("provider_partitioned_event_log_12m".to_owned()),
                 query_filter: Some("count_events".to_owned()),
                 backend_filter: Some("native_async".to_owned()),
                 scheduling_profile_filter: Some("lazy_parallel_buffer_4".to_owned()),
             }
+        );
+        let execution_options = provider_exec_scan_execution_options(
+            DeltaProviderReaderBackend::NativeAsync,
+            ProviderExecSchedulingProfile::default_execution_case(),
+            &config.provider_exec,
+        )?;
+        assert_eq!(execution_options.parquet_metadata_size_hint, None);
+        assert_eq!(
+            execution_options.parquet_full_file_read_threshold,
+            Some(1_048_576)
         );
 
         Ok(())
@@ -6965,6 +7226,32 @@ mod tests {
             Err(BenchmarkRunnerConfigError::DuplicateProviderExecStorageProfile)
         );
         assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-parquet-metadata-size-hint"]),
+            Err(BenchmarkRunnerConfigError::MissingProviderExecParquetBytes(
+                "--provider-exec-parquet-metadata-size-hint"
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse(["--provider-exec-parquet-metadata-size-hint", "0"]),
+            Err(BenchmarkRunnerConfigError::InvalidProviderExecParquetBytes(
+                "--provider-exec-parquet-metadata-size-hint",
+                "0".to_owned()
+            ))
+        );
+        assert_eq!(
+            BenchmarkRunnerConfig::parse([
+                "--provider-exec-parquet-full-file-read-threshold",
+                "disabled",
+                "--provider-exec-parquet-full-file-read-threshold",
+                "1024"
+            ]),
+            Err(
+                BenchmarkRunnerConfigError::DuplicateProviderExecParquetBytes(
+                    "--provider-exec-parquet-full-file-read-threshold"
+                )
+            )
+        );
+        assert_eq!(
             BenchmarkRunnerConfig::parse(["--provider-exec-workload"]),
             Err(BenchmarkRunnerConfigError::MissingProviderExecWorkloadFilter)
         );
@@ -7036,6 +7323,8 @@ mod tests {
         assert!(usage.contains("Use --host-probe-local-io"));
         assert!(usage.contains("Use --provider-exec-repetitions"));
         assert!(usage.contains("Use --provider-exec-storage-profile"));
+        assert!(usage.contains("Use --provider-exec-parquet-metadata-size-hint"));
+        assert!(usage.contains("Use --provider-exec-retain-fixtures"));
         assert!(usage.contains("Use --provider-exec-workload"));
         assert!(usage.contains("Use --provider-exec-default-case"));
         assert!(usage.contains("Use --provider-exec-phase-aligned-workflow"));
@@ -7690,6 +7979,18 @@ mod tests {
     }
 
     #[test]
+    fn provider_exec_optional_p50_preserves_unavailable_metrics() {
+        assert_eq!(
+            provider_exec_read_stats_optional_p50([Some(10), Some(30), Some(20)]),
+            Some(20)
+        );
+        assert_eq!(
+            provider_exec_read_stats_optional_p50([Some(10), None]),
+            None
+        );
+    }
+
+    #[test]
     fn throughput_per_second_handles_zero_and_integer_rate() {
         assert_eq!(throughput_per_second(0, 100), 0);
         assert_eq!(throughput_per_second(100, 0), 0);
@@ -8163,6 +8464,24 @@ mod tests {
             &"provider_stats_dynamic_partition_files_not_pruned_unsupported_expression_p50"
         ));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"parquet_metadata_size_hint"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"parquet_full_file_read_threshold"));
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER
+                .contains(&"provider_stats_parquet_data_file_range_get_operations_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER
+                .contains(&"provider_stats_parquet_data_file_full_get_operations_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER
+                .contains(&"provider_stats_parquet_data_file_bytes_received_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_parquet_data_file_opened_bytes_p50")
+        );
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"fixture_fingerprint"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
@@ -8218,7 +8537,8 @@ mod tests {
                 "provider_many_small_files_sparse_dv",
                 "provider_few_larger_files_sparse_dv",
                 "provider_partitioned_event_log_12m",
-                "provider_wide_event_export_13m"
+                "provider_wide_event_export_13m",
+                "provider_many_unequal_files"
             ]
         );
         assert_eq!(workloads[0].deletion_vector_deleted_rows(), 0);
@@ -8236,9 +8556,22 @@ mod tests {
         );
         assert_eq!(workloads[5].file_count(), 1_204);
         assert_eq!(workloads[5].row_count(), 13_394_789);
+        assert_eq!(workloads[6].file_count(), 64);
+        assert_eq!(workloads[6].row_count(), 72_704);
+        assert_eq!(
+            workloads[6]
+                .file_specs
+                .iter()
+                .take(32)
+                .map(|file| file.rows)
+                .sum::<usize>(),
+            4_096
+        );
         assert!(simple_query_names.contains(&"project_id"));
         assert!(simple_query_names.contains(&"count_rows"));
         assert!(simple_query_names.contains(&"filter_tail_ids"));
+        assert!(simple_query_names.contains(&"full_rows"));
+        assert_eq!(simple_query_cases[3].sql, "select * from orders");
         assert!(synthetic_query_names.contains(&"project_event_keys"));
         assert!(synthetic_query_names.contains(&"count_events"));
         assert!(synthetic_query_names.contains(&"filter_recent_events"));
@@ -8444,6 +8777,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let source = load_delta_source_with_tracing(
             DeltaSourceConfig::new("orders", table.table_uri.clone())
@@ -8488,6 +8822,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let source = load_delta_source_with_tracing(
             DeltaSourceConfig::new("orders", table.table_uri.clone())
@@ -8508,6 +8843,67 @@ mod tests {
                 .join(synthetic_file_path(partition_date, 0))
                 .exists()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_fixture_fingerprint_is_stable_and_retention_is_opt_in()
+    -> Result<(), Box<dyn Error>> {
+        let workload =
+            ProviderExecWorkloadCase::simple_orders("test_provider_fingerprint", 1, 16, &[]);
+        let temporary = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+            false,
+        )?;
+        let retained = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+            true,
+        )?;
+        let temporary_path = temporary.path.clone();
+        let retained_path = retained.path.clone();
+
+        assert!(temporary.fixture_fingerprint.starts_with("fnv1a64:"));
+        assert_eq!(temporary.fixture_fingerprint, retained.fixture_fingerprint);
+        drop(temporary);
+        drop(retained);
+        assert!(!temporary_path.exists());
+        assert!(retained_path.exists());
+        fs::remove_dir_all(retained_path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_many_unequal_files_proves_file_pruning() -> Result<(), Box<dyn Error>> {
+        let workload = ProviderExecWorkloadCase::many_unequal_simple_orders();
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+            false,
+        )?;
+        let query = workload.query_cases()[2];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let config = ProviderExecConfig::default();
+        let measurement = runtime.block_on(run_provider_exec_once(
+            &table,
+            query,
+            DeltaProviderReaderBackend::NativeAsync,
+            ProviderExecSchedulingProfile::default_execution_case(),
+            &config,
+            0,
+        ))?;
+
+        assert_eq!(measurement.read_stats.files_planned, 32);
+        assert_eq!(measurement.read_stats.files_started, 32);
+        assert_eq!(measurement.produced_rows, 68_608);
+
         Ok(())
     }
 
@@ -8533,6 +8929,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let query = workload.query_cases()[0];
         let scheduling_profile = ProviderExecSchedulingProfile {
@@ -8547,6 +8944,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let config = ProviderExecConfig::default();
 
         for backend in [
             DeltaProviderReaderBackend::OfficialKernel,
@@ -8557,6 +8955,7 @@ mod tests {
                 query,
                 backend,
                 scheduling_profile,
+                &config,
                 0,
             ))?;
             assert_eq!(measurement.produced_rows, 16);
@@ -8588,16 +8987,19 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let query = workload.query_cases()[0];
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let config = ProviderExecConfig::default();
         let measurement = runtime.block_on(run_provider_exec_once(
             &table,
             query,
             DeltaProviderScanExecutionOptions::default().reader_backend,
             ProviderExecSchedulingProfile::default_execution_case(),
+            &config,
             0,
         ))?;
 
@@ -8633,6 +9035,7 @@ mod tests {
                 read_latency_micros: 1_000,
                 bandwidth_bytes_per_second: None,
             },
+            false,
         )?;
         let query = workload.query_cases()[1];
         let scheduling_profile = ProviderExecSchedulingProfile {
@@ -8647,6 +9050,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let config = ProviderExecConfig::default();
 
         assert!(table.table_uri.starts_with("http://127.0.0.1:"));
         assert_eq!(
@@ -8662,6 +9066,7 @@ mod tests {
                 query,
                 backend,
                 scheduling_profile,
+                &config,
                 0,
             ))?;
             assert_eq!(measurement.produced_rows, 1);
@@ -8699,6 +9104,8 @@ mod tests {
             file_count: 2,
             row_count: 16,
             data_file_bytes: 1024,
+            fixture_fingerprint: "fnv1a64:test".to_owned(),
+            retain_fixture: false,
             deletion_vector_file_count: 2,
             deletion_vector_deleted_rows: 4,
             deletion_vector_deleted_rows_per_file: 2,
@@ -8745,6 +9152,10 @@ mod tests {
                 files_planned: 2,
                 estimated_rows: Some(16),
                 estimated_bytes: Some(1024),
+                parquet_data_file_range_get_operations: Some(11),
+                parquet_data_file_full_get_operations: Some(12),
+                parquet_data_file_bytes_received: Some(13),
+                parquet_data_file_opened_bytes: Some(14),
                 scan_partitions_started: 4,
                 scan_partitions_completed: 4,
                 files_started: 2,
@@ -8792,6 +9203,8 @@ mod tests {
                 uses_default_execution_options: false,
             },
             execution_profile_mode: ExecutionProfileMode::Detailed,
+            parquet_metadata_size_hint: Some(65_536),
+            parquet_full_file_read_threshold: Some(1_048_576),
             summary: &summary,
         });
 
@@ -8828,6 +9241,13 @@ mod tests {
         assert_eq!(row[70], "7");
         assert_eq!(row[71], "19");
         assert_eq!(row[72], "detailed");
+        assert_eq!(row[73], "65536");
+        assert_eq!(row[74], "1048576");
+        assert_eq!(row[75], "11");
+        assert_eq!(row[76], "12");
+        assert_eq!(row[77], "13");
+        assert_eq!(row[78], "14");
+        assert_eq!(row[79], "fnv1a64:test");
     }
 
     #[test]
