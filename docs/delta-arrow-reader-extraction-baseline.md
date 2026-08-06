@@ -150,49 +150,49 @@ Reproduce this section with:
 scripts/verify-delta-arrow-reader-extraction-baseline.sh
 ```
 
-## Public compatibility inventory
+## Public API migration inventory
 
-The published 0.5.0 rustdoc is an exact signature reference because `delta-funnel-v0.5.0` and the frozen source commit have identical trees. #474 requires existing Delta Funnel public definitions to remain the source-compatible facade. Therefore no row requires a breaking change and no row uses `reexport_standalone_type`.
+The published 0.5.0 rustdoc is an exact signature reference because `delta-funnel-v0.5.0` and the frozen source commit have identical trees. The migration is intentionally breaking: standalone-owned exports are removed from the `delta_funnel` root, while genuine Delta Funnel orchestration, reporting, session, and error behavior remains integration. No compatibility alias, wrapper, or re-export is permitted. Canonical destinations are fixed by [#461](https://github.com/mag1cfrog/delta-funnel/issues/461), [#466](https://github.com/mag1cfrog/delta-funnel/issues/466), [#478](https://github.com/mag1cfrog/delta-funnel/issues/478), [#480](https://github.com/mag1cfrog/delta-funnel/issues/480), and [#468](https://github.com/mag1cfrog/delta-funnel/issues/468).
 
 <!-- public-compatibility:start -->
 
-| Crate-root item | Required cutover treatment | Exact 0.5.0 signature source |
-| --- | --- | --- |
-| `DeltaFunnelError` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/error/enum.DeltaFunnelError.html) |
-| `DeltaProtocolReport` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProtocolReport.html) |
-| `DeltaProviderSchedulingReport` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderSchedulingReport.html) |
-| `DeltaSourceReport` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaSourceReport.html) |
-| `SourceUsageStatus` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/enum.SourceUsageStatus.html) |
-| `DeltaSourceConfig` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaSourceConfig.html) |
-| `DeltaStorageOptions` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/type.DeltaStorageOptions.html) |
-| `PlannedDeltaSource` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.PlannedDeltaSource.html) |
-| `ProtocolPreflight` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.ProtocolPreflight.html) |
-| `load_delta_source` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_source.html) |
-| `load_delta_sources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_sources.html) |
-| `load_delta_source_with_tracing` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_source_with_tracing.html) |
-| `preflight_delta_protocol` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_protocol.html) |
-| `preflight_delta_sources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_sources.html) |
-| `preflight_delta_protocol_with_tracing` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_protocol_with_tracing.html) |
-| `DeltaProviderReadStatsSnapshot` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderReadStatsSnapshot.html) |
-| `DeltaProviderReaderBackend` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/enum.DeltaProviderReaderBackend.html) |
-| `DeltaProviderScanExecutionOptions` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderScanExecutionOptions.html) |
-| `DeltaScanPartitionTargetDiagnosticInput` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `DeltaScanPartitionTargetDiagnosticOutput` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `DeltaScanPartitionTargetDiagnosticSource` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `DeltaScanPartitionTargetLocalEnvironmentDiagnostic` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `DeltaTableProviderConfig` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaTableProviderConfig.html) |
-| `QueryOptions` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.QueryOptions.html) |
-| `RegisteredDeltaSource` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.RegisteredDeltaSource.html) |
-| `RegisteredDeltaSources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.RegisteredDeltaSources.html) |
-| `collect_delta_provider_read_stats` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.collect_delta_provider_read_stats.html) |
-| `datafusion_query_output_stream` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_query_output_stream.html) |
-| `datafusion_session_config` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_session_config.html) |
-| `datafusion_session_context` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_session_context.html) |
-| `delta_scan_partition_target_local_environment_diagnostic` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `derive_delta_scan_partition_target_diagnostic` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
-| `register_delta_sources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.register_delta_sources.html) |
-| `register_delta_sources_with_scan_execution_options` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.register_delta_sources_with_scan_execution_options.html) |
+| Crate-root item | Required treatment | Destination or retained responsibility | Affected callers | Migration test/documentation owner | Exact 0.5.0 signature source |
+| --- | --- | --- | --- | --- | --- |
+| `DeltaFunnelError` | `delta_funnel_owned_integration` | Remains `delta_funnel::DeltaFunnelError`; maps stable standalone error kinds at product boundaries. | Rust and Python error consumers | #474 boundary tests; #475 API docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/error/enum.DeltaFunnelError.html) |
+| `DeltaProtocolReport` | `delta_funnel_owned_integration` | Remains `delta_funnel::DeltaProtocolReport`; owns sanitized product reporting. | Reports, progress, Python | #474 report tests; #475 API docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProtocolReport.html) |
+| `DeltaProviderSchedulingReport` | `delta_funnel_owned_integration` | Remains `delta_funnel::DeltaProviderSchedulingReport`; serializes product scheduling policy. | Reports, profiles, Python | #474 report tests; #475 diagnostics docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderSchedulingReport.html) |
+| `DeltaSourceReport` | `delta_funnel_owned_integration` | Remains `delta_funnel::DeltaSourceReport`; combines usage, protocol, scheduling, and metrics. | Reports, workflows, Python | #474 report tests; #475 diagnostics docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaSourceReport.html) |
+| `SourceUsageStatus` | `delta_funnel_owned_integration` | Remains `delta_funnel::SourceUsageStatus`; owns product source-usage state. | Reports and workflows | #474 report tests; #475 diagnostics docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/enum.SourceUsageStatus.html) |
+| `DeltaSourceConfig` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaTableBuilder`; Delta Funnel separately applies source naming and environment policy. | Rust loading, session registry, Python | #474 shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaSourceConfig.html) |
+| `DeltaStorageOptions` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaStorageOptions` | Rust loading and Python options | #474 compile/shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/type.DeltaStorageOptions.html) |
+| `PlannedDeltaSource` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaTable` | Rust loading, provider registration, reports | #474 compile/shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.PlannedDeltaSource.html) |
+| `ProtocolPreflight` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaProtocolInfo` plus `DeltaTable::validate_protocol` | Rust loading, registration, reports | #474 shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.ProtocolPreflight.html) |
+| `load_delta_source` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaTableBuilder::load` | Rust loading, tests, benchmark | #474 shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_source.html) |
+| `load_delta_sources` | `replace_with_standalone_import` | Repeated `delta_arrow_reader::DeltaTableBuilder::load`; Delta Funnel owns the multi-source loop. | Rust multi-source orchestration | #474 shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_sources.html) |
+| `load_delta_source_with_tracing` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaTableBuilder::load`; standalone owns bounded load tracing. | Session registry, progress, benchmark | #474 telemetry shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_source_with_tracing.html) |
+| `preflight_delta_protocol` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaTable::validate_protocol` | Rust reader and provider tests | #474 shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_protocol.html) |
+| `preflight_delta_sources` | `replace_with_standalone_import` | Repeated `delta_arrow_reader::DeltaTable::validate_protocol`; Delta Funnel owns the multi-source loop. | Rust multi-source orchestration | #474 shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_sources.html) |
+| `preflight_delta_protocol_with_tracing` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaTable::validate_protocol`; standalone owns bounded validation tracing. | Session registry, progress, benchmark | #474 telemetry shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_protocol_with_tracing.html) |
+| `DeltaProviderReadStatsSnapshot` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaDataFusionMetricsSnapshot` plus its nested `DeltaReadMetricsSnapshot` | Reports, profiles, progress, benchmark | #474 metrics shadow tests; #475 diagnostics docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderReadStatsSnapshot.html) |
+| `DeltaProviderReaderBackend` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaReaderBackend` | Rust provider callers and benchmark | #474 backend shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/enum.DeltaProviderReaderBackend.html) |
+| `DeltaProviderScanExecutionOptions` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaReaderExecutionOptions` | Session, Python adapter, benchmark | #474 option shadow tests; #475 Rust/Python docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderScanExecutionOptions.html) |
+| `DeltaScanPartitionTargetDiagnosticInput` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaScanPartitionTargetDiagnosticInput` | Benchmark diagnostic path | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `DeltaScanPartitionTargetDiagnosticOutput` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaScanPartitionTargetDiagnosticOutput` | Benchmark diagnostic path | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `DeltaScanPartitionTargetDiagnosticSource` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaScanPartitionTargetDiagnosticSource` | Benchmark diagnostic path | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `DeltaScanPartitionTargetLocalEnvironmentDiagnostic` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaScanPartitionTargetLocalEnvironmentDiagnostic` | Benchmark host probe | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus` | Benchmark host probe | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `DeltaTableProviderConfig` | `replace_with_standalone_import` | `delta_arrow_reader::DeltaDataFusionScanOptions` plus `DeltaTable` | Session registry and provider tests | #474 registration shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaTableProviderConfig.html) |
+| `QueryOptions` | `delta_funnel_owned_integration` | Remains `delta_funnel::QueryOptions`; owns application session policy. | Rust and Python sessions | #474 session tests; #475 API docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.QueryOptions.html) |
+| `RegisteredDeltaSource` | `replace_with_standalone_import` | `delta_arrow_reader::RegisteredDeltaTable` | Session registry, reports, tests | #474 registration shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.RegisteredDeltaSource.html) |
+| `RegisteredDeltaSources` | `delta_funnel_owned_integration` | Remains `delta_funnel::RegisteredDeltaSources`; owns all-or-nothing multi-source results over canonical registered tables. | Session registry, reports, tests | #474 registration shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.RegisteredDeltaSources.html) |
+| `collect_delta_provider_read_stats` | `replace_with_standalone_import` | `delta_arrow_reader::collect_delta_datafusion_metrics` | Reports, profiles, progress, benchmark | #474 metrics shadow tests; #475 diagnostics docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.collect_delta_provider_read_stats.html) |
+| `datafusion_query_output_stream` | `delta_funnel_owned_integration` | Remains `delta_funnel::datafusion_query_output_stream`; owns application output handoff. | Workflows and query handoff | #474 workflow tests; #475 API docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_query_output_stream.html) |
+| `datafusion_session_config` | `delta_funnel_owned_integration` | Remains `delta_funnel::datafusion_session_config`; owns application session configuration. | Rust and Python sessions | #474 session tests; #475 API docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_session_config.html) |
+| `datafusion_session_context` | `delta_funnel_owned_integration` | Remains `delta_funnel::datafusion_session_context`; owns application session construction. | Rust and Python sessions | #474 session tests; #475 API docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_session_context.html) |
+| `delta_scan_partition_target_local_environment_diagnostic` | `replace_with_standalone_import` | `delta_arrow_reader::delta_scan_partition_target_local_environment_diagnostic` | Benchmark host probe | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `derive_delta_scan_partition_target_diagnostic` | `replace_with_standalone_import` | `delta_arrow_reader::derive_delta_scan_partition_target_diagnostic` | Benchmark synthetic/host paths | #474 compile tests; #475 benchmark docs | exact hidden declaration below |
+| `register_delta_sources` | `delta_funnel_owned_integration` | Remains `delta_funnel::register_delta_sources`; owns all-or-nothing multi-source orchestration over `delta_arrow_reader::register_delta_table`. | Session registry, tests, benchmark | #474 registration shadow tests; #475 migration docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.register_delta_sources.html) |
+| `register_delta_sources_with_scan_execution_options` | `delta_funnel_owned_integration` | Remains `delta_funnel::register_delta_sources_with_scan_execution_options`; adapts product options then calls `delta_arrow_reader::register_delta_table`. | Session registry, Python, benchmark | #474 option/registration shadow tests; #475 Rust/Python docs | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.register_delta_sources_with_scan_execution_options.html) |
 
 <!-- public-compatibility:end -->
 
@@ -256,27 +256,27 @@ pub fn delta_scan_partition_target_local_environment_diagnostic()
 
 ### Reader-used DeltaFunnelError variants
 
-The existing `DeltaFunnelError` envelope, display contract, and Python mapping remain Delta Funnel-owned. Rows marked `reader_context_in_delta_funnel_wrapper` preserve the listed context while mapping the standalone error category through #474.
+The existing `DeltaFunnelError` envelope, display contract, and Python mapping remain Delta Funnel-owned. Rows marked `standalone_error_mapped_at_integration` replace the reader error with its stable standalone category, then add only the listed sanitized Delta Funnel context at a real product boundary.
 
 | Variant | Exact fields | Context ownership after cutover |
 | --- | --- | --- |
 | `Config` | `message: String` | `delta_funnel_owned` |
 | `InvalidSourceName` | `name: String, reason: &'static str` | `delta_funnel_owned` |
 | `DuplicateSourceName` | `name: String` | `delta_funnel_owned` |
-| `InvalidSourceUri` | `reason: &'static str` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaSourceEngine` | `reason: &'static str` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaSnapshotLoad` | `reason: String` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaProtocolCompatibility` | `source_name: String, table_uri: String, snapshot_version: u64, reason: String` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaSourceSchema` | `source_name: String, table_uri: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `InvalidSourceUri` | `reason: &'static str` | `standalone_error_mapped_at_integration` |
+| `DeltaSourceEngine` | `reason: &'static str` | `standalone_error_mapped_at_integration` |
+| `DeltaSnapshotLoad` | `reason: String` | `standalone_error_mapped_at_integration` |
+| `DeltaProtocolCompatibility` | `source_name: String, table_uri: String, snapshot_version: u64, reason: String` | `standalone_error_mapped_at_integration` |
+| `DeltaSourceSchema` | `source_name: String, table_uri: String, reason: String` | `standalone_error_mapped_at_integration` |
 | `DataFusionRegistration` | `source_name: String, table_uri: String, reason: String` | `delta_funnel_owned` |
-| `DeltaScanProjection` | `source_name: String, table_uri: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanFilter` | `source_name: String, table_uri: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanConstruction` | `source_name: String, table_uri: String, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanMetadataExpansion` | `source_name: String, table_uri: String, snapshot_version: u64, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanFileTaskPlanning` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanFileTaskPartitionPlanning` | `source_name: String, table_uri: String, snapshot_version: u64, reason: String` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanFileRead` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, phase: DeltaScanFileReadPhase, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
-| `DeltaScanDeletionVector` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, phase: DeltaScanDeletionVectorPhase, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanProjection` | `source_name: String, table_uri: String, reason: String` | `standalone_error_mapped_at_integration` |
+| `DeltaScanFilter` | `source_name: String, table_uri: String, reason: String` | `standalone_error_mapped_at_integration` |
+| `DeltaScanConstruction` | `source_name: String, table_uri: String, source: Box<delta_kernel::Error>` | `standalone_error_mapped_at_integration` |
+| `DeltaScanMetadataExpansion` | `source_name: String, table_uri: String, snapshot_version: u64, source: Box<delta_kernel::Error>` | `standalone_error_mapped_at_integration` |
+| `DeltaScanFileTaskPlanning` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, reason: String` | `standalone_error_mapped_at_integration` |
+| `DeltaScanFileTaskPartitionPlanning` | `source_name: String, table_uri: String, snapshot_version: u64, reason: String` | `standalone_error_mapped_at_integration` |
+| `DeltaScanFileRead` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, phase: DeltaScanFileReadPhase, source: Box<delta_kernel::Error>` | `standalone_error_mapped_at_integration` |
+| `DeltaScanDeletionVector` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, phase: DeltaScanDeletionVectorPhase, source: Box<delta_kernel::Error>` | `standalone_error_mapped_at_integration` |
 
 The two public phase enums used above are:
 
@@ -410,3 +410,98 @@ cargo tree -p delta-funnel -d
 ```
 
 The resolved graph contains one compatibility-critical universe: Arrow/Parquet `58.3.0`, DataFusion `54.1.0`, object_store `0.13.2`, and Delta Kernel/default-engine `0.25.0`. No duplicate of those packages exists. Unrelated transitive packages do not cross the public Arrow/DataFusion/object-store boundary.
+
+## Correctness baseline
+
+The production tree under test is the frozen source commit. This baseline branch changes only this document and its verifier. Focused results captured on `2026-08-06` UTC were:
+
+| Command | Result | Coverage |
+| --- | --- | --- |
+| `cargo test --locked -p delta-funnel --all-features table_formats::delta` | pass: 176, fail: 0 | Snapshot/protocol/schema, projection/filter/pruning, deletion vectors, storage, and reader redaction. |
+| `cargo test --locked -p delta-funnel --all-features query_engine::datafusion` | pass: 635, fail: 0 | Provider registration/execution, partition targets, longest-file-first grouping, scheduling, both Parquet controls, cancellation/backpressure, and DataFusion public behavior. |
+| `cargo test --locked -p delta-funnel --all-features report` | pass: 201, fail: 0, ignored: 3 opt-in external trace tests | #448/#449 metrics, JSON, terminal summaries, source reports, and #612 exact profiles. |
+| `cargo test --locked -p delta-funnel --all-features perfetto_profile` | pass: 81, fail: 0, ignored: 3 opt-in external trace tests | Current #545 ranked artifact, report, terminal, sanitization, and bounded-output behavior. |
+| `cargo test --locked -p delta-funnel --all-features --bin delta_scan_partition_bench` | pass: 68, fail: 0 | Benchmark parsing, fixture generation, CSV schema, storage profiles, and summary math. |
+| `cargo test --locked -p delta-funnel-python --all-features` | pass: 192, fail: 0, ignored: 9 SQL Server integration tests owned by `cargo xtask sqlserver-test` | Python option parsing/defaults/validation, API stubs, reports, progress, and redaction. |
+
+The normal repository gates also passed:
+
+```console
+cargo fmt --all --check
+cargo check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+git diff --check
+```
+
+The full workspace test result was 1,471 Delta Funnel library tests passed with three documented opt-in external-trace tests ignored; 68 benchmark tests, 21 Rust integration tests, 192 Python binding tests, nine xtask tests, and one doctest passed. Nine Python SQL Server tests remained explicitly ignored because their owning command requires the external SQL Server lane. There were no failures and no unexplained accepted failures.
+
+## Controlled performance and I/O baseline
+
+### Supported diagnostic capture
+
+The existing release binary was built with `Cargo.lock` SHA-256 `be88d1fac0c3ac6ee221138c702c0bd10b0a9e21cc597819ea95968099948a8b`. Capture used benchmark CSV schema 21, seed 0, two warm-up repetitions, five measured repetitions, and scheduling profile `prefetch_2_ap_target_scan_3x`: 16 scan partitions, scan-wide capacity 48, per-partition capacity 3, output buffer 1, and NativeAsync file prefetch 2. NativeAsync therefore used the 65,536-byte metadata hint and disabled full-file buffering; OfficialKernel ignores both settings. Capture completed on an otherwise idle host at `2026-08-06T12:15:36Z` UTC.
+
+The clean-checkout command pattern is:
+
+```bash
+git checkout --detach 46f23d8fbec7effe3806bf7507a0b43b91a594ec
+cargo build --locked --release -p delta-funnel --bin delta_scan_partition_bench
+run_case() {
+  name=$1 workload=$2 query=$3 backend=$4 storage=$5
+  for repetitions in 2 5; do
+    target/release/delta_scan_partition_bench \
+      --mode provider-exec --seed 0 \
+      --provider-exec-storage-profile "$storage" \
+      --provider-exec-workload "$workload" \
+      --provider-exec-query "$query" \
+      --provider-exec-backend "$backend" \
+      --provider-exec-scheduling-profile prefetch_2_ap_target_scan_3x \
+      --provider-exec-repetitions "$repetitions" \
+      --output "target/issue-459-${name}-${repetitions}.csv"
+  done
+}
+run_case local-native-projection provider_few_larger_files project_id native_async local
+run_case local-official-projection provider_few_larger_files project_id official_kernel local
+run_case local-native-filtered provider_few_larger_files filter_tail_ids native_async local
+run_case local-native-many-small provider_many_small_files project_id native_async local
+run_case local-native-dv provider_few_larger_files_sparse_dv project_id native_async local
+run_case local-official-dv provider_few_larger_files_sparse_dv project_id official_kernel local
+run_case throttled-native-projection provider_few_larger_files project_id native_async s3_throttled
+```
+
+For each call, repetition count 2 is warm-up and count 5 is measured. Fixture throughput is `data_file_bytes / total_micros_p50`; it is not observed object-store traffic. Rows per second and all deterministic observations come directly from schema-21 CSV.
+
+| Workload / query | Storage / backend | p50 us | Fixture MiB/s | Source rows/s | Deterministic observations |
+| --- | --- | ---: | ---: | ---: | --- |
+| `provider_few_larger_files` / `project_id` | `local` / `native_async` | 658 | 1,188.14 | 49,799,392 | 4 files and 32,768 rows planned/started/completed; 32,768 rows in 4 batches. |
+| `provider_few_larger_files` / `project_id` | `local` / `official_kernel` | 852 | 917.60 | 38,460,093 | 4 files and 32,768 rows planned/started/completed; 32,768 rows in 36 batches. |
+| `provider_few_larger_files` / `filter_tail_ids` | `local` / `native_async` | 818 | 955.74 | 40,058,679 | 4 files started; 28,672 rows in 4 batches; this filters 4,096 rows but prunes no file. |
+| `provider_many_small_files` / `project_id` | `local` / `native_async` | 1,776 | 126.99 | 4,612,612 | 64 files and 8,192 rows planned/started/completed; 8,192 rows in 64 batches. |
+| `provider_few_larger_files_sparse_dv` / `project_id` | `local` / `native_async` | 1,417 | 551.73 | 23,124,911 | 4 DVs loaded/applied; 12 rows deleted; 32,756 rows in 4 batches. |
+| `provider_few_larger_files_sparse_dv` / `project_id` | `local` / `official_kernel` | 959 | 815.22 | 34,168,925 | 4 DVs loaded/applied; 12 rows deleted; 32,756 rows in 36 batches. |
+| `provider_few_larger_files` / `project_id` | `s3_throttled` / `native_async` | 91,726 | 8.52 | 357,237 | Delayed localhost object-store profile; 4 files and 32,768 rows completed in 4 batches. |
+
+These rows are diagnostic evidence only, not an accepted complete #459 performance baseline. The filtered case did not prune a file, and the equal-sized many-small-file fixture cannot measure the longest-file-first ordering advantage.
+
+### Fixture provenance and portability gate
+
+The provider-exec fixtures are generated locally by `crates/delta-funnel/src/bin/delta_scan_partition_bench.rs`, frozen blob `89a65aa4c5dc5fa12715c89e157ed8102e43a49b`, using Arrow/Parquet 58.3.0 from the locked graph. Their source and generated output are covered by the repository's Apache-2.0 license. The three captured shapes are four files by 8,192 rows, 64 files by 128 rows, and four files by 8,192 rows with three deleted indexes per file. They contain deterministic synthetic values and no external or private data.
+
+The generator deletes each temporary table at process exit and emits neither a canonical directory digest nor per-file fingerprints. The source recipe is legally portable, but identical generated-content fingerprints cannot be proved from a clean checkout through the existing public command. Therefore the required standalone fixture fingerprint gate is not passed.
+
+### Blocking frozen-harness gaps
+
+The following are blockers to closing #459, not accepted omissions:
+
+1. The frozen CLI has no full-column provider query; all simple-order queries project or aggregate `id`.
+2. The CLI has no options or scheduling profiles for metadata prefetch disabled, an undersized hint, or an enabled full-file threshold. Only the 65,536-byte/disabled defaults can be measured.
+3. Schema-21 CSV omits all four #448 Parquet request/byte counters, and provider-exec tracing records only stats-collection lifecycle, so recording/throttled request and byte observations cannot be retained.
+4. The available filtered small fixture did not prune a file, and the many-small-file fixture uses equal-sized files, so the required pruned and longest-file-first performance observations are absent.
+5. Generated fixtures are deleted without a stable content fingerprint, blocking the required identical-fingerprint standalone reproduction proof.
+
+Issue #459 forbids changing or inventing a benchmark in this baseline and requires every row to reproduce from the frozen source SHA. Consequently these gaps cannot be repaired by documentation or verifier changes. The baseline must remain open until the issue authority supplies a frozen-source-compatible procedure or explicitly authorizes a benchmark-only prerequisite and a refreshed single source SHA.
+
+### Committed-artifact redaction
+
+Only this compact document and its verifier are committed. Raw CSV, trace, build, and test logs remain uncommitted under `target/`. The verifier rejects a home-directory path, credential-bearing URI, common secret assignment, or private-key marker. The committed artifact contains no username, private hostname, environment value, credential, table URI, object-store path, connection string, SQL literal, row value, or raw dependency error.

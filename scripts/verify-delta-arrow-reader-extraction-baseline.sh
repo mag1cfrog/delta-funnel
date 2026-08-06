@@ -139,41 +139,41 @@ fi
 
 sed -n '/^EXPORTS$/,/^END$/p' <<'EXPORT_LIST' | sed '1d;$d' | LC_ALL=C sort >"$tmpdir/expected-exports"
 EXPORTS
-DeltaFunnelError delta_funnel_owned_unchanged
-DeltaProtocolReport delta_funnel_compatibility_wrapper
-DeltaProviderReadStatsSnapshot delta_funnel_compatibility_wrapper
-DeltaProviderReaderBackend delta_funnel_compatibility_wrapper
-DeltaProviderScanExecutionOptions delta_funnel_compatibility_wrapper
-DeltaProviderSchedulingReport delta_funnel_owned_unchanged
-DeltaScanPartitionTargetDiagnosticInput delta_funnel_compatibility_wrapper
-DeltaScanPartitionTargetDiagnosticOutput delta_funnel_compatibility_wrapper
-DeltaScanPartitionTargetDiagnosticSource delta_funnel_compatibility_wrapper
-DeltaScanPartitionTargetLocalEnvironmentDiagnostic delta_funnel_compatibility_wrapper
-DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus delta_funnel_compatibility_wrapper
-DeltaSourceConfig delta_funnel_compatibility_wrapper
-DeltaSourceReport delta_funnel_owned_unchanged
-DeltaStorageOptions delta_funnel_compatibility_wrapper
-DeltaTableProviderConfig delta_funnel_compatibility_wrapper
-PlannedDeltaSource delta_funnel_compatibility_wrapper
-ProtocolPreflight delta_funnel_compatibility_wrapper
-QueryOptions delta_funnel_owned_unchanged
-RegisteredDeltaSource delta_funnel_compatibility_wrapper
-RegisteredDeltaSources delta_funnel_compatibility_wrapper
-SourceUsageStatus delta_funnel_owned_unchanged
-collect_delta_provider_read_stats delta_funnel_compatibility_wrapper
-datafusion_query_output_stream delta_funnel_owned_unchanged
-datafusion_session_config delta_funnel_owned_unchanged
-datafusion_session_context delta_funnel_owned_unchanged
-delta_scan_partition_target_local_environment_diagnostic delta_funnel_compatibility_wrapper
-derive_delta_scan_partition_target_diagnostic delta_funnel_compatibility_wrapper
-load_delta_source delta_funnel_compatibility_wrapper
-load_delta_source_with_tracing delta_funnel_compatibility_wrapper
-load_delta_sources delta_funnel_compatibility_wrapper
-preflight_delta_protocol delta_funnel_compatibility_wrapper
-preflight_delta_protocol_with_tracing delta_funnel_compatibility_wrapper
-preflight_delta_sources delta_funnel_compatibility_wrapper
-register_delta_sources delta_funnel_compatibility_wrapper
-register_delta_sources_with_scan_execution_options delta_funnel_compatibility_wrapper
+DeltaFunnelError delta_funnel_owned_integration
+DeltaProtocolReport delta_funnel_owned_integration
+DeltaProviderReadStatsSnapshot replace_with_standalone_import
+DeltaProviderReaderBackend replace_with_standalone_import
+DeltaProviderScanExecutionOptions replace_with_standalone_import
+DeltaProviderSchedulingReport delta_funnel_owned_integration
+DeltaScanPartitionTargetDiagnosticInput replace_with_standalone_import
+DeltaScanPartitionTargetDiagnosticOutput replace_with_standalone_import
+DeltaScanPartitionTargetDiagnosticSource replace_with_standalone_import
+DeltaScanPartitionTargetLocalEnvironmentDiagnostic replace_with_standalone_import
+DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus replace_with_standalone_import
+DeltaSourceConfig replace_with_standalone_import
+DeltaSourceReport delta_funnel_owned_integration
+DeltaStorageOptions replace_with_standalone_import
+DeltaTableProviderConfig replace_with_standalone_import
+PlannedDeltaSource replace_with_standalone_import
+ProtocolPreflight replace_with_standalone_import
+QueryOptions delta_funnel_owned_integration
+RegisteredDeltaSource replace_with_standalone_import
+RegisteredDeltaSources delta_funnel_owned_integration
+SourceUsageStatus delta_funnel_owned_integration
+collect_delta_provider_read_stats replace_with_standalone_import
+datafusion_query_output_stream delta_funnel_owned_integration
+datafusion_session_config delta_funnel_owned_integration
+datafusion_session_context delta_funnel_owned_integration
+delta_scan_partition_target_local_environment_diagnostic replace_with_standalone_import
+derive_delta_scan_partition_target_diagnostic replace_with_standalone_import
+load_delta_source replace_with_standalone_import
+load_delta_source_with_tracing replace_with_standalone_import
+load_delta_sources replace_with_standalone_import
+preflight_delta_protocol replace_with_standalone_import
+preflight_delta_protocol_with_tracing replace_with_standalone_import
+preflight_delta_sources replace_with_standalone_import
+register_delta_sources delta_funnel_owned_integration
+register_delta_sources_with_scan_execution_options delta_funnel_owned_integration
 END
 EXPORT_LIST
 
@@ -195,6 +195,34 @@ awk -F '|' '
 ' "$document" | LC_ALL=C sort >"$tmpdir/recorded-exports"
 
 diff -u "$tmpdir/expected-exports" "$tmpdir/recorded-exports"
+
+if ! awk -F '|' '
+    /<!-- public-compatibility:start -->/ { capture = 1; next }
+    /<!-- public-compatibility:end -->/ { capture = 0; next }
+    capture && /^\| `/ {
+        treatment = $3
+        destination = $4
+        callers = $5
+        owner = $6
+        signature = $7
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", treatment)
+        if (destination !~ /[^[:space:]]/ || callers !~ /[^[:space:]]/ ||
+            owner !~ /#474/ || owner !~ /#475/ || signature !~ /[^[:space:]]/) {
+            exit 1
+        }
+        if (treatment == "replace_with_standalone_import" &&
+            destination !~ /delta_arrow_reader::/) {
+            exit 1
+        }
+        if (treatment == "delta_funnel_owned_integration" &&
+            destination !~ /delta_funnel::/) {
+            exit 1
+        }
+    }
+' "$document"; then
+    echo "public migration row is missing its destination, callers, owner, or signature" >&2
+    exit 1
+fi
 
 git show "$source_sha:crates/delta-funnel/src/lib.rs" |
     awk '
@@ -222,7 +250,7 @@ diff -u "$tmpdir/module-reader-exports" "$tmpdir/recorded-module-reader-exports"
 
 while read -r item treatment; do
     case "$treatment" in
-        reexport_standalone_type|delta_funnel_compatibility_wrapper|delta_funnel_owned_unchanged) ;;
+        replace_with_standalone_import|delta_funnel_owned_integration|remove) ;;
         *)
             echo "invalid compatibility treatment: $item" >&2
             exit 1
@@ -308,7 +336,31 @@ do
     fi
 done
 
-printf 'verified %s ownership entries, %s public exports, and provider option/report fields at %s\n' \
+for heading in \
+    "## Source identity" \
+    "## Reader ownership map" \
+    "## Public API migration inventory" \
+    "## Error and report inventory" \
+    "## Dependency and feature baseline" \
+    "## Correctness baseline" \
+    "## Controlled performance and I/O baseline"
+do
+    grep -Fx "$heading" "$document" >/dev/null
+done
+
+if grep -E -n \
+    '/home/|/Users/|file://|s3://|[[:alnum:]_]+:[^/@[:space:]]+@|BEGIN [A-Z ]*PRIVATE KEY|(^|[^[:alnum:]_])(password|token|secret|access_key)[[:space:]]*[:=]' \
+    "$document"; then
+    echo "possible private path or secret-bearing value in baseline document" >&2
+    exit 1
+fi
+
+if grep -E -n 'TBD|TODO|PLACEHOLDER' "$document"; then
+    echo "placeholder text in baseline document" >&2
+    exit 1
+fi
+
+printf 'verified %s ownership entries, %s public exports, provider fields, and redaction at %s; performance blockers remain documented\n' \
     "$(wc -l <"$tmpdir/recorded" | tr -d ' ')" \
     "$(wc -l <"$tmpdir/recorded-exports" | tr -d ' ')" \
     "$source_sha"
