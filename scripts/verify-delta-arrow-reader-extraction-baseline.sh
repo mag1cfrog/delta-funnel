@@ -137,4 +137,178 @@ if [ "$recorded_digest" != "$actual_digest" ]; then
     exit 1
 fi
 
-printf 'verified %s reader ownership entries at %s\n' "$(wc -l <"$tmpdir/recorded" | tr -d ' ')" "$source_sha"
+sed -n '/^EXPORTS$/,/^END$/p' <<'EXPORT_LIST' | sed '1d;$d' | LC_ALL=C sort >"$tmpdir/expected-exports"
+EXPORTS
+DeltaFunnelError delta_funnel_owned_unchanged
+DeltaProtocolReport delta_funnel_compatibility_wrapper
+DeltaProviderReadStatsSnapshot delta_funnel_compatibility_wrapper
+DeltaProviderReaderBackend delta_funnel_compatibility_wrapper
+DeltaProviderScanExecutionOptions delta_funnel_compatibility_wrapper
+DeltaProviderSchedulingReport delta_funnel_owned_unchanged
+DeltaScanPartitionTargetDiagnosticInput delta_funnel_compatibility_wrapper
+DeltaScanPartitionTargetDiagnosticOutput delta_funnel_compatibility_wrapper
+DeltaScanPartitionTargetDiagnosticSource delta_funnel_compatibility_wrapper
+DeltaScanPartitionTargetLocalEnvironmentDiagnostic delta_funnel_compatibility_wrapper
+DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus delta_funnel_compatibility_wrapper
+DeltaSourceConfig delta_funnel_compatibility_wrapper
+DeltaSourceReport delta_funnel_owned_unchanged
+DeltaStorageOptions delta_funnel_compatibility_wrapper
+DeltaTableProviderConfig delta_funnel_compatibility_wrapper
+PlannedDeltaSource delta_funnel_compatibility_wrapper
+ProtocolPreflight delta_funnel_compatibility_wrapper
+QueryOptions delta_funnel_owned_unchanged
+RegisteredDeltaSource delta_funnel_compatibility_wrapper
+RegisteredDeltaSources delta_funnel_compatibility_wrapper
+SourceUsageStatus delta_funnel_owned_unchanged
+collect_delta_provider_read_stats delta_funnel_compatibility_wrapper
+datafusion_query_output_stream delta_funnel_owned_unchanged
+datafusion_session_config delta_funnel_owned_unchanged
+datafusion_session_context delta_funnel_owned_unchanged
+delta_scan_partition_target_local_environment_diagnostic delta_funnel_compatibility_wrapper
+derive_delta_scan_partition_target_diagnostic delta_funnel_compatibility_wrapper
+load_delta_source delta_funnel_compatibility_wrapper
+load_delta_source_with_tracing delta_funnel_compatibility_wrapper
+load_delta_sources delta_funnel_compatibility_wrapper
+preflight_delta_protocol delta_funnel_compatibility_wrapper
+preflight_delta_protocol_with_tracing delta_funnel_compatibility_wrapper
+preflight_delta_sources delta_funnel_compatibility_wrapper
+register_delta_sources delta_funnel_compatibility_wrapper
+register_delta_sources_with_scan_execution_options delta_funnel_compatibility_wrapper
+END
+EXPORT_LIST
+
+awk -F '|' '
+    /<!-- public-compatibility:start -->/ { found_start = 1; capture = 1; next }
+    /<!-- public-compatibility:end -->/ { found_end = 1; capture = 0; next }
+    capture && /^\| `/ {
+        item = $2
+        treatment = $3
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", item)
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", treatment)
+        print item " " treatment
+    }
+    END {
+        if (!found_start || !found_end) {
+            exit 1
+        }
+    }
+' "$document" | LC_ALL=C sort >"$tmpdir/recorded-exports"
+
+diff -u "$tmpdir/expected-exports" "$tmpdir/recorded-exports"
+
+git show "$source_sha:crates/delta-funnel/src/lib.rs" |
+    awk '
+        /^pub use query_engine::\{/ || /^pub use table_formats::\{/ { capture = 1 }
+        capture { print }
+        capture && /};$/ { capture = 0 }
+    ' |
+    sed -e 's/^pub use [^{]*{//' -e 's/};$//' |
+    tr ',' '\n' |
+    sed 's/[[:space:]]//g' |
+    sed '/^$/d' |
+    LC_ALL=C sort >"$tmpdir/module-reader-exports"
+
+awk '
+    $1 != "DeltaFunnelError" &&
+    $1 != "DeltaProtocolReport" &&
+    $1 != "DeltaProviderSchedulingReport" &&
+    $1 != "DeltaSourceReport" &&
+    $1 != "SourceUsageStatus" {
+        print $1
+    }
+' "$tmpdir/recorded-exports" | LC_ALL=C sort >"$tmpdir/recorded-module-reader-exports"
+
+diff -u "$tmpdir/module-reader-exports" "$tmpdir/recorded-module-reader-exports"
+
+while read -r item treatment; do
+    case "$treatment" in
+        reexport_standalone_type|delta_funnel_compatibility_wrapper|delta_funnel_owned_unchanged) ;;
+        *)
+            echo "invalid compatibility treatment: $item" >&2
+            exit 1
+            ;;
+    esac
+    git show "$source_sha:crates/delta-funnel/src/lib.rs" | grep -F "$item" >/dev/null
+done <"$tmpdir/recorded-exports"
+
+sed -n '/^OPTIONS$/,/^END$/p' <<'OPTION_LIST' | sed '1d;$d' | LC_ALL=C sort >"$tmpdir/expected-options"
+OPTIONS
+max_concurrent_file_reads_per_partition
+max_concurrent_file_reads_per_scan
+native_async_prefetch_file_count_per_partition
+output_buffer_capacity_per_partition
+parquet_full_file_read_threshold
+parquet_metadata_size_hint
+END
+OPTION_LIST
+
+awk -F '|' '
+    /<!-- provider-scan-options:start -->/ { found_start = 1; capture = 1; next }
+    /<!-- provider-scan-options:end -->/ { found_end = 1; capture = 0; next }
+    capture && /^\| `/ {
+        item = $2
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", item)
+        print item
+    }
+    END {
+        if (!found_start || !found_end) {
+            exit 1
+        }
+    }
+' "$document" | LC_ALL=C sort >"$tmpdir/recorded-options"
+
+diff -u "$tmpdir/expected-options" "$tmpdir/recorded-options"
+
+for filepath in \
+    crates/delta-funnel-python/deltafunnel.pyi \
+    crates/delta-funnel-python/src/session.rs \
+    crates/delta-funnel/src/report/json.rs
+do
+    while read -r option; do
+        git show "$source_sha:$filepath" | grep -F "$option" >/dev/null
+    done <"$tmpdir/expected-options"
+done
+
+sed -n '/^FIELDS$/,/^END$/p' <<'FIELD_LIST' | sed '1d;$d' | LC_ALL=C sort >"$tmpdir/expected-scheduling-fields"
+FIELDS
+max_concurrent_file_reads_per_partition
+max_concurrent_file_reads_per_scan
+native_async_prefetch_file_count_per_partition
+output_buffer_capacity_per_partition
+parquet_full_file_read_threshold
+parquet_metadata_size_hint
+query_target_partitions
+reader_backend
+END
+FIELD_LIST
+
+awk '
+    /<!-- scheduling-json-fields:start -->/ { found_start = 1; capture = 1; next }
+    /<!-- scheduling-json-fields:end -->/ { found_end = 1; capture = 0; next }
+    capture && /^[a-z_]+$/ { print }
+    END {
+        if (!found_start || !found_end) {
+            exit 1
+        }
+    }
+' "$document" | LC_ALL=C sort >"$tmpdir/recorded-scheduling-fields"
+
+diff -u "$tmpdir/expected-scheduling-fields" "$tmpdir/recorded-scheduling-fields"
+
+for field in parquet_metadata_size_hint parquet_full_file_read_threshold
+do
+    field_count=$(
+        git show "$source_sha:crates/delta-funnel/src/report/json.rs" |
+            sed -n '/impl DeltaSourceReport {/,/impl MssqlDryRunOutputFieldReport {/p' |
+            grep -c "\"$field\""
+    )
+    if [ "$field_count" -ne 1 ]; then
+        echo "scheduling JSON field count mismatch: $field" >&2
+        exit 1
+    fi
+done
+
+printf 'verified %s ownership entries, %s public exports, and provider option/report fields at %s\n' \
+    "$(wc -l <"$tmpdir/recorded" | tr -d ' ')" \
+    "$(wc -l <"$tmpdir/recorded-exports" | tr -d ' ')" \
+    "$source_sha"

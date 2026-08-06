@@ -149,3 +149,264 @@ Reproduce this section with:
 ```console
 scripts/verify-delta-arrow-reader-extraction-baseline.sh
 ```
+
+## Public compatibility inventory
+
+The published 0.5.0 rustdoc is an exact signature reference because `delta-funnel-v0.5.0` and the frozen source commit have identical trees. #474 requires existing Delta Funnel public definitions to remain the source-compatible facade. Therefore no row requires a breaking change and no row uses `reexport_standalone_type`.
+
+<!-- public-compatibility:start -->
+
+| Crate-root item | Required cutover treatment | Exact 0.5.0 signature source |
+| --- | --- | --- |
+| `DeltaFunnelError` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/error/enum.DeltaFunnelError.html) |
+| `DeltaProtocolReport` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProtocolReport.html) |
+| `DeltaProviderSchedulingReport` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderSchedulingReport.html) |
+| `DeltaSourceReport` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaSourceReport.html) |
+| `SourceUsageStatus` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/enum.SourceUsageStatus.html) |
+| `DeltaSourceConfig` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaSourceConfig.html) |
+| `DeltaStorageOptions` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/type.DeltaStorageOptions.html) |
+| `PlannedDeltaSource` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.PlannedDeltaSource.html) |
+| `ProtocolPreflight` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.ProtocolPreflight.html) |
+| `load_delta_source` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_source.html) |
+| `load_delta_sources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_sources.html) |
+| `load_delta_source_with_tracing` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.load_delta_source_with_tracing.html) |
+| `preflight_delta_protocol` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_protocol.html) |
+| `preflight_delta_sources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_sources.html) |
+| `preflight_delta_protocol_with_tracing` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.preflight_delta_protocol_with_tracing.html) |
+| `DeltaProviderReadStatsSnapshot` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderReadStatsSnapshot.html) |
+| `DeltaProviderReaderBackend` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/enum.DeltaProviderReaderBackend.html) |
+| `DeltaProviderScanExecutionOptions` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaProviderScanExecutionOptions.html) |
+| `DeltaScanPartitionTargetDiagnosticInput` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `DeltaScanPartitionTargetDiagnosticOutput` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `DeltaScanPartitionTargetDiagnosticSource` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `DeltaScanPartitionTargetLocalEnvironmentDiagnostic` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `DeltaTableProviderConfig` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.DeltaTableProviderConfig.html) |
+| `QueryOptions` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.QueryOptions.html) |
+| `RegisteredDeltaSource` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.RegisteredDeltaSource.html) |
+| `RegisteredDeltaSources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/struct.RegisteredDeltaSources.html) |
+| `collect_delta_provider_read_stats` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.collect_delta_provider_read_stats.html) |
+| `datafusion_query_output_stream` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_query_output_stream.html) |
+| `datafusion_session_config` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_session_config.html) |
+| `datafusion_session_context` | `delta_funnel_owned_unchanged` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.datafusion_session_context.html) |
+| `delta_scan_partition_target_local_environment_diagnostic` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `derive_delta_scan_partition_target_diagnostic` | `delta_funnel_compatibility_wrapper` | exact hidden declaration below |
+| `register_delta_sources` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.register_delta_sources.html) |
+| `register_delta_sources_with_scan_execution_options` | `delta_funnel_compatibility_wrapper` | [rustdoc](https://docs.rs/delta-funnel/0.5.0/delta_funnel/fn.register_delta_sources_with_scan_execution_options.html) |
+
+<!-- public-compatibility:end -->
+
+The diagnostic surface is `#[doc(hidden)]`, so these exact declarations replace unavailable rustdoc pages:
+
+```rust
+pub struct DeltaScanPartitionTargetDiagnosticInput {
+    pub explicit_target_partitions: Option<usize>,
+    pub datafusion_target_partitions: Option<usize>,
+    pub available_parallelism: Option<usize>,
+    pub available_memory_bytes: Option<u64>,
+    pub unix_soft_file_descriptor_limit: Option<u64>,
+    pub min_default_partitions: usize,
+    pub parallelism_multiplier: usize,
+    pub file_descriptors_per_partition: usize,
+    pub available_memory_bytes_per_partition: u64,
+}
+
+pub struct DeltaScanPartitionTargetDiagnosticOutput {
+    pub target_partitions: usize,
+    pub source: DeltaScanPartitionTargetDiagnosticSource,
+    pub explicit_target_partitions: Option<usize>,
+    pub datafusion_target_partitions: Option<usize>,
+    pub available_parallelism: Option<usize>,
+    pub datafusion_target_cap: Option<usize>,
+    pub unix_file_descriptor_cap: Option<usize>,
+    pub memory_cap: Option<usize>,
+}
+
+pub struct DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+    pub policy_input: DeltaScanPartitionTargetDiagnosticInput,
+    pub memory_total_bytes: Option<u64>,
+    pub memory_available_bytes: Option<u64>,
+    pub unix_soft_file_descriptor_limit: Option<u64>,
+    pub unix_soft_file_descriptor_limit_status:
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+}
+
+pub enum DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus {
+    Unsupported,
+    Unknown,
+    Finite,
+    Unlimited,
+}
+
+pub enum DeltaScanPartitionTargetDiagnosticSource {
+    ExplicitOverride,
+    AvailableParallelismFallback,
+    StaticFallback,
+}
+
+pub fn derive_delta_scan_partition_target_diagnostic(
+    input: DeltaScanPartitionTargetDiagnosticInput,
+) -> Result<DeltaScanPartitionTargetDiagnosticOutput, DeltaFunnelError>;
+
+pub fn delta_scan_partition_target_local_environment_diagnostic()
+    -> DeltaScanPartitionTargetLocalEnvironmentDiagnostic;
+```
+
+## Error and report inventory
+
+### Reader-used DeltaFunnelError variants
+
+The existing `DeltaFunnelError` envelope, display contract, and Python mapping remain Delta Funnel-owned. Rows marked `reader_context_in_delta_funnel_wrapper` preserve the listed context while mapping the standalone error category through #474.
+
+| Variant | Exact fields | Context ownership after cutover |
+| --- | --- | --- |
+| `Config` | `message: String` | `delta_funnel_owned` |
+| `InvalidSourceName` | `name: String, reason: &'static str` | `delta_funnel_owned` |
+| `DuplicateSourceName` | `name: String` | `delta_funnel_owned` |
+| `InvalidSourceUri` | `reason: &'static str` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaSourceEngine` | `reason: &'static str` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaSnapshotLoad` | `reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaProtocolCompatibility` | `source_name: String, table_uri: String, snapshot_version: u64, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaSourceSchema` | `source_name: String, table_uri: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DataFusionRegistration` | `source_name: String, table_uri: String, reason: String` | `delta_funnel_owned` |
+| `DeltaScanProjection` | `source_name: String, table_uri: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanFilter` | `source_name: String, table_uri: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanConstruction` | `source_name: String, table_uri: String, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanMetadataExpansion` | `source_name: String, table_uri: String, snapshot_version: u64, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanFileTaskPlanning` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanFileTaskPartitionPlanning` | `source_name: String, table_uri: String, snapshot_version: u64, reason: String` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanFileRead` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, phase: DeltaScanFileReadPhase, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
+| `DeltaScanDeletionVector` | `source_name: String, table_uri: String, snapshot_version: u64, path: String, phase: DeltaScanDeletionVectorPhase, source: Box<delta_kernel::Error>` | `reader_context_in_delta_funnel_wrapper` |
+
+The two public phase enums used above are:
+
+- [`DeltaScanFileReadPhase`](https://docs.rs/delta-funnel/0.5.0/delta_funnel/error/enum.DeltaScanFileReadPhase.html): `TableUriParsing`, `FileMetadataConversion`, `FilePathResolution`, `ObjectStoreEngineConstruction`, `ParquetReadSetup`, `ParquetBatchRead`, `RowIndexGeneration`, `PredicateEvaluation`, `ArrowConversion`, `TransformApplication`, `UnsupportedReadMode`, `DeletionVectorPredicateRejection`, and `DeletionVectorMasking`.
+- [`DeltaScanDeletionVectorPhase`](https://docs.rs/delta-funnel/0.5.0/delta_funnel/error/enum.DeltaScanDeletionVectorPhase.html): `TableUriParsing`, `ObjectStoreEngineConstruction`, `DescriptorAccess`, `PayloadRead`, `SelectionVectorLengthMismatch`, and `SelectionVectorExhaustion`.
+
+### Report and JSON fields
+
+A `DeltaSourceReport` serializes reader information at `sources[]`. An exact execution profile embeds the same provider snapshot at `operators[].delta_provider_read_stats`.
+
+Protocol fields:
+
+```text
+source_name
+table_uri
+snapshot_version
+min_reader_version
+min_writer_version
+reader_features
+writer_features
+```
+
+Scheduling fields:
+
+<!-- scheduling-json-fields:start -->
+```text
+query_target_partitions
+reader_backend
+max_concurrent_file_reads_per_scan
+max_concurrent_file_reads_per_partition
+output_buffer_capacity_per_partition
+native_async_prefetch_file_count_per_partition
+parquet_metadata_size_hint
+parquet_full_file_read_threshold
+```
+<!-- scheduling-json-fields:end -->
+
+Provider read-stat fields:
+
+```text
+source_name
+snapshot_version
+reader_backend
+scan_metadata_exhausted
+scan_partitions_planned
+files_planned
+approximate_files_filtered_during_planning
+estimated_rows
+estimated_bytes
+parquet_data_file_range_get_operations
+parquet_data_file_full_get_operations
+parquet_data_file_bytes_received
+parquet_data_file_opened_bytes
+datafusion_output_batch_size
+scan_partitions_started
+scan_partitions_completed
+files_started
+files_completed
+dynamic_partition_files_pruned
+dynamic_partition_files_kept
+dynamic_filters_received
+dynamic_filters_accepted
+dynamic_filters_unsupported
+dynamic_filter_snapshots
+dynamic_partition_files_not_pruned_missing_metadata
+dynamic_partition_files_not_pruned_unsupported_expression
+batches_produced
+rows_produced
+deletion_vector_payloads_loaded
+deletion_vectors_applied
+deletion_vector_rows_deleted
+deletion_vector_failures
+deletion_vector_rejections
+```
+
+The terminal `delta_provider_parquet_io_summary` event authorizes only `source_name` after sanitization, `snapshot_version`, `reader_backend`, `outcome`, `metrics_available`, and the four Parquet counters when available. Reports additionally authorize the validated source name, sanitized URI, protocol versions/features, numeric scheduling/read metrics, usage state, reason codes, and phase names/status. They do not authorize storage options, credentials, URI userinfo/query/fragment, file paths, object paths, concrete ranges, headers, SQL, row values, or dependency error text.
+
+Existing focused redaction coverage includes `error.rs` reader error display tests; `source_load_errors_do_not_expose_secret_bearing_uri`; `snapshot_load_cause_redacts_secret_bearing_uris`; `snapshot_errors_do_not_expose_secret_bearing_uri`; `protocol_report_sanitizes_uri_context`; `compatibility_error_display_redacts_uri_credentials`; `provider_io_summary_sanitizes_hostile_source_names`; JSON `assert_no_secret_or_raw_sql_text`; execution-profile provider-stat redaction tests; and Python source repr/progress tests.
+
+### Rust and Python execution options
+
+Rust-only backend selection defaults to `DeltaProviderReaderBackend::NativeAsync`. `OfficialKernel` remains available through Rust. Python `ProviderScanOptions` does not expose a backend selector.
+
+<!-- provider-scan-options:start -->
+
+| Python key | Rust field and default | Accepted Python value | Validation and meaning |
+| --- | --- | --- | --- |
+| `max_concurrent_file_reads_per_scan` | same field, `None` | `int`; omission preserves `None` | Positive when supplied; `None` means derive scan-wide capacity. |
+| `max_concurrent_file_reads_per_partition` | same field, `3` | `int` | Positive. |
+| `output_buffer_capacity_per_partition` | same field, `1` | `int` | Positive. |
+| `native_async_prefetch_file_count_per_partition` | same field, `2` | `int` | Non-negative; zero disables prefetch. |
+| `parquet_metadata_size_hint` | same field, `Some(65_536)` | `int \| None` | Positive when present; `None` disables metadata prefetch. |
+| `parquet_full_file_read_threshold` | same field, `None` | `int \| None` | Positive when present; `None` disables full-file buffering. |
+
+<!-- provider-scan-options:end -->
+
+Python rejects booleans as integers, negative or oversized integers during `usize` extraction, zero for every positive-only field, and unknown keys before value conversion. Each Python key maps directly to the same Rust field, then the complete Rust `validate()` method runs. Both Parquet controls appear once in the Python type stub and once in scheduling JSON.
+
+## Dependency and feature baseline
+
+Workspace edition is `2024`; MSRV is `1.88`. The lockfile-resolved workspace feature union at capture is:
+
+```text
+arrow 58.3.0: arrow-csv,arrow-ipc,arrow-json,canonical_extension_types,chrono-tz,csv,default,ffi,ipc,json,prettyprint
+arrow-schema 58.3.0: bitflags,canonical_extension_types,ffi
+parquet 58.3.0: arrow,arrow-array,arrow-buffer,arrow-data,arrow-ipc,arrow-schema,arrow-select,async,base64,brotli,default,flate2,flate2-zlib-rs,futures,lz4,lz4_flex,object_store,simdutf8,snap,tokio,zstd
+datafusion 54.1.0: datafusion-sql,sql,sqlparser
+object_store 0.13.2: aws,azure,base64,cloud,default,form_urlencoded,fs,gcp,http,http-body-util,httparse,hyper,md-5,quick-xml,rand,reqwest,ring,rustls-pki-types,serde,serde_json,serde_urlencoded,tokio,walkdir
+tokio 1.52.3: bytes,default,fs,io-util,libc,macros,mio,net,rt,rt-multi-thread,socket2,sync,time,tokio-macros,windows-sys
+delta_kernel 0.25.0: arrow,arrow-58,arrow-conversion,arrow-expression,default,default-engine-base,internal-api,need-arrow,reqwest
+delta_kernel_default_engine 0.25.0: arrow,arrow-58,native-tls
+futures 0.3.32: alloc,async-await,default,executor,futures-executor,std
+futures-util 0.3.32: alloc,async-await,async-await-macro,channel,default,futures-channel,futures-io,futures-macro,futures-sink,io,memchr,sink,slab,std
+tracing 0.1.44: attributes,default,log,std,tracing-attributes
+```
+
+The direct manifest disables defaults for DataFusion and selects `sql`; disables defaults for `delta_kernel` and selects `arrow,internal-api`; disables defaults for `delta_kernel_default_engine` and selects `arrow,native-tls`; enables Parquet `async,object_store`; and enables Tokio `net,rt-multi-thread,sync,time`. The default engine's `native-tls` path resolves `native-tls 0.2.18` and `hyper-tls 0.6.0`. `rustls 0.23.40` is also present through the object-store dependency graph, not through a Delta Kernel rustls feature.
+
+The accepted #560 composition is one private `Arc<DeltaKernelEngineContext>` per loaded source. It owns the normalized table URL, one shared `Arc<dyn ObjectStore>`, and one `Arc<dyn delta_kernel::Engine + Send + Sync>` built with `DefaultEngineBuilder`. The loaded snapshot, scan planning, OfficialKernel reader, NativeAsync reader, and deletion-vector reader share that context; none reconstructs credentials, object stores, or engines. Source loading is the single construction-failure boundary.
+
+Published default-engine handlers own snapshot, JSON/checkpoint, scan-metadata, schema/protocol, Kernel evaluation, and OfficialKernel data-file behavior. NativeAsync alone performs direct Parquet reads over a clone of the same base store. Delta Funnel neither copies nor replaces upstream handlers or the upstream-selected default executor. The context stays alive through every snapshot, plan, reader, evaluator, deletion-vector operation, and stream reference, then drops with the last `Arc`; there is no global, static, thread-local, URI cache, or process-lifetime owner.
+
+NativeAsync uses the caller-owned DataFusion/Tokio runtime and async Parquet/object-store futures. OfficialKernel iteration runs on DataFusion's bounded `RecordBatchReceiverStreamBuilder::spawn_blocking` boundary. The reader creates no Tokio runtime, calls no `Runtime::block_on`, adds no custom executor, and has no global engine cache.
+
+The compact dependency proof commands are:
+
+```console
+cargo tree -p delta-funnel --edges normal --depth 1
+cargo metadata --format-version 1 --locked
+cargo tree -p delta-funnel -d
+```
+
+The resolved graph contains one compatibility-critical universe: Arrow/Parquet `58.3.0`, DataFusion `54.1.0`, object_store `0.13.2`, and Delta Kernel/default-engine `0.25.0`. No duplicate of those packages exists. Unrelated transitive packages do not cross the public Arrow/DataFusion/object-store boundary.
