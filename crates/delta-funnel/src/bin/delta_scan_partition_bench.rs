@@ -219,7 +219,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 79] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 80] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -299,6 +299,7 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 79] = [
     "provider_stats_parquet_data_file_full_get_operations_p50",
     "provider_stats_parquet_data_file_bytes_received_p50",
     "provider_stats_parquet_data_file_opened_bytes_p50",
+    "fixture_fingerprint",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -575,17 +576,24 @@ async fn write_provider_exec_benchmark_csv_async(
     writeln!(output, "{}", PROVIDER_EXEC_CSV_HEADER.join(","))?;
     for workload in &workloads {
         provider_exec_fixture_create_started(workload, config.storage_profile);
-        let table =
-            match ProviderExecDeltaTable::create(&temp_root, workload, config.storage_profile) {
-                Ok(table) => {
-                    provider_exec_fixture_create_completed(&table, workload);
-                    table
+        let table = match ProviderExecDeltaTable::create(
+            &temp_root,
+            workload,
+            config.storage_profile,
+            config.retain_fixtures,
+        ) {
+            Ok(table) => {
+                provider_exec_fixture_create_completed(&table, workload);
+                if config.retain_fixtures {
+                    eprintln!("retained provider-exec fixture: {}", table.path.display());
                 }
-                Err(error) => {
-                    provider_exec_fixture_create_failed(workload, config.storage_profile, &*error);
-                    return Err(error);
-                }
-            };
+                table
+            }
+            Err(error) => {
+                provider_exec_fixture_create_failed(workload, config.storage_profile, &*error);
+                return Err(error);
+            }
+        };
         let query_cases = workload
             .query_cases()
             .into_iter()
@@ -710,6 +718,10 @@ fn print_usage(mut output: impl Write) -> io::Result<()> {
     )?;
     writeln!(
         output,
+        "Use --provider-exec-retain-fixtures to keep generated Delta tables beneath the provider-exec temp directory."
+    )?;
+    writeln!(
+        output,
         "Use --provider-exec-workload, --provider-exec-query, --provider-exec-backend, and --provider-exec-scheduling-profile to run a focused provider-exec case."
     )?;
     writeln!(
@@ -757,6 +769,7 @@ struct ProviderExecConfig {
     execution_profile_mode: ExecutionProfileMode,
     parquet_metadata_size_hint: Option<usize>,
     parquet_full_file_read_threshold: Option<usize>,
+    retain_fixtures: bool,
     workload_filter: Option<String>,
     query_filter: Option<String>,
     backend_filter: Option<String>,
@@ -986,6 +999,8 @@ struct ProviderExecDeltaTable {
     file_count: usize,
     row_count: usize,
     data_file_bytes: u64,
+    fixture_fingerprint: String,
+    retain_fixture: bool,
     deletion_vector_file_count: usize,
     deletion_vector_deleted_rows: usize,
     deletion_vector_deleted_rows_per_file: usize,
@@ -1007,7 +1022,9 @@ impl Drop for ProviderExecDeltaTable {
         if let Some(server) = &self.delayed_http_server {
             server.shutdown();
         }
-        let _ = fs::remove_dir_all(&self.path);
+        if !self.retain_fixture {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -1302,6 +1319,8 @@ impl BenchmarkRunnerConfig {
                 provider_exec_parquet_full_file_read_threshold_seen = true;
                 provider_exec.parquet_full_file_read_threshold =
                     parse_provider_exec_parquet_bytes(argument, &value.to_string_lossy())?;
+            } else if arg == "--provider-exec-retain-fixtures" {
+                provider_exec.retain_fixtures = true;
             } else if arg == "--provider-exec-default-case" {
                 provider_exec.default_case = true;
             } else if arg == "--provider-exec-phase-aligned-workflow" {
@@ -1402,6 +1421,7 @@ impl Default for ProviderExecConfig {
             execution_profile_mode: ExecutionProfileMode::Disabled,
             parquet_metadata_size_hint: execution_options.parquet_metadata_size_hint,
             parquet_full_file_read_threshold: execution_options.parquet_full_file_read_threshold,
+            retain_fixtures: false,
             workload_filter: None,
             query_filter: None,
             backend_filter: None,
@@ -1593,6 +1613,7 @@ impl ProviderExecWorkloadCase {
             ),
             Self::synthetic_partitioned_event_log()?,
             Self::synthetic_wide_event_export()?,
+            Self::many_unequal_simple_orders(),
         ])
     }
 
@@ -1615,6 +1636,27 @@ impl ProviderExecWorkloadCase {
             schema_kind: ProviderExecSchemaKind::SimpleOrders,
             file_specs,
             deleted_row_indexes_per_file,
+        }
+    }
+
+    fn many_unequal_simple_orders() -> Self {
+        let file_specs = (0_usize..64)
+            .map(|file_index| ProviderExecFileSpec {
+                path: format!("part-{file_index:05}.parquet"),
+                rows: if file_index >= 32 && file_index.is_multiple_of(4) {
+                    8_192
+                } else {
+                    128
+                },
+                partition_date: None,
+            })
+            .collect();
+
+        Self {
+            name: "provider_many_unequal_files",
+            schema_kind: ProviderExecSchemaKind::SimpleOrders,
+            file_specs,
+            deleted_row_indexes_per_file: &[],
         }
     }
 
@@ -1853,6 +1895,7 @@ impl ProviderExecDeltaTable {
         temp_root: &std::path::Path,
         workload: &ProviderExecWorkloadCase,
         storage_profile: ProviderExecStorageProfile,
+        retain_fixture: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let path = temp_root.join(unique_benchmark_name(workload.name)?);
         let log_path = path.join("_delta_log");
@@ -1930,6 +1973,19 @@ impl ProviderExecDeltaTable {
             log_path.join("00000000000000000001.json"),
             format!("{}\n", add_actions.join("\n")),
         )?;
+        let mut fixture_files = workload
+            .file_specs
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        fixture_files.extend([
+            "_delta_log/00000000000000000000.json".to_owned(),
+            "_delta_log/00000000000000000001.json".to_owned(),
+        ]);
+        if workload.has_deletion_vectors() {
+            fixture_files.push(PROVIDER_EXEC_RELATIVE_DV_FILE.to_owned());
+        }
+        let fixture_fingerprint = provider_exec_fixture_fingerprint(&path, fixture_files)?;
         let delayed_http_server = if storage_profile.uses_delayed_http() {
             Some(ProviderExecDelayedHttpServer::start(
                 path.clone(),
@@ -1957,6 +2013,8 @@ impl ProviderExecDeltaTable {
             file_count: workload.file_count(),
             row_count: workload.row_count(),
             data_file_bytes,
+            fixture_fingerprint,
+            retain_fixture,
             deletion_vector_file_count: if workload.has_deletion_vectors() {
                 workload.file_count()
             } else {
@@ -1969,6 +2027,41 @@ impl ProviderExecDeltaTable {
 
     fn storage_profile_name(&self) -> &'static str {
         self.storage_profile.name
+    }
+}
+
+fn provider_exec_fixture_fingerprint(
+    root: &Path,
+    mut relative_paths: Vec<String>,
+) -> io::Result<String> {
+    relative_paths.sort_unstable();
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+
+    for relative_path in relative_paths {
+        let path_bytes = relative_path.as_bytes();
+        let path_len = u64::try_from(path_bytes.len()).map_err(io::Error::other)?;
+        fnv1a64_update(&mut hash, &path_len.to_le_bytes());
+        fnv1a64_update(&mut hash, path_bytes);
+
+        let mut file = File::open(root.join(&relative_path))?;
+        fnv1a64_update(&mut hash, &file.metadata()?.len().to_le_bytes());
+        loop {
+            let bytes_read = file.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            fnv1a64_update(&mut hash, &buffer[..bytes_read]);
+        }
+    }
+
+    Ok(format!("fnv1a64:{hash:016x}"))
+}
+
+fn fnv1a64_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(1_099_511_628_211);
     }
 }
 
@@ -3361,6 +3454,7 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         optional_u64(read_stats.parquet_data_file_full_get_operations),
         optional_u64(read_stats.parquet_data_file_bytes_received),
         optional_u64(read_stats.parquet_data_file_opened_bytes),
+        input.table.fixture_fingerprint.clone(),
     ]
 }
 
@@ -3405,6 +3499,7 @@ fn provider_exec_fixture_create_completed(
         file_count = table.file_count,
         row_count = table.row_count,
         data_file_bytes = table.data_file_bytes,
+        fixture_fingerprint = table.fixture_fingerprint,
         message = PROVIDER_EXEC_FIXTURE_CREATE_COMPLETED_EVENT
     );
 }
@@ -6248,23 +6343,11 @@ fn deterministic_file_hash(file: &SyntheticFile, seed: u64) -> u64 {
     let mut hash = 14_695_981_039_346_656_037_u64;
 
     if seed != DEFAULT_BENCHMARK_SEED {
-        for byte in seed.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(1_099_511_628_211);
-        }
+        fnv1a64_update(&mut hash, &seed.to_le_bytes());
     }
-    for byte in file.path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
-    for byte in file.rows.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
-    for byte in file.size_bytes.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
+    fnv1a64_update(&mut hash, file.path.as_bytes());
+    fnv1a64_update(&mut hash, &file.rows.to_le_bytes());
+    fnv1a64_update(&mut hash, &file.size_bytes.to_le_bytes());
 
     hash
 }
@@ -6870,6 +6953,7 @@ mod tests {
             "disabled",
             "--provider-exec-parquet-full-file-read-threshold",
             "1048576",
+            "--provider-exec-retain-fixtures",
             "--provider-exec-phase-aligned-workflow",
             "--provider-exec-detailed-profile",
             "--provider-exec-workload",
@@ -6894,6 +6978,7 @@ mod tests {
                 execution_profile_mode: ExecutionProfileMode::Detailed,
                 parquet_metadata_size_hint: None,
                 parquet_full_file_read_threshold: Some(1_048_576),
+                retain_fixtures: true,
                 workload_filter: Some("provider_partitioned_event_log_12m".to_owned()),
                 query_filter: Some("count_events".to_owned()),
                 backend_filter: Some("native_async".to_owned()),
@@ -7239,6 +7324,7 @@ mod tests {
         assert!(usage.contains("Use --provider-exec-repetitions"));
         assert!(usage.contains("Use --provider-exec-storage-profile"));
         assert!(usage.contains("Use --provider-exec-parquet-metadata-size-hint"));
+        assert!(usage.contains("Use --provider-exec-retain-fixtures"));
         assert!(usage.contains("Use --provider-exec-workload"));
         assert!(usage.contains("Use --provider-exec-default-case"));
         assert!(usage.contains("Use --provider-exec-phase-aligned-workflow"));
@@ -8395,6 +8481,7 @@ mod tests {
         assert!(
             PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_parquet_data_file_opened_bytes_p50")
         );
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"fixture_fingerprint"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
@@ -8450,7 +8537,8 @@ mod tests {
                 "provider_many_small_files_sparse_dv",
                 "provider_few_larger_files_sparse_dv",
                 "provider_partitioned_event_log_12m",
-                "provider_wide_event_export_13m"
+                "provider_wide_event_export_13m",
+                "provider_many_unequal_files"
             ]
         );
         assert_eq!(workloads[0].deletion_vector_deleted_rows(), 0);
@@ -8468,6 +8556,17 @@ mod tests {
         );
         assert_eq!(workloads[5].file_count(), 1_204);
         assert_eq!(workloads[5].row_count(), 13_394_789);
+        assert_eq!(workloads[6].file_count(), 64);
+        assert_eq!(workloads[6].row_count(), 72_704);
+        assert_eq!(
+            workloads[6]
+                .file_specs
+                .iter()
+                .take(32)
+                .map(|file| file.rows)
+                .sum::<usize>(),
+            4_096
+        );
         assert!(simple_query_names.contains(&"project_id"));
         assert!(simple_query_names.contains(&"count_rows"));
         assert!(simple_query_names.contains(&"filter_tail_ids"));
@@ -8678,6 +8777,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let source = load_delta_source_with_tracing(
             DeltaSourceConfig::new("orders", table.table_uri.clone())
@@ -8722,6 +8822,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let source = load_delta_source_with_tracing(
             DeltaSourceConfig::new("orders", table.table_uri.clone())
@@ -8742,6 +8843,67 @@ mod tests {
                 .join(synthetic_file_path(partition_date, 0))
                 .exists()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_fixture_fingerprint_is_stable_and_retention_is_opt_in()
+    -> Result<(), Box<dyn Error>> {
+        let workload =
+            ProviderExecWorkloadCase::simple_orders("test_provider_fingerprint", 1, 16, &[]);
+        let temporary = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+            false,
+        )?;
+        let retained = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+            true,
+        )?;
+        let temporary_path = temporary.path.clone();
+        let retained_path = retained.path.clone();
+
+        assert!(temporary.fixture_fingerprint.starts_with("fnv1a64:"));
+        assert_eq!(temporary.fixture_fingerprint, retained.fixture_fingerprint);
+        drop(temporary);
+        drop(retained);
+        assert!(!temporary_path.exists());
+        assert!(retained_path.exists());
+        fs::remove_dir_all(retained_path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn provider_exec_many_unequal_files_proves_file_pruning() -> Result<(), Box<dyn Error>> {
+        let workload = ProviderExecWorkloadCase::many_unequal_simple_orders();
+        let table = ProviderExecDeltaTable::create(
+            &env::temp_dir(),
+            &workload,
+            ProviderExecStorageProfile::local(),
+            false,
+        )?;
+        let query = workload.query_cases()[2];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let config = ProviderExecConfig::default();
+        let measurement = runtime.block_on(run_provider_exec_once(
+            &table,
+            query,
+            DeltaProviderReaderBackend::NativeAsync,
+            ProviderExecSchedulingProfile::default_execution_case(),
+            &config,
+            0,
+        ))?;
+
+        assert_eq!(measurement.read_stats.files_planned, 32);
+        assert_eq!(measurement.read_stats.files_started, 32);
+        assert_eq!(measurement.produced_rows, 68_608);
+
         Ok(())
     }
 
@@ -8767,6 +8929,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let query = workload.query_cases()[0];
         let scheduling_profile = ProviderExecSchedulingProfile {
@@ -8824,6 +8987,7 @@ mod tests {
             &env::temp_dir(),
             &workload,
             ProviderExecStorageProfile::local(),
+            false,
         )?;
         let query = workload.query_cases()[0];
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8871,6 +9035,7 @@ mod tests {
                 read_latency_micros: 1_000,
                 bandwidth_bytes_per_second: None,
             },
+            false,
         )?;
         let query = workload.query_cases()[1];
         let scheduling_profile = ProviderExecSchedulingProfile {
@@ -8939,6 +9104,8 @@ mod tests {
             file_count: 2,
             row_count: 16,
             data_file_bytes: 1024,
+            fixture_fingerprint: "fnv1a64:test".to_owned(),
+            retain_fixture: false,
             deletion_vector_file_count: 2,
             deletion_vector_deleted_rows: 4,
             deletion_vector_deleted_rows_per_file: 2,
@@ -9080,6 +9247,7 @@ mod tests {
         assert_eq!(row[76], "12");
         assert_eq!(row[77], "13");
         assert_eq!(row[78], "14");
+        assert_eq!(row[79], "fnv1a64:test");
     }
 
     #[test]
