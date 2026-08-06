@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-source_sha=46f23d8fbec7effe3806bf7507a0b43b91a594ec
+source_sha=e2650427ff5e2e1a7a4e5ef9eaf30969b217fec3
 document=docs/delta-arrow-reader-extraction-baseline.md
 repo_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
@@ -336,6 +336,93 @@ do
     fi
 done
 
+grep -F "$source_sha" "$document" >/dev/null
+
+benchmark_source=$tmpdir/delta_scan_partition_bench.rs
+git show "$source_sha:crates/delta-funnel/src/bin/delta_scan_partition_bench.rs" >"$benchmark_source"
+for token in \
+    'const BENCHMARK_SCHEMA_VERSION: u32 = 22;' \
+    'name: "full_rows"' \
+    'name: "provider_many_unequal_files"' \
+    '--provider-exec-parquet-metadata-size-hint' \
+    '--provider-exec-parquet-full-file-read-threshold' \
+    '--provider-exec-retain-fixtures' \
+    '"fixture_fingerprint"' \
+    '"provider_stats_parquet_data_file_range_get_operations_p50"' \
+    '"provider_stats_parquet_data_file_full_get_operations_p50"' \
+    '"provider_stats_parquet_data_file_bytes_received_p50"' \
+    '"provider_stats_parquet_data_file_opened_bytes_p50"'
+do
+    grep -F -- "$token" "$benchmark_source" >/dev/null
+done
+
+sed -n '/^CASES$/,/^END$/p' <<'CASE_LIST' | sed '1d;$d' | LC_ALL=C sort >"$tmpdir/expected-benchmark-cases"
+CASES
+local-native-dv
+local-native-full
+local-native-full-read-eligible
+local-native-full-read-ineligible
+local-native-many-small
+local-native-metadata-disabled
+local-native-metadata-undersized
+local-native-projection
+local-native-pruned-unequal
+local-official-dv
+local-official-full
+throttled-native-full
+END
+CASE_LIST
+
+awk -F '|' '
+    /<!-- controlled-benchmark-results:start -->/ { found_start = 1; capture = 1; next }
+    /<!-- controlled-benchmark-results:end -->/ { found_end = 1; capture = 0; next }
+    capture && /^\| `/ {
+        item = $2
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", item)
+        print item
+    }
+    END {
+        if (!found_start || !found_end) {
+            exit 1
+        }
+    }
+' "$document" | LC_ALL=C sort >"$tmpdir/recorded-benchmark-cases"
+
+diff -u "$tmpdir/expected-benchmark-cases" "$tmpdir/recorded-benchmark-cases"
+
+sed -n '/^FIXTURES$/,/^END$/p' <<'FIXTURE_LIST' | sed '1d;$d' | LC_ALL=C sort >"$tmpdir/expected-fixtures"
+FIXTURES
+provider_few_larger_files fnv1a64:a3f6509701b2a6fc
+provider_few_larger_files_sparse_dv fnv1a64:e1509da31486f25a
+provider_many_small_files fnv1a64:05a1a9efa301e8be
+provider_many_unequal_files fnv1a64:e29235befe1d61e3
+END
+FIXTURE_LIST
+
+awk -F '|' '
+    /<!-- benchmark-fixture-fingerprints:start -->/ { found_start = 1; capture = 1; next }
+    /<!-- benchmark-fixture-fingerprints:end -->/ { found_end = 1; capture = 0; next }
+    capture && /^\| `/ {
+        fixture = $2
+        fingerprint = $4
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", fixture)
+        gsub(/^[[:space:]]*`|`[[:space:]]*$/, "", fingerprint)
+        print fixture " " fingerprint
+    }
+    END {
+        if (!found_start || !found_end) {
+            exit 1
+        }
+    }
+' "$document" | LC_ALL=C sort >"$tmpdir/recorded-fixtures"
+
+diff -u "$tmpdir/expected-fixtures" "$tmpdir/recorded-fixtures"
+grep -Fx '### Resolved frozen-harness gaps' "$document" >/dev/null
+if grep -F '### Blocking frozen-harness gaps' "$document" >/dev/null; then
+    echo "frozen benchmark blockers remain in completed baseline" >&2
+    exit 1
+fi
+
 for heading in \
     "## Source identity" \
     "## Reader ownership map" \
@@ -360,7 +447,7 @@ if grep -E -n 'TBD|TODO|PLACEHOLDER' "$document"; then
     exit 1
 fi
 
-printf 'verified %s ownership entries, %s public exports, provider fields, and redaction at %s; performance blockers remain documented\n' \
+printf 'verified %s ownership entries, %s public exports, provider fields, benchmark cases, fixture fingerprints, and redaction at %s\n' \
     "$(wc -l <"$tmpdir/recorded" | tr -d ' ')" \
     "$(wc -l <"$tmpdir/recorded-exports" | tr -d ' ')" \
     "$source_sha"

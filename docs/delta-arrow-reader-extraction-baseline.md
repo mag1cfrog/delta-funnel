@@ -4,11 +4,11 @@ This is the evidence artifact required by [issue #459](https://github.com/mag1cf
 
 ## Source identity
 
-- Source commit: `46f23d8fbec7effe3806bf7507a0b43b91a594ec` from Delta Funnel's default `main` branch.
+- Source commit: `e2650427ff5e2e1a7a4e5ef9eaf30969b217fec3` from Delta Funnel's default `main` branch.
 - Package identity: workspace package `delta-funnel` version `0.5.0`.
-- Release identity: tag `delta-funnel-v0.5.0` at `29c7cabf02451fbfa330f9db95eb1f9fc65c8f2e`; the source commit is the immediately following release-PR merge commit.
-- Required reader changes: the source commit contains #631 (`a3060716`), #633 (`dfed15da`), #635 (`d4b55edc`), and #639 (`d57775fb`).
-- Inventory capture: `2026-08-06T11:04:33Z` UTC.
+- Release identity: tag `delta-funnel-v0.5.0` at `29c7cabf02451fbfa330f9db95eb1f9fc65c8f2e`; the package remains version `0.5.0`, and the source commit is the later benchmark-only merge for PR #640.
+- Required reader changes: the source commit contains #631 (`a3060716`), #633 (`dfed15da`), #635 (`d4b55edc`), #639 (`d57775fb`), and the #459 benchmark prerequisite in PR #640 (`e2650427`).
+- Inventory capture: `2026-08-06T15:36:25Z` UTC.
 - Rust toolchain: `rustc 1.97.0 (2d8144b78 2026-07-07)`, host `x86_64-unknown-linux-gnu`, LLVM `22.1.6`.
 - Host: `Linux x86_64`, available parallelism `16`.
 - Benchmark build profile: Cargo `release`.
@@ -28,6 +28,7 @@ The active extraction source is the v0.5.0 state above. The #561 TestPyPI `0.4.2
 | [#560](https://github.com/mag1cfrog/delta-funnel/issues/560) | closed, completed | PR #578, `a24edbad9b72c8c74d38500d640c1be2416cfb47` |
 | [#561](https://github.com/mag1cfrog/delta-funnel/issues/561) | closed, not planned after evidence found no justified optimization child | no closing PR; accepted result is included in the source commit |
 | [#612](https://github.com/mag1cfrog/delta-funnel/issues/612) | closed, completed | PR #613, `2689ba21713bb1ff360dc6ed423af2617acf5f75` |
+| [#640](https://github.com/mag1cfrog/delta-funnel/pull/640) | closed, completed benchmark prerequisite for #459 | `e2650427ff5e2e1a7a4e5ef9eaf30969b217fec3` |
 | [#447](https://github.com/mag1cfrog/delta-funnel/issues/447) and its 26 native children | open, implementation-ready | #459 is the first child and the family parent is the membership authority |
 
 There were no open pull requests in the repository at capture. The planned open work touching the inventory is the #447 family recorded by its parent; it is not competing source drift.
@@ -53,7 +54,7 @@ ccb975ddc2f06021ec6b26efffa5fad91fe7f373 23 delta_funnel_integration Cargo.toml
 7b8732c9e0e53bfcbdb998c73267032203ea268c 2994 delta_funnel_only crates/delta-funnel-python/src/progress.rs
 0ff7e9f00915c3c265c9dc64166bd320697edaed 4848 delta_funnel_integration crates/delta-funnel-python/src/session.rs
 cd30cbde2c8ba6efb37f765cda258d18e5ff15c8 79 delta_funnel_integration crates/delta-funnel/Cargo.toml
-89a65aa4c5dc5fa12715c89e157ed8102e43a49b 8995 delta_funnel_only crates/delta-funnel/src/bin/delta_scan_partition_bench.rs
+52284e22a5deb0cddce4aa7257012468dc88f25e 9415 delta_funnel_only crates/delta-funnel/src/bin/delta_scan_partition_bench.rs
 8d9f81687958575d86f2ea9e9fa7740a7e6cfef0 1043 delta_funnel_integration crates/delta-funnel/src/error.rs
 9961345ab58573c4d211b8977d77eb05fc08c5af 187 delta_funnel_integration crates/delta-funnel/src/lib.rs
 f4c153f7dba545bb7a9492b375fba792709be1bd 2182 delta_funnel_only crates/delta-funnel/src/observability.rs
@@ -142,7 +143,7 @@ a5d74f6c7cee2c2bb183c2fb4bcd29e2572aa7b1 4 standalone_datafusion docs/scan-parti
 ```
 <!-- reader-ownership-map:end -->
 
-Inventory digest (SHA-256 of sorted `git_blob repository_path` lines): `a9c7f6fff06cc2f1a4b32589ff46cd531a411d969e6dea47fc0f6f075a296866`.
+Inventory digest (SHA-256 of sorted `git_blob repository_path` lines): `7b7f406f0713c6414a36d28cd45a761e036cea027267ed2c28dfb73dd8233db7`.
 
 Reproduce this section with:
 
@@ -421,34 +422,35 @@ The production tree under test is the frozen source commit. This baseline branch
 | `cargo test --locked -p delta-funnel --all-features query_engine::datafusion` | pass: 635, fail: 0 | Provider registration/execution, partition targets, longest-file-first grouping, scheduling, both Parquet controls, cancellation/backpressure, and DataFusion public behavior. |
 | `cargo test --locked -p delta-funnel --all-features report` | pass: 201, fail: 0, ignored: 3 opt-in external trace tests | #448/#449 metrics, JSON, terminal summaries, source reports, and #612 exact profiles. |
 | `cargo test --locked -p delta-funnel --all-features perfetto_profile` | pass: 81, fail: 0, ignored: 3 opt-in external trace tests | Current #545 ranked artifact, report, terminal, sanitization, and bounded-output behavior. |
-| `cargo test --locked -p delta-funnel --all-features --bin delta_scan_partition_bench` | pass: 68, fail: 0 | Benchmark parsing, fixture generation, CSV schema, storage profiles, and summary math. |
+| `cargo test --locked -p delta-funnel --all-features --bin delta_scan_partition_bench` | pass: 71, fail: 0 | Benchmark parsing, fixture generation, CSV schema, storage profiles, and summary math. |
 | `cargo test --locked -p delta-funnel-python --all-features` | pass: 192, fail: 0, ignored: 9 SQL Server integration tests owned by `cargo xtask sqlserver-test` | Python option parsing/defaults/validation, API stubs, reports, progress, and redaction. |
 
 The normal repository gates also passed:
 
 ```console
-cargo fmt --all --check
+cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-features
 git diff --check
 ```
 
-The full workspace test result was 1,471 Delta Funnel library tests passed with three documented opt-in external-trace tests ignored; 68 benchmark tests, 21 Rust integration tests, 192 Python binding tests, nine xtask tests, and one doctest passed. Nine Python SQL Server tests remained explicitly ignored because their owning command requires the external SQL Server lane. There were no failures and no unexplained accepted failures.
+The full workspace test result was 1,471 Delta Funnel library tests passed with three documented opt-in external-trace tests ignored; 71 benchmark tests, 21 Rust integration tests, 192 Python binding tests, nine xtask tests, and one doctest passed. Nine Python SQL Server tests remained explicitly ignored because their owning command requires the external SQL Server lane. There were no failures and no unexplained accepted failures.
 
 ## Controlled performance and I/O baseline
 
 ### Supported diagnostic capture
 
-The existing release binary was built with `Cargo.lock` SHA-256 `be88d1fac0c3ac6ee221138c702c0bd10b0a9e21cc597819ea95968099948a8b`. Capture used benchmark CSV schema 21, seed 0, two warm-up repetitions, five measured repetitions, and scheduling profile `prefetch_2_ap_target_scan_3x`: 16 scan partitions, scan-wide capacity 48, per-partition capacity 3, output buffer 1, and NativeAsync file prefetch 2. NativeAsync therefore used the 65,536-byte metadata hint and disabled full-file buffering; OfficialKernel ignores both settings. Capture completed on an otherwise idle host at `2026-08-06T12:15:36Z` UTC.
+The release binary was built with `Cargo.lock` SHA-256 `be88d1fac0c3ac6ee221138c702c0bd10b0a9e21cc597819ea95968099948a8b`. Capture used benchmark CSV schema 22, seed 0, two warm-up repetitions, five measured repetitions, and scheduling profile `prefetch_2_ap_target_scan_3x`: 16 scan partitions, scan-wide capacity 48, per-partition capacity 3, output buffer 1, and NativeAsync file prefetch 2. OfficialKernel ignores both Parquet controls and reports its four I/O counters as unavailable. Capture completed on an otherwise idle host at `2026-08-06T15:38:27Z` UTC.
 
 The clean-checkout command pattern is:
 
 ```bash
-git checkout --detach 46f23d8fbec7effe3806bf7507a0b43b91a594ec
+git checkout --detach e2650427ff5e2e1a7a4e5ef9eaf30969b217fec3
 cargo build --locked --release -p delta-funnel --bin delta_scan_partition_bench
 run_case() {
   name=$1 workload=$2 query=$3 backend=$4 storage=$5
+  metadata_hint=$6 full_read_threshold=$7
   for repetitions in 2 5; do
     target/release/delta_scan_partition_bench \
       --mode provider-exec --seed 0 \
@@ -457,50 +459,73 @@ run_case() {
       --provider-exec-query "$query" \
       --provider-exec-backend "$backend" \
       --provider-exec-scheduling-profile prefetch_2_ap_target_scan_3x \
+      --provider-exec-parquet-metadata-size-hint "$metadata_hint" \
+      --provider-exec-parquet-full-file-read-threshold "$full_read_threshold" \
       --provider-exec-repetitions "$repetitions" \
       --output "target/issue-459-${name}-${repetitions}.csv"
   done
 }
-run_case local-native-projection provider_few_larger_files project_id native_async local
-run_case local-official-projection provider_few_larger_files project_id official_kernel local
-run_case local-native-filtered provider_few_larger_files filter_tail_ids native_async local
-run_case local-native-many-small provider_many_small_files project_id native_async local
-run_case local-native-dv provider_few_larger_files_sparse_dv project_id native_async local
-run_case local-official-dv provider_few_larger_files_sparse_dv project_id official_kernel local
-run_case throttled-native-projection provider_few_larger_files project_id native_async s3_throttled
+run_case local-native-full provider_few_larger_files full_rows native_async local 65536 disabled
+run_case local-native-projection provider_few_larger_files project_id native_async local 65536 disabled
+run_case local-official-full provider_few_larger_files full_rows official_kernel local 65536 disabled
+run_case local-native-pruned-unequal provider_many_unequal_files filter_tail_ids native_async local 65536 disabled
+run_case local-native-many-small provider_many_small_files project_id native_async local 65536 disabled
+run_case local-native-metadata-disabled provider_few_larger_files full_rows native_async local disabled disabled
+run_case local-native-metadata-undersized provider_few_larger_files full_rows native_async local 8 disabled
+run_case local-native-full-read-eligible provider_few_larger_files full_rows native_async local 65536 1000000
+run_case local-native-full-read-ineligible provider_few_larger_files full_rows native_async local 65536 1000
+run_case local-native-dv provider_few_larger_files_sparse_dv project_id native_async local 65536 disabled
+run_case local-official-dv provider_few_larger_files_sparse_dv project_id official_kernel local 65536 disabled
+run_case throttled-native-full provider_few_larger_files full_rows native_async s3_throttled 65536 disabled
 ```
 
-For each call, repetition count 2 is warm-up and count 5 is measured. Fixture throughput is `data_file_bytes / total_micros_p50`; it is not observed object-store traffic. Rows per second and all deterministic observations come directly from schema-21 CSV.
+For each call, repetition count 2 is warm-up and count 5 is measured. Fixture throughput is `data_file_bytes / total_micros_p50`; it is a stable whole-fixture diagnostic, not observed object-store traffic. Source rows per second and every deterministic observation below come directly from the schema-22 measured row. Slash-separated columns are ordered exactly as named.
 
-| Workload / query | Storage / backend | p50 us | Fixture MiB/s | Source rows/s | Deterministic observations |
-| --- | --- | ---: | ---: | ---: | --- |
-| `provider_few_larger_files` / `project_id` | `local` / `native_async` | 658 | 1,188.14 | 49,799,392 | 4 files and 32,768 rows planned/started/completed; 32,768 rows in 4 batches. |
-| `provider_few_larger_files` / `project_id` | `local` / `official_kernel` | 852 | 917.60 | 38,460,093 | 4 files and 32,768 rows planned/started/completed; 32,768 rows in 36 batches. |
-| `provider_few_larger_files` / `filter_tail_ids` | `local` / `native_async` | 818 | 955.74 | 40,058,679 | 4 files started; 28,672 rows in 4 batches; this filters 4,096 rows but prunes no file. |
-| `provider_many_small_files` / `project_id` | `local` / `native_async` | 1,776 | 126.99 | 4,612,612 | 64 files and 8,192 rows planned/started/completed; 8,192 rows in 64 batches. |
-| `provider_few_larger_files_sparse_dv` / `project_id` | `local` / `native_async` | 1,417 | 551.73 | 23,124,911 | 4 DVs loaded/applied; 12 rows deleted; 32,756 rows in 4 batches. |
-| `provider_few_larger_files_sparse_dv` / `project_id` | `local` / `official_kernel` | 959 | 815.22 | 34,168,925 | 4 DVs loaded/applied; 12 rows deleted; 32,756 rows in 36 batches. |
-| `provider_few_larger_files` / `project_id` | `s3_throttled` / `native_async` | 91,726 | 8.52 | 357,237 | Delayed localhost object-store profile; 4 files and 32,768 rows completed in 4 batches. |
+<!-- controlled-benchmark-results:start -->
+| Case | p50 us | Fixture MiB/s | Source rows/s | Files planned / started | Rows / batches | Metadata hint / full threshold | Range / full GETs | Bytes received / opened | DV loaded / applied / deleted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `local-native-dv` | 1349 | 579.54 | 24290585 | 4 / 4 | 32756 / 4 | 65536 / disabled | 8 / 0 | 446708 / 819772 | 4 / 4 / 12 |
+| `local-native-full` | 913 | 856.29 | 35890470 | 4 / 4 | 32768 / 4 | 65536 / disabled | 8 / 0 | 1078950 / 819772 | 0 / 0 / 0 |
+| `local-native-full-read-eligible` | 811 | 963.99 | 40404438 | 4 / 4 | 32768 / 4 | 65536 / 1000000 | 0 / 4 | 819772 / 819772 | 0 / 0 / 0 |
+| `local-native-full-read-ineligible` | 916 | 853.49 | 35772925 | 4 / 4 | 32768 / 4 | 65536 / 1000 | 8 / 0 | 1078950 / 819772 | 0 / 0 / 0 |
+| `local-native-many-small` | 1853 | 121.71 | 4420939 | 64 / 64 | 8192 / 64 | 65536 / disabled | 128 / 0 | 278921 / 236489 | 0 / 0 / 0 |
+| `local-native-metadata-disabled` | 911 | 858.17 | 35969264 | 4 / 4 | 32768 / 4 | disabled / disabled | 12 / 0 | 819343 / 819772 | 0 / 0 / 0 |
+| `local-native-metadata-undersized` | 983 | 795.32 | 33334689 | 4 / 4 | 32768 / 4 | 8 / disabled | 12 / 0 | 819343 / 819772 | 0 / 0 / 0 |
+| `local-native-projection` | 725 | 1078.34 | 45197241 | 4 / 4 | 32768 / 4 | 65536 / disabled | 8 / 0 | 446708 / 819772 | 0 / 0 / 0 |
+| `local-native-pruned-unequal` | 1440 | 1235.69 | 50488888 | 32 / 32 | 68608 / 32 | 65536 / disabled | 64 / 0 | 1001608 / 1748159 | 0 / 0 / 0 |
+| `local-official-dv` | 970 | 805.97 | 33781443 | 4 / 4 | 32756 / 36 | 65536 / disabled | unavailable / unavailable | unavailable / unavailable | 4 / 4 / 12 |
+| `local-official-full` | 1395 | 560.43 | 23489605 | 4 / 4 | 32768 / 36 | 65536 / disabled | unavailable / unavailable | unavailable / unavailable | 0 / 0 / 0 |
+| `throttled-native-full` | 97793 | 7.99 | 335075 | 4 / 4 | 32768 / 4 | 65536 / disabled | 8 / 0 | 1078950 / 819772 | 0 / 0 / 0 |
+<!-- controlled-benchmark-results:end -->
 
-These rows are diagnostic evidence only, not an accepted complete #459 performance baseline. The filtered case did not prune a file, and the equal-sized many-small-file fixture cannot measure the longest-file-first ordering advantage.
+The full and projection rows separate column materialization cost. The unequal fixture places 4,096 rows in its first 32 small files; `filter_tail_ids` excludes those files during planning, then schedules 32 retained files containing eight 8,192-row files and 24 128-row files through the accepted longest-file-first/lightest-partition algorithm. Metadata prefetch default, disabled, and 8-byte undersized modes produce 8, 12, and 12 range GETs respectively. A 1,000,000-byte full-file threshold admits all four larger files and produces four full GETs with no range GETs; a 1,000-byte threshold admits none. The local NativeAsync rows retain metered request and byte observations, while the throttled row exercises the delayed localhost object-store profile.
 
 ### Fixture provenance and portability gate
 
-The provider-exec fixtures are generated locally by `crates/delta-funnel/src/bin/delta_scan_partition_bench.rs`, frozen blob `89a65aa4c5dc5fa12715c89e157ed8102e43a49b`, using Arrow/Parquet 58.3.0 from the locked graph. Their source and generated output are covered by the repository's Apache-2.0 license. The three captured shapes are four files by 8,192 rows, 64 files by 128 rows, and four files by 8,192 rows with three deleted indexes per file. They contain deterministic synthetic values and no external or private data.
+The provider-exec fixtures are generated locally by `crates/delta-funnel/src/bin/delta_scan_partition_bench.rs`, frozen blob `52284e22a5deb0cddce4aa7257012468dc88f25e`, using Arrow/Parquet 58.3.0 from the locked graph. Their source and generated output are covered by the repository's Apache-2.0 license. They contain deterministic synthetic values and no external or private data.
 
-The generator deletes each temporary table at process exit and emits neither a canonical directory digest nor per-file fingerprints. The source recipe is legally portable, but identical generated-content fingerprints cannot be proved from a clean checkout through the existing public command. Therefore the required standalone fixture fingerprint gate is not passed.
+<!-- benchmark-fixture-fingerprints:start -->
+| Fixture | Shape | Canonical content fingerprint |
+| --- | --- | --- |
+| `provider_few_larger_files` | 4 files by 8,192 rows | `fnv1a64:a3f6509701b2a6fc` |
+| `provider_many_small_files` | 64 files by 128 rows | `fnv1a64:05a1a9efa301e8be` |
+| `provider_many_unequal_files` | 32 initial 128-row files, then 8 8,192-row and 24 128-row files | `fnv1a64:e29235befe1d61e3` |
+| `provider_few_larger_files_sparse_dv` | 4 files by 8,192 rows with three deleted indexes per file | `fnv1a64:e1509da31486f25a` |
+<!-- benchmark-fixture-fingerprints:end -->
 
-### Blocking frozen-harness gaps
+The fingerprint is FNV-1a 64 over each sorted repository-relative generated path, path length, file size, and file bytes. Every warm-up and measured generation reproduced the same value for its fixture. `--provider-exec-retain-fixtures` keeps a generated Delta table beneath the selected temporary root when an extraction child needs to copy or independently inspect it; the default still removes it. The standalone DataFusion fixture path is to copy this Apache-2.0 deterministic recipe without a production dependency and require the same fingerprints before accepting post-extraction comparisons. This clean-checkout recipe, portable ownership, and repeated identical output pass the fixture gate without committing generated data.
 
-The following are blockers to closing #459, not accepted omissions:
+### Resolved frozen-harness gaps
 
-1. The frozen CLI has no full-column provider query; all simple-order queries project or aggregate `id`.
-2. The CLI has no options or scheduling profiles for metadata prefetch disabled, an undersized hint, or an enabled full-file threshold. Only the 65,536-byte/disabled defaults can be measured.
-3. Schema-21 CSV omits all four #448 Parquet request/byte counters, and provider-exec tracing records only stats-collection lifecycle, so recording/throttled request and byte observations cannot be retained.
-4. The available filtered small fixture did not prune a file, and the many-small-file fixture uses equal-sized files, so the required pruned and longest-file-first performance observations are absent.
-5. Generated fixtures are deleted without a stable content fingerprint, blocking the required identical-fingerprint standalone reproduction proof.
+PR #640 resolved the five previously blocking harness gaps in the single frozen source:
 
-Issue #459 forbids changing or inventing a benchmark in this baseline and requires every row to reproduce from the frozen source SHA. Consequently these gaps cannot be repaired by documentation or verifier changes. The baseline must remain open until the issue authority supplies a frozen-source-compatible procedure or explicitly authorizes a benchmark-only prerequisite and a refreshed single source SHA.
+1. `full_rows` provides a full-column provider scan.
+2. Both Parquet controls accept explicit positive byte values or `disabled`.
+3. Schema-22 CSV records the exact settings and all four #448 request/byte counters.
+4. `provider_many_unequal_files` provides a pruned, size-skewed scheduling case.
+5. Every generated comparison fixture emits a stable canonical content fingerprint and supports opt-in retention.
+
+The controlled performance and fixture portability gates are complete at the source SHA above. Later extraction work must compare against this one frozen baseline and must not substitute a newer benchmark or source commit.
 
 ### Committed-artifact redaction
 
