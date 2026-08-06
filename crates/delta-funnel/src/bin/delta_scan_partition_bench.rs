@@ -109,7 +109,7 @@ const HOST_PROBE_DEFAULT_LOCAL_IO_BYTES: usize = MIB as usize;
 const HOST_PROBE_MAX_LOCAL_IO_BYTES: usize = 64 * MIB as usize;
 const HOST_PROBE_DEFAULT_LOCAL_IO_REPETITIONS: usize = 3;
 const HOST_PROBE_MAX_LOCAL_IO_REPETITIONS: usize = 128;
-const BENCHMARK_SCHEMA_VERSION: u32 = 21;
+const BENCHMARK_SCHEMA_VERSION: u32 = 22;
 const DEFAULT_BENCHMARK_SEED: u64 = 0;
 const DEFAULT_PROVIDER_EXEC_REPETITIONS: usize = 3;
 const PROVIDER_EXEC_DEFAULT_CASE_WORKLOAD: &str = "provider_partitioned_event_log_12m";
@@ -219,7 +219,7 @@ const BENCHMARK_CSV_HEADER: [&str; 80] = [
     "host_local_io_probe_latency_micros",
     "host_local_io_probe_throughput_bytes_per_second",
 ];
-const PROVIDER_EXEC_CSV_HEADER: [&str; 73] = [
+const PROVIDER_EXEC_CSV_HEADER: [&str; 79] = [
     "benchmark_schema_version",
     "benchmark_mode",
     "host_os",
@@ -293,6 +293,12 @@ const PROVIDER_EXEC_CSV_HEADER: [&str; 73] = [
     "execution_profile_operator_count_max",
     "execution_profile_metric_count_max",
     "execution_profile_mode",
+    "parquet_metadata_size_hint",
+    "parquet_full_file_read_threshold",
+    "provider_stats_parquet_data_file_range_get_operations_p50",
+    "provider_stats_parquet_data_file_full_get_operations_p50",
+    "provider_stats_parquet_data_file_bytes_received_p50",
+    "provider_stats_parquet_data_file_opened_bytes_p50",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -652,6 +658,9 @@ async fn write_provider_exec_benchmark_csv_async(
                             backend: *backend,
                             scheduling_profile: *scheduling_profile,
                             execution_profile_mode: config.execution_profile_mode,
+                            parquet_metadata_size_hint: config.parquet_metadata_size_hint,
+                            parquet_full_file_read_threshold: config
+                                .parquet_full_file_read_threshold,
                             summary: &summary,
                         })
                         .join(",")
@@ -1033,6 +1042,10 @@ struct ProviderExecReadStatsMeasurement {
     files_planned: u64,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
+    parquet_data_file_range_get_operations: Option<u64>,
+    parquet_data_file_full_get_operations: Option<u64>,
+    parquet_data_file_bytes_received: Option<u64>,
+    parquet_data_file_opened_bytes: Option<u64>,
     scan_partitions_started: u64,
     scan_partitions_completed: u64,
     files_started: u64,
@@ -1079,6 +1092,10 @@ struct ProviderExecReadStatsSummary {
     files_planned: u64,
     estimated_rows: Option<u64>,
     estimated_bytes: Option<u64>,
+    parquet_data_file_range_get_operations: Option<u64>,
+    parquet_data_file_full_get_operations: Option<u64>,
+    parquet_data_file_bytes_received: Option<u64>,
+    parquet_data_file_opened_bytes: Option<u64>,
     scan_partitions_started: u64,
     scan_partitions_completed: u64,
     files_started: u64,
@@ -1118,6 +1135,8 @@ struct ProviderExecCsvRowInput<'a> {
     backend: DeltaProviderReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     execution_profile_mode: ExecutionProfileMode,
+    parquet_metadata_size_hint: Option<usize>,
+    parquet_full_file_read_threshold: Option<usize>,
     summary: &'a ProviderExecSummary,
 }
 
@@ -2930,6 +2949,26 @@ fn provider_exec_read_stats_measurement(
         estimated_bytes: sum_provider_exec_read_stats_optional(
             snapshots.iter().map(|snapshot| snapshot.estimated_bytes),
         ),
+        parquet_data_file_range_get_operations: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_range_get_operations),
+        ),
+        parquet_data_file_full_get_operations: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_full_get_operations),
+        ),
+        parquet_data_file_bytes_received: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_bytes_received),
+        ),
+        parquet_data_file_opened_bytes: sum_provider_exec_read_stats_optional(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parquet_data_file_opened_bytes),
+        ),
         scan_partitions_started: snapshots
             .iter()
             .map(|snapshot| snapshot.scan_partitions_started)
@@ -3041,6 +3080,26 @@ fn provider_exec_read_stats_summary(
         ),
         estimated_bytes: provider_exec_read_stats_optional_max(
             stats.iter().map(|stats| stats.estimated_bytes),
+        ),
+        parquet_data_file_range_get_operations: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_range_get_operations),
+        ),
+        parquet_data_file_full_get_operations: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_full_get_operations),
+        ),
+        parquet_data_file_bytes_received: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_bytes_received),
+        ),
+        parquet_data_file_opened_bytes: provider_exec_read_stats_optional_p50(
+            stats
+                .iter()
+                .map(|stats| stats.parquet_data_file_opened_bytes),
         ),
         scan_partitions_started: provider_exec_read_stats_counter_p50(&stats, |stats| {
             stats.scan_partitions_started
@@ -3180,6 +3239,15 @@ fn provider_exec_read_stats_optional_max(
     values.into_iter().flatten().max()
 }
 
+fn provider_exec_read_stats_optional_p50(
+    values: impl IntoIterator<Item = Option<u64>>,
+) -> Option<u64> {
+    Some(percentile(
+        &values.into_iter().collect::<Option<Vec<_>>>()?,
+        50,
+    ))
+}
+
 fn provider_exec_scan_metadata_exhausted_value(value: ProviderExecScanMetadataExhausted) -> String {
     match value {
         ProviderExecScanMetadataExhausted::True => "true",
@@ -3287,6 +3355,12 @@ fn provider_exec_csv_row(input: ProviderExecCsvRowInput<'_>) -> Vec<String> {
         summary.execution_profile_operator_count_max.to_string(),
         summary.execution_profile_metric_count_max.to_string(),
         execution_profile_mode_name(input.execution_profile_mode).to_owned(),
+        optional_usize(input.parquet_metadata_size_hint),
+        optional_usize(input.parquet_full_file_read_threshold),
+        optional_u64(read_stats.parquet_data_file_range_get_operations),
+        optional_u64(read_stats.parquet_data_file_full_get_operations),
+        optional_u64(read_stats.parquet_data_file_bytes_received),
+        optional_u64(read_stats.parquet_data_file_opened_bytes),
     ]
 }
 
@@ -7819,6 +7893,18 @@ mod tests {
     }
 
     #[test]
+    fn provider_exec_optional_p50_preserves_unavailable_metrics() {
+        assert_eq!(
+            provider_exec_read_stats_optional_p50([Some(10), Some(30), Some(20)]),
+            Some(20)
+        );
+        assert_eq!(
+            provider_exec_read_stats_optional_p50([Some(10), None]),
+            None
+        );
+    }
+
+    #[test]
     fn throughput_per_second_handles_zero_and_integer_rate() {
         assert_eq!(throughput_per_second(0, 100), 0);
         assert_eq!(throughput_per_second(100, 0), 0);
@@ -8292,6 +8378,23 @@ mod tests {
             &"provider_stats_dynamic_partition_files_not_pruned_unsupported_expression_p50"
         ));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_rows_produced_p50"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"parquet_metadata_size_hint"));
+        assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"parquet_full_file_read_threshold"));
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER
+                .contains(&"provider_stats_parquet_data_file_range_get_operations_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER
+                .contains(&"provider_stats_parquet_data_file_full_get_operations_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER
+                .contains(&"provider_stats_parquet_data_file_bytes_received_p50")
+        );
+        assert!(
+            PROVIDER_EXEC_CSV_HEADER.contains(&"provider_stats_parquet_data_file_opened_bytes_p50")
+        );
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"process_peak_rss_delta_bytes"));
         assert!(PROVIDER_EXEC_CSV_HEADER.contains(&"planning_micros_p99"));
@@ -8882,6 +8985,10 @@ mod tests {
                 files_planned: 2,
                 estimated_rows: Some(16),
                 estimated_bytes: Some(1024),
+                parquet_data_file_range_get_operations: Some(11),
+                parquet_data_file_full_get_operations: Some(12),
+                parquet_data_file_bytes_received: Some(13),
+                parquet_data_file_opened_bytes: Some(14),
                 scan_partitions_started: 4,
                 scan_partitions_completed: 4,
                 files_started: 2,
@@ -8929,6 +9036,8 @@ mod tests {
                 uses_default_execution_options: false,
             },
             execution_profile_mode: ExecutionProfileMode::Detailed,
+            parquet_metadata_size_hint: Some(65_536),
+            parquet_full_file_read_threshold: Some(1_048_576),
             summary: &summary,
         });
 
@@ -8965,6 +9074,12 @@ mod tests {
         assert_eq!(row[70], "7");
         assert_eq!(row[71], "19");
         assert_eq!(row[72], "detailed");
+        assert_eq!(row[73], "65536");
+        assert_eq!(row[74], "1048576");
+        assert_eq!(row[75], "11");
+        assert_eq!(row[76], "12");
+        assert_eq!(row[77], "13");
+        assert_eq!(row[78], "14");
     }
 
     #[test]
