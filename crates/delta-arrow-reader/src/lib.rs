@@ -1,6 +1,7 @@
 //! Read-only Delta Lake to Arrow support.
 
 mod config;
+mod deletion_vector;
 mod error;
 mod kernel;
 mod metrics;
