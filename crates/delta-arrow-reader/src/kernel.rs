@@ -2,12 +2,27 @@
 
 use std::sync::Arc;
 
-use delta_kernel::{Engine, Snapshot, SnapshotRef, try_parse_uri};
+use delta_kernel::{
+    Engine, Snapshot, SnapshotRef,
+    table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
+    try_parse_uri,
+};
 use delta_kernel_default_engine::{DefaultEngineBuilder, storage::store_from_url_opts};
 use object_store::ObjectStore;
 use url::Url;
 
 use crate::DeltaStorageOptions;
+
+#[allow(dead_code)]
+pub(crate) const TABLE_FEATURES_READER_VERSION: i32 = TABLE_FEATURES_MIN_READER_VERSION;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeltaKernelProtocol {
+    pub(crate) min_reader_version: i32,
+    pub(crate) min_writer_version: i32,
+    pub(crate) reader_features: Vec<String>,
+    pub(crate) writer_features: Vec<String>,
+}
 
 pub(crate) fn parse_uri(table_uri: &str) -> delta_kernel::DeltaResult<Url> {
     try_parse_uri(table_uri)
@@ -67,6 +82,32 @@ pub(crate) struct KernelSnapshot(SnapshotRef);
 impl KernelSnapshot {
     pub(crate) fn version(&self) -> u64 {
         self.0.version()
+    }
+}
+
+pub(crate) fn snapshot_protocol_report(snapshot: &KernelSnapshot) -> DeltaKernelProtocol {
+    let protocol = snapshot.0.table_configuration().protocol();
+
+    DeltaKernelProtocol {
+        min_reader_version: protocol.min_reader_version(),
+        min_writer_version: protocol.min_writer_version(),
+        reader_features: feature_names(protocol.reader_features()),
+        writer_features: feature_names(protocol.writer_features()),
+    }
+}
+
+fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {
+    features
+        .unwrap_or_default()
+        .iter()
+        .map(feature_name)
+        .collect()
+}
+
+fn feature_name(feature: &TableFeature) -> String {
+    match feature {
+        TableFeature::Unknown(name) => name.clone(),
+        _ => feature.as_ref().to_owned(),
     }
 }
 

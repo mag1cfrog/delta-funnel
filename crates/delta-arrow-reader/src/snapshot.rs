@@ -5,7 +5,7 @@ use std::sync::Arc;
 use snafu::ResultExt;
 
 use crate::{
-    DeltaReaderError, DeltaSnapshotSelection, DeltaStorageOptions,
+    DeltaProtocolInfo, DeltaReaderError, DeltaSnapshotSelection, DeltaStorageOptions,
     error::{SnapshotLoadSnafu, StorageInitializationSnafu},
     kernel::{DeltaKernelEngineContext, KernelSnapshot},
     uri::normalize_delta_table_uri,
@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct LoadedDeltaTableSnapshot {
     snapshot: KernelSnapshot,
+    protocol_info: DeltaProtocolInfo,
     engine_context: Arc<DeltaKernelEngineContext>,
 }
 
@@ -25,6 +26,10 @@ impl LoadedDeltaTableSnapshot {
 
     pub(crate) fn version(&self) -> u64 {
         self.snapshot.version()
+    }
+
+    pub(crate) fn protocol_info(&self) -> &DeltaProtocolInfo {
+        &self.protocol_info
     }
 
     pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
@@ -55,9 +60,11 @@ pub(crate) fn load_delta_table_snapshot_blocking(
         .context(SnapshotLoadSnafu {
             reason: snapshot_load_failed_reason(s3_auth_mode_hint),
         })?;
+    let protocol_info = DeltaProtocolInfo::from_snapshot(&snapshot);
 
     Ok(LoadedDeltaTableSnapshot {
         snapshot,
+        protocol_info,
         engine_context,
     })
 }

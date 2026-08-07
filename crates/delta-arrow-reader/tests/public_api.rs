@@ -1,14 +1,29 @@
 use std::error::Error as _;
 
 use delta_arrow_reader::{
-    DeltaReadMetrics, DeltaReadMetricsSnapshot, DeltaReaderBackend, DeltaReaderError,
-    DeltaReaderExecutionOptions, DeltaReaderPhase, DeltaSnapshotSelection, DeltaStorageOptions,
+    DeltaProtocolInfo, DeltaReadMetrics, DeltaReadMetricsSnapshot, DeltaReaderBackend,
+    DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase, DeltaSnapshotSelection,
+    DeltaStorageOptions,
 };
 
 #[test]
 fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> {
     let snapshot: fn(&DeltaReadMetrics) -> DeltaReadMetricsSnapshot = DeltaReadMetrics::snapshot;
     let _ = snapshot;
+    let snapshot_version: fn(&DeltaProtocolInfo) -> u64 = DeltaProtocolInfo::snapshot_version;
+    let min_reader_version: fn(&DeltaProtocolInfo) -> i32 = DeltaProtocolInfo::min_reader_version;
+    let min_writer_version: fn(&DeltaProtocolInfo) -> i32 = DeltaProtocolInfo::min_writer_version;
+    let reader_features: for<'a> fn(&'a DeltaProtocolInfo) -> &'a [String] =
+        DeltaProtocolInfo::reader_features;
+    let writer_features: for<'a> fn(&'a DeltaProtocolInfo) -> &'a [String] =
+        DeltaProtocolInfo::writer_features;
+    let _ = (
+        snapshot_version,
+        min_reader_version,
+        min_writer_version,
+        reader_features,
+        writer_features,
+    );
 
     let mut storage_options = DeltaStorageOptions::new();
     storage_options.insert("region".into(), "example".into());
