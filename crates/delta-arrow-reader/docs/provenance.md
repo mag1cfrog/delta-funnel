@@ -26,7 +26,7 @@ publish the candidate package.
 
 ## Path mapping
 
-No reader paths have moved in #460.
-
 | Delta Funnel source path | Staged crate path | Owning issue |
 | --- | --- | --- |
+| `crates/delta-funnel/src/table_formats/delta/uri.rs` | `crates/delta-arrow-reader/src/uri.rs` | #462 |
+| `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/kernel.rs` | #462 |

@@ -2,7 +2,9 @@
 
 mod config;
 mod error;
+mod kernel;
 mod metrics;
+mod uri;
 
 pub use config::{
     DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaSnapshotSelection, DeltaStorageOptions,
