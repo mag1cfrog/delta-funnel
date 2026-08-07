@@ -3116,7 +3116,8 @@ mod tests {
             table.path(),
             Arc::clone(&construction_count),
         )?;
-        let table_uri = format!("{scheme}://table/");
+        // --x-s3 makes Delta Kernel sort this LocalFileSystem-backed custom listing.
+        let table_uri = format!("{scheme}://table--x-s3/");
         let storage_options = BTreeMap::from([
             ("authorization".to_owned(), "reader-token".to_owned()),
             ("region".to_owned(), "us-east-1".to_owned()),

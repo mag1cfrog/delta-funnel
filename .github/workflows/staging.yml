@@ -1,0 +1,78 @@
+name: Staging CI
+
+on:
+  pull_request:
+    branches:
+      - refactor/delta-arrow-reader-staging
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  staging:
+    name: Staging CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Read Rust version
+        id: rust-version
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${{ steps.rust-version.outputs.version }}" --profile minimal --component rustfmt,clippy
+          rustup default "${{ steps.rust-version.outputs.version }}"
+
+      - name: Check staging isolation
+        run: scripts/verify-delta-arrow-reader-staging.sh
+
+      - name: Check staging crate
+        run: |
+          cargo fmt --all -- --check
+          cargo check -p delta-arrow-reader --all-targets
+          cargo clippy -p delta-arrow-reader --all-targets -- -D warnings
+          cargo test -p delta-arrow-reader
+          RUSTDOCFLAGS="-D warnings" cargo doc -p delta-arrow-reader --no-deps
+          cargo package -p delta-arrow-reader --allow-dirty
+          git diff --check
+
+      - name: Inspect release-plz selection
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+          dry_run: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Check release-plz selection
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          if printf '%s' "$RELEASES" | grep -F 'delta-arrow-reader'; then
+            echo "release-plz selected the temporary package"
+            exit 1
+          fi
+
+      - name: Check Delta Funnel release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json name,tagName |
+            grep -F 'delta-arrow-reader'; then
+            echo "Delta Funnel has a delta-arrow-reader release artifact"
+            exit 1
+          fi

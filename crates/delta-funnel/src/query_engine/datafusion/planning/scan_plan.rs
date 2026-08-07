@@ -359,7 +359,8 @@ mod tests {
             ("region".to_owned(), "us-east-1".to_owned()),
         ]);
         let source = load_delta_source(
-            DeltaSourceConfig::new("orders", format!("{scheme}://table/"))
+            // --x-s3 makes Delta Kernel sort this LocalFileSystem-backed custom listing.
+            DeltaSourceConfig::new("orders", format!("{scheme}://table--x-s3/"))
                 .with_storage_options(options.clone()),
         )?;
         let source_context = Arc::clone(source.engine_context());
