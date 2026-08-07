@@ -5,3 +5,27 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 publish = false
+
+[features]
+default = ["native-async"]
+native-async = []
+official-kernel = []
+datafusion = ["dep:datafusion"]
+
+[dependencies]
+async-trait = "0.1"
+arrow = "58.3.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+datafusion = { version = "54.1.0", default-features = false, features = ["sql"], optional = true }
+delta_kernel = { version = "=0.25.0", default-features = false, features = ["arrow", "internal-api"] }
+delta_kernel_default_engine = { version = "=0.25.0", default-features = false, features = ["arrow", "native-tls"] }
+futures-util = "0.3"
+object_store = "0.13.2"
+parquet = { version = "58.3.0", features = ["async", "object_store"] }
+snafu = "0.9"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+serde_json = "1"
