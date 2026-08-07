@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod kernel;
 mod metrics;
+mod snapshot;
 mod uri;
 
 pub use config::{

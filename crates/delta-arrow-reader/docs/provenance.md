@@ -30,3 +30,4 @@ publish the candidate package.
 | --- | --- | --- |
 | `crates/delta-funnel/src/table_formats/delta/uri.rs` | `crates/delta-arrow-reader/src/uri.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/kernel.rs` | #462 |
+| `crates/delta-funnel/src/table_formats/delta/snapshot.rs` | `crates/delta-arrow-reader/src/snapshot.rs` | #462 |

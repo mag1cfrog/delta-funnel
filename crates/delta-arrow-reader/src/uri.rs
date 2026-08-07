@@ -1,10 +1,9 @@
 //! Delta table URI normalization.
 
-use crate::{DeltaReaderError, error::InvalidTableUriSnafu, kernel::try_parse_uri};
+use crate::{DeltaReaderError, error::InvalidTableUriSnafu, kernel::parse_uri};
 
 /// Normalizes a Delta table URI for snapshot loading.
-#[allow(dead_code)]
-pub(crate) fn normalize_delta_table_uri(table_uri: &str) -> Result<String, DeltaReaderError> {
+pub(crate) fn normalize_delta_table_uri(table_uri: &str) -> Result<url::Url, DeltaReaderError> {
     if table_uri.trim().is_empty() {
         return InvalidTableUriSnafu {
             reason: "empty_table_uri",
@@ -12,14 +11,12 @@ pub(crate) fn normalize_delta_table_uri(table_uri: &str) -> Result<String, Delta
         .fail();
     }
 
-    try_parse_uri(table_uri)
-        .map(|table_url| table_url.to_string())
-        .map_err(|_| {
-            InvalidTableUriSnafu {
-                reason: "invalid_table_uri",
-            }
-            .build()
-        })
+    parse_uri(table_uri).map_err(|_| {
+        InvalidTableUriSnafu {
+            reason: "invalid_table_uri",
+        }
+        .build()
+    })
 }
 
 #[cfg(test)]
@@ -30,7 +27,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{normalize_delta_table_uri, try_parse_uri};
+    use super::normalize_delta_table_uri;
     use crate::DeltaReaderPhase;
 
     struct TestDir(PathBuf);
@@ -69,14 +66,17 @@ mod tests {
 
         let absolute_uri = normalize_delta_table_uri(&absolute.0.to_string_lossy())?;
         let relative_uri = normalize_delta_table_uri(&relative.0.to_string_lossy())?;
-        let relative_path = try_parse_uri(&relative_uri)?
+        let relative_path = relative_uri
             .to_file_path()
             .map_err(|()| std::io::Error::other("expected a local file URI"))?;
 
-        assert!(absolute_uri.starts_with("file://"));
-        assert!(absolute_uri.ends_with('/'));
+        assert!(absolute_uri.as_str().starts_with("file://"));
+        assert!(absolute_uri.as_str().ends_with('/'));
         assert_eq!(relative_path, fs::canonicalize(&relative.0)?);
-        assert_eq!(normalize_delta_table_uri(&absolute_uri)?, absolute_uri);
+        assert_eq!(
+            normalize_delta_table_uri(absolute_uri.as_str())?,
+            absolute_uri
+        );
         Ok(())
     }
 
@@ -84,7 +84,7 @@ mod tests {
     fn preserves_remote_url_semantics_without_opening_a_store()
     -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
-            normalize_delta_table_uri("s3://bucket/path/to/table")?,
+            normalize_delta_table_uri("s3://bucket/path/to/table")?.as_str(),
             "s3://bucket/path/to/table/"
         );
         Ok(())
