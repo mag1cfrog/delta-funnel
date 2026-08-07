@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use snafu::ResultExt;
 
 use crate::{
     DeltaProtocolInfo, DeltaReaderError, DeltaSnapshotSelection, DeltaStorageOptions,
-    error::{SnapshotLoadSnafu, StorageInitializationSnafu},
-    kernel::{DeltaKernelEngineContext, KernelSnapshot},
+    error::{SchemaConversionSnafu, SnapshotLoadSnafu, StorageInitializationSnafu},
+    kernel::{DeltaKernelEngineContext, KernelSnapshot, snapshot_arrow_schema},
     uri::normalize_delta_table_uri,
 };
 
@@ -15,6 +16,7 @@ use crate::{
 pub(crate) struct LoadedDeltaTableSnapshot {
     snapshot: KernelSnapshot,
     protocol_info: DeltaProtocolInfo,
+    schema: SchemaRef,
     engine_context: Arc<DeltaKernelEngineContext>,
 }
 
@@ -30,6 +32,10 @@ impl LoadedDeltaTableSnapshot {
 
     pub(crate) fn protocol_info(&self) -> &DeltaProtocolInfo {
         &self.protocol_info
+    }
+
+    pub(crate) fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 
     pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
@@ -61,10 +67,16 @@ pub(crate) fn load_delta_table_snapshot_blocking(
             reason: snapshot_load_failed_reason(s3_auth_mode_hint),
         })?;
     let protocol_info = DeltaProtocolInfo::from_snapshot(&snapshot);
+    let schema = snapshot_arrow_schema(&snapshot)
+        .boxed()
+        .context(SchemaConversionSnafu {
+            reason: "schema_conversion_failed",
+        })?;
 
     Ok(LoadedDeltaTableSnapshot {
         snapshot,
         protocol_info,
+        schema,
         engine_context,
     })
 }
@@ -212,6 +224,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use arrow::datatypes::{DataType, TimeUnit};
     use futures_util::future;
 
     use super::{
@@ -225,11 +238,23 @@ mod tests {
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const SUPPORTED_TYPES_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["timestampNtz"],"writerFeatures":["timestampNtz"]}}"#;
+    const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"nickname\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":false},\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"long\",\"valueContainsNull\":false},\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
+    const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
 
     struct DeltaLogTable(PathBuf);
 
     impl DeltaLogTable {
         fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol_and_metadata(name, PROTOCOL_JSON, METADATA_JSON)
+        }
+
+        fn new_with_protocol_and_metadata(
+            name: &str,
+            protocol_json: &str,
+            metadata_json: &str,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let path = Path::new("target")
                 .join("delta-arrow-reader-snapshot-tests")
                 .join(unique_name(name)?);
@@ -237,7 +262,7 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+                format!("{protocol_json}\n{metadata_json}\n"),
             )?;
             fs::write(
                 log_path.join("00000000000000000001.json"),
@@ -293,6 +318,115 @@ mod tests {
             &latest.engine_context().object_store(),
             &cloned.engine_context().object_store()
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn converts_and_reuses_the_logical_arrow_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_and_metadata(
+            "supported-schema",
+            SUPPORTED_TYPES_PROTOCOL_JSON,
+            SUPPORTED_TYPES_METADATA_JSON,
+        )?;
+        let loaded = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let schema = loaded.schema();
+        let cached = loaded.schema();
+
+        assert!(Arc::ptr_eq(&schema, &cached));
+        assert_eq!(
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>(),
+            [
+                "id",
+                "profile",
+                "tags",
+                "attributes",
+                "amount",
+                "event_ts",
+                "event_ts_ntz",
+            ]
+        );
+        assert!(!schema.field_with_name("id")?.is_nullable());
+        assert_eq!(
+            schema.field_with_name("amount")?.data_type(),
+            &DataType::Decimal128(10, 2)
+        );
+        assert_eq!(
+            schema.field_with_name("event_ts")?.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            schema.field_with_name("event_ts_ntz")?.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+
+        let DataType::Struct(profile) = schema.field_with_name("profile")?.data_type() else {
+            panic!("profile must remain a struct");
+        };
+        assert_eq!(profile[0].name(), "age");
+        assert!(!profile[0].is_nullable());
+        assert_eq!(profile[1].name(), "nickname");
+        assert!(profile[1].is_nullable());
+
+        let DataType::List(element) = schema.field_with_name("tags")?.data_type() else {
+            panic!("tags must remain a list");
+        };
+        assert_eq!(element.data_type(), &DataType::Int32);
+        assert!(!element.is_nullable());
+
+        let DataType::Map(entries, false) = schema.field_with_name("attributes")?.data_type()
+        else {
+            panic!("attributes must remain a map");
+        };
+        let DataType::Struct(key_value) = entries.data_type() else {
+            panic!("map entries must remain a struct");
+        };
+        assert_eq!(key_value[0].data_type(), &DataType::Utf8);
+        assert_eq!(key_value[1].data_type(), &DataType::Int64);
+        assert!(!key_value[1].is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn keeps_column_mapping_names_logical_and_metadata_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_and_metadata(
+            "column-mapping-schema",
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            COLUMN_MAPPING_METADATA_JSON,
+        )?;
+        let loaded = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let schema = loaded.schema();
+
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "customer_name");
+        assert_eq!(
+            schema
+                .field(0)
+                .metadata()
+                .get("delta.columnMapping.physicalName")
+                .map(String::as_str),
+            Some("phys_id")
+        );
+        assert_eq!(
+            schema
+                .field(1)
+                .metadata()
+                .get("delta.columnMapping.physicalName")
+                .map(String::as_str),
+            Some("phys_customer_name")
+        );
         Ok(())
     }
 

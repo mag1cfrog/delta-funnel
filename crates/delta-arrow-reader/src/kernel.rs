@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use arrow::{datatypes::SchemaRef, error::ArrowError};
 use delta_kernel::{
     Engine, Snapshot, SnapshotRef,
+    engine::arrow_conversion::TryIntoArrow,
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
@@ -94,6 +96,10 @@ pub(crate) fn snapshot_protocol_report(snapshot: &KernelSnapshot) -> DeltaKernel
         reader_features: feature_names(protocol.reader_features()),
         writer_features: feature_names(protocol.writer_features()),
     }
+}
+
+pub(crate) fn snapshot_arrow_schema(snapshot: &KernelSnapshot) -> Result<SchemaRef, ArrowError> {
+    snapshot.0.schema().as_ref().try_into_arrow().map(Arc::new)
 }
 
 fn feature_names(features: Option<&[TableFeature]>) -> Vec<String> {
