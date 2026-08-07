@@ -84,6 +84,7 @@ jobs:
   release:
     name: Release-plz release
     if: >-
+      github.ref == 'refs/heads/main' &&
       github.repository_owner == 'mag1cfrog' &&
       (
         github.event_name == 'workflow_dispatch' ||
