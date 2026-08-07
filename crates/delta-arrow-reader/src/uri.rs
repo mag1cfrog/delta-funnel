@@ -96,11 +96,15 @@ mod tests {
         let missing = std::env::temp_dir()
             .join("sensitive-missing-table")
             .join(unique_name("missing")?);
+        let parent = TestDir::absolute("regular-file")?;
+        let regular_file = parent.0.join("not-a-directory");
+        fs::write(&regular_file, "not a table")?;
 
         for (table_uri, expected_reason) in [
             ("", "empty_table_uri"),
             (" \t\n", "empty_table_uri"),
             (&missing.to_string_lossy(), "invalid_table_uri"),
+            (&regular_file.to_string_lossy(), "invalid_table_uri"),
             ("s3://secret-user:secret-password@[", "invalid_table_uri"),
         ] {
             let error = normalize_delta_table_uri(table_uri).expect_err("URI should be rejected");

@@ -9,6 +9,8 @@ use delta_kernel::{
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
+#[cfg(test)]
+pub(crate) use delta_kernel_default_engine::storage::insert_url_handler;
 use delta_kernel_default_engine::{DefaultEngineBuilder, storage::store_from_url_opts};
 use object_store::ObjectStore;
 use url::Url;

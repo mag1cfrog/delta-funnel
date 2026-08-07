@@ -199,6 +199,35 @@ mod tests {
     }
 
     #[test]
+    fn preserves_legacy_versions_and_treats_writer_only_features_as_diagnostic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (name, protocol_json, reader_version, writer_features) in [
+            (
+                "legacy-column-mapping",
+                r#"{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}"#,
+                2,
+                &[][..],
+            ),
+            (
+                "writer-only",
+                r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":[],"writerFeatures":["inCommitTimestamp"]}}"#,
+                3,
+                &["inCommitTimestamp"][..],
+            ),
+        ] {
+            let table = DeltaLogTable::new(name, protocol_json)?;
+            let loaded = table.load()?;
+            let protocol = loaded.protocol_info();
+
+            assert_eq!(protocol.min_reader_version(), reader_version);
+            assert!(protocol.reader_features().is_empty());
+            assert_eq!(protocol.writer_features(), writer_features);
+            validate_protocol(protocol)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_feature_remains_inspectable_until_validation()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new(

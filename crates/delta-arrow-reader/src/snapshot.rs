@@ -287,6 +287,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, TimeUnit};
     use futures_util::future;
+    use object_store::{memory::InMemory, path::Path as ObjectStorePath};
     use tracing::{
         Event, Level, Metadata, Subscriber,
         field::{Field, Visit},
@@ -301,7 +302,7 @@ mod tests {
     };
     use crate::{
         DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaStorageOptions,
-        kernel::is_kernel_error,
+        kernel::{insert_url_handler, is_kernel_error},
     };
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
@@ -447,6 +448,14 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    fn empty_delta_table(name: &str) -> Result<DeltaLogTable, Box<dyn std::error::Error>> {
+        let path = Path::new("target")
+            .join("delta-arrow-reader-snapshot-tests")
+            .join(unique_name(name)?);
+        fs::create_dir_all(&path)?;
+        Ok(DeltaLogTable(path))
     }
 
     #[test]
@@ -719,6 +728,81 @@ mod tests {
     }
 
     #[test]
+    fn empty_and_metadata_free_tables_fail_as_snapshot_loads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = empty_delta_table("empty-table")?;
+        let metadata_free = DeltaLogTable::new("metadata-free")?;
+        fs::write(
+            metadata_free.0.join("_delta_log/00000000000000000000.json"),
+            r#"{"add":{"path":"part-00000.parquet","partitionValues":{},"size":0,"modificationTime":1587968586000,"dataChange":true}}"#,
+        )?;
+
+        for table in [&empty, &metadata_free] {
+            let error = match load_delta_table_snapshot_blocking(
+                &table.0.to_string_lossy(),
+                &DeltaStorageOptions::new(),
+                DeltaSnapshotSelection::Latest,
+            ) {
+                Ok(_) => panic!("invalid table must fail"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DeltaReaderError::SnapshotLoad { .. }));
+            assert_eq!(error.phase(), DeltaReaderPhase::Snapshot);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forwards_storage_options_to_exactly_one_store_construction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = format!(
+            "darstorage{}{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        let captured = Arc::new(Mutex::new(Vec::<DeltaStorageOptions>::new()));
+        let handler_capture = Arc::clone(&captured);
+        insert_url_handler(
+            &scheme,
+            Arc::new(move |_url, options| {
+                handler_capture
+                    .lock()
+                    .map_err(|_| object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::other("capture lock poisoned").into(),
+                    })?
+                    .push(options.into_iter().collect());
+                Ok((Box::new(InMemory::new()), ObjectStorePath::from("")))
+            }),
+        )?;
+        let options = storage_options(&[
+            ("authorization", "secret-source-token"),
+            ("region", "us-east-1"),
+        ]);
+
+        let error = match load_delta_table_snapshot_blocking(
+            &format!("{scheme}://table/root"),
+            &options,
+            DeltaSnapshotSelection::Latest,
+        ) {
+            Ok(_) => panic!("empty in-memory store must fail snapshot loading"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, DeltaReaderError::SnapshotLoad { .. }));
+        assert_eq!(
+            captured
+                .lock()
+                .map(|options| options.clone())
+                .unwrap_or_default(),
+            vec![options]
+        );
+        assert!(!error.to_string().contains("secret-source-token"));
+        assert!(!format!("{error:?}").contains("authorization"));
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_store_preserves_its_source_without_uri_disclosure() {
         let result = load_delta_table_snapshot_blocking(
             "ftp://user:password@example.com/table",
@@ -744,6 +828,23 @@ mod tests {
     #[test]
     fn s3_auth_mode_hint_preserves_the_existing_classification()
     -> Result<(), Box<dyn std::error::Error>> {
+        for table_uri in [
+            "s3://bucket/table",
+            "s3a://bucket/table",
+            "https://s3.us-east-1.amazonaws.com/bucket/table",
+            "https://bucket.s3.us-east-1.amazonaws.com/table",
+            "https://ACCOUNT_ID.r2.cloudflarestorage.com/bucket/table",
+        ] {
+            assert_eq!(
+                s3_auth_mode_hint_for_source(
+                    &url::Url::parse(table_uri)?,
+                    &DeltaStorageOptions::new()
+                ),
+                Some(S3AuthModeHint::ImplicitProviderChain),
+                "{table_uri}"
+            );
+        }
+
         let table_url = url::Url::parse("s3://bucket/table")?;
         let cases = [
             (
@@ -763,6 +864,21 @@ mod tests {
             (
                 storage_options(&[("aws_container_credentials_relative_uri", "/credentials")]),
                 S3AuthModeHint::ExplicitContainer,
+            ),
+            (
+                storage_options(&[
+                    ("aws_container_credentials_full_uri", "http://example.com"),
+                    ("aws_container_authorization_token_file", "/token"),
+                ]),
+                S3AuthModeHint::ExplicitContainer,
+            ),
+            (
+                storage_options(&[("aws_container_credentials_full_uri", "http://example.com")]),
+                S3AuthModeHint::OtherExplicit,
+            ),
+            (
+                storage_options(&[("AWS_METADATA_ENDPOINT", "http://169.254.169.254")]),
+                S3AuthModeHint::OtherExplicit,
             ),
             (
                 storage_options(&[("AWS_SESSION_TOKEN", "partial")]),
