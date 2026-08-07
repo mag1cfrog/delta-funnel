@@ -12,6 +12,11 @@ use crate::{
     uri::normalize_delta_table_uri,
 };
 
+const TRACING_TARGET: &str = "delta_arrow_reader";
+const SNAPSHOT_LOAD_STARTED_EVENT: &str = "snapshot_load.started";
+const SNAPSHOT_LOAD_COMPLETED_EVENT: &str = "snapshot_load.completed";
+const SNAPSHOT_LOAD_FAILED_EVENT: &str = "snapshot_load.failed";
+
 #[derive(Clone)]
 pub(crate) struct LoadedDeltaTableSnapshot {
     snapshot: KernelSnapshot,
@@ -48,37 +53,48 @@ pub(crate) fn load_delta_table_snapshot_blocking(
     storage_options: &DeltaStorageOptions,
     selection: DeltaSnapshotSelection,
 ) -> Result<LoadedDeltaTableSnapshot, DeltaReaderError> {
-    let table_url = normalize_delta_table_uri(table_uri)?;
-    let s3_auth_mode_hint = s3_auth_mode_hint_for_source(&table_url, storage_options);
-    let engine_context = DeltaKernelEngineContext::build(table_url, storage_options)
-        .boxed()
-        .context(StorageInitializationSnafu {
-            reason: "storage_initialization_failed",
-        })?;
-    let engine_context = Arc::new(engine_context);
-    let version = match selection {
-        DeltaSnapshotSelection::Latest => None,
-        DeltaSnapshotSelection::Version(version) => Some(version),
-    };
-    let snapshot = engine_context
-        .load_snapshot(version)
-        .boxed()
-        .context(SnapshotLoadSnafu {
-            reason: snapshot_load_failed_reason(s3_auth_mode_hint),
-        })?;
-    let protocol_info = DeltaProtocolInfo::from_snapshot(&snapshot);
-    let schema = snapshot_arrow_schema(&snapshot)
-        .boxed()
-        .context(SchemaConversionSnafu {
-            reason: "schema_conversion_failed",
-        })?;
+    let selection_kind = snapshot_selection_kind(selection);
+    trace_snapshot_load_started(selection_kind);
+    let result = (|| {
+        let table_url = normalize_delta_table_uri(table_uri)?;
+        let s3_auth_mode_hint = s3_auth_mode_hint_for_source(&table_url, storage_options);
+        let engine_context = DeltaKernelEngineContext::build(table_url, storage_options)
+            .boxed()
+            .context(StorageInitializationSnafu {
+                reason: "storage_initialization_failed",
+            })?;
+        let engine_context = Arc::new(engine_context);
+        let version = match selection {
+            DeltaSnapshotSelection::Latest => None,
+            DeltaSnapshotSelection::Version(version) => Some(version),
+        };
+        let snapshot =
+            engine_context
+                .load_snapshot(version)
+                .boxed()
+                .context(SnapshotLoadSnafu {
+                    reason: snapshot_load_failed_reason(s3_auth_mode_hint),
+                })?;
+        let protocol_info = DeltaProtocolInfo::from_snapshot(&snapshot);
+        let schema = snapshot_arrow_schema(&snapshot)
+            .boxed()
+            .context(SchemaConversionSnafu {
+                reason: "schema_conversion_failed",
+            })?;
 
-    Ok(LoadedDeltaTableSnapshot {
-        snapshot,
-        protocol_info,
-        schema,
-        engine_context,
-    })
+        Ok(LoadedDeltaTableSnapshot {
+            snapshot,
+            protocol_info,
+            schema,
+            engine_context,
+        })
+    })();
+
+    match &result {
+        Ok(snapshot) => trace_snapshot_load_completed(selection_kind, snapshot),
+        Err(error) => trace_snapshot_load_failed(selection_kind, error),
+    }
+    result
 }
 
 #[allow(dead_code)]
@@ -91,14 +107,58 @@ pub(crate) async fn load_delta_table_snapshot_async(
     storage_options: DeltaStorageOptions,
     selection: DeltaSnapshotSelection,
 ) -> Result<LoadedDeltaTableSnapshot, DeltaReaderError> {
-    tokio::task::spawn_blocking(move || {
+    let selection_kind = snapshot_selection_kind(selection);
+    let result = tokio::task::spawn_blocking(move || {
         load_delta_table_snapshot_blocking(&table_uri, &storage_options, selection)
     })
     .await
     .boxed()
     .context(SnapshotLoadSnafu {
         reason: "snapshot_load_task_failed",
-    })?
+    });
+
+    match result {
+        Ok(result) => result,
+        Err(error) => {
+            trace_snapshot_load_failed(selection_kind, &error);
+            Err(error)
+        }
+    }
+}
+
+const fn snapshot_selection_kind(selection: DeltaSnapshotSelection) -> &'static str {
+    match selection {
+        DeltaSnapshotSelection::Latest => "latest",
+        DeltaSnapshotSelection::Version(_) => "version",
+    }
+}
+
+fn trace_snapshot_load_started(selection: &'static str) {
+    tracing::debug!(
+        target: TRACING_TARGET,
+        event = SNAPSHOT_LOAD_STARTED_EVENT,
+        selection
+    );
+}
+
+fn trace_snapshot_load_completed(selection: &'static str, snapshot: &LoadedDeltaTableSnapshot) {
+    tracing::debug!(
+        target: TRACING_TARGET,
+        event = SNAPSHOT_LOAD_COMPLETED_EVENT,
+        selection,
+        snapshot_version = snapshot.version(),
+        protocol_reader_version = snapshot.protocol_info().min_reader_version()
+    );
+}
+
+fn trace_snapshot_load_failed(selection: &'static str, error: &DeltaReaderError) {
+    tracing::debug!(
+        target: TRACING_TARGET,
+        event = SNAPSHOT_LOAD_FAILED_EVENT,
+        selection,
+        error_variant = error.as_str(),
+        error_phase = error.phase().as_str()
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,19 +277,27 @@ fn snapshot_load_failed_reason(s3_auth_mode_hint: Option<S3AuthModeHint>) -> &'s
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         error::Error as _,
-        fs,
+        fmt, fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex, Once},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use arrow::datatypes::{DataType, TimeUnit};
     use futures_util::future;
+    use tracing::{
+        Event, Level, Metadata, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Id, Record},
+        subscriber::Interest,
+    };
 
     use super::{
-        S3AuthModeHint, load_delta_table_snapshot_async, load_delta_table_snapshot_blocking,
-        s3_auth_mode_hint_for_source, snapshot_load_failed_reason,
+        S3AuthModeHint, TRACING_TARGET, load_delta_table_snapshot_async,
+        load_delta_table_snapshot_blocking, s3_auth_mode_hint_for_source,
+        snapshot_load_failed_reason,
     };
     use crate::{
         DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaStorageOptions,
@@ -242,6 +310,97 @@ mod tests {
     const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"nickname\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":false},\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"long\",\"valueContainsNull\":false},\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
     const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
+
+    static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TRACING_TEST_GLOBAL_SUBSCRIBER: Once = Once::new();
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CapturedEvent {
+        target: &'static str,
+        level: Level,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCollector(Option<Arc<Mutex<Vec<CapturedEvent>>>>);
+
+    impl EventCollector {
+        fn capturing() -> Self {
+            Self(Some(Arc::new(Mutex::new(Vec::new()))))
+        }
+
+        fn events(&self) -> Vec<CapturedEvent> {
+            self.0
+                .as_ref()
+                .and_then(|events| events.lock().ok().map(|events| events.clone()))
+                .unwrap_or_default()
+        }
+    }
+
+    impl Subscriber for EventCollector {
+        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+            if metadata.target() == TRACING_TARGET && *metadata.level() == Level::DEBUG {
+                Interest::always()
+            } else {
+                Interest::sometimes()
+            }
+        }
+
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == TRACING_TARGET && *metadata.level() == Level::DEBUG
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            if visitor
+                .0
+                .get("event")
+                .is_some_and(|name| name.starts_with("snapshot_load."))
+                && let Some(events) = &self.0
+                && let Ok(mut events) = events.lock()
+            {
+                events.push(CapturedEvent {
+                    target: event.metadata().target(),
+                    level: *event.metadata().level(),
+                    fields: visitor.0,
+                });
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor(BTreeMap<String, String>);
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+    }
 
     struct DeltaLogTable(PathBuf);
 
@@ -426,6 +585,86 @@ mod tests {
                 .get("delta.columnMapping.physicalName")
                 .map(String::as_str),
             Some("phys_customer_name")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tracing_emits_only_the_bounded_load_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = TRACING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let table = DeltaLogTable::new("tracing")?;
+        let collector = EventCollector::capturing();
+        let capture = collector.clone();
+        let secret_uri = "ftp://user:password@example.com/table?token=secret";
+
+        TRACING_TEST_GLOBAL_SUBSCRIBER.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(EventCollector::default());
+        });
+        tracing::subscriber::with_default(collector, || {
+            tracing::callsite::rebuild_interest_cache();
+            load_delta_table_snapshot_blocking(
+                &table.0.to_string_lossy(),
+                &DeltaStorageOptions::new(),
+                DeltaSnapshotSelection::Latest,
+            )?;
+            assert!(
+                load_delta_table_snapshot_blocking(
+                    secret_uri,
+                    &DeltaStorageOptions::new(),
+                    DeltaSnapshotSelection::Version(9),
+                )
+                .is_err()
+            );
+            Ok::<_, DeltaReaderError>(())
+        })?;
+        tracing::callsite::rebuild_interest_cache();
+
+        let events = capture.events();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| {
+            event.target == TRACING_TARGET
+                && event.level == Level::DEBUG
+                && !format!("{:?}", event.fields).contains("user")
+                && !format!("{:?}", event.fields).contains("password")
+                && !format!("{:?}", event.fields).contains("token")
+                && !format!("{:?}", event.fields).contains("example.com")
+        }));
+        assert_eq!(
+            events[0].fields,
+            BTreeMap::from([
+                ("event".to_owned(), "snapshot_load.started".to_owned()),
+                ("selection".to_owned(), "latest".to_owned()),
+            ])
+        );
+        assert_eq!(
+            events[1].fields,
+            BTreeMap::from([
+                ("event".to_owned(), "snapshot_load.completed".to_owned()),
+                ("protocol_reader_version".to_owned(), "1".to_owned()),
+                ("selection".to_owned(), "latest".to_owned()),
+                ("snapshot_version".to_owned(), "1".to_owned()),
+            ])
+        );
+        assert_eq!(
+            events[2].fields,
+            BTreeMap::from([
+                ("event".to_owned(), "snapshot_load.started".to_owned()),
+                ("selection".to_owned(), "version".to_owned()),
+            ])
+        );
+        assert_eq!(
+            events[3].fields,
+            BTreeMap::from([
+                ("error_phase".to_owned(), "storage".to_owned()),
+                (
+                    "error_variant".to_owned(),
+                    "storage_initialization".to_owned(),
+                ),
+                ("event".to_owned(), "snapshot_load.failed".to_owned()),
+                ("selection".to_owned(), "version".to_owned()),
+            ])
         );
         Ok(())
     }
