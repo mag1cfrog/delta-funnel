@@ -1322,6 +1322,22 @@ dependencies = [
 [[package]]
 name = "delta-arrow-reader"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "futures-util",
+ "object_store",
+ "parquet",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "delta-funnel"
