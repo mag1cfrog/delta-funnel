@@ -98,6 +98,10 @@ impl KernelScan {
         self.scan.physical_predicate().is_some()
     }
 
+    pub(crate) fn physical_predicate(&self) -> Option<DeltaKernelPredicate> {
+        self.scan.physical_predicate().map(DeltaKernelPredicate)
+    }
+
     pub(crate) fn file_metadata(
         &self,
         engine_context: &DeltaKernelEngineContext,

@@ -31,7 +31,7 @@ pub(crate) struct DeltaScanPlan {
     pub(crate) files_filtered_during_planning: Option<u64>,
     pub(crate) estimated_bytes: Option<u64>,
     pub(crate) estimated_rows: Option<u64>,
-    pub(crate) kernel_predicate: Option<DeltaKernelPredicate>,
+    pub(crate) physical_predicate: Option<DeltaKernelPredicate>,
     pub(crate) execution_options: DeltaReaderExecutionOptions,
 }
 
@@ -56,14 +56,17 @@ pub(crate) fn build_scan(
 pub(crate) fn plan_scan(
     snapshot: &LoadedDeltaTableSnapshot,
     projection: Option<&[String]>,
+    hidden_columns: &[String],
     kernel_predicate: Option<DeltaKernelPredicate>,
     include_stats: bool,
     execution_options: DeltaReaderExecutionOptions,
 ) -> Result<DeltaScanPlan, DeltaReaderError> {
     execution_options.validate()?;
+    let logical_projection =
+        logical_projection(snapshot.schema().as_ref(), projection, hidden_columns)?;
     let scan = build_scan(
         snapshot,
-        projection,
+        logical_projection.as_deref(),
         kernel_predicate.clone(),
         include_stats,
     )?;
@@ -80,21 +83,56 @@ pub(crate) fn plan_scan(
         .collect::<Result<Vec<_>, _>>()?;
     let estimated_bytes = exact_sum(file_tasks.iter().map(|task| task.estimated_bytes));
     let estimated_rows = exact_sum(file_tasks.iter().map(|task| task.estimated_rows));
+    let logical_schema = scan.logical_schema();
+    let physical_predicate = scan.physical_predicate();
+    let projected_schema = match projection {
+        None => Arc::clone(&logical_schema),
+        Some(names) => Arc::new(Schema::new_with_metadata(
+            logical_schema.fields()[..names.len()].to_vec(),
+            logical_schema.metadata().clone(),
+        )),
+    };
 
     Ok(DeltaScanPlan {
         snapshot_version: snapshot.version(),
         engine_context: Arc::clone(snapshot.engine_context()),
-        logical_schema: snapshot.schema(),
+        logical_schema,
         physical_schema: scan.physical_schema(),
-        projected_schema: scan.logical_schema(),
+        projected_schema,
         file_tasks,
         scan_metadata_exhausted: true,
         files_filtered_during_planning: metadata.files_filtered_during_planning,
         estimated_bytes,
         estimated_rows,
-        kernel_predicate,
+        physical_predicate,
         execution_options,
     })
+}
+
+fn logical_projection(
+    schema: &Schema,
+    projection: Option<&[String]>,
+    hidden_columns: &[String],
+) -> Result<Option<Vec<String>>, DeltaReaderError> {
+    validate_projection(schema, projection)?;
+    for name in hidden_columns {
+        if schema.index_of(name).is_err() {
+            return InvalidProjectionSnafu {
+                reason: "column_not_found",
+            }
+            .fail();
+        }
+    }
+
+    Ok(projection.map(|projection| {
+        let mut logical = projection.to_vec();
+        for name in hidden_columns {
+            if !logical.contains(name) {
+                logical.push(name.clone());
+            }
+        }
+        logical
+    }))
 }
 
 fn exact_sum(estimates: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
@@ -240,8 +278,16 @@ mod tests {
     }
 
     fn add(path: &str, size: i64, rows: Option<u64>) -> String {
-        let stats = rows.map_or_else(String::new, |rows| {
-            format!(r#", "stats":"{{\"numRecords\":{rows}}}""#)
+        let stats = rows.map(|rows| format!(r#"{{"numRecords":{rows}}}"#));
+        add_with_stats(path, size, stats.as_deref())
+    }
+
+    fn add_with_stats(path: &str, size: i64, stats: Option<&str>) -> String {
+        let stats = stats.map_or_else(String::new, |stats| {
+            format!(
+                ",\"stats\":{}",
+                serde_json::to_string(stats).expect("stats string is serializable")
+            )
         });
         format!(
             r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":1587968586000,"dataChange":true{stats}}}}}"#
@@ -348,7 +394,7 @@ mod tests {
     fn file_task_planning_exhausts_empty_single_and_multi_batch_scans()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
-        let empty = plan_scan(&empty_snapshot, None, None, true, Default::default())?;
+        let empty = plan_scan(&empty_snapshot, None, &[], None, true, Default::default())?;
         assert!(empty.file_tasks.is_empty());
         assert_eq!(empty.estimated_bytes, Some(0));
         assert_eq!(empty.estimated_rows, Some(0));
@@ -356,7 +402,7 @@ mod tests {
         let single_add = [add("single.parquet", 0, None)];
         let (_single_table, single_snapshot) =
             loaded_snapshot_with_adds("single-file", &single_add)?;
-        let single = plan_scan(&single_snapshot, None, None, true, Default::default())?;
+        let single = plan_scan(&single_snapshot, None, &[], None, true, Default::default())?;
         assert_eq!(single.file_tasks.len(), 1);
         assert_eq!(single.file_tasks[0].path, "single.parquet");
         assert_eq!(single.file_tasks[0].estimated_bytes, Some(0));
@@ -377,6 +423,7 @@ mod tests {
         let many = plan_scan(
             &many_snapshot,
             Some(&projection),
+            &[],
             None,
             true,
             Default::default(),
@@ -397,10 +444,10 @@ mod tests {
             many_snapshot.engine_context()
         ));
         assert_eq!(many.snapshot_version, many_snapshot.version());
-        assert_eq!(field_names(&many.logical_schema), ["id", "label", "hidden"]);
+        assert_eq!(field_names(&many.logical_schema), ["label", "id"]);
         assert_eq!(field_names(&many.physical_schema), ["label", "id"]);
         assert_eq!(field_names(&many.projected_schema), ["label", "id"]);
-        assert!(many.kernel_predicate.is_none());
+        assert!(many.physical_predicate.is_none());
         assert_eq!(many.execution_options, Default::default());
 
         Ok(())
@@ -415,7 +462,7 @@ mod tests {
         ];
         let (_table, snapshot) = loaded_snapshot_with_adds("all-or-error", &adds)?;
 
-        let error = match plan_scan(&snapshot, None, None, true, Default::default()) {
+        let error = match plan_scan(&snapshot, None, &[], None, true, Default::default()) {
             Ok(_) => return Err("invalid task must fail the plan".into()),
             Err(error) => error,
         };
@@ -432,6 +479,78 @@ mod tests {
         assert_eq!(exact_sum([Some(2), Some(3)]), Some(5));
         assert_eq!(exact_sum([Some(2), None, Some(3)]), None);
         assert_eq!(exact_sum([Some(u64::MAX), Some(1)]), None);
+    }
+
+    #[test]
+    fn scan_plan_keeps_hidden_columns_and_applies_static_stats_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add_with_stats(
+                "impossible.parquet",
+                10,
+                Some(
+                    r#"{"numRecords":2,"minValues":{"hidden":1},"maxValues":{"hidden":10},"nullCount":{"hidden":0}}"#,
+                ),
+            ),
+            add_with_stats(
+                "possible.parquet",
+                20,
+                Some(
+                    r#"{"numRecords":3,"minValues":{"hidden":101},"maxValues":{"hidden":200},"nullCount":{"hidden":0}}"#,
+                ),
+            ),
+            add("missing-stats.parquet", 30, None),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("stats-pruning", &adds)?;
+        let predicate = DeltaPredicate::Compare {
+            column: "hidden".to_owned(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(100),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+        let projection = ["label".to_owned()];
+        let hidden = ["hidden".to_owned()];
+
+        let plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &hidden,
+            Some(kernel_predicate),
+            true,
+            Default::default(),
+        )?;
+
+        assert_eq!(field_names(&plan.logical_schema), ["label", "hidden"]);
+        assert_eq!(field_names(&plan.physical_schema), ["label", "hidden"]);
+        assert_eq!(field_names(&plan.projected_schema), ["label"]);
+        assert_eq!(
+            plan.file_tasks
+                .iter()
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            ["possible.parquet", "missing-stats.parquet"]
+        );
+        assert_eq!(plan.files_filtered_during_planning, Some(1));
+        assert_eq!(plan.estimated_bytes, Some(50));
+        assert_eq!(plan.estimated_rows, None);
+        assert!(plan.physical_predicate.is_some());
+
+        let empty_projection = Vec::new();
+        let empty = plan_scan(
+            &snapshot,
+            Some(&empty_projection),
+            &hidden,
+            None,
+            false,
+            Default::default(),
+        )?;
+        assert_eq!(field_names(&empty.logical_schema), ["hidden"]);
+        assert_eq!(field_names(&empty.physical_schema), ["hidden"]);
+        assert!(empty.projected_schema.fields().is_empty());
+
+        Ok(())
     }
 
     #[test]
@@ -505,6 +624,22 @@ mod tests {
             assert!(!display.contains("secret-missing"));
             assert!(!format!("{error:?}").contains("secret-missing"));
         }
+
+        let projection = ["id".to_owned()];
+        let hidden = ["secret-hidden".to_owned()];
+        let error = match plan_scan(
+            &snapshot,
+            Some(&projection),
+            &hidden,
+            None,
+            false,
+            Default::default(),
+        ) {
+            Ok(_) => return Err("invalid hidden column must fail".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.as_str(), "invalid_projection");
+        assert!(!error.to_string().contains("secret-hidden"));
 
         Ok(())
     }
