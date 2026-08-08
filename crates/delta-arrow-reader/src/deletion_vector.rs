@@ -147,8 +147,14 @@ impl DeletionVectorSelection {
     pub(crate) fn mask_original_row_indexes(
         &mut self,
         batch: RecordBatch,
-        row_indexes: &Int64Array,
+        row_indexes: Option<&Int64Array>,
     ) -> Result<RecordBatch, DeltaReaderError> {
+        let Some(row_indexes) = row_indexes else {
+            return self.reject(
+                "invalid_deletion_vector_coordinates",
+                "original row indexes are missing",
+            );
+        };
         if row_indexes.len() != batch.num_rows() {
             return self.reject(
                 "invalid_deletion_vector_coordinates",
@@ -417,6 +423,8 @@ mod tests {
     };
 
     const INLINE_DV_DELETED_ROW_INDEXES: &[u64] = &[3, 4, 7, 11, 18, 29];
+    const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+    const RELATIVE_DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-dv-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 
@@ -475,9 +483,6 @@ mod tests {
         table: &DeltaLogTable,
         deleted_rows: impl IntoIterator<Item = u64>,
     ) -> Result<DeletionVectorMetadata, Box<dyn std::error::Error>> {
-        const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
-        const RELATIVE_DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
-
         let mut buffer = Vec::new();
         let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
         let mut deletion_vector = KernelDeletionVector::new();
@@ -493,6 +498,17 @@ mod tests {
             write_result.size_in_bytes,
             write_result.cardinality,
         )?))
+    }
+
+    fn missing_relative_metadata() -> Result<DeletionVectorMetadata, delta_kernel::Error> {
+        DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedRelative,
+            RELATIVE_DV_ID,
+            Some(1),
+            36,
+            2,
+        )
+        .map(metadata)
     }
 
     #[test]
@@ -583,17 +599,9 @@ mod tests {
     #[test]
     fn lazy_loader_maps_payload_failures_once_and_redacts_context()
     -> Result<(), Box<dyn std::error::Error>> {
-        const MISSING_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
-
         let table = DeltaLogTable::new("secret-token")?;
         let snapshot = table.snapshot()?;
-        let missing = metadata(DeletionVectorDescriptor::try_new(
-            DeletionVectorStorageType::PersistedRelative,
-            MISSING_DV_ID,
-            Some(1),
-            36,
-            2,
-        )?);
+        let missing = missing_relative_metadata()?;
         let metrics = metrics();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -612,11 +620,53 @@ mod tests {
         );
         let debug = format!("{error:?}");
         assert!(!debug.contains("secret-token"));
-        assert!(!debug.contains(MISSING_DV_ID));
+        assert!(!debug.contains(RELATIVE_DV_ID));
         let metrics = metrics.snapshot();
         assert_eq!(metrics.deletion_vector_payloads_loaded, 0);
         assert_eq!(metrics.deletion_vector_failures, 1);
         assert_eq!(metrics.deletion_vector_rejections, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_loader_leaves_malformed_and_truncated_payloads_to_kernel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MALFORMED_INLINE: &str = "not-valid-inline-payload";
+
+        let table = DeltaLogTable::new("hostile-payload")?;
+        fs::write(table.0.join(RELATIVE_DV_FILE), [0_u8, 1, 2])?;
+        let snapshot = table.snapshot()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let malformed = metadata(DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            MALFORMED_INLINE,
+            None,
+            4,
+            1,
+        )?);
+        let truncated = missing_relative_metadata()?;
+
+        for metadata in [malformed, truncated] {
+            let metrics = metrics();
+            let error = runtime
+                .block_on(load_deletion_vector_selection(
+                    &snapshot, metadata, &metrics,
+                ))
+                .err()
+                .expect("invalid Kernel payload must fail");
+            assert_eq!(error.as_str(), "deletion_vector_read");
+            assert!(error.source().is_some_and(is_kernel_error));
+            assert!(!error.to_string().contains(MALFORMED_INLINE));
+            assert!(!format!("{error:?}").contains(RELATIVE_DV_ID));
+            let metrics = metrics.snapshot();
+            assert_eq!(metrics.deletion_vector_payloads_loaded, 0);
+            assert_eq!(metrics.deletion_vector_failures, 1);
+            assert_eq!(metrics.deletion_vector_rejections, 0);
+            assert_eq!(metrics.parquet_data_file_range_get_operations, Some(0));
+            assert_eq!(metrics.parquet_data_file_full_get_operations, Some(0));
+        }
         Ok(())
     }
 
@@ -854,8 +904,8 @@ mod tests {
         assert_eq!(all_batch.schema().field(1).name(), "label");
 
         let mut sparse = selection(vec![2], 5)?;
-        let sparse_batch =
-            sparse.mask_original_row_indexes(batch(&[10, 12, 14]), &row_indexes(&[0, 2, 4]))?;
+        let sparse_batch = sparse
+            .mask_original_row_indexes(batch(&[10, 12, 14]), Some(&row_indexes(&[0, 2, 4])))?;
         sparse.finish()?;
         assert_eq!(ids(&sparse_batch), [10, 14]);
         Ok(())
@@ -875,12 +925,92 @@ mod tests {
         let mut selection = DeletionVectorSelection::try_new(vec![1], mismatch_metrics.clone())?;
         selection.bind_physical_row_count(3)?;
         let _ = selection
-            .mask_original_row_indexes(batch(&[10, 11]), &row_indexes(&[0]))
+            .mask_original_row_indexes(batch(&[10, 11]), Some(&row_indexes(&[0])))
             .expect_err("row-index count mismatch must fail");
         let snapshot = mismatch_metrics.snapshot();
         assert_eq!(snapshot.deletion_vectors_applied, 0);
         assert_eq!(snapshot.deletion_vector_failures, 0);
         assert_eq!(snapshot.deletion_vector_rejections, 1);
+
+        let missing_metrics = metrics();
+        let mut selection = DeletionVectorSelection::try_new(vec![1], missing_metrics.clone())?;
+        selection.bind_physical_row_count(3)?;
+        let _ = selection
+            .mask_original_row_indexes(batch(&[10, 11]), None)
+            .expect_err("missing row indexes must fail");
+        let snapshot = missing_metrics.snapshot();
+        assert_eq!(snapshot.deletion_vectors_applied, 0);
+        assert_eq!(snapshot.deletion_vector_failures, 0);
+        assert_eq!(snapshot.deletion_vector_rejections, 1);
         Ok(())
+    }
+
+    #[test]
+    fn terminal_errors_increment_exactly_one_failure_or_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selection_metrics = metrics();
+        let _ = DeletionVectorSelection::try_new(vec![2, 1], selection_metrics.clone())
+            .err()
+            .expect("invalid selection must fail");
+
+        let coordinate_metrics = metrics();
+        let mut selection = DeletionVectorSelection::try_new(vec![1], coordinate_metrics.clone())?;
+        selection.bind_physical_row_count(3)?;
+        let _ = selection
+            .mask_original_row_indexes(batch(&[10]), None)
+            .expect_err("missing coordinates must fail");
+
+        let payload_metrics = metrics();
+        let table = DeltaLogTable::new("terminal-classification")?;
+        let snapshot = table.snapshot()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let _ = runtime
+            .block_on(load_deletion_vector_selection(
+                &snapshot,
+                missing_relative_metadata()?,
+                &payload_metrics,
+            ))
+            .err()
+            .expect("missing payload must fail");
+
+        for (name, snapshot, failures, rejections) in [
+            ("selection", selection_metrics.snapshot(), 0, 1),
+            ("coordinate", coordinate_metrics.snapshot(), 0, 1),
+            ("payload", payload_metrics.snapshot(), 1, 0),
+        ] {
+            assert_eq!(snapshot.deletion_vector_failures, failures, "{name}");
+            assert_eq!(snapshot.deletion_vector_rejections, rejections, "{name}");
+            assert_eq!(failures + rejections, 1, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_boundary_reuses_kernel_context_without_an_extra_decoder_or_runtime() {
+        let deletion_vector_source = include_str!("deletion_vector.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        let kernel_source = include_str!("kernel.rs");
+
+        for forbidden in [
+            "DefaultEngineBuilder",
+            "store_from_url_opts",
+            "Runtime::",
+            "Roaring",
+            "z85",
+            "datafusion",
+            "tracing::",
+        ] {
+            assert!(!deletion_vector_source.contains(forbidden), "{forbidden}");
+        }
+        assert_eq!(
+            kernel_source.matches("DefaultEngineBuilder::new").count(),
+            1
+        );
+        assert_eq!(kernel_source.matches("store_from_url_opts(").count(), 1);
+        assert_eq!(kernel_source.matches("get_row_indexes(").count(), 1);
     }
 }
