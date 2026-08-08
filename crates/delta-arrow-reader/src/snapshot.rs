@@ -46,6 +46,10 @@ impl LoadedDeltaTableSnapshot {
     pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
         &self.engine_context
     }
+
+    pub(crate) fn kernel_snapshot(&self) -> &KernelSnapshot {
+        &self.snapshot
+    }
 }
 
 pub(crate) fn load_delta_table_snapshot_blocking(

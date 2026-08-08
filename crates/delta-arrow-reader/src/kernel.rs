@@ -1,13 +1,21 @@
 //! Private boundary for stability-sensitive `delta_kernel` APIs.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, error::ArrowError};
+use arrow::{
+    array::Array as _, datatypes::SchemaRef, error::ArrowError, record_batch::RecordBatch,
+};
 use delta_kernel::{
     Engine, Snapshot, SnapshotRef,
-    engine::arrow_conversion::TryIntoArrow,
-    expressions::{ColumnName, Expression, Predicate, PredicateRef, Scalar},
-    scan::state::DvInfo,
+    engine::{
+        arrow_conversion::TryIntoArrow,
+        arrow_data::{ArrowEngineData, EngineDataArrowExt},
+    },
+    expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar},
+    scan::ScanMetadata,
+    scan::state::{DvInfo, ScanFile, transform_to_logical},
+    scan::{Scan as DeltaKernelScan, StatsOptions},
+    schema::SchemaRef as KernelSchemaRef,
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
@@ -45,6 +53,139 @@ pub(crate) struct DeltaKernelEngineContext {
 pub(crate) struct KernelDeletionVectorHandle(DvInfo);
 
 #[allow(dead_code)]
+pub(crate) struct KernelScanFileMetadata {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) modification_time_ms: Option<i64>,
+    pub(crate) estimated_rows: Option<u64>,
+    pub(crate) partition_values: BTreeMap<String, String>,
+    pub(crate) deletion_vector: Option<KernelDeletionVectorHandle>,
+    pub(crate) transform: KernelPhysicalToLogicalTransform,
+}
+
+#[allow(dead_code)]
+pub(crate) struct KernelPhysicalToLogicalTransform(Option<ExpressionRef>);
+
+#[allow(dead_code)]
+pub(crate) struct KernelScan {
+    scan: DeltaKernelScan,
+    schemas: KernelScanSchemas,
+    logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct KernelScanSchemas {
+    logical: KernelSchemaRef,
+    physical: KernelSchemaRef,
+}
+
+#[allow(dead_code)]
+pub(crate) struct KernelScanMetadata {
+    pub(crate) files: Vec<KernelScanFileMetadata>,
+    pub(crate) files_filtered_during_planning: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl KernelPhysicalToLogicalTransform {
+    pub(crate) fn is_required(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn into_inner(self) -> Option<ExpressionRef> {
+        self.0
+    }
+
+    pub(crate) fn apply(
+        &self,
+        engine_context: &DeltaKernelEngineContext,
+        schemas: &KernelScanSchemas,
+        batch: RecordBatch,
+    ) -> delta_kernel::DeltaResult<RecordBatch> {
+        let Some(transform) = self.0.clone() else {
+            return Ok(batch);
+        };
+        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::new(batch));
+        transform_to_logical(
+            engine_context.engine.as_ref(),
+            data,
+            &schemas.physical,
+            schemas.logical.as_ref(),
+            Some(transform),
+        )?
+        .try_into_record_batch()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_expression(expression: Expression) -> Self {
+        Self(Some(Arc::new(expression)))
+    }
+}
+
+#[allow(dead_code)]
+impl KernelScan {
+    pub(crate) fn logical_schema(&self) -> SchemaRef {
+        Arc::clone(&self.logical_schema)
+    }
+
+    pub(crate) fn physical_schema(&self) -> SchemaRef {
+        Arc::clone(&self.physical_schema)
+    }
+
+    pub(crate) fn schemas(&self) -> KernelScanSchemas {
+        self.schemas.clone()
+    }
+
+    pub(crate) fn has_physical_predicate(&self) -> bool {
+        self.scan.physical_predicate().is_some()
+    }
+
+    pub(crate) fn physical_predicate(&self) -> Option<DeltaKernelPredicate> {
+        self.scan.physical_predicate().map(DeltaKernelPredicate)
+    }
+
+    pub(crate) fn file_metadata(
+        &self,
+        engine_context: &DeltaKernelEngineContext,
+    ) -> delta_kernel::DeltaResult<KernelScanMetadata> {
+        fn collect(files: &mut Vec<KernelScanFileMetadata>, file: ScanFile) {
+            files.push(KernelScanFileMetadata::from_scan_file(file));
+        }
+
+        let mut files = Vec::new();
+        let mut filtered = Some(0_u64);
+        let mut saw_batch = false;
+        for metadata in self.scan.scan_metadata(engine_context.engine.as_ref())? {
+            let metadata = metadata?;
+            saw_batch = true;
+            filtered = filtered.and_then(|total| {
+                files_filtered(&metadata).and_then(|count| total.checked_add(count))
+            });
+            files = metadata.visit_scan_files(files, collect)?;
+        }
+        Ok(KernelScanMetadata {
+            files,
+            files_filtered_during_planning: saw_batch.then_some(filtered).flatten(),
+        })
+    }
+}
+
+fn files_filtered(metadata: &ScanMetadata) -> Option<u64> {
+    let data = metadata
+        .scan_files
+        .data()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()?;
+    let paths = data.record_batch().column_by_name("path")?;
+    let selection = metadata.scan_files.selection_vector();
+    let count = (0..paths.len())
+        .filter(|&index| !paths.is_null(index) && !selection.get(index).copied().unwrap_or(true))
+        .count();
+    u64::try_from(count).ok()
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeltaKernelPredicate(PredicateRef);
 
@@ -64,6 +205,31 @@ pub(crate) fn preserve_deletion_vector(dv_info: DvInfo) -> Option<KernelDeletion
     dv_info
         .has_vector()
         .then_some(KernelDeletionVectorHandle(dv_info))
+}
+
+#[allow(dead_code)]
+impl KernelScanFileMetadata {
+    pub(crate) fn from_scan_file(file: ScanFile) -> Self {
+        let ScanFile {
+            path,
+            size,
+            modification_time,
+            stats,
+            dv_info,
+            transform,
+            partition_values,
+        } = file;
+
+        Self {
+            path,
+            size,
+            modification_time_ms: Some(modification_time),
+            estimated_rows: stats.map(|stats| stats.num_records),
+            partition_values: partition_values.into_iter().collect(),
+            deletion_vector: preserve_deletion_vector(dv_info),
+            transform: KernelPhysicalToLogicalTransform(transform),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -260,6 +426,39 @@ pub(crate) struct KernelSnapshot(SnapshotRef);
 impl KernelSnapshot {
     pub(crate) fn version(&self) -> u64 {
         self.0.version()
+    }
+
+    pub(crate) fn build_scan(
+        &self,
+        projection: Option<&[String]>,
+        predicate: Option<DeltaKernelPredicate>,
+        include_stats: bool,
+    ) -> delta_kernel::DeltaResult<KernelScan> {
+        let logical_schema = match projection {
+            Some(names) => self.0.schema().project(names)?,
+            None => self.0.schema(),
+        };
+        let mut builder = Arc::clone(&self.0)
+            .scan_builder()
+            .with_schema(logical_schema)
+            .with_predicate(predicate.map(DeltaKernelPredicate::into_inner));
+        if include_stats {
+            builder = builder.with_stats(StatsOptions::all());
+        }
+        let scan = builder.build()?;
+        let schemas = KernelScanSchemas {
+            logical: Arc::clone(scan.logical_schema()),
+            physical: Arc::clone(scan.physical_schema()),
+        };
+        let logical_schema = Arc::new(schemas.logical.as_ref().try_into_arrow()?);
+        let physical_schema = Arc::new(schemas.physical.as_ref().try_into_arrow()?);
+
+        Ok(KernelScan {
+            scan,
+            schemas,
+            logical_schema,
+            physical_schema,
+        })
     }
 }
 

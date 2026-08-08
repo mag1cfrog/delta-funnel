@@ -1,0 +1,999 @@
+//! Private scan planning models.
+
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
+
+use arrow::datatypes::{Schema, SchemaRef};
+use snafu::ResultExt;
+
+use crate::{
+    DeltaReaderError, DeltaReaderExecutionOptions,
+    deletion_vector::DeletionVectorMetadata,
+    error::{InvalidProjectionSnafu, ScanPlanningSnafu},
+    kernel::{
+        DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
+        KernelScan, KernelScanFileMetadata, KernelScanSchemas,
+    },
+    snapshot::LoadedDeltaTableSnapshot,
+};
+
+#[allow(dead_code)]
+pub(crate) struct DeltaScanPlan {
+    pub(crate) snapshot_version: u64,
+    pub(crate) engine_context: Arc<DeltaKernelEngineContext>,
+    pub(crate) logical_schema: SchemaRef,
+    pub(crate) physical_schema: SchemaRef,
+    pub(crate) projected_schema: SchemaRef,
+    pub(crate) kernel_schemas: KernelScanSchemas,
+    pub(crate) file_tasks: Vec<DeltaScanFileTask>,
+    pub(crate) scan_metadata_exhausted: bool,
+    pub(crate) files_filtered_during_planning: Option<u64>,
+    pub(crate) estimated_bytes: Option<u64>,
+    pub(crate) estimated_rows: Option<u64>,
+    pub(crate) physical_predicate: Option<DeltaKernelPredicate>,
+    pub(crate) execution_options: DeltaReaderExecutionOptions,
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_scan(
+    snapshot: &LoadedDeltaTableSnapshot,
+    projection: Option<&[String]>,
+    predicate: Option<DeltaKernelPredicate>,
+    include_stats: bool,
+) -> Result<KernelScan, DeltaReaderError> {
+    validate_projection(snapshot.schema().as_ref(), projection)?;
+    snapshot
+        .kernel_snapshot()
+        .build_scan(projection, predicate, include_stats)
+        .boxed()
+        .context(ScanPlanningSnafu {
+            reason: "kernel_scan_build_failed",
+        })
+}
+
+#[allow(dead_code)]
+pub(crate) fn plan_scan(
+    snapshot: &LoadedDeltaTableSnapshot,
+    projection: Option<&[String]>,
+    hidden_columns: &[String],
+    kernel_predicate: Option<DeltaKernelPredicate>,
+    include_stats: bool,
+    execution_options: DeltaReaderExecutionOptions,
+) -> Result<DeltaScanPlan, DeltaReaderError> {
+    execution_options.validate()?;
+    let logical_projection =
+        logical_projection(snapshot.schema().as_ref(), projection, hidden_columns)?;
+    let scan = build_scan(
+        snapshot,
+        logical_projection.as_deref(),
+        kernel_predicate.clone(),
+        include_stats,
+    )?;
+    let metadata = scan
+        .file_metadata(snapshot.engine_context())
+        .boxed()
+        .context(ScanPlanningSnafu {
+            reason: "kernel_scan_metadata_failed",
+        })?;
+    let file_tasks = metadata
+        .files
+        .into_iter()
+        .map(DeltaScanFileTask::try_from_kernel)
+        .collect::<Result<Vec<_>, _>>()?;
+    let estimated_bytes = exact_sum(file_tasks.iter().map(|task| task.estimated_bytes));
+    let estimated_rows = exact_sum(file_tasks.iter().map(|task| task.estimated_rows));
+    let logical_schema = scan.logical_schema();
+    let physical_predicate = scan.physical_predicate();
+    let projected_schema = match projection {
+        None => Arc::clone(&logical_schema),
+        Some(names) => Arc::new(Schema::new_with_metadata(
+            logical_schema.fields()[..names.len()].to_vec(),
+            logical_schema.metadata().clone(),
+        )),
+    };
+
+    Ok(DeltaScanPlan {
+        snapshot_version: snapshot.version(),
+        engine_context: Arc::clone(snapshot.engine_context()),
+        logical_schema,
+        physical_schema: scan.physical_schema(),
+        projected_schema,
+        kernel_schemas: scan.schemas(),
+        file_tasks,
+        scan_metadata_exhausted: true,
+        files_filtered_during_planning: metadata.files_filtered_during_planning,
+        estimated_bytes,
+        estimated_rows,
+        physical_predicate,
+        execution_options,
+    })
+}
+
+fn logical_projection(
+    schema: &Schema,
+    projection: Option<&[String]>,
+    hidden_columns: &[String],
+) -> Result<Option<Vec<String>>, DeltaReaderError> {
+    validate_projection(schema, projection)?;
+    for name in hidden_columns {
+        if schema.index_of(name).is_err() {
+            return InvalidProjectionSnafu {
+                reason: "column_not_found",
+            }
+            .fail();
+        }
+    }
+
+    Ok(projection.map(|projection| {
+        let mut logical = projection.to_vec();
+        for name in hidden_columns {
+            if !logical.contains(name) {
+                logical.push(name.clone());
+            }
+        }
+        logical
+    }))
+}
+
+fn exact_sum(estimates: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    estimates
+        .into_iter()
+        .try_fold(0_u64, |total, value| total.checked_add(value?))
+}
+
+fn validate_projection(
+    schema: &Schema,
+    projection: Option<&[String]>,
+) -> Result<(), DeltaReaderError> {
+    let Some(projection) = projection else {
+        return Ok(());
+    };
+    let mut seen = HashSet::with_capacity(projection.len());
+
+    for name in projection {
+        if !seen.insert(name) {
+            return InvalidProjectionSnafu {
+                reason: "duplicate_column",
+            }
+            .fail();
+        }
+        if schema.index_of(name).is_err() {
+            return InvalidProjectionSnafu {
+                reason: "column_not_found",
+            }
+            .fail();
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) struct DeltaScanFileTask {
+    pub(crate) path: String,
+    pub(crate) estimated_bytes: Option<u64>,
+    pub(crate) estimated_rows: Option<u64>,
+    pub(crate) stats: Option<DeltaScanFileStats>,
+    pub(crate) modification_time_ms: Option<i64>,
+    pub(crate) partition_values: BTreeMap<String, String>,
+    pub(crate) deletion_vector: DeletionVectorMetadata,
+    pub(crate) transform: KernelPhysicalToLogicalTransform,
+}
+
+#[allow(dead_code)]
+pub(crate) struct DeltaScanFileStats {
+    pub(crate) num_records: u64,
+}
+
+#[allow(dead_code)]
+impl DeltaScanFileTask {
+    pub(crate) fn try_from_kernel(file: KernelScanFileMetadata) -> Result<Self, DeltaReaderError> {
+        let estimated_bytes = u64::try_from(file.size)
+            .boxed()
+            .context(ScanPlanningSnafu {
+                reason: "negative_file_size",
+            })?;
+
+        let stats = file
+            .estimated_rows
+            .map(|num_records| DeltaScanFileStats { num_records });
+
+        Ok(Self {
+            path: file.path,
+            estimated_bytes: Some(estimated_bytes),
+            estimated_rows: stats.as_ref().map(|stats| stats.num_records),
+            stats,
+            modification_time_ms: file.modification_time_ms,
+            partition_values: file.partition_values,
+            deletion_vector: DeletionVectorMetadata::from_kernel(file.deletion_vector),
+            transform: file.transform,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use arrow::{
+        array::{Int32Array, StringArray, StructArray},
+        datatypes::{DataType, Schema},
+        record_batch::RecordBatch,
+    };
+    use delta_kernel::{
+        actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType},
+        expressions::{ColumnName, Expression},
+        scan::state::{DvInfo, ScanFile, Stats},
+    };
+
+    use super::{
+        DeltaScanFileTask, KernelPhysicalToLogicalTransform, build_scan, exact_sum, plan_scan,
+    };
+    use crate::{
+        DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
+        DeltaStorageOptions,
+        kernel::{KernelScanFileMetadata, delta_predicate_to_kernel_pruning},
+        predicate::validate_predicate,
+        snapshot::load_delta_table_snapshot_blocking,
+    };
+
+    const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
+    const METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"hidden\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
+    const INVALID_PARTITION_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-invalid-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["long_part"],"configuration":{},"createdTime":1587968585495}}"#;
+    const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-column-mapping-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":4,\"delta.columnMapping.physicalName\":\"phys_first_name\"}},{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_age\"}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_profile\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"5"},"createdTime":1587968585495}}"#;
+
+    struct DeltaLogTable(PathBuf);
+
+    impl DeltaLogTable {
+        fn new_with_metadata_and_adds(
+            name: &str,
+            metadata: &str,
+            adds: &[String],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol_metadata_and_adds(name, PROTOCOL_JSON, metadata, adds)
+        }
+
+        fn new_with_protocol_metadata_and_adds(
+            name: &str,
+            protocol: &str,
+            metadata: &str,
+            adds: &[String],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let path = Path::new("target")
+                .join("delta-arrow-reader-planning-tests")
+                .join(format!("{}-{name}-{nanos}", std::process::id()));
+            let log_path = path.join("_delta_log");
+            fs::create_dir_all(&log_path)?;
+            fs::write(
+                log_path.join("00000000000000000000.json"),
+                format!("{protocol}\n{metadata}\n{}", adds.join("\n")),
+            )?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for DeltaLogTable {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn loaded_snapshot(
+        name: &str,
+    ) -> Result<
+        (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
+        Box<dyn std::error::Error>,
+    > {
+        loaded_snapshot_with_adds(name, &[])
+    }
+
+    fn loaded_snapshot_with_adds(
+        name: &str,
+        adds: &[String],
+    ) -> Result<
+        (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
+        Box<dyn std::error::Error>,
+    > {
+        loaded_snapshot_with_metadata_and_adds(name, METADATA_JSON, adds)
+    }
+
+    fn loaded_snapshot_with_metadata_and_adds(
+        name: &str,
+        metadata: &str,
+        adds: &[String],
+    ) -> Result<
+        (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
+        Box<dyn std::error::Error>,
+    > {
+        let table = DeltaLogTable::new_with_metadata_and_adds(name, metadata, adds)?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        Ok((table, snapshot))
+    }
+
+    fn add(path: &str, size: i64, rows: Option<u64>) -> String {
+        let stats = rows.map(|rows| format!(r#"{{"numRecords":{rows}}}"#));
+        add_with_stats(path, size, stats.as_deref())
+    }
+
+    fn add_with_stats(path: &str, size: i64, stats: Option<&str>) -> String {
+        add_action(path, size, "{}", stats)
+    }
+
+    fn add_with_partition(path: &str, size: i64, rows: u64, region: &str) -> String {
+        let stats = format!(r#"{{"numRecords":{rows}}}"#);
+        let region = serde_json::to_string(region).expect("partition value is serializable");
+        add_action(
+            path,
+            size,
+            &format!(r#"{{"region":{region}}}"#),
+            Some(&stats),
+        )
+    }
+
+    fn add_action(path: &str, size: i64, partition_values: &str, stats: Option<&str>) -> String {
+        let stats = stats.map_or_else(String::new, |stats| {
+            format!(
+                ",\"stats\":{}",
+                serde_json::to_string(stats).expect("stats string is serializable")
+            )
+        });
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{partition_values},"size":{size},"modificationTime":1587968586000,"dataChange":true{stats}}}}}"#
+        )
+    }
+
+    fn field_names(schema: &arrow::datatypes::SchemaRef) -> Vec<&str> {
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect()
+    }
+
+    fn kernel_file(path: &str) -> ScanFile {
+        ScanFile {
+            path: path.to_owned(),
+            size: 123,
+            modification_time: 1_587_968_586_000,
+            stats: Some(Stats { num_records: 7 }),
+            dv_info: DvInfo::default(),
+            transform: None,
+            partition_values: HashMap::from([
+                ("region".to_owned(), "us-west".to_owned()),
+                ("day".to_owned(), "2026-06-11".to_owned()),
+            ]),
+        }
+    }
+
+    fn task(file: ScanFile) -> Result<DeltaScanFileTask, crate::DeltaReaderError> {
+        DeltaScanFileTask::try_from_kernel(KernelScanFileMetadata::from_scan_file(file))
+    }
+
+    #[test]
+    fn file_task_preserves_kernel_metadata_without_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = kernel_file("part-00000.parquet");
+        file.dv_info = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            "inline-payload",
+            None,
+            14,
+            2,
+        )?
+        .into();
+        file.transform = Some(Arc::new(Expression::Column(ColumnName::new([
+            "physical_id",
+        ]))));
+
+        let task = task(file)?;
+
+        assert_eq!(task.path, "part-00000.parquet");
+        assert_eq!(task.estimated_bytes, Some(123));
+        assert_eq!(task.estimated_rows, Some(7));
+        assert_eq!(task.stats.as_ref().map(|stats| stats.num_records), Some(7));
+        assert_eq!(task.modification_time_ms, Some(1_587_968_586_000));
+        assert_eq!(
+            task.partition_values.into_iter().collect::<Vec<_>>(),
+            [
+                ("day".to_owned(), "2026-06-11".to_owned()),
+                ("region".to_owned(), "us-west".to_owned()),
+            ]
+        );
+        assert!(task.deletion_vector.is_present());
+        assert!(task.transform.is_required());
+        assert!(task.transform.into_inner().is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_task_preserves_zero_and_missing_estimates() -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = kernel_file("empty.parquet");
+        file.size = 0;
+        file.stats = None;
+
+        let task = task(file)?;
+
+        assert_eq!(task.estimated_bytes, Some(0));
+        assert_eq!(task.estimated_rows, None);
+        assert!(task.stats.is_none());
+        assert!(!task.deletion_vector.is_present());
+        assert!(!task.transform.is_required());
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_task_rejects_negative_size_without_disclosing_path() {
+        let mut file = kernel_file("secret-file.parquet");
+        file.size = -1;
+
+        let error = match task(file) {
+            Ok(_) => panic!("negative size must fail"),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+
+        assert_eq!(error.as_str(), "scan_planning");
+        assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+        assert!(!display.contains("secret-file"));
+        assert!(!format!("{error:?}").contains("secret-file"));
+    }
+
+    #[test]
+    fn file_task_planning_exhausts_empty_single_and_multi_batch_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
+        let empty = plan_scan(&empty_snapshot, None, &[], None, true, Default::default())?;
+        assert!(empty.file_tasks.is_empty());
+        assert_eq!(empty.estimated_bytes, Some(0));
+        assert_eq!(empty.estimated_rows, Some(0));
+
+        let single_add = [add("single.parquet", 0, None)];
+        let (_single_table, single_snapshot) =
+            loaded_snapshot_with_adds("single-file", &single_add)?;
+        let single = plan_scan(&single_snapshot, None, &[], None, true, Default::default())?;
+        assert_eq!(single.file_tasks.len(), 1);
+        assert_eq!(single.file_tasks[0].path, "single.parquet");
+        assert_eq!(single.file_tasks[0].estimated_bytes, Some(0));
+        assert_eq!(single.estimated_bytes, Some(0));
+        assert_eq!(single.estimated_rows, None);
+
+        let adds = (0_u32..1_001)
+            .map(|index| {
+                add(
+                    &format!("part-{index:04}.parquet"),
+                    i64::from(index),
+                    (index % 2 == 0).then_some(u64::from(index)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (_many_table, many_snapshot) = loaded_snapshot_with_adds("many-files", &adds)?;
+        let projection = ["label".to_owned(), "id".to_owned()];
+        let many = plan_scan(
+            &many_snapshot,
+            Some(&projection),
+            &[],
+            None,
+            true,
+            Default::default(),
+        )?;
+
+        assert_eq!(many.file_tasks.len(), adds.len());
+        assert_eq!(many.file_tasks[0].path, "part-0000.parquet");
+        assert_eq!(many.file_tasks[1].estimated_rows, None);
+        assert_eq!(many.file_tasks[1_000].path, "part-1000.parquet");
+        assert_eq!(many.file_tasks[1_000].estimated_bytes, Some(1_000));
+        assert_eq!(many.file_tasks[1_000].estimated_rows, Some(1_000));
+        assert!(many.scan_metadata_exhausted);
+        assert_eq!(many.files_filtered_during_planning, Some(0));
+        assert_eq!(many.estimated_bytes, Some(500_500));
+        assert_eq!(many.estimated_rows, None);
+        assert!(Arc::ptr_eq(
+            &many.engine_context,
+            many_snapshot.engine_context()
+        ));
+        assert_eq!(many.snapshot_version, many_snapshot.version());
+        assert_eq!(field_names(&many.logical_schema), ["label", "id"]);
+        assert_eq!(field_names(&many.physical_schema), ["label", "id"]);
+        assert_eq!(field_names(&many.projected_schema), ["label", "id"]);
+        assert!(many.physical_predicate.is_none());
+        assert_eq!(many.execution_options, Default::default());
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_task_planning_returns_no_partial_result() -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add("first.parquet", 1, Some(1)),
+            add("secret-invalid.parquet", -1, Some(1)),
+            add("last.parquet", 1, Some(1)),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("all-or-error", &adds)?;
+
+        let error = match plan_scan(&snapshot, None, &[], None, true, Default::default()) {
+            Ok(_) => return Err("invalid task must fail the plan".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.as_str(), "scan_planning");
+        assert!(!error.to_string().contains("secret-invalid"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_metadata_visitor_failure_returns_no_partial_plan_or_sensitive_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const INVALID_VALUE: &str = "secret-not-an-integer";
+        let adds = [add_action(
+            "secret-invalid-partition.parquet",
+            1,
+            &format!(r#"{{"long_part":"{INVALID_VALUE}"}}"#),
+            None,
+        )];
+        let (_table, snapshot) = loaded_snapshot_with_metadata_and_adds(
+            "invalid-partition",
+            INVALID_PARTITION_METADATA_JSON,
+            &adds,
+        )?;
+
+        let error = match plan_scan(&snapshot, None, &[], None, false, Default::default()) {
+            Ok(_) => return Err("invalid partition metadata must fail the whole plan".into()),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert_eq!(error.as_str(), "scan_planning");
+        assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+        assert!(!display.contains(INVALID_VALUE));
+        assert!(!display.contains("secret-invalid-partition"));
+        assert!(!debug.contains(INVALID_VALUE));
+        assert!(!debug.contains("secret-invalid-partition"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_estimates_are_exact_or_unknown() {
+        assert_eq!(exact_sum([]), Some(0));
+        assert_eq!(exact_sum([Some(2), Some(3)]), Some(5));
+        assert_eq!(exact_sum([Some(2), None, Some(3)]), None);
+        assert_eq!(exact_sum([Some(u64::MAX), Some(1)]), None);
+    }
+
+    #[test]
+    fn scan_plan_keeps_hidden_columns_and_applies_static_stats_pruning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add_with_stats(
+                "impossible.parquet",
+                10,
+                Some(
+                    r#"{"numRecords":2,"minValues":{"hidden":1},"maxValues":{"hidden":10},"nullCount":{"hidden":0}}"#,
+                ),
+            ),
+            add_with_stats(
+                "possible.parquet",
+                20,
+                Some(
+                    r#"{"numRecords":3,"minValues":{"hidden":101},"maxValues":{"hidden":200},"nullCount":{"hidden":0}}"#,
+                ),
+            ),
+            add("missing-stats.parquet", 30, None),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("stats-pruning", &adds)?;
+        let predicate = DeltaPredicate::Compare {
+            column: "hidden".to_owned(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(100),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+        let projection = ["label".to_owned()];
+        let hidden = ["hidden".to_owned()];
+
+        let plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &hidden,
+            Some(kernel_predicate),
+            true,
+            Default::default(),
+        )?;
+
+        assert_eq!(field_names(&plan.logical_schema), ["label", "hidden"]);
+        assert_eq!(field_names(&plan.physical_schema), ["label", "hidden"]);
+        assert_eq!(field_names(&plan.projected_schema), ["label"]);
+        assert_eq!(
+            plan.file_tasks
+                .iter()
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            ["possible.parquet", "missing-stats.parquet"]
+        );
+        assert_eq!(plan.files_filtered_during_planning, Some(1));
+        assert_eq!(plan.estimated_bytes, Some(50));
+        assert_eq!(plan.estimated_rows, None);
+        assert!(plan.physical_predicate.is_some());
+
+        let empty_projection = Vec::new();
+        let empty = plan_scan(
+            &snapshot,
+            Some(&empty_projection),
+            &hidden,
+            None,
+            false,
+            Default::default(),
+        )?;
+        assert_eq!(field_names(&empty.logical_schema), ["hidden"]);
+        assert_eq!(field_names(&empty.physical_schema), ["hidden"]);
+        assert!(empty.projected_schema.fields().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_applies_one_transform_without_copying_no_transform_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("part.parquet", 10, Some(3))];
+        let (_table, snapshot) = loaded_snapshot_with_adds("transforms", &adds)?;
+        let projection = ["id".to_owned(), "label".to_owned()];
+        let mut plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &[],
+            None,
+            false,
+            Default::default(),
+        )?;
+        let mut task = plan.file_tasks.pop().ok_or("expected one task")?;
+        let batch = || {
+            RecordBatch::try_new(
+                Arc::clone(&plan.physical_schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+        };
+
+        let physical = batch()?;
+        let first_column = Arc::clone(physical.column(0));
+        let unchanged = plan.apply_transform(&task, physical)?;
+        assert!(Arc::ptr_eq(&first_column, unchanged.column(0)));
+        assert_eq!(unchanged.schema(), plan.logical_schema);
+
+        let mismatch = plan
+            .apply_transform(&task, RecordBatch::new_empty(Arc::new(Schema::empty())))
+            .expect_err("wrong logical schema must fail");
+        assert_eq!(mismatch.as_str(), "physical_to_logical_transform");
+        assert_eq!(mismatch.phase(), DeltaReaderPhase::Transform);
+
+        task.transform =
+            KernelPhysicalToLogicalTransform::from_test_expression(Expression::struct_from([
+                Expression::Column(ColumnName::new(["id"])),
+                Expression::Literal(delta_kernel::expressions::Scalar::String(
+                    "transformed".to_owned(),
+                )),
+            ]));
+        let transformed = plan.apply_transform(&task, batch()?)?;
+        let labels = transformed
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected string labels")?;
+
+        assert_eq!(transformed.num_rows(), 3);
+        assert_eq!(transformed.schema(), plan.logical_schema);
+        assert_eq!(
+            labels.iter().collect::<Vec<_>>(),
+            [
+                Some("transformed"),
+                Some("transformed"),
+                Some("transformed"),
+            ]
+        );
+
+        task.transform = KernelPhysicalToLogicalTransform::from_test_expression(
+            Expression::Column(ColumnName::new(["secret_missing"])),
+        );
+        let error = plan
+            .apply_transform(&task, batch()?)
+            .expect_err("invalid transform must fail");
+        assert_eq!(error.as_str(), "physical_to_logical_transform");
+        assert_eq!(error.phase(), DeltaReaderPhase::Transform);
+        assert!(!error.to_string().contains("secret_missing"));
+        assert!(!format!("{error:?}").contains("secret_missing"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_applies_nested_kernel_column_mapping_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("mapped.parquet", 10, Some(2))];
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "column-mapping-transform",
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            COLUMN_MAPPING_METADATA_JSON,
+            &adds,
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let plan = plan_scan(&snapshot, None, &[], None, false, Default::default())?;
+        let task = plan.file_tasks.first().ok_or("expected one mapped task")?;
+
+        assert_eq!(
+            field_names(&plan.physical_schema),
+            ["phys_id", "phys_customer_name", "phys_profile"]
+        );
+        assert_eq!(
+            field_names(&plan.logical_schema),
+            ["id", "customer_name", "profile"]
+        );
+        assert!(task.transform.is_required());
+        let DataType::Struct(profile_fields) = plan.physical_schema.field(2).data_type() else {
+            return Err("expected a physical profile struct".into());
+        };
+        assert_eq!(profile_fields[0].name(), "phys_first_name");
+        assert_eq!(profile_fields[1].name(), "phys_age");
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("alice"), None])),
+                Arc::new(Int32Array::from(vec![Some(30), None])),
+            ],
+            None,
+        );
+
+        let physical = RecordBatch::try_new(
+            Arc::clone(&plan.physical_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("customer-a"), None])),
+                Arc::new(profile),
+            ],
+        )?;
+        let logical = plan.apply_transform(task, physical)?;
+        let profile = logical
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected mapped profile")?;
+        let first_names = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected mapped first names")?;
+        let ages = profile
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected mapped ages")?;
+
+        assert_eq!(logical.schema(), plan.logical_schema);
+        assert_eq!(logical.num_rows(), 2);
+        assert_eq!(profile.fields()[0].name(), "first_name");
+        assert_eq!(profile.fields()[1].name(), "age");
+        assert_eq!(
+            first_names.iter().collect::<Vec<_>>(),
+            [Some("alice"), None]
+        );
+        assert_eq!(ages.iter().collect::<Vec<_>>(), [Some(30), None]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_preserves_partition_pruning_transform_and_fake_478_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add_with_partition("east.parquet", 10, 1, "us-east"),
+            add_with_partition("west.parquet", 20, 2, "us-west"),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_metadata_and_adds(
+            "partition-transform",
+            PARTITIONED_METADATA_JSON,
+            &adds,
+        )?;
+        let predicate = DeltaPredicate::Compare {
+            column: "region".to_owned(),
+            op: DeltaComparison::Eq,
+            value: DeltaScalar::Utf8("us-west".to_owned()),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+        let projection = ["id".to_owned()];
+        let hidden = ["region".to_owned()];
+        let plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &hidden,
+            Some(kernel_predicate),
+            false,
+            Default::default(),
+        )?;
+
+        assert_eq!(field_names(&plan.logical_schema), ["id", "region"]);
+        assert_eq!(field_names(&plan.physical_schema), ["id"]);
+        assert_eq!(field_names(&plan.projected_schema), ["id"]);
+        let grouping_handoff = (
+            plan.scan_metadata_exhausted,
+            plan.file_tasks.len(),
+            plan.files_filtered_during_planning,
+            plan.estimated_bytes,
+            plan.estimated_rows,
+        );
+        assert_eq!(grouping_handoff, (true, 1, Some(1), Some(20), Some(2)));
+        assert!(Arc::ptr_eq(&plan.engine_context, snapshot.engine_context()));
+
+        let task = plan
+            .file_tasks
+            .first()
+            .ok_or("expected one selected task")?;
+        assert_eq!(task.path, "west.parquet");
+        assert_eq!(task.stats.as_ref().map(|stats| stats.num_records), Some(2));
+        assert_eq!(
+            task.partition_values.get("region").map(String::as_str),
+            Some("us-west")
+        );
+        assert!(task.transform.is_required());
+        let physical = RecordBatch::try_new(
+            Arc::clone(&plan.physical_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let logical = plan.apply_transform(task, physical)?;
+        let regions = logical
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected partition values")?;
+
+        assert_eq!(logical.schema(), plan.logical_schema);
+        assert_eq!(
+            regions.iter().collect::<Vec<_>>(),
+            [Some("us-west"), Some("us-west"),]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_preserves_full_ordered_and_empty_projections() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_table, snapshot) = loaded_snapshot("projections")?;
+
+        let full = build_scan(&snapshot, None, None, false)?;
+        assert_eq!(
+            field_names(&full.logical_schema()),
+            ["id", "label", "hidden"]
+        );
+        assert_eq!(
+            field_names(&full.physical_schema()),
+            ["id", "label", "hidden"]
+        );
+
+        let ordered_names = ["label".to_owned(), "id".to_owned()];
+        let ordered = build_scan(&snapshot, Some(&ordered_names), None, false)?;
+        assert_eq!(field_names(&ordered.logical_schema()), ["label", "id"]);
+        assert_eq!(field_names(&ordered.physical_schema()), ["label", "id"]);
+
+        let empty_names = Vec::<String>::new();
+        let empty = build_scan(&snapshot, Some(&empty_names), None, false)?;
+        assert!(empty.logical_schema().fields().is_empty());
+        assert!(empty.physical_schema().fields().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_keeps_metadata_predicate_out_of_projected_schemas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, snapshot) = loaded_snapshot("hidden-predicate")?;
+        let predicate = DeltaPredicate::Compare {
+            column: "hidden".to_owned(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(1),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+        let projection = ["label".to_owned()];
+
+        let scan = build_scan(&snapshot, Some(&projection), Some(kernel_predicate), false)?;
+
+        assert_eq!(field_names(&scan.logical_schema()), ["label"]);
+        assert_eq!(field_names(&scan.physical_schema()), ["label"]);
+        assert!(scan.has_physical_predicate());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_rejects_missing_and_duplicate_projections_without_disclosure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, snapshot) = loaded_snapshot("invalid-projection")?;
+
+        for projection in [
+            vec!["secret-missing".to_owned()],
+            vec!["id".to_owned(), "id".to_owned()],
+        ] {
+            let error = match build_scan(&snapshot, Some(&projection), None, false) {
+                Ok(_) => return Err("invalid projection must fail".into()),
+                Err(error) => error,
+            };
+            let display = error.to_string();
+
+            assert_eq!(error.as_str(), "invalid_projection");
+            assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+            assert!(!display.contains("secret-missing"));
+            assert!(!format!("{error:?}").contains("secret-missing"));
+        }
+
+        let projection = ["id".to_owned()];
+        let hidden = ["secret-hidden".to_owned()];
+        let error = match plan_scan(
+            &snapshot,
+            Some(&projection),
+            &hidden,
+            None,
+            false,
+            Default::default(),
+        ) {
+            Ok(_) => return Err("invalid hidden column must fail".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.as_str(), "invalid_projection");
+        assert!(!error.to_string().contains("secret-hidden"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn planning_boundary_contains_no_execution_grouping_or_second_engine() {
+        let planning_source = include_str!("planning.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production planning source");
+        let transform_source = include_str!("transform.rs");
+
+        for forbidden in [
+            "DefaultEngineBuilder",
+            "store_from_url_opts",
+            "Runtime::",
+            "block_on(",
+            "read_parquet",
+            "get_row_indexes",
+            "datafusion::",
+            "MetricBuilder",
+            "ExecutionPlanMetricsSet",
+            "tracing::",
+        ] {
+            assert!(!planning_source.contains(forbidden), "{forbidden}");
+            assert!(!transform_source.contains(forbidden), "{forbidden}");
+        }
+    }
+}
