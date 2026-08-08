@@ -62,10 +62,21 @@ fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> 
 
 #[test]
 fn scan_partition_target_diagnostic_contract_is_public() -> Result<(), DeltaReaderError> {
+    let _: DeltaScanPartitionTargetDiagnosticInput = Default::default();
     let local: DeltaScanPartitionTargetLocalEnvironmentDiagnostic =
         delta_scan_partition_target_local_environment_diagnostic();
+    let _: DeltaScanPartitionTargetDiagnosticInput = local.policy_input;
+    let _: Option<u64> = local.memory_total_bytes;
+    let _: Option<u64> = local.memory_available_bytes;
+    let _: Option<u64> = local.unix_soft_file_descriptor_limit;
     let _: DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus =
         local.unix_soft_file_descriptor_limit_status;
+    let _ = [
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported,
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown,
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite,
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited,
+    ];
     let input = DeltaScanPartitionTargetDiagnosticInput {
         explicit_target_partitions: None,
         datafusion_target_partitions: Some(8),
@@ -85,6 +96,17 @@ fn scan_partition_target_diagnostic_contract_is_public() -> Result<(), DeltaRead
         output.source,
         DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback
     );
+    let _ = [
+        DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride,
+        DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback,
+        DeltaScanPartitionTargetDiagnosticSource::StaticFallback,
+    ];
+    assert_eq!(output.explicit_target_partitions, None);
+    assert_eq!(output.datafusion_target_partitions, Some(8));
+    assert_eq!(output.available_parallelism, Some(4));
+    assert_eq!(output.datafusion_target_cap, Some(8));
+    assert_eq!(output.unix_file_descriptor_cap, None);
+    assert_eq!(output.memory_cap, None);
     Ok(())
 }
 

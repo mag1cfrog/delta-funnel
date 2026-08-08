@@ -38,13 +38,20 @@ publish the candidate package.
 | DV coordinate portions of `crates/delta-funnel/src/query_engine/datafusion/execution/native_async_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #477 |
 | DataFusion predicate-adapter portions of `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/predicate.rs` and `src/kernel.rs` | #484 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/partition_target.rs` | `crates/delta-arrow-reader/src/partition_target.rs` | #478 |
+| Host-diagnostic portions of `crates/delta-funnel/src/query_engine/datafusion/execution/environment.rs` | `crates/delta-arrow-reader/src/partition_target.rs` | #478 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/file_task_partition.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
+| Final partitioned-plan assembly portions of `crates/delta-funnel/src/query_engine/datafusion/planning/scan_plan.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
+| Planning-metrics initialization portions of `crates/delta-funnel/src/query_engine/datafusion/execution/planning_exec.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
 
 ## Test migration
 
 - #477 ports the focused deletion-vector metadata, payload, coordinate,
   masking, redaction, and metric assertions into the staged crate.
-- Scan-metadata preservation remains with #463 because it requires the
-  unpartitioned task planner that does not exist yet.
+- #463 ports scan-metadata, ordered file-task, schema, and transform
+  preservation. #478 ports target selection, host diagnostics, deterministic
+  grouping, final partitioned-plan assembly, and planning-metrics
+  initialization over those tasks.
 - Parquet/backend/provider integration assertions remain in Delta Funnel for
   #464, #465, #482, and #483. Their movable coordinate and masking assertions
   are already covered here.
