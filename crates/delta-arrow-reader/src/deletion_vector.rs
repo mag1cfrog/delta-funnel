@@ -1,6 +1,10 @@
 //! Private deletion-vector coordinate handling and Arrow masking.
 
-use arrow::{array::BooleanArray, compute::filter_record_batch, record_batch::RecordBatch};
+use arrow::{
+    array::{Array, BooleanArray, Int64Array},
+    compute::filter_record_batch,
+    record_batch::RecordBatch,
+};
 use snafu::ResultExt;
 
 use crate::{
@@ -143,7 +147,7 @@ impl DeletionVectorSelection {
     pub(crate) fn mask_original_row_indexes(
         &mut self,
         batch: RecordBatch,
-        row_indexes: &[u64],
+        row_indexes: &Int64Array,
     ) -> Result<RecordBatch, DeltaReaderError> {
         if row_indexes.len() != batch.num_rows() {
             return self.reject(
@@ -217,12 +221,24 @@ impl DeletionVectorSelection {
 
     fn select_original_row_indexes(
         &mut self,
-        row_indexes: &[u64],
+        row_indexes: &Int64Array,
     ) -> Result<Vec<bool>, DeltaReaderError> {
         self.require_open()?;
         let physical_row_count = self.require_physical_row_count()?;
         let mut previous = self.last_original_row_index;
-        for &row_index in row_indexes {
+        for index in 0..row_indexes.len() {
+            if row_indexes.is_null(index) {
+                return self.reject(
+                    "invalid_deletion_vector_coordinates",
+                    "original row index is missing",
+                );
+            }
+            let Ok(row_index) = u64::try_from(row_indexes.value(index)) else {
+                return self.reject(
+                    "invalid_deletion_vector_coordinates",
+                    "original row index is negative",
+                );
+            };
             if row_index >= physical_row_count {
                 return self.reject(
                     "invalid_deletion_vector_coordinates",
@@ -240,7 +256,9 @@ impl DeletionVectorSelection {
         self.select_mode(DeletionVectorAccessMode::OriginalRowIndex)?;
 
         let mut keep_mask = Vec::with_capacity(row_indexes.len());
-        for &row_index in row_indexes {
+        for index in 0..row_indexes.len() {
+            let row_index = u64::try_from(row_indexes.value(index))
+                .expect("original row indexes were validated above");
             while self
                 .deleted_row_indexes
                 .get(self.deleted_cursor)
@@ -377,7 +395,7 @@ mod tests {
     };
 
     use arrow::{
-        array::{ArrayRef, Int32Array, StringArray},
+        array::{ArrayRef, Int32Array, Int64Array, StringArray},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
@@ -651,6 +669,10 @@ mod tests {
             .to_vec()
     }
 
+    fn row_indexes(values: &[i64]) -> Int64Array {
+        Int64Array::from(values.to_vec())
+    }
+
     #[test]
     fn validates_owned_deleted_row_indexes_and_row_bound() {
         for indexes in [vec![2, 1], vec![1, 1]] {
@@ -705,6 +727,10 @@ mod tests {
         let mut overrun = selection(vec![1], 2)?;
         assert!(overrun.consume_ordered_batch(3).is_err());
 
+        let mut overflow = selection(Vec::new(), u64::MAX)?;
+        overflow.consumed_row_count = u64::MAX;
+        assert!(overflow.consume_ordered_batch(1).is_err());
+
         let mut underrun = selection(vec![1], 3)?;
         underrun.consume_ordered_batch(2)?;
         assert!(underrun.finish().is_err());
@@ -717,11 +743,11 @@ mod tests {
         let mut selection = selection(vec![1, 4, 7], 10)?;
 
         assert_eq!(
-            selection.select_original_row_indexes(&[0, 1, 3])?,
+            selection.select_original_row_indexes(&row_indexes(&[0, 1, 3]))?,
             [true, false, true]
         );
         assert_eq!(
-            selection.select_original_row_indexes(&[4, 8, 9])?,
+            selection.select_original_row_indexes(&row_indexes(&[4, 8, 9]))?,
             [false, true, true]
         );
         selection.finish()?;
@@ -729,9 +755,16 @@ mod tests {
     }
 
     #[test]
-    fn original_index_mode_rejects_duplicate_decreasing_and_out_of_domain_indexes()
+    fn original_index_mode_rejects_missing_negative_duplicate_decreasing_and_out_of_domain_indexes()
     -> Result<(), DeltaReaderError> {
-        for indexes in [&[1, 1][..], &[2, 1], &[1, 3]] {
+        let cases = [
+            Int64Array::from(vec![Some(0), None]),
+            row_indexes(&[-1]),
+            row_indexes(&[1, 1]),
+            row_indexes(&[2, 1]),
+            row_indexes(&[1, 3]),
+        ];
+        for indexes in &cases {
             let mut selection = selection(vec![1], 3)?;
             assert!(selection.select_original_row_indexes(indexes).is_err());
         }
@@ -742,10 +775,14 @@ mod tests {
     fn coordinate_modes_cannot_be_mixed() -> Result<(), DeltaReaderError> {
         let mut ordered = selection(vec![1], 3)?;
         ordered.consume_ordered_batch(1)?;
-        assert!(ordered.select_original_row_indexes(&[1]).is_err());
+        assert!(
+            ordered
+                .select_original_row_indexes(&row_indexes(&[1]))
+                .is_err()
+        );
 
         let mut original = selection(vec![1], 3)?;
-        original.select_original_row_indexes(&[0])?;
+        original.select_original_row_indexes(&row_indexes(&[0]))?;
         assert!(original.consume_ordered_batch(1).is_err());
         Ok(())
     }
@@ -786,6 +823,23 @@ mod tests {
     }
 
     #[test]
+    fn dropping_selection_preserves_partial_masking_metrics() -> Result<(), DeltaReaderError> {
+        let metrics = metrics();
+        let mut selection = DeletionVectorSelection::try_new(vec![1, 3], metrics.clone())?;
+        selection.bind_physical_row_count(4)?;
+        let masked = selection.mask_ordered_batch(batch(&[10, 11]))?;
+        assert_eq!(ids(&masked), [10]);
+        drop(selection);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.deletion_vectors_applied, 1);
+        assert_eq!(snapshot.deletion_vector_rows_deleted, 1);
+        assert_eq!(snapshot.deletion_vector_failures, 0);
+        assert_eq!(snapshot.deletion_vector_rejections, 0);
+        Ok(())
+    }
+
+    #[test]
     fn masking_handles_none_all_and_sparse_original_rows() -> Result<(), DeltaReaderError> {
         let mut none = selection(Vec::new(), 3)?;
         let none_batch = none.mask_ordered_batch(batch(&[10, 11, 12]))?;
@@ -800,7 +854,8 @@ mod tests {
         assert_eq!(all_batch.schema().field(1).name(), "label");
 
         let mut sparse = selection(vec![2], 5)?;
-        let sparse_batch = sparse.mask_original_row_indexes(batch(&[10, 12, 14]), &[0, 2, 4])?;
+        let sparse_batch =
+            sparse.mask_original_row_indexes(batch(&[10, 12, 14]), &row_indexes(&[0, 2, 4]))?;
         sparse.finish()?;
         assert_eq!(ids(&sparse_batch), [10, 14]);
         Ok(())
@@ -820,7 +875,7 @@ mod tests {
         let mut selection = DeletionVectorSelection::try_new(vec![1], mismatch_metrics.clone())?;
         selection.bind_physical_row_count(3)?;
         let _ = selection
-            .mask_original_row_indexes(batch(&[10, 11]), &[0])
+            .mask_original_row_indexes(batch(&[10, 11]), &row_indexes(&[0]))
             .expect_err("row-index count mismatch must fail");
         let snapshot = mismatch_metrics.snapshot();
         assert_eq!(snapshot.deletion_vectors_applied, 0);
