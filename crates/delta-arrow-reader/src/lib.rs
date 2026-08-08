@@ -5,6 +5,7 @@ mod deletion_vector;
 mod error;
 mod kernel;
 mod metrics;
+mod partition_target;
 mod planning;
 mod predicate;
 mod protocol;
@@ -17,6 +18,11 @@ pub use config::{
 };
 pub use error::{DeltaReaderError, DeltaReaderPhase};
 pub use metrics::{DeltaReadMetrics, DeltaReadMetricsSnapshot};
+#[doc(hidden)]
+pub use partition_target::{
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, derive_delta_scan_partition_target_diagnostic,
+};
 pub use predicate::{DeltaComparison, DeltaPredicate, DeltaScalar};
 pub use protocol::DeltaProtocolInfo;
 

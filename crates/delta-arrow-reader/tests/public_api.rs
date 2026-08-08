@@ -3,7 +3,9 @@ use std::error::Error as _;
 use delta_arrow_reader::{
     DeltaComparison, DeltaPredicate, DeltaProtocolInfo, DeltaReadMetrics, DeltaReadMetricsSnapshot,
     DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase,
-    DeltaScalar, DeltaSnapshotSelection, DeltaStorageOptions,
+    DeltaScalar, DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaSnapshotSelection, DeltaStorageOptions,
+    derive_delta_scan_partition_target_diagnostic,
 };
 
 #[test]
@@ -53,6 +55,30 @@ fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> 
     assert_eq!(error.as_str(), "invalid_configuration");
     assert!(error.source().is_none());
 
+    Ok(())
+}
+
+#[test]
+fn scan_partition_target_diagnostic_contract_is_public() -> Result<(), DeltaReaderError> {
+    let input = DeltaScanPartitionTargetDiagnosticInput {
+        explicit_target_partitions: None,
+        datafusion_target_partitions: Some(8),
+        available_parallelism: Some(4),
+        available_memory_bytes: None,
+        unix_soft_file_descriptor_limit: None,
+        min_default_partitions: 1,
+        parallelism_multiplier: 1,
+        file_descriptors_per_partition: 16,
+        available_memory_bytes_per_partition: 256 * 1024 * 1024,
+    };
+    let output: DeltaScanPartitionTargetDiagnosticOutput =
+        derive_delta_scan_partition_target_diagnostic(input)?;
+
+    assert_eq!(output.target_partitions, 4);
+    assert_eq!(
+        output.source,
+        DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback
+    );
     Ok(())
 }
 
