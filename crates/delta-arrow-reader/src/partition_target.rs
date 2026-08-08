@@ -243,7 +243,7 @@ fn memory_hint(total_bytes: Option<u64>, available_bytes: Option<u64>) -> Option
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn nonzero(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
 }
@@ -258,16 +258,21 @@ fn local_unix_file_descriptor_limit() -> Option<UnixResourceLimit> {
     // SAFETY: `getrlimit` succeeded, so `limit` is initialized.
     let limit = unsafe { limit.assume_init() }.rlim_cur;
 
-    Some(if limit == libc::RLIM_INFINITY {
-        UnixResourceLimit::Unlimited
-    } else {
-        UnixResourceLimit::Finite(limit)
-    })
+    Some(unix_resource_limit_from_raw(limit))
 }
 
 #[cfg(not(unix))]
 fn local_unix_file_descriptor_limit() -> Option<UnixResourceLimit> {
     None
+}
+
+#[cfg(unix)]
+fn unix_resource_limit_from_raw(limit: libc::rlim_t) -> UnixResourceLimit {
+    if limit == libc::RLIM_INFINITY {
+        UnixResourceLimit::Unlimited
+    } else {
+        UnixResourceLimit::Finite(limit)
+    }
 }
 
 fn unix_soft_file_descriptor_diagnostic(
@@ -457,6 +462,9 @@ mod tests {
             explicit.source,
             DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride
         );
+        assert_eq!(explicit.explicit_target_partitions, Some(12));
+        assert_eq!(explicit.datafusion_target_partitions, Some(8));
+        assert_eq!(explicit.available_parallelism, Some(4));
         assert_eq!(explicit.datafusion_target_cap, None);
         assert_eq!(explicit.unix_file_descriptor_cap, None);
         assert_eq!(explicit.memory_cap, None);
@@ -503,6 +511,51 @@ mod tests {
     }
 
     #[test]
+    fn parallelism_fallback_preserves_multiplier_and_has_no_fixed_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (parallelism, multiplier, expected) in [(1, 1, 1), (512, 1, 512), (8, 2, 16)] {
+            let output = derive_delta_scan_partition_target_diagnostic(
+                DeltaScanPartitionTargetDiagnosticInput {
+                    available_parallelism: Some(parallelism),
+                    parallelism_multiplier: multiplier,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(output.target_partitions, expected);
+            assert_eq!(
+                output.source,
+                DeltaScanPartitionTargetDiagnosticSource::AvailableParallelismFallback
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn datafusion_and_unix_file_descriptor_caps_can_each_be_decisive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let datafusion = derive_delta_scan_partition_target_diagnostic(
+            DeltaScanPartitionTargetDiagnosticInput {
+                datafusion_target_partitions: Some(8),
+                available_parallelism: Some(16),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(datafusion.target_partitions, 8);
+        assert_eq!(datafusion.datafusion_target_cap, Some(8));
+
+        let file_descriptors = derive_delta_scan_partition_target_diagnostic(
+            DeltaScanPartitionTargetDiagnosticInput {
+                available_parallelism: Some(64),
+                unix_soft_file_descriptor_limit: Some(64),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(file_descriptors.target_partitions, 4);
+        assert_eq!(file_descriptors.unix_file_descriptor_cap, Some(4));
+        Ok(())
+    }
+
+    #[test]
     fn invalid_and_hostile_inputs_are_safe_and_redacted() -> Result<(), Box<dyn std::error::Error>>
     {
         for input in [
@@ -520,6 +573,18 @@ mod tests {
             },
             DeltaScanPartitionTargetDiagnosticInput {
                 parallelism_multiplier: 0,
+                ..Default::default()
+            },
+            DeltaScanPartitionTargetDiagnosticInput {
+                min_default_partitions: 0,
+                ..Default::default()
+            },
+            DeltaScanPartitionTargetDiagnosticInput {
+                file_descriptors_per_partition: 0,
+                ..Default::default()
+            },
+            DeltaScanPartitionTargetDiagnosticInput {
+                available_memory_bytes_per_partition: 0,
                 ..Default::default()
             },
         ] {
@@ -559,6 +624,12 @@ mod tests {
             diagnostic.unix_soft_file_descriptor_limit
         );
         assert!(output.target_partitions > 0);
+        if diagnostic.unix_soft_file_descriptor_limit.is_some() {
+            assert_eq!(
+                diagnostic.unix_soft_file_descriptor_limit_status,
+                DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite
+            );
+        }
         Ok(())
     }
 
@@ -598,5 +669,30 @@ mod tests {
         assert_eq!(hint.available_bytes, Some(8_388_608_000));
         assert_eq!(parse_linux_meminfo("SwapTotal: 1024 kB\n"), None);
         assert_eq!(parse_linux_meminfo("MemTotal: 1 MB\n"), None);
+        assert_eq!(
+            parse_linux_meminfo(
+                "MemTotal: 16384000 kB\nHugePages_Total: 0\nMemAvailable: 8192000 kB\n",
+            ),
+            Some(hint)
+        );
+    }
+
+    #[test]
+    fn zero_memory_values_are_missing() {
+        assert_eq!(nonzero(0), None);
+        assert_eq!(nonzero(1), Some(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_resource_limit_preserves_finite_and_unlimited_values() {
+        assert_eq!(
+            unix_resource_limit_from_raw(512),
+            UnixResourceLimit::Finite(512)
+        );
+        assert_eq!(
+            unix_resource_limit_from_raw(libc::RLIM_INFINITY),
+            UnixResourceLimit::Unlimited
+        );
     }
 }

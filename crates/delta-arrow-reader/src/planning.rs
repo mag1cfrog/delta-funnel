@@ -690,10 +690,42 @@ mod tests {
     fn file_task_planning_exhausts_empty_single_and_multi_batch_scans()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
-        let empty = plan_scan(&empty_snapshot, None, &[], None, true, Default::default())?;
+        let execution_options = crate::DeltaReaderExecutionOptions::default()
+            .with_reader_backend(crate::DeltaReaderBackend::OfficialKernel)?;
+        let empty = plan_scan(&empty_snapshot, None, &[], None, true, execution_options)?;
         assert!(empty.partitions.is_empty());
         assert_eq!(empty.estimated_bytes, Some(0));
         assert_eq!(empty.estimated_rows, Some(0));
+        let empty_metrics = empty.metrics.snapshot();
+        assert_eq!(empty_metrics.snapshot_version, empty.snapshot_version);
+        assert_eq!(
+            empty_metrics.reader_backend,
+            crate::DeltaReaderBackend::OfficialKernel
+        );
+        assert_eq!(empty_metrics.scan_metadata_exhausted, Some(true));
+        assert_eq!(empty_metrics.scan_partitions_planned, 0);
+        assert_eq!(empty_metrics.files_planned, 0);
+        assert_eq!(
+            empty_metrics.files_filtered_during_planning,
+            empty.files_filtered_during_planning
+        );
+        assert_eq!(empty_metrics.estimated_bytes, Some(0));
+        assert_eq!(empty_metrics.estimated_rows, Some(0));
+        assert_eq!(empty_metrics.scan_partitions_started, 0);
+        assert_eq!(empty_metrics.scan_partitions_completed, 0);
+        assert_eq!(empty_metrics.files_started, 0);
+        assert_eq!(empty_metrics.files_completed, 0);
+        assert_eq!(empty_metrics.batches_produced, 0);
+        assert_eq!(empty_metrics.rows_produced, 0);
+        assert_eq!(empty_metrics.deletion_vector_payloads_loaded, 0);
+        assert_eq!(empty_metrics.deletion_vectors_applied, 0);
+        assert_eq!(empty_metrics.deletion_vector_rows_deleted, 0);
+        assert_eq!(empty_metrics.deletion_vector_failures, 0);
+        assert_eq!(empty_metrics.deletion_vector_rejections, 0);
+        assert_eq!(empty_metrics.parquet_data_file_range_get_operations, None);
+        assert_eq!(empty_metrics.parquet_data_file_full_get_operations, None);
+        assert_eq!(empty_metrics.parquet_data_file_bytes_received, None);
+        assert_eq!(empty_metrics.parquet_data_file_opened_bytes, None);
 
         let single_add = [add("single.parquet", 0, None)];
         let (_single_table, single_snapshot) =
@@ -1047,6 +1079,8 @@ mod tests {
         );
         assert_eq!(partitions[0].estimated_bytes, Some(0));
         assert_eq!(partitions[1].estimated_bytes, Some(0));
+        assert_eq!(partitions[0].estimated_rows, Some(0));
+        assert_eq!(partitions[1].estimated_rows, Some(0));
         Ok(())
     }
 
@@ -1091,6 +1125,14 @@ mod tests {
     #[test]
     fn grouped_tasks_preserve_delta_metadata() -> Result<(), Box<dyn std::error::Error>> {
         let mut file = kernel_file("part-with-delta-metadata.parquet");
+        file.dv_info = DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            "inline-payload",
+            None,
+            14,
+            2,
+        )?
+        .into();
         file.transform = Some(Arc::new(Expression::Column(ColumnName::new([
             "physical_id",
         ]))));
@@ -1104,6 +1146,7 @@ mod tests {
             grouped.partition_values.get("region").map(String::as_str),
             Some("us-west")
         );
+        assert!(grouped.deletion_vector.is_present());
         assert!(grouped.transform.is_required());
         Ok(())
     }
