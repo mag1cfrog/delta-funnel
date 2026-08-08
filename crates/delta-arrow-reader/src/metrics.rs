@@ -174,6 +174,32 @@ impl DeltaReadMetrics {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn record_scan_partition_started(&self) {
+        saturating_fetch_add(&self.inner.scan_partitions_started, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_scan_partition_completed(&self) {
+        saturating_fetch_add(&self.inner.scan_partitions_completed, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_file_started(&self) {
+        saturating_fetch_add(&self.inner.files_started, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_file_completed(&self) {
+        saturating_fetch_add(&self.inner.files_completed, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_batch_produced(&self, rows: usize) {
+        saturating_fetch_add(&self.inner.batches_produced, 1);
+        saturating_fetch_add(&self.inner.rows_produced, usize_to_u64_saturating(rows));
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn record_deletion_vector_payload_loaded(&self) {
         saturating_fetch_add(&self.inner.deletion_vector_payloads_loaded, 1);
     }
