@@ -1,8 +1,9 @@
-//! Private deletion-vector coordinate handling.
+//! Private deletion-vector coordinate handling and Arrow masking.
 
+use arrow::{array::BooleanArray, compute::filter_record_batch, record_batch::RecordBatch};
 use snafu::ResultExt;
 
-use crate::{DeltaReaderError, error::DeletionVectorReadSnafu};
+use crate::{DeltaReadMetrics, DeltaReaderError, error::DeletionVectorReadSnafu};
 
 #[allow(dead_code)]
 pub(crate) struct DeletionVectorSelection {
@@ -12,6 +13,8 @@ pub(crate) struct DeletionVectorSelection {
     deleted_cursor: usize,
     last_original_row_index: Option<u64>,
     access_mode: DeletionVectorAccessMode,
+    metrics: DeltaReadMetrics,
+    applied: bool,
     closed: bool,
 }
 
@@ -25,15 +28,19 @@ enum DeletionVectorAccessMode {
 
 #[allow(dead_code)]
 impl DeletionVectorSelection {
-    pub(crate) fn try_new(deleted_row_indexes: Vec<u64>) -> Result<Self, DeltaReaderError> {
+    pub(crate) fn try_new(
+        deleted_row_indexes: Vec<u64>,
+        metrics: DeltaReadMetrics,
+    ) -> Result<Self, DeltaReaderError> {
         if deleted_row_indexes
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
         {
-            return rejection(
+            metrics.record_deletion_vector_rejection();
+            return Err(rejection_error(
                 "invalid_deletion_vector_selection",
                 "deleted row indexes must be strictly increasing",
-            );
+            ));
         }
 
         Ok(Self {
@@ -43,6 +50,8 @@ impl DeletionVectorSelection {
             deleted_cursor: 0,
             last_original_row_index: None,
             access_mode: DeletionVectorAccessMode::Unused,
+            metrics,
+            applied: false,
             closed: false,
         })
     }
@@ -52,7 +61,7 @@ impl DeletionVectorSelection {
         physical_row_count: u64,
     ) -> Result<(), DeltaReaderError> {
         if self.physical_row_count.is_some() {
-            return rejection(
+            return self.reject(
                 "invalid_deletion_vector_selection",
                 "physical row count was already bound",
             );
@@ -62,7 +71,7 @@ impl DeletionVectorSelection {
             .last()
             .is_some_and(|row_index| *row_index >= physical_row_count)
         {
-            return rejection(
+            return self.reject(
                 "invalid_deletion_vector_selection",
                 "deleted row index exceeds the physical row count",
             );
@@ -72,56 +81,80 @@ impl DeletionVectorSelection {
         Ok(())
     }
 
-    pub(crate) fn consume_ordered_batch(
+    pub(crate) fn mask_ordered_batch(
         &mut self,
-        batch_len: usize,
-    ) -> Result<Vec<bool>, DeltaReaderError> {
+        batch: RecordBatch,
+    ) -> Result<RecordBatch, DeltaReaderError> {
+        let keep_mask = self.consume_ordered_batch(batch.num_rows())?;
+        self.apply_keep_mask(batch, keep_mask)
+    }
+
+    pub(crate) fn mask_original_row_indexes(
+        &mut self,
+        batch: RecordBatch,
+        row_indexes: &[u64],
+    ) -> Result<RecordBatch, DeltaReaderError> {
+        if row_indexes.len() != batch.num_rows() {
+            return self.reject(
+                "invalid_deletion_vector_coordinates",
+                "original row-index count does not match the batch row count",
+            );
+        }
+        let keep_mask = self.select_original_row_indexes(row_indexes)?;
+        self.apply_keep_mask(batch, keep_mask)
+    }
+
+    fn consume_ordered_batch(&mut self, batch_len: usize) -> Result<Vec<bool>, DeltaReaderError> {
         self.require_open()?;
         let physical_row_count = self.require_physical_row_count()?;
-        let batch_len = u64::try_from(batch_len).map_err(|_| {
-            rejection_error(
-                "invalid_deletion_vector_coordinates",
-                "batch length does not fit the deletion-vector coordinate type",
-            )
-        })?;
-        let requested_end = self
-            .consumed_row_count
-            .checked_add(batch_len)
-            .ok_or_else(|| {
-                rejection_error(
+        let batch_len = match u64::try_from(batch_len) {
+            Ok(batch_len) => batch_len,
+            Err(_) => {
+                return self.reject(
                     "invalid_deletion_vector_coordinates",
-                    "ordered deletion-vector coordinate overflow",
-                )
-            })?;
+                    "batch length does not fit the deletion-vector coordinate type",
+                );
+            }
+        };
+        let Some(requested_end) = self.consumed_row_count.checked_add(batch_len) else {
+            return self.reject(
+                "invalid_deletion_vector_coordinates",
+                "ordered deletion-vector coordinate overflow",
+            );
+        };
         if requested_end > physical_row_count {
-            return rejection(
+            return self.reject(
                 "invalid_deletion_vector_coordinates",
                 "ordered batch exceeds the physical row count",
             );
         }
         self.select_mode(DeletionVectorAccessMode::Ordered)?;
 
-        let mut keep_mask = vec![
-            true;
-            usize::try_from(batch_len).map_err(|_| {
-                rejection_error(
+        let batch_len = match usize::try_from(batch_len) {
+            Ok(batch_len) => batch_len,
+            Err(_) => {
+                return self.reject(
                     "invalid_deletion_vector_coordinates",
                     "batch length does not fit the host index type",
-                )
-            })?
-        ];
+                );
+            }
+        };
+        let mut keep_mask = vec![true; batch_len];
         while let Some(&deleted_row_index) = self.deleted_row_indexes.get(self.deleted_cursor) {
             if deleted_row_index >= requested_end {
                 break;
             }
             if deleted_row_index >= self.consumed_row_count {
-                let batch_index = usize::try_from(deleted_row_index - self.consumed_row_count)
-                    .map_err(|_| {
-                        rejection_error(
+                let batch_index = match usize::try_from(deleted_row_index - self.consumed_row_count)
+                {
+                    Ok(batch_index) => batch_index,
+                    Err(_) => {
+                        return self.reject(
                             "invalid_deletion_vector_coordinates",
                             "deleted row index does not fit the host index type",
-                        )
-                    })?;
+                        );
+                    }
+                };
                 keep_mask[batch_index] = false;
             }
             self.deleted_cursor += 1;
@@ -131,7 +164,7 @@ impl DeletionVectorSelection {
         Ok(keep_mask)
     }
 
-    pub(crate) fn select_original_row_indexes(
+    fn select_original_row_indexes(
         &mut self,
         row_indexes: &[u64],
     ) -> Result<Vec<bool>, DeltaReaderError> {
@@ -140,13 +173,13 @@ impl DeletionVectorSelection {
         let mut previous = self.last_original_row_index;
         for &row_index in row_indexes {
             if row_index >= physical_row_count {
-                return rejection(
+                return self.reject(
                     "invalid_deletion_vector_coordinates",
                     "original row index exceeds the physical row count",
                 );
             }
             if previous.is_some_and(|last_row_index| row_index <= last_row_index) {
-                return rejection(
+                return self.reject(
                     "invalid_deletion_vector_coordinates",
                     "original row indexes must be strictly increasing",
                 );
@@ -175,6 +208,41 @@ impl DeletionVectorSelection {
         Ok(keep_mask)
     }
 
+    fn apply_keep_mask(
+        &mut self,
+        batch: RecordBatch,
+        keep_mask: Vec<bool>,
+    ) -> Result<RecordBatch, DeltaReaderError> {
+        if !self.applied {
+            self.metrics.record_deletion_vector_applied();
+            self.applied = true;
+        }
+        let deleted_rows = keep_mask.iter().filter(|keep| !**keep).count();
+        let result = if deleted_rows == 0 {
+            Ok(batch)
+        } else if deleted_rows == batch.num_rows() {
+            Ok(RecordBatch::new_empty(batch.schema()))
+        } else {
+            filter_record_batch(&batch, &BooleanArray::from(keep_mask))
+                .boxed()
+                .context(DeletionVectorReadSnafu {
+                    reason: "deletion_vector_masking_failed",
+                })
+        };
+
+        match result {
+            Ok(batch) => {
+                self.metrics
+                    .record_deletion_vector_rows_deleted(deleted_rows);
+                Ok(batch)
+            }
+            Err(error) => {
+                self.metrics.record_deletion_vector_failure();
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn finish(&mut self) -> Result<(), DeltaReaderError> {
         self.require_open()?;
         self.closed = true;
@@ -182,7 +250,7 @@ impl DeletionVectorSelection {
         if self.access_mode == DeletionVectorAccessMode::Ordered
             && self.consumed_row_count != self.require_physical_row_count()?
         {
-            return rejection(
+            return self.reject(
                 "invalid_deletion_vector_coordinates",
                 "ordered deletion-vector consumption ended before the physical file",
             );
@@ -193,7 +261,7 @@ impl DeletionVectorSelection {
 
     fn require_open(&self) -> Result<(), DeltaReaderError> {
         if self.closed {
-            rejection(
+            self.reject(
                 "invalid_deletion_vector_coordinates",
                 "deletion-vector selection is already closed",
             )
@@ -204,6 +272,7 @@ impl DeletionVectorSelection {
 
     fn require_physical_row_count(&self) -> Result<u64, DeltaReaderError> {
         self.physical_row_count.ok_or_else(|| {
+            self.metrics.record_deletion_vector_rejection();
             rejection_error(
                 "invalid_deletion_vector_selection",
                 "physical row count is not bound",
@@ -218,17 +287,17 @@ impl DeletionVectorSelection {
                 Ok(())
             }
             current if current == mode => Ok(()),
-            _ => rejection(
+            _ => self.reject(
                 "invalid_deletion_vector_coordinates",
                 "deletion-vector coordinate modes cannot be mixed",
             ),
         }
     }
-}
 
-#[allow(dead_code)]
-fn rejection<T>(reason: &'static str, detail: &'static str) -> Result<T, DeltaReaderError> {
-    Err(rejection_error(reason, detail))
+    fn reject<T>(&self, reason: &'static str, detail: &'static str) -> Result<T, DeltaReaderError> {
+        self.metrics.record_deletion_vector_rejection();
+        Err(rejection_error(reason, detail))
+    }
 }
 
 #[allow(dead_code)]
@@ -241,24 +310,73 @@ fn rejection_error(reason: &'static str, detail: &'static str) -> DeltaReaderErr
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as _;
+    use std::{error::Error as _, sync::Arc};
+
+    use arrow::{
+        array::{ArrayRef, Int32Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
 
     use super::DeletionVectorSelection;
-    use crate::{DeltaReaderError, DeltaReaderPhase, kernel::is_kernel_error};
+    use crate::{
+        DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderPhase,
+        kernel::is_kernel_error, metrics::DeltaReadMetricsConfig,
+    };
+
+    fn metrics() -> DeltaReadMetrics {
+        DeltaReadMetrics::new(DeltaReadMetricsConfig {
+            snapshot_version: 7,
+            reader_backend: DeltaReaderBackend::NativeAsync,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 1,
+            files_planned: 1,
+            files_filtered_during_planning: Some(0),
+            estimated_rows: None,
+            estimated_bytes: None,
+        })
+    }
 
     fn selection(
         deleted_row_indexes: Vec<u64>,
         physical_row_count: u64,
     ) -> Result<DeletionVectorSelection, DeltaReaderError> {
-        let mut selection = DeletionVectorSelection::try_new(deleted_row_indexes)?;
+        let mut selection = DeletionVectorSelection::try_new(deleted_row_indexes, metrics())?;
         selection.bind_physical_row_count(physical_row_count)?;
         Ok(selection)
+    }
+
+    fn batch(ids: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let labels = ids.iter().map(|id| format!("row-{id}")).collect::<Vec<_>>();
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(labels)) as ArrayRef,
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    fn ids(batch: &RecordBatch) -> Vec<i32> {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id column")
+            .values()
+            .to_vec()
     }
 
     #[test]
     fn validates_owned_deleted_row_indexes_and_row_bound() {
         for indexes in [vec![2, 1], vec![1, 1]] {
-            let error = DeletionVectorSelection::try_new(indexes)
+            let error = DeletionVectorSelection::try_new(indexes, metrics())
                 .err()
                 .expect("unordered or duplicate indexes must fail");
             assert_eq!(error.as_str(), "deletion_vector_read");
@@ -266,8 +384,8 @@ mod tests {
             assert!(error.source().is_some_and(is_kernel_error));
         }
 
-        let mut selection =
-            DeletionVectorSelection::try_new(vec![1, 3]).expect("ordered indexes are valid");
+        let mut selection = DeletionVectorSelection::try_new(vec![1, 3], metrics())
+            .expect("ordered indexes are valid");
         let error = selection
             .bind_physical_row_count(3)
             .expect_err("row index equal to the row count must fail");
@@ -356,11 +474,80 @@ mod tests {
 
     #[test]
     fn physical_row_count_is_required_and_bound_once() -> Result<(), DeltaReaderError> {
-        let mut selection = DeletionVectorSelection::try_new(Vec::new())?;
+        let mut selection = DeletionVectorSelection::try_new(Vec::new(), metrics())?;
         assert!(selection.consume_ordered_batch(0).is_err());
         selection.bind_physical_row_count(0)?;
         assert!(selection.bind_physical_row_count(0).is_err());
         selection.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_masking_preserves_schema_row_order_and_exact_metrics() -> Result<(), DeltaReaderError>
+    {
+        let metrics = metrics();
+        let mut selection = DeletionVectorSelection::try_new(vec![1, 3], metrics.clone())?;
+        selection.bind_physical_row_count(5)?;
+        let first = batch(&[10, 11]);
+        let schema = first.schema();
+
+        let first = selection.mask_ordered_batch(first)?;
+        let second = selection.mask_ordered_batch(batch(&[12, 13, 14]))?;
+        selection.finish()?;
+
+        assert_eq!(ids(&first), [10]);
+        assert_eq!(ids(&second), [12, 14]);
+        assert_eq!(first.schema(), schema);
+        assert_eq!(second.schema(), schema);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.deletion_vectors_applied, 1);
+        assert_eq!(snapshot.deletion_vector_rows_deleted, 2);
+        assert_eq!(snapshot.deletion_vector_failures, 0);
+        assert_eq!(snapshot.deletion_vector_rejections, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn masking_handles_none_all_and_sparse_original_rows() -> Result<(), DeltaReaderError> {
+        let mut none = selection(Vec::new(), 3)?;
+        let none_batch = none.mask_ordered_batch(batch(&[10, 11, 12]))?;
+        none.finish()?;
+        assert_eq!(ids(&none_batch), [10, 11, 12]);
+
+        let mut all = selection(vec![0, 1, 2], 3)?;
+        let all_batch = all.mask_ordered_batch(batch(&[10, 11, 12]))?;
+        all.finish()?;
+        assert_eq!(all_batch.num_rows(), 0);
+        assert_eq!(all_batch.schema().field(0).name(), "id");
+        assert_eq!(all_batch.schema().field(1).name(), "label");
+
+        let mut sparse = selection(vec![2], 5)?;
+        let sparse_batch = sparse.mask_original_row_indexes(batch(&[10, 12, 14]), &[0, 2, 4])?;
+        sparse.finish()?;
+        assert_eq!(ids(&sparse_batch), [10, 14]);
+        Ok(())
+    }
+
+    #[test]
+    fn coordinate_rejections_increment_only_rejection_metrics() -> Result<(), DeltaReaderError> {
+        let invalid_metrics = metrics();
+        let _ = DeletionVectorSelection::try_new(vec![2, 1], invalid_metrics.clone())
+            .err()
+            .expect("unordered indexes must fail");
+        let snapshot = invalid_metrics.snapshot();
+        assert_eq!(snapshot.deletion_vector_failures, 0);
+        assert_eq!(snapshot.deletion_vector_rejections, 1);
+
+        let mismatch_metrics = metrics();
+        let mut selection = DeletionVectorSelection::try_new(vec![1], mismatch_metrics.clone())?;
+        selection.bind_physical_row_count(3)?;
+        let _ = selection
+            .mask_original_row_indexes(batch(&[10, 11]), &[0])
+            .expect_err("row-index count mismatch must fail");
+        let snapshot = mismatch_metrics.snapshot();
+        assert_eq!(snapshot.deletion_vectors_applied, 0);
+        assert_eq!(snapshot.deletion_vector_failures, 0);
+        assert_eq!(snapshot.deletion_vector_rejections, 1);
         Ok(())
     }
 }
