@@ -10,7 +10,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use snafu::ResultExt;
 
 use crate::{
-    DeltaReaderError, DeltaReaderExecutionOptions,
+    DeltaReadMetrics, DeltaReaderError, DeltaReaderExecutionOptions,
     deletion_vector::DeletionVectorMetadata,
     error::{
         InvalidConfigurationSnafu, InvalidProjectionSnafu, ScanPartitionPlanningSnafu,
@@ -20,8 +20,20 @@ use crate::{
         DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
         KernelScan, KernelScanFileMetadata, KernelScanSchemas,
     },
+    metrics::DeltaReadMetricsConfig,
+    partition_target::{
+        DeltaScanPartitionTargetDiagnosticOutput,
+        delta_scan_partition_target_local_environment_diagnostic,
+        derive_delta_scan_partition_target_diagnostic,
+    },
     snapshot::LoadedDeltaTableSnapshot,
 };
+
+#[derive(Default)]
+pub(crate) struct DeltaScanPartitionTargetOptions {
+    pub(crate) explicit_target_partitions: Option<usize>,
+    pub(crate) caller_target_partitions: Option<usize>,
+}
 
 #[allow(dead_code)]
 pub(crate) struct DeltaScanPlan {
@@ -31,13 +43,15 @@ pub(crate) struct DeltaScanPlan {
     pub(crate) physical_schema: SchemaRef,
     pub(crate) projected_schema: SchemaRef,
     pub(crate) kernel_schemas: KernelScanSchemas,
-    pub(crate) file_tasks: Vec<DeltaScanFileTask>,
+    pub(crate) partitions: Vec<DeltaScanFileTaskPartition>,
+    pub(crate) partition_target_diagnostic: DeltaScanPartitionTargetDiagnosticOutput,
     pub(crate) scan_metadata_exhausted: bool,
     pub(crate) files_filtered_during_planning: Option<u64>,
     pub(crate) estimated_bytes: Option<u64>,
     pub(crate) estimated_rows: Option<u64>,
     pub(crate) physical_predicate: Option<DeltaKernelPredicate>,
     pub(crate) execution_options: DeltaReaderExecutionOptions,
+    pub(crate) metrics: DeltaReadMetrics,
 }
 
 #[allow(dead_code)]
@@ -65,8 +79,10 @@ pub(crate) fn plan_scan(
     kernel_predicate: Option<DeltaKernelPredicate>,
     include_stats: bool,
     execution_options: DeltaReaderExecutionOptions,
+    partition_target_options: DeltaScanPartitionTargetOptions,
 ) -> Result<DeltaScanPlan, DeltaReaderError> {
     execution_options.validate()?;
+    let partition_target_diagnostic = local_partition_target_diagnostic(partition_target_options)?;
     let logical_projection =
         logical_projection(snapshot.schema().as_ref(), projection, hidden_columns)?;
     let scan = build_scan(
@@ -86,8 +102,17 @@ pub(crate) fn plan_scan(
         .into_iter()
         .map(DeltaScanFileTask::try_from_kernel)
         .collect::<Result<Vec<_>, _>>()?;
-    let estimated_bytes = exact_sum(file_tasks.iter().map(|task| task.estimated_bytes));
-    let estimated_rows = exact_sum(file_tasks.iter().map(|task| task.estimated_rows));
+    let files_planned = file_tasks.len();
+    let estimated_bytes = checked_sum(
+        file_tasks.iter().map(|task| task.estimated_bytes),
+        "scan_estimated_bytes_overflow",
+    )?;
+    let estimated_rows = checked_sum(
+        file_tasks.iter().map(|task| task.estimated_rows),
+        "scan_estimated_rows_overflow",
+    )?;
+    let partitions =
+        group_scan_file_tasks(file_tasks, partition_target_diagnostic.target_partitions)?;
     let logical_schema = scan.logical_schema();
     let physical_predicate = scan.physical_predicate();
     let projected_schema = match projection {
@@ -98,6 +123,17 @@ pub(crate) fn plan_scan(
         )),
     };
 
+    let metrics = DeltaReadMetrics::new(DeltaReadMetricsConfig {
+        snapshot_version: snapshot.version(),
+        reader_backend: execution_options.reader_backend(),
+        scan_metadata_exhausted: Some(true),
+        scan_partitions_planned: partitions.len(),
+        files_planned,
+        files_filtered_during_planning: metadata.files_filtered_during_planning,
+        estimated_rows,
+        estimated_bytes,
+    });
+
     Ok(DeltaScanPlan {
         snapshot_version: snapshot.version(),
         engine_context: Arc::clone(snapshot.engine_context()),
@@ -105,14 +141,27 @@ pub(crate) fn plan_scan(
         physical_schema: scan.physical_schema(),
         projected_schema,
         kernel_schemas: scan.schemas(),
-        file_tasks,
+        partitions,
+        partition_target_diagnostic,
         scan_metadata_exhausted: true,
         files_filtered_during_planning: metadata.files_filtered_during_planning,
         estimated_bytes,
         estimated_rows,
         physical_predicate,
         execution_options,
+        metrics,
     })
+}
+
+fn local_partition_target_diagnostic(
+    options: DeltaScanPartitionTargetOptions,
+) -> Result<DeltaScanPartitionTargetDiagnosticOutput, DeltaReaderError> {
+    let mut input = delta_scan_partition_target_local_environment_diagnostic().policy_input;
+    input.explicit_target_partitions = options.explicit_target_partitions;
+    if options.caller_target_partitions.is_some() {
+        input.datafusion_target_partitions = options.caller_target_partitions;
+    }
+    derive_delta_scan_partition_target_diagnostic(input)
 }
 
 fn logical_projection(
@@ -139,12 +188,6 @@ fn logical_projection(
         }
         logical
     }))
-}
-
-fn exact_sum(estimates: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
-    estimates
-        .into_iter()
-        .try_fold(0_u64, |total, value| total.checked_add(value?))
 }
 
 #[allow(dead_code)]
@@ -372,8 +415,8 @@ mod tests {
     };
 
     use super::{
-        DeltaScanFileStats, DeltaScanFileTask, DeltaScanFileTaskPartition,
-        KernelPhysicalToLogicalTransform, build_scan, exact_sum, group_scan_file_tasks, plan_scan,
+        DeltaScanFileStats, DeltaScanFileTask, DeltaScanFileTaskPartition, DeltaScanPlan,
+        KernelPhysicalToLogicalTransform, build_scan, checked_sum, group_scan_file_tasks,
     };
     use crate::{
         DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
@@ -547,6 +590,31 @@ mod tests {
             .collect()
     }
 
+    fn planned_tasks(plan: &DeltaScanPlan) -> impl Iterator<Item = &DeltaScanFileTask> {
+        plan.partitions
+            .iter()
+            .flat_map(|partition| partition.file_tasks.iter())
+    }
+
+    fn plan_scan(
+        snapshot: &crate::snapshot::LoadedDeltaTableSnapshot,
+        projection: Option<&[String]>,
+        hidden_columns: &[String],
+        kernel_predicate: Option<crate::kernel::DeltaKernelPredicate>,
+        include_stats: bool,
+        execution_options: crate::DeltaReaderExecutionOptions,
+    ) -> Result<DeltaScanPlan, crate::DeltaReaderError> {
+        super::plan_scan(
+            snapshot,
+            projection,
+            hidden_columns,
+            kernel_predicate,
+            include_stats,
+            execution_options,
+            Default::default(),
+        )
+    }
+
     #[test]
     fn file_task_preserves_kernel_metadata_without_execution()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -623,7 +691,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
         let empty = plan_scan(&empty_snapshot, None, &[], None, true, Default::default())?;
-        assert!(empty.file_tasks.is_empty());
+        assert!(empty.partitions.is_empty());
         assert_eq!(empty.estimated_bytes, Some(0));
         assert_eq!(empty.estimated_rows, Some(0));
 
@@ -631,9 +699,10 @@ mod tests {
         let (_single_table, single_snapshot) =
             loaded_snapshot_with_adds("single-file", &single_add)?;
         let single = plan_scan(&single_snapshot, None, &[], None, true, Default::default())?;
-        assert_eq!(single.file_tasks.len(), 1);
-        assert_eq!(single.file_tasks[0].path, "single.parquet");
-        assert_eq!(single.file_tasks[0].estimated_bytes, Some(0));
+        let single_task = planned_tasks(&single).next().ok_or("expected one task")?;
+        assert_eq!(planned_tasks(&single).count(), 1);
+        assert_eq!(single_task.path, "single.parquet");
+        assert_eq!(single_task.estimated_bytes, Some(0));
         assert_eq!(single.estimated_bytes, Some(0));
         assert_eq!(single.estimated_rows, None);
 
@@ -657,12 +726,20 @@ mod tests {
             Default::default(),
         )?;
 
-        assert_eq!(many.file_tasks.len(), adds.len());
-        assert_eq!(many.file_tasks[0].path, "part-0000.parquet");
-        assert_eq!(many.file_tasks[1].estimated_rows, None);
-        assert_eq!(many.file_tasks[1_000].path, "part-1000.parquet");
-        assert_eq!(many.file_tasks[1_000].estimated_bytes, Some(1_000));
-        assert_eq!(many.file_tasks[1_000].estimated_rows, Some(1_000));
+        assert_eq!(planned_tasks(&many).count(), adds.len());
+        let first = planned_tasks(&many)
+            .find(|task| task.path == "part-0000.parquet")
+            .ok_or("expected first task")?;
+        let second = planned_tasks(&many)
+            .find(|task| task.path == "part-0001.parquet")
+            .ok_or("expected second task")?;
+        let last = planned_tasks(&many)
+            .find(|task| task.path == "part-1000.parquet")
+            .ok_or("expected last task")?;
+        assert_eq!(first.estimated_bytes, Some(0));
+        assert_eq!(second.estimated_rows, None);
+        assert_eq!(last.estimated_bytes, Some(1_000));
+        assert_eq!(last.estimated_rows, Some(1_000));
         assert!(many.scan_metadata_exhausted);
         assert_eq!(many.files_filtered_during_planning, Some(0));
         assert_eq!(many.estimated_bytes, Some(500_500));
@@ -735,11 +812,13 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_estimates_are_exact_or_unknown() {
-        assert_eq!(exact_sum([]), Some(0));
-        assert_eq!(exact_sum([Some(2), Some(3)]), Some(5));
-        assert_eq!(exact_sum([Some(2), None, Some(3)]), None);
-        assert_eq!(exact_sum([Some(u64::MAX), Some(1)]), None);
+    fn aggregate_estimates_are_exact_unknown_or_rejected_on_overflow()
+    -> Result<(), crate::DeltaReaderError> {
+        assert_eq!(checked_sum([], "overflow")?, Some(0));
+        assert_eq!(checked_sum([Some(2), Some(3)], "overflow")?, Some(5));
+        assert_eq!(checked_sum([Some(2), None, Some(3)], "overflow")?, None);
+        assert!(checked_sum([Some(u64::MAX), Some(1)], "overflow").is_err());
+        Ok(())
     }
 
     #[test]
@@ -1075,6 +1154,124 @@ mod tests {
     }
 
     #[test]
+    fn final_scan_plan_groups_once_and_initializes_one_shared_metrics_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add("part-0.parquet", 40, Some(4)),
+            add("part-1.parquet", 30, Some(3)),
+            add("part-2.parquet", 20, Some(2)),
+            add("part-3.parquet", 10, Some(1)),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("final-plan", &adds)?;
+        let plan = super::plan_scan(
+            &snapshot,
+            None,
+            &[],
+            None,
+            true,
+            Default::default(),
+            super::DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(2),
+                caller_target_partitions: Some(1),
+            },
+        )?;
+
+        assert_eq!(plan.snapshot_version, snapshot.version());
+        assert!(Arc::ptr_eq(&plan.engine_context, snapshot.engine_context()));
+        assert_eq!(plan.partition_target_diagnostic.target_partitions, 2);
+        assert_eq!(
+            plan.partition_target_diagnostic.source,
+            crate::DeltaScanPartitionTargetDiagnosticSource::ExplicitOverride
+        );
+        assert_eq!(
+            partition_paths(&plan.partitions),
+            vec![
+                vec!["part-0.parquet", "part-3.parquet"],
+                vec!["part-1.parquet", "part-2.parquet"]
+            ]
+        );
+        assert_eq!(plan.estimated_bytes, Some(100));
+        assert_eq!(plan.estimated_rows, Some(10));
+
+        let retained_metrics = plan.metrics.clone();
+        let metrics = retained_metrics.snapshot();
+        assert_eq!(metrics.snapshot_version, snapshot.version());
+        assert_eq!(
+            metrics.reader_backend,
+            crate::DeltaReaderBackend::NativeAsync
+        );
+        assert_eq!(metrics.scan_metadata_exhausted, Some(true));
+        assert_eq!(metrics.scan_partitions_planned, 2);
+        assert_eq!(metrics.files_planned, 4);
+        assert_eq!(metrics.files_filtered_during_planning, Some(0));
+        assert_eq!(metrics.estimated_rows, Some(10));
+        assert_eq!(metrics.estimated_bytes, Some(100));
+        assert_eq!(metrics.scan_partitions_started, 0);
+        assert_eq!(metrics.scan_partitions_completed, 0);
+        assert_eq!(metrics.files_started, 0);
+        assert_eq!(metrics.files_completed, 0);
+        assert_eq!(metrics.batches_produced, 0);
+        assert_eq!(metrics.rows_produced, 0);
+        assert_eq!(metrics.deletion_vector_payloads_loaded, 0);
+        assert_eq!(metrics.deletion_vectors_applied, 0);
+        assert_eq!(metrics.deletion_vector_rows_deleted, 0);
+        assert_eq!(metrics.deletion_vector_failures, 0);
+        assert_eq!(metrics.deletion_vector_rejections, 0);
+        assert_eq!(metrics.parquet_data_file_range_get_operations, Some(0));
+        assert_eq!(metrics.parquet_data_file_full_get_operations, Some(0));
+        assert_eq!(metrics.parquet_data_file_bytes_received, Some(0));
+        assert_eq!(metrics.parquet_data_file_opened_bytes, Some(0));
+
+        plan.metrics.record_deletion_vector_failure();
+        assert_eq!(retained_metrics.snapshot().deletion_vector_failures, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_final_plan_target_fails_before_file_task_expansion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("secret-invalid.parquet", -1, Some(1))];
+        let (_table, snapshot) = loaded_snapshot_with_adds("invalid-final-target", &adds)?;
+        let error = super::plan_scan(
+            &snapshot,
+            None,
+            &[],
+            None,
+            true,
+            Default::default(),
+            super::DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(0),
+                caller_target_partitions: None,
+            },
+        )
+        .err()
+        .ok_or("zero target must fail")?;
+
+        assert_eq!(error.as_str(), "invalid_configuration");
+        assert_eq!(error.phase(), DeltaReaderPhase::Configuration);
+        assert!(!error.to_string().contains("secret-invalid"));
+        Ok(())
+    }
+
+    #[test]
+    fn final_scan_plan_rejects_aggregate_overflow() -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add("secret-0.parquet", i64::MAX, Some(1)),
+            add("secret-1.parquet", i64::MAX, Some(1)),
+            add("secret-2.parquet", i64::MAX, Some(1)),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("overflow-final-plan", &adds)?;
+        let error = plan_scan(&snapshot, None, &[], None, true, Default::default())
+            .err()
+            .ok_or("aggregate byte overflow must fail")?;
+
+        assert_eq!(error.as_str(), "scan_partition_planning");
+        assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+        assert!(!error.to_string().contains("secret-"));
+        Ok(())
+    }
+
+    #[test]
     fn scan_plan_keeps_hidden_columns_and_applies_static_stats_pruning()
     -> Result<(), Box<dyn std::error::Error>> {
         let adds = [
@@ -1118,13 +1315,11 @@ mod tests {
         assert_eq!(field_names(&plan.logical_schema), ["label", "hidden"]);
         assert_eq!(field_names(&plan.physical_schema), ["label", "hidden"]);
         assert_eq!(field_names(&plan.projected_schema), ["label"]);
-        assert_eq!(
-            plan.file_tasks
-                .iter()
-                .map(|task| task.path.as_str())
-                .collect::<Vec<_>>(),
-            ["possible.parquet", "missing-stats.parquet"]
-        );
+        let mut paths = planned_tasks(&plan)
+            .map(|task| task.path.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["missing-stats.parquet", "possible.parquet"]);
         assert_eq!(plan.files_filtered_during_planning, Some(1));
         assert_eq!(plan.estimated_bytes, Some(50));
         assert_eq!(plan.estimated_rows, None);
@@ -1160,7 +1355,11 @@ mod tests {
             false,
             Default::default(),
         )?;
-        let mut task = plan.file_tasks.pop().ok_or("expected one task")?;
+        let mut task = plan
+            .partitions
+            .first_mut()
+            .and_then(|partition| partition.file_tasks.pop())
+            .ok_or("expected one task")?;
         let batch = || {
             RecordBatch::try_new(
                 Arc::clone(&plan.physical_schema),
@@ -1238,7 +1437,9 @@ mod tests {
             DeltaSnapshotSelection::Latest,
         )?;
         let plan = plan_scan(&snapshot, None, &[], None, false, Default::default())?;
-        let task = plan.file_tasks.first().ok_or("expected one mapped task")?;
+        let task = planned_tasks(&plan)
+            .next()
+            .ok_or("expected one mapped task")?;
 
         assert_eq!(
             field_names(&plan.physical_schema),
@@ -1302,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_plan_preserves_partition_pruning_transform_and_fake_478_handoff()
+    fn scan_plan_preserves_partition_pruning_transform_and_final_478_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let adds = [
             add_with_partition("east.parquet", 10, 1, "us-east"),
@@ -1335,19 +1536,19 @@ mod tests {
         assert_eq!(field_names(&plan.logical_schema), ["id", "region"]);
         assert_eq!(field_names(&plan.physical_schema), ["id"]);
         assert_eq!(field_names(&plan.projected_schema), ["id"]);
-        let grouping_handoff = (
+        let final_state = (
             plan.scan_metadata_exhausted,
-            plan.file_tasks.len(),
+            plan.partitions.len(),
+            planned_tasks(&plan).count(),
             plan.files_filtered_during_planning,
             plan.estimated_bytes,
             plan.estimated_rows,
         );
-        assert_eq!(grouping_handoff, (true, 1, Some(1), Some(20), Some(2)));
+        assert_eq!(final_state, (true, 1, 1, Some(1), Some(20), Some(2)));
         assert!(Arc::ptr_eq(&plan.engine_context, snapshot.engine_context()));
 
-        let task = plan
-            .file_tasks
-            .first()
+        let task = planned_tasks(&plan)
+            .next()
             .ok_or("expected one selected task")?;
         assert_eq!(task.path, "west.parquet");
         assert_eq!(task.stats.as_ref().map(|stats| stats.num_records), Some(2));
