@@ -1,15 +1,63 @@
 //! Private scan planning models.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+use arrow::datatypes::Schema;
 use snafu::ResultExt;
 
 use crate::{
     DeltaReaderError,
     deletion_vector::DeletionVectorMetadata,
-    error::ScanPlanningSnafu,
-    kernel::{KernelPhysicalToLogicalTransform, KernelScanFileMetadata},
+    error::{InvalidProjectionSnafu, ScanPlanningSnafu},
+    kernel::{
+        DeltaKernelPredicate, KernelPhysicalToLogicalTransform, KernelScan, KernelScanFileMetadata,
+    },
+    snapshot::LoadedDeltaTableSnapshot,
 };
+
+#[allow(dead_code)]
+pub(crate) fn build_scan(
+    snapshot: &LoadedDeltaTableSnapshot,
+    projection: Option<&[String]>,
+    predicate: Option<DeltaKernelPredicate>,
+    include_stats: bool,
+) -> Result<KernelScan, DeltaReaderError> {
+    validate_projection(snapshot.schema().as_ref(), projection)?;
+    snapshot
+        .kernel_snapshot()
+        .build_scan(projection, predicate, include_stats)
+        .boxed()
+        .context(ScanPlanningSnafu {
+            reason: "kernel_scan_build_failed",
+        })
+}
+
+fn validate_projection(
+    schema: &Schema,
+    projection: Option<&[String]>,
+) -> Result<(), DeltaReaderError> {
+    let Some(projection) = projection else {
+        return Ok(());
+    };
+    let mut seen = HashSet::with_capacity(projection.len());
+
+    for name in projection {
+        if !seen.insert(name) {
+            return InvalidProjectionSnafu {
+                reason: "duplicate_column",
+            }
+            .fail();
+        }
+        if schema.index_of(name).is_err() {
+            return InvalidProjectionSnafu {
+                reason: "column_not_found",
+            }
+            .fail();
+        }
+    }
+
+    Ok(())
+}
 
 #[allow(dead_code)]
 pub(crate) struct DeltaScanFileTask {
@@ -45,7 +93,13 @@ impl DeltaScanFileTask {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use delta_kernel::{
         actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType},
@@ -53,8 +107,64 @@ mod tests {
         scan::state::{DvInfo, ScanFile, Stats},
     };
 
-    use super::DeltaScanFileTask;
-    use crate::{DeltaReaderPhase, kernel::KernelScanFileMetadata};
+    use super::{DeltaScanFileTask, build_scan};
+    use crate::{
+        DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
+        DeltaStorageOptions,
+        kernel::{KernelScanFileMetadata, delta_predicate_to_kernel_pruning},
+        predicate::validate_predicate,
+        snapshot::load_delta_table_snapshot_blocking,
+    };
+
+    const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"hidden\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+
+    struct DeltaLogTable(PathBuf);
+
+    impl DeltaLogTable {
+        fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let path = Path::new("target")
+                .join("delta-arrow-reader-planning-tests")
+                .join(format!("{}-{name}-{nanos}", std::process::id()));
+            let log_path = path.join("_delta_log");
+            fs::create_dir_all(&log_path)?;
+            fs::write(
+                log_path.join("00000000000000000000.json"),
+                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+            )?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for DeltaLogTable {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn loaded_snapshot(
+        name: &str,
+    ) -> Result<
+        (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
+        Box<dyn std::error::Error>,
+    > {
+        let table = DeltaLogTable::new(name)?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        Ok((table, snapshot))
+    }
+
+    fn field_names(schema: &arrow::datatypes::SchemaRef) -> Vec<&str> {
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect()
+    }
 
     fn kernel_file(path: &str) -> ScanFile {
         ScanFile {
@@ -142,5 +252,80 @@ mod tests {
         assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
         assert!(!display.contains("secret-file"));
         assert!(!format!("{error:?}").contains("secret-file"));
+    }
+
+    #[test]
+    fn scan_preserves_full_ordered_and_empty_projections() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_table, snapshot) = loaded_snapshot("projections")?;
+
+        let full = build_scan(&snapshot, None, None, false)?;
+        assert_eq!(
+            field_names(&full.logical_schema()),
+            ["id", "label", "hidden"]
+        );
+        assert_eq!(
+            field_names(&full.physical_schema()),
+            ["id", "label", "hidden"]
+        );
+
+        let ordered_names = ["label".to_owned(), "id".to_owned()];
+        let ordered = build_scan(&snapshot, Some(&ordered_names), None, false)?;
+        assert_eq!(field_names(&ordered.logical_schema()), ["label", "id"]);
+        assert_eq!(field_names(&ordered.physical_schema()), ["label", "id"]);
+
+        let empty_names = Vec::<String>::new();
+        let empty = build_scan(&snapshot, Some(&empty_names), None, false)?;
+        assert!(empty.logical_schema().fields().is_empty());
+        assert!(empty.physical_schema().fields().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_keeps_metadata_predicate_out_of_projected_schemas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, snapshot) = loaded_snapshot("hidden-predicate")?;
+        let predicate = DeltaPredicate::Compare {
+            column: "hidden".to_owned(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(1),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+        let projection = ["label".to_owned()];
+
+        let scan = build_scan(&snapshot, Some(&projection), Some(kernel_predicate), false)?;
+
+        assert_eq!(field_names(&scan.logical_schema()), ["label"]);
+        assert_eq!(field_names(&scan.physical_schema()), ["label"]);
+        assert!(scan.has_physical_predicate());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_rejects_missing_and_duplicate_projections_without_disclosure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, snapshot) = loaded_snapshot("invalid-projection")?;
+
+        for projection in [
+            vec!["secret-missing".to_owned()],
+            vec!["id".to_owned(), "id".to_owned()],
+        ] {
+            let error = match build_scan(&snapshot, Some(&projection), None, false) {
+                Ok(_) => return Err("invalid projection must fail".into()),
+                Err(error) => error,
+            };
+            let display = error.to_string();
+
+            assert_eq!(error.as_str(), "invalid_projection");
+            assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+            assert!(!display.contains("secret-missing"));
+            assert!(!format!("{error:?}").contains("secret-missing"));
+        }
+
+        Ok(())
     }
 }

@@ -8,6 +8,7 @@ use delta_kernel::{
     engine::arrow_conversion::TryIntoArrow,
     expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar},
     scan::state::{DvInfo, ScanFile},
+    scan::{Scan as DeltaKernelScan, StatsOptions},
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
@@ -59,6 +60,13 @@ pub(crate) struct KernelScanFileMetadata {
 pub(crate) struct KernelPhysicalToLogicalTransform(Option<ExpressionRef>);
 
 #[allow(dead_code)]
+pub(crate) struct KernelScan {
+    scan: DeltaKernelScan,
+    logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
+}
+
+#[allow(dead_code)]
 impl KernelPhysicalToLogicalTransform {
     pub(crate) fn is_required(&self) -> bool {
         self.0.is_some()
@@ -66,6 +74,21 @@ impl KernelPhysicalToLogicalTransform {
 
     pub(crate) fn into_inner(self) -> Option<ExpressionRef> {
         self.0
+    }
+}
+
+#[allow(dead_code)]
+impl KernelScan {
+    pub(crate) fn logical_schema(&self) -> SchemaRef {
+        Arc::clone(&self.logical_schema)
+    }
+
+    pub(crate) fn physical_schema(&self) -> SchemaRef {
+        Arc::clone(&self.physical_schema)
+    }
+
+    pub(crate) fn has_physical_predicate(&self) -> bool {
+        self.scan.physical_predicate().is_some()
     }
 }
 
@@ -310,6 +333,34 @@ pub(crate) struct KernelSnapshot(SnapshotRef);
 impl KernelSnapshot {
     pub(crate) fn version(&self) -> u64 {
         self.0.version()
+    }
+
+    pub(crate) fn build_scan(
+        &self,
+        projection: Option<&[String]>,
+        predicate: Option<DeltaKernelPredicate>,
+        include_stats: bool,
+    ) -> delta_kernel::DeltaResult<KernelScan> {
+        let logical_schema = match projection {
+            Some(names) => self.0.schema().project(names)?,
+            None => self.0.schema(),
+        };
+        let mut builder = Arc::clone(&self.0)
+            .scan_builder()
+            .with_schema(logical_schema)
+            .with_predicate(predicate.map(DeltaKernelPredicate::into_inner));
+        if include_stats {
+            builder = builder.with_stats(StatsOptions::all());
+        }
+        let scan = builder.build()?;
+        let logical_schema = Arc::new(scan.logical_schema().as_ref().try_into_arrow()?);
+        let physical_schema = Arc::new(scan.physical_schema().as_ref().try_into_arrow()?);
+
+        Ok(KernelScan {
+            scan,
+            logical_schema,
+            physical_schema,
+        })
     }
 }
 
