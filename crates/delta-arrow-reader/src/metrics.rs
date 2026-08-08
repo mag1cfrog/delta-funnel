@@ -172,6 +172,34 @@ impl DeltaReadMetrics {
             DeltaReaderBackend::OfficialKernel => None,
         }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_deletion_vector_payload_loaded(&self) {
+        saturating_fetch_add(&self.inner.deletion_vector_payloads_loaded, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_deletion_vector_applied(&self) {
+        saturating_fetch_add(&self.inner.deletion_vectors_applied, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_deletion_vector_rows_deleted(&self, rows: usize) {
+        saturating_fetch_add(
+            &self.inner.deletion_vector_rows_deleted,
+            usize_to_u64_saturating(rows),
+        );
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_deletion_vector_failure(&self) {
+        saturating_fetch_add(&self.inner.deletion_vector_failures, 1);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_deletion_vector_rejection(&self) {
+        saturating_fetch_add(&self.inner.deletion_vector_rejections, 1);
+    }
 }
 
 fn load(counter: &AtomicU64) -> u64 {

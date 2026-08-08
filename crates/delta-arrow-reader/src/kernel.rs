@@ -6,6 +6,7 @@ use arrow::{datatypes::SchemaRef, error::ArrowError};
 use delta_kernel::{
     Engine, Snapshot, SnapshotRef,
     engine::arrow_conversion::TryIntoArrow,
+    scan::state::DvInfo,
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
@@ -37,6 +38,16 @@ pub(crate) struct DeltaKernelEngineContext {
     table_url: Url,
     object_store: Arc<dyn ObjectStore>,
     engine: Arc<dyn Engine + Send + Sync>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct KernelDeletionVectorHandle(DvInfo);
+
+#[allow(dead_code)]
+pub(crate) fn preserve_deletion_vector(dv_info: DvInfo) -> Option<KernelDeletionVectorHandle> {
+    dv_info
+        .has_vector()
+        .then_some(KernelDeletionVectorHandle(dv_info))
 }
 
 impl DeltaKernelEngineContext {
@@ -77,6 +88,17 @@ impl DeltaKernelEngineContext {
             builder = builder.at_version(version);
         }
         builder.build(self.engine.as_ref()).map(KernelSnapshot)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn load_deletion_vector_row_indexes(
+        &self,
+        deletion_vector: &KernelDeletionVectorHandle,
+    ) -> delta_kernel::DeltaResult<Vec<u64>> {
+        deletion_vector
+            .0
+            .get_row_indexes(self.engine.as_ref(), &self.table_url)
+            .map(Option::unwrap_or_default)
     }
 }
 
