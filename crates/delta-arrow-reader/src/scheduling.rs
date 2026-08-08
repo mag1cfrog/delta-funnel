@@ -12,14 +12,14 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
-use futures_util::{Stream, StreamExt, future::BoxFuture};
+use futures_util::{Stream, StreamExt, future::BoxFuture, stream::FuturesOrdered};
 use tokio::{
     sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
 };
 
 use crate::{
-    DeltaReadMetrics, DeltaReaderError, DeltaReaderExecutionOptions,
+    DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
     error::{CancelledSnafu, InvalidConfigurationSnafu},
 };
 
@@ -83,6 +83,8 @@ pub(crate) struct FileScheduler<Task, Output> {
 
 type BatchResult = Result<RecordBatch, DeltaReaderError>;
 type StartPartition = Box<dyn FnOnce(mpsc::Sender<BatchResult>) -> JoinHandle<()> + Send>;
+type FileSetups = FuturesOrdered<ScheduledFile<FileBatchStream>>;
+type ReadyFiles = VecDeque<Result<FileBatchStream, DeltaReaderError>>;
 
 struct PartitionStart {
     output_capacity: usize,
@@ -287,20 +289,11 @@ where
             match admission(&task) {
                 Ok(FileAdmission::Skip) => return Ok(None),
                 Ok(FileAdmission::Admit) => {}
-                Err(error) => {
-                    cancellation.cancel();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
 
             let permit = limiter.acquire_until_cancelled(&cancellation).await?;
-            match executor(task, permit, cancellation.clone()).await {
-                Ok(output) => Ok(Some(output)),
-                Err(error) => {
-                    cancellation.cancel();
-                    Err(error)
-                }
-            }
+            executor(task, permit, cancellation.clone()).await.map(Some)
         }))
     }
 
@@ -314,7 +307,7 @@ impl PartitionStream {
     pub(crate) fn new<Task>(
         file_tasks: Vec<Task>,
         partition_limiter: PartitionReadLimiter,
-        output_capacity: usize,
+        options: DeltaReaderExecutionOptions,
         admission: FileAdmissionFn<Task>,
         executor: FileExecutor<Task, FileBatchStream>,
         metrics: DeltaReadMetrics,
@@ -323,6 +316,13 @@ impl PartitionStream {
     where
         Task: Send + 'static,
     {
+        let output_capacity = options.output_buffer_capacity_per_partition();
+        let prefetch_file_count = match options.reader_backend() {
+            DeltaReaderBackend::NativeAsync => {
+                options.native_async_prefetch_file_count_per_partition()
+            }
+            DeltaReaderBackend::OfficialKernel => 0,
+        };
         let measured_metrics = metrics.clone();
         let measured_executor = Arc::new(move |task, permit, cancellation| {
             measured_metrics.record_file_started();
@@ -337,7 +337,13 @@ impl PartitionStream {
         );
         let run_cancellation = cancellation.clone();
         let start = Box::new(move |output| {
-            tokio::spawn(run_partition(output, scheduler, metrics, run_cancellation))
+            tokio::spawn(run_partition(
+                output,
+                scheduler,
+                metrics,
+                run_cancellation,
+                prefetch_file_count,
+            ))
         });
 
         Self {
@@ -426,58 +432,193 @@ async fn run_partition<Task>(
     mut scheduler: FileScheduler<Task, FileBatchStream>,
     metrics: DeltaReadMetrics,
     cancellation: ScanCancellation,
+    prefetch_file_count: usize,
 ) where
     Task: Send + 'static,
 {
     metrics.record_scan_partition_started();
-    while let Some(file) = scheduler.schedule_next() {
-        let file = tokio::select! {
-            biased;
-            file = file => file,
-            () = cancellation.cancelled() => return,
-        };
-        let Some(mut file) = (match file {
-            Ok(file) => file,
-            Err(error) => {
+    let mut in_flight = FuturesOrdered::new();
+    let mut ready = VecDeque::new();
+
+    loop {
+        let mut file = match take_next_file(
+            &mut scheduler,
+            &mut in_flight,
+            &mut ready,
+            prefetch_file_count,
+            &cancellation,
+        )
+        .await
+        {
+            NextFile::Ready(file) => file,
+            NextFile::Exhausted => {
+                metrics.record_scan_partition_completed();
+                return;
+            }
+            NextFile::Cancelled => return,
+            NextFile::Error(error) => {
+                cancellation.cancel();
                 let _ = output.send(Err(error)).await;
                 return;
             }
-        }) else {
-            continue;
         };
+        refill_file_setups(
+            &mut scheduler,
+            &mut in_flight,
+            ready.len(),
+            prefetch_file_count,
+        );
 
-        loop {
-            let batch = tokio::select! {
-                biased;
-                batch = file.next() => batch,
-                () = cancellation.cancelled() => return,
-            };
-            let Some(batch) = batch else {
-                metrics.record_file_completed();
-                break;
-            };
-            let batch = match batch {
-                Ok(batch) => batch,
-                Err(error) => {
-                    cancellation.cancel();
-                    let _ = output.send(Err(error)).await;
-                    return;
-                }
-            };
-            let rows = batch.num_rows();
-            let sent = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return,
-                sent = output.send(Ok(batch)) => sent,
-            };
-            if sent.is_err() {
+        match drain_current_file(
+            &output,
+            &mut file,
+            &mut scheduler,
+            &mut in_flight,
+            &mut ready,
+            prefetch_file_count,
+            &metrics,
+            &cancellation,
+        )
+        .await
+        {
+            DrainFile::Completed => metrics.record_file_completed(),
+            DrainFile::Cancelled => return,
+            DrainFile::Error(error) => {
                 cancellation.cancel();
+                let _ = output.send(Err(error)).await;
                 return;
             }
-            metrics.record_batch_produced(rows);
         }
     }
-    metrics.record_scan_partition_completed();
+}
+
+enum NextFile {
+    Ready(FileBatchStream),
+    Exhausted,
+    Cancelled,
+    Error(DeltaReaderError),
+}
+
+enum DrainFile {
+    Completed,
+    Cancelled,
+    Error(DeltaReaderError),
+}
+
+async fn take_next_file<Task>(
+    scheduler: &mut FileScheduler<Task, FileBatchStream>,
+    in_flight: &mut FileSetups,
+    ready: &mut ReadyFiles,
+    prefetch_file_count: usize,
+    cancellation: &ScanCancellation,
+) -> NextFile
+where
+    Task: Send + 'static,
+{
+    loop {
+        refill_file_setups(
+            scheduler,
+            in_flight,
+            ready.len(),
+            prefetch_file_count.saturating_add(1),
+        );
+        if let Some(file) = ready.pop_front() {
+            return match file {
+                Ok(file) => NextFile::Ready(file),
+                Err(error) => NextFile::Error(error),
+            };
+        }
+        let file = tokio::select! {
+            biased;
+            file = in_flight.next() => file,
+            () = cancellation.cancelled() => return NextFile::Cancelled,
+        };
+        match file {
+            Some(Ok(Some(file))) => return NextFile::Ready(file),
+            Some(Ok(None)) => {}
+            Some(Err(error)) => return NextFile::Error(error),
+            None => return NextFile::Exhausted,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_current_file<Task>(
+    output: &mpsc::Sender<BatchResult>,
+    file: &mut FileBatchStream,
+    scheduler: &mut FileScheduler<Task, FileBatchStream>,
+    in_flight: &mut FileSetups,
+    ready: &mut ReadyFiles,
+    prefetch_file_count: usize,
+    metrics: &DeltaReadMetrics,
+    cancellation: &ScanCancellation,
+) -> DrainFile
+where
+    Task: Send + 'static,
+{
+    loop {
+        let batch = if ready.is_empty() && !in_flight.is_empty() {
+            tokio::select! {
+                biased;
+                batch = file.next() => Some(batch),
+                setup = in_flight.next() => {
+                    match setup {
+                        Some(Ok(Some(file))) => ready.push_back(Ok(file)),
+                        Some(Ok(None)) | None => {}
+                        Some(Err(error)) => return DrainFile::Error(error),
+                    }
+                    refill_file_setups(
+                        scheduler,
+                        in_flight,
+                        ready.len(),
+                        prefetch_file_count,
+                    );
+                    continue;
+                }
+                () = cancellation.cancelled() => return DrainFile::Cancelled,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                batch = file.next() => Some(batch),
+                () = cancellation.cancelled() => return DrainFile::Cancelled,
+            }
+        };
+        let Some(batch) = batch.flatten() else {
+            return DrainFile::Completed;
+        };
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => return DrainFile::Error(error),
+        };
+        let rows = batch.num_rows();
+        let sent = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return DrainFile::Cancelled,
+            sent = output.send(Ok(batch)) => sent,
+        };
+        if sent.is_err() {
+            cancellation.cancel();
+            return DrainFile::Cancelled;
+        }
+        metrics.record_batch_produced(rows);
+    }
+}
+
+fn refill_file_setups<Task>(
+    scheduler: &mut FileScheduler<Task, FileBatchStream>,
+    in_flight: &mut FileSetups,
+    ready_count: usize,
+    target_file_count: usize,
+) where
+    Task: Send + 'static,
+{
+    while in_flight.len().saturating_add(ready_count) < target_file_count {
+        let Some(file) = scheduler.schedule_next() else {
+            return;
+        };
+        in_flight.push_back(file);
+    }
 }
 
 async fn acquire_until_cancelled(
@@ -508,6 +649,7 @@ mod tests {
         record_batch::RecordBatch,
     };
     use futures_util::{FutureExt, StreamExt, stream};
+    use tokio::sync::Notify;
 
     use crate::{
         DeltaReadMetrics, DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaReaderPhase,
@@ -542,6 +684,15 @@ mod tests {
         })
     }
 
+    fn stream_options(
+        output_capacity: usize,
+        prefetch_file_count: usize,
+    ) -> Result<DeltaReaderExecutionOptions, crate::DeltaReaderError> {
+        DeltaReaderExecutionOptions::new()
+            .with_native_async_prefetch_file_count_per_partition(prefetch_file_count)?
+            .with_output_buffer_capacity_per_partition(output_capacity)
+    }
+
     fn batch(ids: Vec<i32>) -> Result<RecordBatch, Box<dyn std::error::Error>> {
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
@@ -565,6 +716,23 @@ mod tests {
                 batches
                     .pop_front()
                     .map(|batch| (Ok(batch), (batches, permit)))
+            },
+        ))
+    }
+
+    fn gated_file_stream(
+        permit: FileReadPermit,
+        batches: Vec<RecordBatch>,
+        gate: Arc<Notify>,
+    ) -> FileBatchStream {
+        Box::pin(stream::unfold(
+            (false, VecDeque::from(batches), permit, gate),
+            |(wait, mut batches, permit, gate)| async move {
+                let batch = batches.pop_front()?;
+                if wait {
+                    gate.notified().await;
+                }
+                Some((Ok(batch), (true, batches, permit, gate)))
             },
         ))
     }
@@ -731,7 +899,7 @@ mod tests {
         assert_eq!(error.as_str(), "invalid_configuration");
         assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
         assert_eq!(limiter.active_file_reads(), 0);
-        assert!(cancellation.is_cancelled());
+        assert!(!cancellation.is_cancelled());
         Ok(())
     }
 
@@ -780,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn executor_failure_is_first_and_cancels_future_admission()
+    async fn runner_cancellation_after_executor_failure_stops_future_admission()
     -> Result<(), Box<dyn std::error::Error>> {
         let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
         let admission_calls = Arc::new(AtomicUsize::new(0));
@@ -814,9 +982,9 @@ mod tests {
             .await
             .expect_err("executor must fail");
         assert_eq!(first.as_str(), "invalid_configuration");
-        assert!(cancellation.is_cancelled());
         assert_eq!(limiter.active_file_reads(), 0);
 
+        cancellation.cancel();
         let later = scheduler
             .schedule_next()
             .ok_or("expected later file")?
@@ -836,7 +1004,7 @@ mod tests {
         let stream = PartitionStream::new(
             Vec::<i32>::new(),
             limiter.partition(0)?,
-            1,
+            stream_options(1, 0)?,
             Arc::new(|_| Ok(FileAdmission::Admit)),
             batch_executor(BTreeMap::new(), Arc::clone(&calls)),
             metrics.clone(),
@@ -852,7 +1020,7 @@ mod tests {
         let mut empty = PartitionStream::new(
             Vec::<i32>::new(),
             limiter.partition(0)?,
-            1,
+            stream_options(1, 0)?,
             Arc::new(|_| Ok(FileAdmission::Admit)),
             batch_executor(BTreeMap::new(), calls),
             metrics.clone(),
@@ -879,7 +1047,7 @@ mod tests {
         let stream = PartitionStream::new(
             vec![1, 2],
             limiter.partition(0)?,
-            1,
+            stream_options(1, 0)?,
             Arc::new(|_| Ok(FileAdmission::Admit)),
             batch_executor(batches, Arc::clone(&calls)),
             metrics.clone(),
@@ -912,6 +1080,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefetch_zero_waits_for_current_file_exhaustion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(2, 2)?, 1, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let mut batches = BTreeMap::new();
+        batches.insert(1, vec![batch(vec![1])?, batch(vec![2])?]);
+        batches.insert(2, vec![batch(vec![3])?]);
+        let executor: FileExecutor<i32, FileBatchStream> = {
+            let calls = Arc::clone(&calls);
+            let gate = Arc::clone(&gate);
+            Arc::new(move |task, permit, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let gate = Arc::clone(&gate);
+                let batches = batches.get(&task).cloned().unwrap_or_default();
+                async move {
+                    Ok(if task == 1 {
+                        gated_file_stream(permit, batches, gate)
+                    } else {
+                        file_stream(permit, batches)
+                    })
+                }
+                .boxed()
+            })
+        };
+        let mut stream = PartitionStream::new(
+            vec![1, 2],
+            limiter.partition(0)?,
+            stream_options(3, 0)?,
+            Arc::new(|_| Ok(FileAdmission::Admit)),
+            executor,
+            metrics(),
+            ScanCancellation::new(),
+        );
+
+        let first = stream.next().await.ok_or("expected first batch")??;
+        assert_eq!(batch_ids(&first)?, vec![1]);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        gate.notify_one();
+        let remaining = stream.collect::<Vec<_>>().await;
+        let ids = remaining
+            .into_iter()
+            .map(|batch| batch.map_err(Box::<dyn std::error::Error>::from))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(limiter.active_file_reads(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_prefetch_overlaps_setup_and_preserves_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(3, 3)?, 1, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let mut batches = BTreeMap::new();
+        for task in [1, 2, 3] {
+            batches.insert(task, vec![batch(vec![task])?, batch(vec![task * 10])?]);
+        }
+        let executor: FileExecutor<i32, FileBatchStream> = {
+            let calls = Arc::clone(&calls);
+            let gate = Arc::clone(&gate);
+            Arc::new(move |task, permit, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let gate = Arc::clone(&gate);
+                let batches = batches.get(&task).cloned().unwrap_or_default();
+                async move {
+                    Ok(if task == 1 {
+                        gated_file_stream(permit, batches, gate)
+                    } else {
+                        file_stream(permit, batches)
+                    })
+                }
+                .boxed()
+            })
+        };
+        let mut stream = PartitionStream::new(
+            vec![1, 2, 3],
+            limiter.partition(0)?,
+            stream_options(6, 1)?,
+            Arc::new(|_| Ok(FileAdmission::Admit)),
+            executor,
+            metrics(),
+            ScanCancellation::new(),
+        );
+
+        let first = stream.next().await.ok_or("expected first batch")??;
+        assert_eq!(batch_ids(&first)?, vec![1]);
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(limiter.active_file_reads(), 2);
+
+        gate.notify_one();
+        let remaining = stream.collect::<Vec<_>>().await;
+        let ids = remaining
+            .into_iter()
+            .map(|batch| batch.map_err(Box::<dyn std::error::Error>::from))
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .map(batch_ids)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![10, 2, 20, 3, 30]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(limiter.active_file_reads(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bounded_handoff_and_drop_preserve_partial_metrics_and_release_permit()
     -> Result<(), Box<dyn std::error::Error>> {
         let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
@@ -921,7 +1215,7 @@ mod tests {
         let mut stream = PartitionStream::new(
             vec![1],
             limiter.partition(0)?,
-            1,
+            stream_options(1, 0)?,
             Arc::new(|_| Ok(FileAdmission::Admit)),
             batch_executor(batches, Arc::new(AtomicUsize::new(0))),
             metrics.clone(),
@@ -983,7 +1277,7 @@ mod tests {
         let mut stream = PartitionStream::new(
             vec![1],
             limiter.partition(0)?,
-            1,
+            stream_options(1, 0)?,
             Arc::new(|_| Ok(FileAdmission::Admit)),
             executor,
             metrics.clone(),
@@ -1006,6 +1300,51 @@ mod tests {
         assert_eq!(snapshot.files_completed, 0);
         assert_eq!(snapshot.batches_produced, 0);
         assert_eq!(snapshot.rows_produced, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_error_is_returned_once_and_cancels_future_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let cancellation = ScanCancellation::new();
+        let executor: FileExecutor<i32, FileBatchStream> = Arc::new(|_, permit, _| {
+            async move {
+                let _permit = permit;
+                InvalidConfigurationSnafu {
+                    reason: "fake_setup_failure",
+                }
+                .fail()
+            }
+            .boxed()
+        });
+        let mut stream = PartitionStream::new(
+            vec![1, 2],
+            limiter.partition(0)?,
+            stream_options(1, 0)?,
+            {
+                let calls = Arc::clone(&admission_calls);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(FileAdmission::Admit)
+                })
+            },
+            executor,
+            metrics(),
+            cancellation.clone(),
+        );
+
+        let error = stream
+            .next()
+            .await
+            .ok_or("expected setup error")?
+            .expect_err("file setup must fail");
+        assert_eq!(error.as_str(), "invalid_configuration");
+        assert!(stream.next().await.is_none());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(limiter.active_file_reads(), 0);
         Ok(())
     }
 }
