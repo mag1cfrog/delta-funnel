@@ -4,7 +4,9 @@ use delta_arrow_reader::{
     DeltaComparison, DeltaPredicate, DeltaProtocolInfo, DeltaReadMetrics, DeltaReadMetricsSnapshot,
     DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase,
     DeltaScalar, DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, DeltaSnapshotSelection, DeltaStorageOptions,
+    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSnapshotSelection,
+    DeltaStorageOptions, delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic,
 };
 
@@ -60,6 +62,10 @@ fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> 
 
 #[test]
 fn scan_partition_target_diagnostic_contract_is_public() -> Result<(), DeltaReaderError> {
+    let local: DeltaScanPartitionTargetLocalEnvironmentDiagnostic =
+        delta_scan_partition_target_local_environment_diagnostic();
+    let _: DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus =
+        local.unix_soft_file_descriptor_limit_status;
     let input = DeltaScanPartitionTargetDiagnosticInput {
         explicit_target_partitions: None,
         datafusion_target_partitions: Some(8),

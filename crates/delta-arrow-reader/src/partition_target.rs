@@ -1,5 +1,14 @@
 //! Scan partition target selection and diagnostics.
 
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(windows)]
+use std::mem;
+#[cfg(unix)]
+use std::mem::MaybeUninit;
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
 use crate::{DeltaReaderError, error::InvalidConfigurationSnafu};
 
 const DEFAULT_MIN_PARTITIONS: usize = 1;
@@ -65,6 +74,37 @@ pub enum DeltaScanPartitionTargetDiagnosticSource {
     StaticFallback,
 }
 
+/// Local environment diagnostic used by scan partition tools.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+    /// Production diagnostic policy input derived from cheap local host signals.
+    pub policy_input: DeltaScanPartitionTargetDiagnosticInput,
+    /// Total physical memory in bytes, when available.
+    pub memory_total_bytes: Option<u64>,
+    /// Available memory in bytes, when available.
+    pub memory_available_bytes: Option<u64>,
+    /// Unix soft file descriptor limit, when finite and available.
+    pub unix_soft_file_descriptor_limit: Option<u64>,
+    /// Status of the Unix soft file descriptor limit probe.
+    pub unix_soft_file_descriptor_limit_status:
+        DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+}
+
+/// Diagnostic status for the local Unix file descriptor soft limit probe.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus {
+    /// The current platform does not expose a Unix file descriptor limit.
+    Unsupported,
+    /// The probe failed or returned no usable value.
+    Unknown,
+    /// The Unix soft file descriptor limit is finite.
+    Finite,
+    /// The Unix soft file descriptor limit is unlimited.
+    Unlimited,
+}
+
 impl Default for DeltaScanPartitionTargetDiagnosticInput {
     fn default() -> Self {
         Self {
@@ -98,6 +138,162 @@ pub fn derive_delta_scan_partition_target_diagnostic(
         unix_file_descriptor_cap: decision.unix_file_descriptor_cap,
         memory_cap: decision.memory_cap,
     })
+}
+
+/// Collects cheap local host signals for scan partition target diagnostics.
+#[doc(hidden)]
+pub fn delta_scan_partition_target_local_environment_diagnostic()
+-> DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+    let available_parallelism = std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZeroUsize::get);
+    let memory = local_memory_hint();
+    let (unix_soft_file_descriptor_limit, unix_soft_file_descriptor_limit_status) =
+        unix_soft_file_descriptor_diagnostic(local_unix_file_descriptor_limit());
+
+    DeltaScanPartitionTargetLocalEnvironmentDiagnostic {
+        policy_input: DeltaScanPartitionTargetDiagnosticInput {
+            datafusion_target_partitions: available_parallelism,
+            available_parallelism,
+            available_memory_bytes: memory.and_then(|memory| memory.available_bytes),
+            unix_soft_file_descriptor_limit,
+            ..Default::default()
+        },
+        memory_total_bytes: memory.and_then(|memory| memory.total_bytes),
+        memory_available_bytes: memory.and_then(|memory| memory.available_bytes),
+        unix_soft_file_descriptor_limit,
+        unix_soft_file_descriptor_limit_status,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryHint {
+    total_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixResourceLimit {
+    Finite(u64),
+    Unlimited,
+}
+
+#[cfg(target_os = "linux")]
+fn local_memory_hint() -> Option<MemoryHint> {
+    fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_linux_meminfo(&contents))
+}
+
+#[cfg(windows)]
+fn local_memory_hint() -> Option<MemoryHint> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: mem::size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is a valid MEMORYSTATUSEX with the required length field.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return None;
+    }
+    memory_hint(nonzero(status.ullTotalPhys), nonzero(status.ullAvailPhys))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn local_memory_hint() -> Option<MemoryHint> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_meminfo(contents: &str) -> Option<MemoryHint> {
+    let mut total_bytes = None;
+    let mut available_bytes = None;
+
+    for line in contents.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        match name {
+            "MemTotal" => total_bytes = Some(parse_linux_kib(value)?),
+            "MemAvailable" => available_bytes = Some(parse_linux_kib(value)?),
+            _ => {}
+        }
+    }
+
+    memory_hint(total_bytes, available_bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_kib(value: &str) -> Option<u64> {
+    let mut fields = value.split_whitespace();
+    let kib = fields.next()?.parse::<u64>().ok()?;
+    (fields.next()? == "kB").then(|| kib.checked_mul(1024))?
+}
+
+fn memory_hint(total_bytes: Option<u64>, available_bytes: Option<u64>) -> Option<MemoryHint> {
+    (total_bytes.is_some() || available_bytes.is_some()).then_some(MemoryHint {
+        total_bytes,
+        available_bytes,
+    })
+}
+
+#[cfg(windows)]
+fn nonzero(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+#[cfg(unix)]
+fn local_unix_file_descriptor_limit() -> Option<UnixResourceLimit> {
+    let mut limit = MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `getrlimit` initializes the valid pointer when it returns success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `getrlimit` succeeded, so `limit` is initialized.
+    let limit = unsafe { limit.assume_init() }.rlim_cur;
+
+    Some(if limit == libc::RLIM_INFINITY {
+        UnixResourceLimit::Unlimited
+    } else {
+        UnixResourceLimit::Finite(limit)
+    })
+}
+
+#[cfg(not(unix))]
+fn local_unix_file_descriptor_limit() -> Option<UnixResourceLimit> {
+    None
+}
+
+fn unix_soft_file_descriptor_diagnostic(
+    limit: Option<UnixResourceLimit>,
+) -> (
+    Option<u64>,
+    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+) {
+    match limit {
+        Some(UnixResourceLimit::Finite(limit)) => (
+            Some(limit),
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite,
+        ),
+        Some(UnixResourceLimit::Unlimited) => (
+            None,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited,
+        ),
+        None if cfg!(unix) => (
+            None,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown,
+        ),
+        None => (
+            None,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported,
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,5 +538,65 @@ mod tests {
         )?;
         assert_eq!(huge.target_partitions, usize::MAX);
         Ok(())
+    }
+
+    #[test]
+    fn local_environment_diagnostic_feeds_the_same_policy() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let diagnostic = delta_scan_partition_target_local_environment_diagnostic();
+        let output = derive_delta_scan_partition_target_diagnostic(diagnostic.policy_input)?;
+
+        assert_eq!(
+            diagnostic.policy_input.datafusion_target_partitions,
+            diagnostic.policy_input.available_parallelism
+        );
+        assert_eq!(
+            diagnostic.policy_input.available_memory_bytes,
+            diagnostic.memory_available_bytes
+        );
+        assert_eq!(
+            diagnostic.policy_input.unix_soft_file_descriptor_limit,
+            diagnostic.unix_soft_file_descriptor_limit
+        );
+        assert!(output.target_partitions > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unix_file_descriptor_diagnostic_preserves_every_status() {
+        let (value, status) = unix_soft_file_descriptor_diagnostic(None);
+        assert_eq!(value, None);
+        assert!(matches!(
+            status,
+            DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unknown
+                | DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unsupported
+        ));
+        assert_eq!(
+            unix_soft_file_descriptor_diagnostic(Some(UnixResourceLimit::Finite(128))),
+            (
+                Some(128),
+                DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Finite
+            )
+        );
+        assert_eq!(
+            unix_soft_file_descriptor_diagnostic(Some(UnixResourceLimit::Unlimited)),
+            (
+                None,
+                DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus::Unlimited
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_memory_parser_preserves_valid_values_and_rejects_invalid_units() {
+        let hint = parse_linux_meminfo(
+            "MemTotal: 16384000 kB\nMemFree: 1000000 kB\nMemAvailable: 8192000 kB\n",
+        )
+        .expect("valid Linux memory hint");
+        assert_eq!(hint.total_bytes, Some(16_777_216_000));
+        assert_eq!(hint.available_bytes, Some(8_388_608_000));
+        assert_eq!(parse_linux_meminfo("SwapTotal: 1024 kB\n"), None);
+        assert_eq!(parse_linux_meminfo("MemTotal: 1 MB\n"), None);
     }
 }
