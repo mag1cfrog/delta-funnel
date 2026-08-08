@@ -5,6 +5,7 @@ mod deletion_vector;
 mod error;
 mod kernel;
 mod metrics;
+mod planning;
 mod predicate;
 mod protocol;
 mod snapshot;

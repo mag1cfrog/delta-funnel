@@ -1,13 +1,13 @@
 //! Private boundary for stability-sensitive `delta_kernel` APIs.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, error::ArrowError};
 use delta_kernel::{
     Engine, Snapshot, SnapshotRef,
     engine::arrow_conversion::TryIntoArrow,
-    expressions::{ColumnName, Expression, Predicate, PredicateRef, Scalar},
-    scan::state::DvInfo,
+    expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar},
+    scan::state::{DvInfo, ScanFile},
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
@@ -45,6 +45,31 @@ pub(crate) struct DeltaKernelEngineContext {
 pub(crate) struct KernelDeletionVectorHandle(DvInfo);
 
 #[allow(dead_code)]
+pub(crate) struct KernelScanFileMetadata {
+    pub(crate) path: String,
+    pub(crate) size: i64,
+    pub(crate) modification_time_ms: Option<i64>,
+    pub(crate) estimated_rows: Option<u64>,
+    pub(crate) partition_values: BTreeMap<String, String>,
+    pub(crate) deletion_vector: Option<KernelDeletionVectorHandle>,
+    pub(crate) transform: KernelPhysicalToLogicalTransform,
+}
+
+#[allow(dead_code)]
+pub(crate) struct KernelPhysicalToLogicalTransform(Option<ExpressionRef>);
+
+#[allow(dead_code)]
+impl KernelPhysicalToLogicalTransform {
+    pub(crate) fn is_required(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn into_inner(self) -> Option<ExpressionRef> {
+        self.0
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeltaKernelPredicate(PredicateRef);
 
@@ -64,6 +89,31 @@ pub(crate) fn preserve_deletion_vector(dv_info: DvInfo) -> Option<KernelDeletion
     dv_info
         .has_vector()
         .then_some(KernelDeletionVectorHandle(dv_info))
+}
+
+#[allow(dead_code)]
+impl KernelScanFileMetadata {
+    pub(crate) fn from_scan_file(file: ScanFile) -> Self {
+        let ScanFile {
+            path,
+            size,
+            modification_time,
+            stats,
+            dv_info,
+            transform,
+            partition_values,
+        } = file;
+
+        Self {
+            path,
+            size,
+            modification_time_ms: Some(modification_time),
+            estimated_rows: stats.map(|stats| stats.num_records),
+            partition_values: partition_values.into_iter().collect(),
+            deletion_vector: preserve_deletion_vector(dv_info),
+            transform: KernelPhysicalToLogicalTransform(transform),
+        }
+    }
 }
 
 #[allow(dead_code)]
