@@ -2,11 +2,12 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, error::ArrowError};
+use arrow::{array::Array as _, datatypes::SchemaRef, error::ArrowError};
 use delta_kernel::{
     Engine, Snapshot, SnapshotRef,
-    engine::arrow_conversion::TryIntoArrow,
+    engine::{arrow_conversion::TryIntoArrow, arrow_data::ArrowEngineData},
     expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar},
+    scan::ScanMetadata,
     scan::state::{DvInfo, ScanFile},
     scan::{Scan as DeltaKernelScan, StatsOptions},
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
@@ -67,6 +68,12 @@ pub(crate) struct KernelScan {
 }
 
 #[allow(dead_code)]
+pub(crate) struct KernelScanMetadata {
+    pub(crate) files: Vec<KernelScanFileMetadata>,
+    pub(crate) files_filtered_during_planning: Option<u64>,
+}
+
+#[allow(dead_code)]
 impl KernelPhysicalToLogicalTransform {
     pub(crate) fn is_required(&self) -> bool {
         self.0.is_some()
@@ -94,17 +101,41 @@ impl KernelScan {
     pub(crate) fn file_metadata(
         &self,
         engine_context: &DeltaKernelEngineContext,
-    ) -> delta_kernel::DeltaResult<Vec<KernelScanFileMetadata>> {
+    ) -> delta_kernel::DeltaResult<KernelScanMetadata> {
         fn collect(files: &mut Vec<KernelScanFileMetadata>, file: ScanFile) {
             files.push(KernelScanFileMetadata::from_scan_file(file));
         }
 
         let mut files = Vec::new();
+        let mut filtered = Some(0_u64);
+        let mut saw_batch = false;
         for metadata in self.scan.scan_metadata(engine_context.engine.as_ref())? {
-            files = metadata?.visit_scan_files(files, collect)?;
+            let metadata = metadata?;
+            saw_batch = true;
+            filtered = filtered.and_then(|total| {
+                files_filtered(&metadata).and_then(|count| total.checked_add(count))
+            });
+            files = metadata.visit_scan_files(files, collect)?;
         }
-        Ok(files)
+        Ok(KernelScanMetadata {
+            files,
+            files_filtered_during_planning: saw_batch.then_some(filtered).flatten(),
+        })
     }
+}
+
+fn files_filtered(metadata: &ScanMetadata) -> Option<u64> {
+    let data = metadata
+        .scan_files
+        .data()
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()?;
+    let paths = data.record_batch().column_by_name("path")?;
+    let selection = metadata.scan_files.selection_vector();
+    let count = (0..paths.len())
+        .filter(|&index| !paths.is_null(index) && !selection.get(index).copied().unwrap_or(true))
+        .count();
+    u64::try_from(count).ok()
 }
 
 #[allow(dead_code)]

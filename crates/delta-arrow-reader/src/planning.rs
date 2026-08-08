@@ -1,19 +1,39 @@
 //! Private scan planning models.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use snafu::ResultExt;
 
 use crate::{
-    DeltaReaderError,
+    DeltaReaderError, DeltaReaderExecutionOptions,
     deletion_vector::DeletionVectorMetadata,
     error::{InvalidProjectionSnafu, ScanPlanningSnafu},
     kernel::{
-        DeltaKernelPredicate, KernelPhysicalToLogicalTransform, KernelScan, KernelScanFileMetadata,
+        DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
+        KernelScan, KernelScanFileMetadata,
     },
     snapshot::LoadedDeltaTableSnapshot,
 };
+
+#[allow(dead_code)]
+pub(crate) struct DeltaScanPlan {
+    pub(crate) snapshot_version: u64,
+    pub(crate) engine_context: Arc<DeltaKernelEngineContext>,
+    pub(crate) logical_schema: SchemaRef,
+    pub(crate) physical_schema: SchemaRef,
+    pub(crate) projected_schema: SchemaRef,
+    pub(crate) file_tasks: Vec<DeltaScanFileTask>,
+    pub(crate) scan_metadata_exhausted: bool,
+    pub(crate) files_filtered_during_planning: Option<u64>,
+    pub(crate) estimated_bytes: Option<u64>,
+    pub(crate) estimated_rows: Option<u64>,
+    pub(crate) kernel_predicate: Option<DeltaKernelPredicate>,
+    pub(crate) execution_options: DeltaReaderExecutionOptions,
+}
 
 #[allow(dead_code)]
 pub(crate) fn build_scan(
@@ -33,18 +53,54 @@ pub(crate) fn build_scan(
 }
 
 #[allow(dead_code)]
-pub(crate) fn plan_file_tasks(
+pub(crate) fn plan_scan(
     snapshot: &LoadedDeltaTableSnapshot,
-    scan: &KernelScan,
-) -> Result<Vec<DeltaScanFileTask>, DeltaReaderError> {
-    scan.file_metadata(snapshot.engine_context())
+    projection: Option<&[String]>,
+    kernel_predicate: Option<DeltaKernelPredicate>,
+    include_stats: bool,
+    execution_options: DeltaReaderExecutionOptions,
+) -> Result<DeltaScanPlan, DeltaReaderError> {
+    execution_options.validate()?;
+    let scan = build_scan(
+        snapshot,
+        projection,
+        kernel_predicate.clone(),
+        include_stats,
+    )?;
+    let metadata = scan
+        .file_metadata(snapshot.engine_context())
         .boxed()
         .context(ScanPlanningSnafu {
             reason: "kernel_scan_metadata_failed",
-        })?
+        })?;
+    let file_tasks = metadata
+        .files
         .into_iter()
         .map(DeltaScanFileTask::try_from_kernel)
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let estimated_bytes = exact_sum(file_tasks.iter().map(|task| task.estimated_bytes));
+    let estimated_rows = exact_sum(file_tasks.iter().map(|task| task.estimated_rows));
+
+    Ok(DeltaScanPlan {
+        snapshot_version: snapshot.version(),
+        engine_context: Arc::clone(snapshot.engine_context()),
+        logical_schema: snapshot.schema(),
+        physical_schema: scan.physical_schema(),
+        projected_schema: scan.logical_schema(),
+        file_tasks,
+        scan_metadata_exhausted: true,
+        files_filtered_during_planning: metadata.files_filtered_during_planning,
+        estimated_bytes,
+        estimated_rows,
+        kernel_predicate,
+        execution_options,
+    })
+}
+
+fn exact_sum(estimates: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    estimates
+        .into_iter()
+        .try_fold(0_u64, |total, value| total.checked_add(value?))
 }
 
 fn validate_projection(
@@ -122,7 +178,7 @@ mod tests {
         scan::state::{DvInfo, ScanFile, Stats},
     };
 
-    use super::{DeltaScanFileTask, build_scan, plan_file_tasks};
+    use super::{DeltaScanFileTask, build_scan, exact_sum, plan_scan};
     use crate::{
         DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
         DeltaStorageOptions,
@@ -292,18 +348,20 @@ mod tests {
     fn file_task_planning_exhausts_empty_single_and_multi_batch_scans()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
-        let empty_scan = build_scan(&empty_snapshot, None, None, true)?;
-        assert!(plan_file_tasks(&empty_snapshot, &empty_scan)?.is_empty());
+        let empty = plan_scan(&empty_snapshot, None, None, true, Default::default())?;
+        assert!(empty.file_tasks.is_empty());
+        assert_eq!(empty.estimated_bytes, Some(0));
+        assert_eq!(empty.estimated_rows, Some(0));
 
         let single_add = [add("single.parquet", 0, None)];
         let (_single_table, single_snapshot) =
             loaded_snapshot_with_adds("single-file", &single_add)?;
-        let single_scan = build_scan(&single_snapshot, None, None, true)?;
-        let single = plan_file_tasks(&single_snapshot, &single_scan)?;
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].path, "single.parquet");
-        assert_eq!(single[0].estimated_bytes, Some(0));
-        assert_eq!(single[0].estimated_rows, None);
+        let single = plan_scan(&single_snapshot, None, None, true, Default::default())?;
+        assert_eq!(single.file_tasks.len(), 1);
+        assert_eq!(single.file_tasks[0].path, "single.parquet");
+        assert_eq!(single.file_tasks[0].estimated_bytes, Some(0));
+        assert_eq!(single.estimated_bytes, Some(0));
+        assert_eq!(single.estimated_rows, None);
 
         let adds = (0_u32..1_001)
             .map(|index| {
@@ -315,15 +373,35 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (_many_table, many_snapshot) = loaded_snapshot_with_adds("many-files", &adds)?;
-        let many_scan = build_scan(&many_snapshot, None, None, true)?;
-        let many = plan_file_tasks(&many_snapshot, &many_scan)?;
+        let projection = ["label".to_owned(), "id".to_owned()];
+        let many = plan_scan(
+            &many_snapshot,
+            Some(&projection),
+            None,
+            true,
+            Default::default(),
+        )?;
 
-        assert_eq!(many.len(), adds.len());
-        assert_eq!(many[0].path, "part-0000.parquet");
-        assert_eq!(many[1].estimated_rows, None);
-        assert_eq!(many[1_000].path, "part-1000.parquet");
-        assert_eq!(many[1_000].estimated_bytes, Some(1_000));
-        assert_eq!(many[1_000].estimated_rows, Some(1_000));
+        assert_eq!(many.file_tasks.len(), adds.len());
+        assert_eq!(many.file_tasks[0].path, "part-0000.parquet");
+        assert_eq!(many.file_tasks[1].estimated_rows, None);
+        assert_eq!(many.file_tasks[1_000].path, "part-1000.parquet");
+        assert_eq!(many.file_tasks[1_000].estimated_bytes, Some(1_000));
+        assert_eq!(many.file_tasks[1_000].estimated_rows, Some(1_000));
+        assert!(many.scan_metadata_exhausted);
+        assert_eq!(many.files_filtered_during_planning, Some(0));
+        assert_eq!(many.estimated_bytes, Some(500_500));
+        assert_eq!(many.estimated_rows, None);
+        assert!(Arc::ptr_eq(
+            &many.engine_context,
+            many_snapshot.engine_context()
+        ));
+        assert_eq!(many.snapshot_version, many_snapshot.version());
+        assert_eq!(field_names(&many.logical_schema), ["id", "label", "hidden"]);
+        assert_eq!(field_names(&many.physical_schema), ["label", "id"]);
+        assert_eq!(field_names(&many.projected_schema), ["label", "id"]);
+        assert!(many.kernel_predicate.is_none());
+        assert_eq!(many.execution_options, Default::default());
 
         Ok(())
     }
@@ -336,9 +414,8 @@ mod tests {
             add("last.parquet", 1, Some(1)),
         ];
         let (_table, snapshot) = loaded_snapshot_with_adds("all-or-error", &adds)?;
-        let scan = build_scan(&snapshot, None, None, true)?;
 
-        let error = match plan_file_tasks(&snapshot, &scan) {
+        let error = match plan_scan(&snapshot, None, None, true, Default::default()) {
             Ok(_) => return Err("invalid task must fail the plan".into()),
             Err(error) => error,
         };
@@ -347,6 +424,14 @@ mod tests {
         assert!(!error.to_string().contains("secret-invalid"));
 
         Ok(())
+    }
+
+    #[test]
+    fn aggregate_estimates_are_exact_or_unknown() {
+        assert_eq!(exact_sum([]), Some(0));
+        assert_eq!(exact_sum([Some(2), Some(3)]), Some(5));
+        assert_eq!(exact_sum([Some(2), None, Some(3)]), None);
+        assert_eq!(exact_sum([Some(u64::MAX), Some(1)]), None);
     }
 
     #[test]
