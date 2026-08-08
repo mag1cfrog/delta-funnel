@@ -1,8 +1,15 @@
 //! Private bounded scan scheduling primitives.
 
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use futures_util::future::BoxFuture;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     DeltaReaderError, DeltaReaderExecutionOptions,
@@ -25,6 +32,43 @@ pub(crate) struct PartitionReadLimiter {
 pub(crate) struct FileReadPermit {
     _partition: OwnedSemaphorePermit,
     _scan: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+pub(crate) struct ScanCancellation {
+    inner: Arc<ScanCancellationInner>,
+}
+
+struct ScanCancellationInner {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileAdmission {
+    Admit,
+    Skip,
+}
+
+type Admission<Task> = Arc<dyn Fn(&Task) -> Result<FileAdmission, DeltaReaderError> + Send + Sync>;
+type FileExecutor<Task, Output> = Arc<
+    dyn Fn(
+            Task,
+            FileReadPermit,
+            ScanCancellation,
+        ) -> BoxFuture<'static, Result<Output, DeltaReaderError>>
+        + Send
+        + Sync,
+>;
+pub(crate) type ScheduledFile<Output> =
+    BoxFuture<'static, Result<Option<Output>, DeltaReaderError>>;
+
+pub(crate) struct FileScheduler<Task, Output> {
+    file_tasks: VecDeque<Task>,
+    partition_limiter: PartitionReadLimiter,
+    admission: Admission<Task>,
+    executor: FileExecutor<Task, Output>,
+    cancellation: ScanCancellation,
 }
 
 impl ScanReadLimiter {
@@ -102,6 +146,28 @@ impl PartitionReadLimiter {
         })
     }
 
+    async fn acquire_until_cancelled(
+        &self,
+        cancellation: &ScanCancellation,
+    ) -> Result<FileReadPermit, DeltaReaderError> {
+        let partition = acquire_until_cancelled(
+            Arc::clone(&self.limiter.partition_permits[self.partition]),
+            cancellation,
+            "partition_read_capacity_closed",
+        )
+        .await?;
+        let scan = acquire_until_cancelled(
+            Arc::clone(&self.limiter.scan_permits),
+            cancellation,
+            "scan_read_capacity_closed",
+        )
+        .await?;
+        Ok(FileReadPermit {
+            _partition: partition,
+            _scan: scan,
+        })
+    }
+
     #[cfg(test)]
     fn try_acquire(&self) -> Option<FileReadPermit> {
         let partition = Arc::clone(&self.limiter.partition_permits[self.partition])
@@ -117,14 +183,125 @@ impl PartitionReadLimiter {
     }
 }
 
+impl ScanCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(ScanCancellationInner {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.inner.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+impl<Task, Output> FileScheduler<Task, Output>
+where
+    Task: Send + 'static,
+    Output: Send + 'static,
+{
+    pub(crate) fn new(
+        file_tasks: Vec<Task>,
+        partition_limiter: PartitionReadLimiter,
+        admission: Admission<Task>,
+        executor: FileExecutor<Task, Output>,
+        cancellation: ScanCancellation,
+    ) -> Self {
+        Self {
+            file_tasks: file_tasks.into(),
+            partition_limiter,
+            admission,
+            executor,
+            cancellation,
+        }
+    }
+
+    pub(crate) fn schedule_next(&mut self) -> Option<ScheduledFile<Output>> {
+        let task = self.file_tasks.pop_front()?;
+        let limiter = self.partition_limiter.clone();
+        let admission = Arc::clone(&self.admission);
+        let executor = Arc::clone(&self.executor);
+        let cancellation = self.cancellation.clone();
+
+        Some(Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return CancelledSnafu {
+                    reason: "scan_execution_cancelled",
+                }
+                .fail();
+            }
+            match admission(&task) {
+                Ok(FileAdmission::Skip) => return Ok(None),
+                Ok(FileAdmission::Admit) => {}
+                Err(error) => {
+                    cancellation.cancel();
+                    return Err(error);
+                }
+            }
+
+            let permit = limiter.acquire_until_cancelled(&cancellation).await?;
+            match executor(task, permit, cancellation.clone()).await {
+                Ok(output) => Ok(Some(output)),
+                Err(error) => {
+                    cancellation.cancel();
+                    Err(error)
+                }
+            }
+        }))
+    }
+
+    #[cfg(test)]
+    fn remaining_file_tasks(&self) -> usize {
+        self.file_tasks.len()
+    }
+}
+
+async fn acquire_until_cancelled(
+    permits: Arc<Semaphore>,
+    cancellation: &ScanCancellation,
+    reason: &'static str,
+) -> Result<OwnedSemaphorePermit, DeltaReaderError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => CancelledSnafu { reason: "scan_execution_cancelled" }.fail(),
+        permit = permits.acquire_owned() => permit.map_err(|_| CancelledSnafu { reason }.build()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::task::Poll;
 
-    use crate::{DeltaReaderExecutionOptions, DeltaReaderPhase};
+    use futures_util::FutureExt;
 
-    use super::ScanReadLimiter;
+    use crate::{DeltaReaderExecutionOptions, DeltaReaderPhase, error::InvalidConfigurationSnafu};
+
+    use super::{FileAdmission, FileScheduler, ScanCancellation, ScanReadLimiter};
 
     fn options(
         scan_capacity: usize,
@@ -196,6 +373,190 @@ mod tests {
         assert_eq!(error.phase(), DeltaReaderPhase::Configuration);
         assert_eq!(error.as_str(), "invalid_configuration");
         assert!(!error.to_string().contains('1'));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_scheduling_is_lazy_and_runs_admission_before_permits_and_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let executor_calls = Arc::new(AtomicUsize::new(0));
+        let mut scheduler = FileScheduler::new(
+            vec![7],
+            limiter.partition(0)?,
+            {
+                let calls = Arc::clone(&admission_calls);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(FileAdmission::Admit)
+                })
+            },
+            {
+                let calls = Arc::clone(&executor_calls);
+                Arc::new(move |task, permit, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let _permit = permit;
+                        Ok(task)
+                    }
+                    .boxed()
+                })
+            },
+            ScanCancellation::new(),
+        );
+
+        let scheduled = scheduler.schedule_next().ok_or("expected scheduled file")?;
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        assert_eq!(scheduled.await?, Some(7));
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert_eq!(scheduler.remaining_file_tasks(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skipped_and_failed_admission_start_no_capacity_or_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
+        let executor_calls = Arc::new(AtomicUsize::new(0));
+        let cancellation = ScanCancellation::new();
+        let mut scheduler = FileScheduler::new(
+            vec![1, 2],
+            limiter.partition(0)?,
+            Arc::new(|task| {
+                if *task == 1 {
+                    Ok(FileAdmission::Skip)
+                } else {
+                    Err(InvalidConfigurationSnafu {
+                        reason: "fake_admission_failure",
+                    }
+                    .build())
+                }
+            }),
+            {
+                let calls = Arc::clone(&executor_calls);
+                Arc::new(move |task, permit, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let _permit = permit;
+                        Ok(task)
+                    }
+                    .boxed()
+                })
+            },
+            cancellation.clone(),
+        );
+
+        assert_eq!(
+            scheduler.schedule_next().ok_or("expected skip")?.await?,
+            None
+        );
+        let error = scheduler
+            .schedule_next()
+            .ok_or("expected failure")?
+            .await
+            .expect_err("admission must fail");
+        assert_eq!(error.as_str(), "invalid_configuration");
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.active_file_reads(), 0);
+        assert!(cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_pending_capacity_without_starting_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
+        let partition = limiter.partition(0)?;
+        let held = partition.acquire().await?;
+        let executor_calls = Arc::new(AtomicUsize::new(0));
+        let cancellation = ScanCancellation::new();
+        let mut scheduler = FileScheduler::new(
+            vec![1],
+            partition,
+            Arc::new(|_| Ok(FileAdmission::Admit)),
+            {
+                let calls = Arc::clone(&executor_calls);
+                Arc::new(move |task, permit, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let _permit = permit;
+                        Ok(task)
+                    }
+                    .boxed()
+                })
+            },
+            cancellation.clone(),
+        );
+        let mut scheduled = scheduler.schedule_next().ok_or("expected scheduled file")?;
+        poll_fn(|context| {
+            assert!(matches!(scheduled.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+
+        cancellation.cancel();
+        let error = scheduled.await.expect_err("cancelled capacity must fail");
+        assert_eq!(error.phase(), DeltaReaderPhase::Execution);
+        assert_eq!(error.as_str(), "cancelled");
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.active_file_reads(), 1);
+
+        drop(held);
+        assert_eq!(limiter.active_file_reads(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_failure_is_first_and_cancels_future_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let cancellation = ScanCancellation::new();
+        let mut scheduler: FileScheduler<i32, ()> = FileScheduler::new(
+            vec![1, 2],
+            limiter.partition(0)?,
+            {
+                let calls = Arc::clone(&admission_calls);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(FileAdmission::Admit)
+                })
+            },
+            Arc::new(|_, permit, _| {
+                async move {
+                    let _permit = permit;
+                    Err(InvalidConfigurationSnafu {
+                        reason: "fake_executor_failure",
+                    }
+                    .build())
+                }
+                .boxed()
+            }),
+            cancellation.clone(),
+        );
+
+        let first = scheduler
+            .schedule_next()
+            .ok_or("expected first file")?
+            .await
+            .expect_err("executor must fail");
+        assert_eq!(first.as_str(), "invalid_configuration");
+        assert!(cancellation.is_cancelled());
+        assert_eq!(limiter.active_file_reads(), 0);
+
+        let later = scheduler
+            .schedule_next()
+            .ok_or("expected later file")?
+            .await
+            .expect_err("later work must observe cancellation");
+        assert_eq!(later.as_str(), "cancelled");
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }
