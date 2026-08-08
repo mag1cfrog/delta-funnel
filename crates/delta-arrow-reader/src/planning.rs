@@ -224,8 +224,8 @@ mod tests {
     };
 
     use arrow::{
-        array::{Int32Array, StringArray},
-        datatypes::Schema,
+        array::{Int32Array, StringArray, StructArray},
+        datatypes::{DataType, Schema},
         record_batch::RecordBatch,
     };
     use delta_kernel::{
@@ -246,14 +246,26 @@ mod tests {
     };
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"hidden\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
+    const INVALID_PARTITION_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-invalid-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["long_part"],"configuration":{},"createdTime":1587968585495}}"#;
+    const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-column-mapping-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":4,\"delta.columnMapping.physicalName\":\"phys_first_name\"}},{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_age\"}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_profile\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"5"},"createdTime":1587968585495}}"#;
 
     struct DeltaLogTable(PathBuf);
 
     impl DeltaLogTable {
         fn new_with_metadata_and_adds(
             name: &str,
+            metadata: &str,
+            adds: &[String],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Self::new_with_protocol_metadata_and_adds(name, PROTOCOL_JSON, metadata, adds)
+        }
+
+        fn new_with_protocol_metadata_and_adds(
+            name: &str,
+            protocol: &str,
             metadata: &str,
             adds: &[String],
         ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -265,7 +277,7 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{metadata}\n{}", adds.join("\n")),
+                format!("{protocol}\n{metadata}\n{}", adds.join("\n")),
             )?;
             Ok(Self(path))
         }
@@ -527,6 +539,39 @@ mod tests {
     }
 
     #[test]
+    fn scan_metadata_visitor_failure_returns_no_partial_plan_or_sensitive_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const INVALID_VALUE: &str = "secret-not-an-integer";
+        let adds = [add_action(
+            "secret-invalid-partition.parquet",
+            1,
+            &format!(r#"{{"long_part":"{INVALID_VALUE}"}}"#),
+            None,
+        )];
+        let (_table, snapshot) = loaded_snapshot_with_metadata_and_adds(
+            "invalid-partition",
+            INVALID_PARTITION_METADATA_JSON,
+            &adds,
+        )?;
+
+        let error = match plan_scan(&snapshot, None, &[], None, false, Default::default()) {
+            Ok(_) => return Err("invalid partition metadata must fail the whole plan".into()),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert_eq!(error.as_str(), "scan_planning");
+        assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+        assert!(!display.contains(INVALID_VALUE));
+        assert!(!display.contains("secret-invalid-partition"));
+        assert!(!debug.contains(INVALID_VALUE));
+        assert!(!debug.contains("secret-invalid-partition"));
+
+        Ok(())
+    }
+
+    #[test]
     fn aggregate_estimates_are_exact_or_unknown() {
         assert_eq!(exact_sum([]), Some(0));
         assert_eq!(exact_sum([Some(2), Some(3)]), Some(5));
@@ -683,7 +728,86 @@ mod tests {
     }
 
     #[test]
-    fn scan_plan_preserves_partition_pruning_transform_and_grouping_handoff()
+    fn scan_plan_applies_nested_kernel_column_mapping_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("mapped.parquet", 10, Some(2))];
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "column-mapping-transform",
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            COLUMN_MAPPING_METADATA_JSON,
+            &adds,
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let plan = plan_scan(&snapshot, None, &[], None, false, Default::default())?;
+        let task = plan.file_tasks.first().ok_or("expected one mapped task")?;
+
+        assert_eq!(
+            field_names(&plan.physical_schema),
+            ["phys_id", "phys_customer_name", "phys_profile"]
+        );
+        assert_eq!(
+            field_names(&plan.logical_schema),
+            ["id", "customer_name", "profile"]
+        );
+        assert!(task.transform.is_required());
+        let DataType::Struct(profile_fields) = plan.physical_schema.field(2).data_type() else {
+            return Err("expected a physical profile struct".into());
+        };
+        assert_eq!(profile_fields[0].name(), "phys_first_name");
+        assert_eq!(profile_fields[1].name(), "phys_age");
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("alice"), None])),
+                Arc::new(Int32Array::from(vec![Some(30), None])),
+            ],
+            None,
+        );
+
+        let physical = RecordBatch::try_new(
+            Arc::clone(&plan.physical_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("customer-a"), None])),
+                Arc::new(profile),
+            ],
+        )?;
+        let logical = plan.apply_transform(task, physical)?;
+        let profile = logical
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or("expected mapped profile")?;
+        let first_names = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected mapped first names")?;
+        let ages = profile
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected mapped ages")?;
+
+        assert_eq!(logical.schema(), plan.logical_schema);
+        assert_eq!(logical.num_rows(), 2);
+        assert_eq!(profile.fields()[0].name(), "first_name");
+        assert_eq!(profile.fields()[1].name(), "age");
+        assert_eq!(
+            first_names.iter().collect::<Vec<_>>(),
+            [Some("alice"), None]
+        );
+        assert_eq!(ages.iter().collect::<Vec<_>>(), [Some(30), None]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_preserves_partition_pruning_transform_and_fake_478_handoff()
     -> Result<(), Box<dyn std::error::Error>> {
         let adds = [
             add_with_partition("east.parquet", 10, 1, "us-east"),
@@ -716,10 +840,14 @@ mod tests {
         assert_eq!(field_names(&plan.logical_schema), ["id", "region"]);
         assert_eq!(field_names(&plan.physical_schema), ["id"]);
         assert_eq!(field_names(&plan.projected_schema), ["id"]);
-        assert!(plan.scan_metadata_exhausted);
-        assert_eq!(plan.files_filtered_during_planning, Some(1));
-        assert_eq!(plan.estimated_bytes, Some(20));
-        assert_eq!(plan.estimated_rows, Some(2));
+        let grouping_handoff = (
+            plan.scan_metadata_exhausted,
+            plan.file_tasks.len(),
+            plan.files_filtered_during_planning,
+            plan.estimated_bytes,
+            plan.estimated_rows,
+        );
+        assert_eq!(grouping_handoff, (true, 1, Some(1), Some(20), Some(2)));
         assert!(Arc::ptr_eq(&plan.engine_context, snapshot.engine_context()));
 
         let task = plan
@@ -842,5 +970,30 @@ mod tests {
         assert!(!error.to_string().contains("secret-hidden"));
 
         Ok(())
+    }
+
+    #[test]
+    fn planning_boundary_contains_no_execution_grouping_or_second_engine() {
+        let planning_source = include_str!("planning.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production planning source");
+        let transform_source = include_str!("transform.rs");
+
+        for forbidden in [
+            "DefaultEngineBuilder",
+            "store_from_url_opts",
+            "Runtime::",
+            "block_on(",
+            "read_parquet",
+            "get_row_indexes",
+            "datafusion::",
+            "MetricBuilder",
+            "ExecutionPlanMetricsSet",
+            "tracing::",
+        ] {
+            assert!(!planning_source.contains(forbidden), "{forbidden}");
+            assert!(!transform_source.contains(forbidden), "{forbidden}");
+        }
     }
 }
