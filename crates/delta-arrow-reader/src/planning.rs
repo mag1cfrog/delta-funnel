@@ -32,6 +32,21 @@ pub(crate) fn build_scan(
         })
 }
 
+#[allow(dead_code)]
+pub(crate) fn plan_file_tasks(
+    snapshot: &LoadedDeltaTableSnapshot,
+    scan: &KernelScan,
+) -> Result<Vec<DeltaScanFileTask>, DeltaReaderError> {
+    scan.file_metadata(snapshot.engine_context())
+        .boxed()
+        .context(ScanPlanningSnafu {
+            reason: "kernel_scan_metadata_failed",
+        })?
+        .into_iter()
+        .map(DeltaScanFileTask::try_from_kernel)
+        .collect()
+}
+
 fn validate_projection(
     schema: &Schema,
     projection: Option<&[String]>,
@@ -107,7 +122,7 @@ mod tests {
         scan::state::{DvInfo, ScanFile, Stats},
     };
 
-    use super::{DeltaScanFileTask, build_scan};
+    use super::{DeltaScanFileTask, build_scan, plan_file_tasks};
     use crate::{
         DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
         DeltaStorageOptions,
@@ -122,7 +137,7 @@ mod tests {
     struct DeltaLogTable(PathBuf);
 
     impl DeltaLogTable {
-        fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        fn new_with_adds(name: &str, adds: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let path = Path::new("target")
                 .join("delta-arrow-reader-planning-tests")
@@ -131,7 +146,7 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n{}", adds.join("\n")),
             )?;
             Ok(Self(path))
         }
@@ -149,13 +164,32 @@ mod tests {
         (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
         Box<dyn std::error::Error>,
     > {
-        let table = DeltaLogTable::new(name)?;
+        loaded_snapshot_with_adds(name, &[])
+    }
+
+    fn loaded_snapshot_with_adds(
+        name: &str,
+        adds: &[String],
+    ) -> Result<
+        (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
+        Box<dyn std::error::Error>,
+    > {
+        let table = DeltaLogTable::new_with_adds(name, adds)?;
         let snapshot = load_delta_table_snapshot_blocking(
             &table.0.to_string_lossy(),
             &DeltaStorageOptions::new(),
             DeltaSnapshotSelection::Latest,
         )?;
         Ok((table, snapshot))
+    }
+
+    fn add(path: &str, size: i64, rows: Option<u64>) -> String {
+        let stats = rows.map_or_else(String::new, |rows| {
+            format!(r#", "stats":"{{\"numRecords\":{rows}}}""#)
+        });
+        format!(
+            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":1587968586000,"dataChange":true{stats}}}}}"#
+        )
     }
 
     fn field_names(schema: &arrow::datatypes::SchemaRef) -> Vec<&str> {
@@ -252,6 +286,67 @@ mod tests {
         assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
         assert!(!display.contains("secret-file"));
         assert!(!format!("{error:?}").contains("secret-file"));
+    }
+
+    #[test]
+    fn file_task_planning_exhausts_empty_single_and_multi_batch_scans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
+        let empty_scan = build_scan(&empty_snapshot, None, None, true)?;
+        assert!(plan_file_tasks(&empty_snapshot, &empty_scan)?.is_empty());
+
+        let single_add = [add("single.parquet", 0, None)];
+        let (_single_table, single_snapshot) =
+            loaded_snapshot_with_adds("single-file", &single_add)?;
+        let single_scan = build_scan(&single_snapshot, None, None, true)?;
+        let single = plan_file_tasks(&single_snapshot, &single_scan)?;
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].path, "single.parquet");
+        assert_eq!(single[0].estimated_bytes, Some(0));
+        assert_eq!(single[0].estimated_rows, None);
+
+        let adds = (0_u32..1_001)
+            .map(|index| {
+                add(
+                    &format!("part-{index:04}.parquet"),
+                    i64::from(index),
+                    (index % 2 == 0).then_some(u64::from(index)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (_many_table, many_snapshot) = loaded_snapshot_with_adds("many-files", &adds)?;
+        let many_scan = build_scan(&many_snapshot, None, None, true)?;
+        let many = plan_file_tasks(&many_snapshot, &many_scan)?;
+
+        assert_eq!(many.len(), adds.len());
+        assert_eq!(many[0].path, "part-0000.parquet");
+        assert_eq!(many[1].estimated_rows, None);
+        assert_eq!(many[1_000].path, "part-1000.parquet");
+        assert_eq!(many[1_000].estimated_bytes, Some(1_000));
+        assert_eq!(many[1_000].estimated_rows, Some(1_000));
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_task_planning_returns_no_partial_result() -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add("first.parquet", 1, Some(1)),
+            add("secret-invalid.parquet", -1, Some(1)),
+            add("last.parquet", 1, Some(1)),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("all-or-error", &adds)?;
+        let scan = build_scan(&snapshot, None, None, true)?;
+
+        let error = match plan_file_tasks(&snapshot, &scan) {
+            Ok(_) => return Err("invalid task must fail the plan".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.as_str(), "scan_planning");
+        assert!(!error.to_string().contains("secret-invalid"));
+
+        Ok(())
     }
 
     #[test]

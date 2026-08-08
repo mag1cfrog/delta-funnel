@@ -90,6 +90,21 @@ impl KernelScan {
     pub(crate) fn has_physical_predicate(&self) -> bool {
         self.scan.physical_predicate().is_some()
     }
+
+    pub(crate) fn file_metadata(
+        &self,
+        engine_context: &DeltaKernelEngineContext,
+    ) -> delta_kernel::DeltaResult<Vec<KernelScanFileMetadata>> {
+        fn collect(files: &mut Vec<KernelScanFileMetadata>, file: ScanFile) {
+            files.push(KernelScanFileMetadata::from_scan_file(file));
+        }
+
+        let mut files = Vec::new();
+        for metadata in self.scan.scan_metadata(engine_context.engine.as_ref())? {
+            files = metadata?.visit_scan_files(files, collect)?;
+        }
+        Ok(files)
+    }
 }
 
 #[allow(dead_code)]
