@@ -207,6 +207,17 @@ impl DeltaReaderExecutionOptions {
 
         Ok(())
     }
+
+    pub(crate) fn resolved_max_concurrent_file_reads_per_scan(
+        &self,
+        target_partitions: usize,
+    ) -> usize {
+        self.max_concurrent_file_reads_per_scan.unwrap_or_else(|| {
+            target_partitions
+                .saturating_mul(self.max_concurrent_file_reads_per_partition)
+                .max(1)
+        })
+    }
 }
 
 impl Default for DeltaReaderExecutionOptions {
@@ -307,5 +318,20 @@ mod tests {
             assert_eq!(error.phase(), DeltaReaderPhase::Configuration);
             assert_eq!(error.as_str(), "invalid_configuration");
         }
+    }
+
+    #[test]
+    fn scan_capacity_resolves_once_from_the_fixed_partition_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let defaults = DeltaReaderExecutionOptions::new();
+        assert_eq!(defaults.resolved_max_concurrent_file_reads_per_scan(4), 12);
+        assert_eq!(
+            defaults.resolved_max_concurrent_file_reads_per_scan(usize::MAX),
+            usize::MAX
+        );
+
+        let explicit = defaults.with_max_concurrent_file_reads_per_scan(Some(7))?;
+        assert_eq!(explicit.resolved_max_concurrent_file_reads_per_scan(4), 7);
+        Ok(())
     }
 }
