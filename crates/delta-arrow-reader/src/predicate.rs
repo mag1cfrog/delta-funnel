@@ -1,6 +1,22 @@
+use std::sync::Arc;
+
 use arrow::{
-    array::types::{Decimal128Type, DecimalType, validate_decimal_precision_and_scale},
+    array::{
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeBinaryArray, LargeStringArray, RecordBatch, Scalar as ArrowScalar, StringArray,
+        TimestampMicrosecondArray,
+        types::{Decimal128Type, DecimalType, validate_decimal_precision_and_scale},
+    },
+    compute::{
+        filter_record_batch,
+        kernels::{
+            boolean::{and_kleene, is_not_null, is_null, not, or_kleene},
+            cmp,
+        },
+    },
     datatypes::{DataType, Schema, TimeUnit},
+    error::ArrowError,
 };
 
 use crate::{DeltaReaderError, error::UnsupportedPredicateSnafu};
@@ -126,6 +142,94 @@ pub(crate) fn validate_predicate(
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn evaluate_predicate(
+    batch: &RecordBatch,
+    predicate: &DeltaPredicate,
+) -> Result<RecordBatch, DeltaReaderError> {
+    predicate_selection(batch, predicate)
+        .and_then(|selection| filter_record_batch(batch, &selection))
+        .map_err(|_| unsupported_predicate("predicate_evaluation"))
+}
+
+fn predicate_selection(
+    batch: &RecordBatch,
+    predicate: &DeltaPredicate,
+) -> Result<BooleanArray, ArrowError> {
+    match predicate {
+        DeltaPredicate::Boolean(value) => Ok(BooleanArray::from(vec![*value; batch.num_rows()])),
+        DeltaPredicate::Compare { column, op, value } => {
+            let column = batch.column(batch.schema().index_of(column)?);
+            let scalar = ArrowScalar::new(scalar_array(value)?);
+            match op {
+                DeltaComparison::Eq => cmp::eq(column, &scalar),
+                DeltaComparison::NotEq => cmp::neq(column, &scalar),
+                DeltaComparison::Lt => cmp::lt(column, &scalar),
+                DeltaComparison::LtEq => cmp::lt_eq(column, &scalar),
+                DeltaComparison::Gt => cmp::gt(column, &scalar),
+                DeltaComparison::GtEq => cmp::gt_eq(column, &scalar),
+            }
+        }
+        DeltaPredicate::IsNull { column } => {
+            is_null(batch.column(batch.schema().index_of(column)?).as_ref())
+        }
+        DeltaPredicate::IsNotNull { column } => {
+            is_not_null(batch.column(batch.schema().index_of(column)?).as_ref())
+        }
+        DeltaPredicate::And(children) => combine_selections(batch, children, true, and_kleene),
+        DeltaPredicate::Or(children) => combine_selections(batch, children, false, or_kleene),
+        DeltaPredicate::Not(child) => not(&predicate_selection(batch, child)?),
+    }
+}
+
+fn combine_selections(
+    batch: &RecordBatch,
+    predicates: &[DeltaPredicate],
+    identity: bool,
+    combine: fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>,
+) -> Result<BooleanArray, ArrowError> {
+    let mut predicates = predicates.iter();
+    let Some(first) = predicates.next() else {
+        return Ok(BooleanArray::from(vec![identity; batch.num_rows()]));
+    };
+    let first = predicate_selection(batch, first)?;
+
+    predicates.try_fold(first, |selection, predicate| {
+        combine(&selection, &predicate_selection(batch, predicate)?)
+    })
+}
+
+fn scalar_array(scalar: &DeltaScalar) -> Result<ArrayRef, ArrowError> {
+    let array: ArrayRef = match scalar {
+        DeltaScalar::Boolean(value) => Arc::new(BooleanArray::from(vec![*value])),
+        DeltaScalar::Int8(value) => Arc::new(Int8Array::from(vec![*value])),
+        DeltaScalar::Int16(value) => Arc::new(Int16Array::from(vec![*value])),
+        DeltaScalar::Int32(value) => Arc::new(Int32Array::from(vec![*value])),
+        DeltaScalar::Int64(value) => Arc::new(Int64Array::from(vec![*value])),
+        DeltaScalar::Float32(value) => Arc::new(Float32Array::from(vec![*value])),
+        DeltaScalar::Float64(value) => Arc::new(Float64Array::from(vec![*value])),
+        DeltaScalar::Date32(value) => Arc::new(Date32Array::from(vec![*value])),
+        DeltaScalar::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => Arc::new(
+            Decimal128Array::from(vec![*value]).with_precision_and_scale(*precision, *scale)?,
+        ),
+        DeltaScalar::Utf8(value) => Arc::new(StringArray::from(vec![value.as_str()])),
+        DeltaScalar::LargeUtf8(value) => Arc::new(LargeStringArray::from(vec![value.as_str()])),
+        DeltaScalar::Binary(value) => Arc::new(BinaryArray::from(vec![value.as_slice()])),
+        DeltaScalar::LargeBinary(value) => Arc::new(LargeBinaryArray::from(vec![value.as_slice()])),
+        DeltaScalar::FixedSizeBinary { value, .. } => Arc::new(
+            FixedSizeBinaryArray::try_from_iter(std::iter::once(value.as_slice()))?,
+        ),
+        DeltaScalar::TimestampMicrosecond { value, timezone } => Arc::new(
+            TimestampMicrosecondArray::from(vec![*value]).with_timezone_opt(timezone.clone()),
+        ),
+    };
+    Ok(array)
+}
+
 fn column_data_type<'a>(
     schema: &'a Schema,
     column: &str,
@@ -221,11 +325,22 @@ fn unsupported_predicate(reason: &'static str) -> DeltaReaderError {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{
-        DataType, Field, Fields, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode,
+    use arrow::{
+        array::{
+            Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
+            FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+            Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+            TimestampMicrosecondArray,
+        },
+        datatypes::{
+            DataType, Field, Fields, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode,
+        },
     };
 
-    use super::{DeltaComparison, DeltaPredicate, DeltaScalar, validate_predicate};
+    use super::{
+        DeltaComparison, DeltaPredicate, DeltaScalar, evaluate_predicate, predicate_selection,
+        validate_predicate,
+    };
     use crate::{DeltaReaderError, DeltaReaderPhase};
 
     fn compare(column: &str, value: DeltaScalar) -> DeltaPredicate {
@@ -279,6 +394,22 @@ mod tests {
         let error = validate_predicate(predicate, schema).expect_err("predicate must be rejected");
         assert_eq!(error.as_str(), "unsupported_predicate");
         assert_eq!(error.phase(), DeltaReaderPhase::ScanPlanning);
+    }
+
+    fn selection_values(
+        batch: &RecordBatch,
+        predicate: &DeltaPredicate,
+    ) -> Result<Vec<Option<bool>>, Box<dyn std::error::Error>> {
+        validate_predicate(predicate, batch.schema().as_ref())?;
+        Ok(predicate_selection(batch, predicate)?.iter().collect())
+    }
+
+    fn evaluate_validated(
+        batch: &RecordBatch,
+        predicate: &DeltaPredicate,
+    ) -> Result<RecordBatch, DeltaReaderError> {
+        validate_predicate(predicate, batch.schema().as_ref())?;
+        evaluate_predicate(batch, predicate)
     }
 
     #[test]
@@ -562,5 +693,408 @@ mod tests {
             let schema = Schema::new(vec![Field::new("value", data_type, true)]);
             assert_unsupported(&compare("value", DeltaScalar::Int32(7)), &schema);
         }
+    }
+
+    #[test]
+    fn evaluates_complete_three_valued_truth_tables() -> Result<(), Box<dyn std::error::Error>> {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "a",
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(1),
+                    Some(0),
+                    Some(0),
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(0),
+                    None,
+                    Some(1),
+                    Some(0),
+                    None,
+                    Some(1),
+                    Some(0),
+                    None,
+                ])) as ArrayRef,
+            ),
+        ])?;
+        let a = compare("a", DeltaScalar::Int32(1));
+        let b = compare("b", DeltaScalar::Int32(1));
+
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::Not(Box::new(a.clone())))?,
+            vec![
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::And(vec![a.clone(), b.clone()]))?,
+            vec![
+                Some(true),
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+                Some(false),
+                None,
+            ]
+        );
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::Or(vec![a, b]))?,
+            vec![
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::And(Vec::new()))?,
+            vec![Some(true); 9]
+        );
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::Or(Vec::new()))?,
+            vec![Some(false); 9]
+        );
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::IsNull { column: "a".into() },)?,
+            vec![
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+                Some(true),
+            ]
+        );
+        assert_eq!(
+            selection_values(&batch, &DeltaPredicate::IsNotNull { column: "a".into() },)?,
+            vec![
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_every_comparison_and_scalar_boundary() -> Result<(), Box<dyn std::error::Error>> {
+        let integer_batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), None])) as ArrayRef,
+        )])?;
+        for (op, expected) in [
+            (
+                DeltaComparison::Eq,
+                vec![Some(false), Some(true), Some(false), None],
+            ),
+            (
+                DeltaComparison::NotEq,
+                vec![Some(true), Some(false), Some(true), None],
+            ),
+            (
+                DeltaComparison::Lt,
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                DeltaComparison::LtEq,
+                vec![Some(true), Some(true), Some(false), None],
+            ),
+            (
+                DeltaComparison::Gt,
+                vec![Some(false), Some(false), Some(true), None],
+            ),
+            (
+                DeltaComparison::GtEq,
+                vec![Some(false), Some(true), Some(true), None],
+            ),
+        ] {
+            let predicate = DeltaPredicate::Compare {
+                column: "value".into(),
+                op,
+                value: DeltaScalar::Int32(2),
+            };
+            assert_eq!(selection_values(&integer_batch, &predicate)?, expected);
+        }
+
+        let decimal = Decimal128Array::from(vec![123_i128]).with_precision_and_scale(10, 2)?;
+        let negative_decimal =
+            Decimal128Array::from(vec![123_i128]).with_precision_and_scale(10, -2)?;
+        let fixed_binary = FixedSizeBinaryArray::try_from_iter(std::iter::once(b"abc".as_slice()))?;
+        let scalar_batch = RecordBatch::try_from_iter([
+            (
+                "boolean",
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            ),
+            ("int8", Arc::new(Int8Array::from(vec![-8])) as ArrayRef),
+            ("int16", Arc::new(Int16Array::from(vec![-16])) as ArrayRef),
+            ("int32", Arc::new(Int32Array::from(vec![-32])) as ArrayRef),
+            ("int64", Arc::new(Int64Array::from(vec![-64])) as ArrayRef),
+            (
+                "float32",
+                Arc::new(Float32Array::from(vec![1.5])) as ArrayRef,
+            ),
+            (
+                "float64",
+                Arc::new(Float64Array::from(vec![-2.5])) as ArrayRef,
+            ),
+            (
+                "date32",
+                Arc::new(Date32Array::from(vec![20_000])) as ArrayRef,
+            ),
+            ("decimal", Arc::new(decimal) as ArrayRef),
+            ("negative_decimal", Arc::new(negative_decimal) as ArrayRef),
+            ("utf8", Arc::new(StringArray::from(vec![""])) as ArrayRef),
+            (
+                "large_utf8",
+                Arc::new(LargeStringArray::from(vec![""])) as ArrayRef,
+            ),
+            (
+                "binary",
+                Arc::new(BinaryArray::from(vec![b"".as_slice()])) as ArrayRef,
+            ),
+            (
+                "large_binary",
+                Arc::new(LargeBinaryArray::from(vec![b"".as_slice()])) as ArrayRef,
+            ),
+            ("fixed_binary", Arc::new(fixed_binary) as ArrayRef),
+            (
+                "timestamp",
+                Arc::new(TimestampMicrosecondArray::from(vec![1_234_567_i64]).with_timezone("UTC"))
+                    as ArrayRef,
+            ),
+            (
+                "timestamp_ntz",
+                Arc::new(TimestampMicrosecondArray::from(vec![1_234_567_i64])) as ArrayRef,
+            ),
+        ])?;
+        let scalars = [
+            ("boolean", DeltaScalar::Boolean(true)),
+            ("int8", DeltaScalar::Int8(-8)),
+            ("int16", DeltaScalar::Int16(-16)),
+            ("int32", DeltaScalar::Int32(-32)),
+            ("int64", DeltaScalar::Int64(-64)),
+            ("float32", DeltaScalar::Float32(1.5)),
+            ("float64", DeltaScalar::Float64(-2.5)),
+            ("date32", DeltaScalar::Date32(20_000)),
+            (
+                "decimal",
+                DeltaScalar::Decimal128 {
+                    value: 123,
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
+            (
+                "negative_decimal",
+                DeltaScalar::Decimal128 {
+                    value: 123,
+                    precision: 10,
+                    scale: -2,
+                },
+            ),
+            ("utf8", DeltaScalar::Utf8(String::new())),
+            ("large_utf8", DeltaScalar::LargeUtf8(String::new())),
+            ("binary", DeltaScalar::Binary(Vec::new())),
+            ("large_binary", DeltaScalar::LargeBinary(Vec::new())),
+            (
+                "fixed_binary",
+                DeltaScalar::FixedSizeBinary {
+                    size: 3,
+                    value: b"abc".to_vec(),
+                },
+            ),
+            (
+                "timestamp",
+                DeltaScalar::TimestampMicrosecond {
+                    value: 1_234_567,
+                    timezone: Some("UTC".into()),
+                },
+            ),
+            (
+                "timestamp_ntz",
+                DeltaScalar::TimestampMicrosecond {
+                    value: 1_234_567,
+                    timezone: None,
+                },
+            ),
+        ];
+
+        for (column, scalar) in scalars {
+            assert_eq!(
+                selection_values(&scalar_batch, &compare(column, scalar))?,
+                vec![Some(true)]
+            );
+        }
+
+        let zero_batch = RecordBatch::try_from_iter([
+            (
+                "float32",
+                Arc::new(Float32Array::from(vec![0.0_f32, -0.0])) as ArrayRef,
+            ),
+            (
+                "float64",
+                Arc::new(Float64Array::from(vec![0.0_f64, -0.0])) as ArrayRef,
+            ),
+        ])?;
+        assert_eq!(
+            selection_values(&zero_batch, &compare("float32", DeltaScalar::Float32(0.0)))?,
+            vec![Some(true), Some(false)]
+        );
+        assert_eq!(
+            selection_values(&zero_batch, &compare("float64", DeltaScalar::Float64(-0.0)),)?,
+            vec![Some(false), Some(true)]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn filters_sliced_multi_batch_inputs_with_stable_schema_and_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let full = RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![
+                    Some(99),
+                    None,
+                    Some(3),
+                    Some(1),
+                    Some(4),
+                    Some(2),
+                    Some(88),
+                ])) as ArrayRef,
+            ),
+            (
+                "label",
+                Arc::new(StringArray::from(vec!["x", "n", "c", "a", "d", "b", "y"])) as ArrayRef,
+            ),
+        ])?;
+        let batch = full.slice(1, 5);
+        let predicate = DeltaPredicate::Compare {
+            column: "id".into(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(2),
+        };
+        let filtered = evaluate_validated(&batch, &predicate)?;
+        assert!(Arc::ptr_eq(batch.schema_ref(), filtered.schema_ref()));
+        assert_eq!(
+            filtered
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or("expected Int32 output")?,
+            &Int32Array::from(vec![3, 4])
+        );
+        assert_eq!(
+            filtered
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("expected Utf8 output")?,
+            &StringArray::from(vec!["c", "d"])
+        );
+
+        let second = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![5, 0])) as ArrayRef,
+        )])?;
+        let second_filtered = evaluate_validated(&second, &predicate)?;
+        assert_eq!(second_filtered.num_rows(), 1);
+
+        let no_survivors = evaluate_validated(&batch, &DeltaPredicate::Boolean(false))?;
+        assert_eq!(no_survivors.num_rows(), 0);
+        assert!(Arc::ptr_eq(batch.schema_ref(), no_survivors.schema_ref()));
+
+        let empty = RecordBatch::new_empty(batch.schema());
+        assert_eq!(evaluate_validated(&empty, &predicate)?.num_rows(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn evaluation_is_stateless_concurrent_and_redacts_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let batch = Arc::new(RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])?);
+        let predicate = Arc::new(DeltaPredicate::Compare {
+            column: "id".into(),
+            op: DeltaComparison::GtEq,
+            value: DeltaScalar::Int32(2),
+        });
+        validate_predicate(predicate.as_ref(), batch.schema().as_ref())?;
+
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let batch = Arc::clone(&batch);
+                    let predicate = Arc::clone(&predicate);
+                    scope.spawn(move || evaluate_predicate(&batch, &predicate))
+                })
+                .collect::<Vec<_>>();
+
+            for handle in handles {
+                let result = handle.join();
+                assert!(result.is_ok());
+                assert_eq!(
+                    result
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|batch| batch.num_rows()),
+                    Some(2)
+                );
+            }
+        });
+
+        let hostile = compare(
+            "sensitive-column",
+            DeltaScalar::Utf8("sensitive-literal".into()),
+        );
+        let error = evaluate_predicate(&batch, &hostile)
+            .expect_err("unexpected evaluation failure must be mapped");
+        let display = error.to_string();
+        assert_eq!(error.as_str(), "unsupported_predicate");
+        assert!(!display.contains("sensitive-column"));
+        assert!(!display.contains("sensitive-literal"));
+        assert!(!format!("{error:?}").contains("sensitive"));
+
+        Ok(())
     }
 }
