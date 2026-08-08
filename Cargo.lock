@@ -1330,6 +1330,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "futures-util",
+ "libc",
  "object_store",
  "parquet",
  "serde_json",
@@ -1337,6 +1338,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
