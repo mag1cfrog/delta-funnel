@@ -175,10 +175,16 @@ pub(crate) struct DeltaScanFileTask {
     pub(crate) path: String,
     pub(crate) estimated_bytes: Option<u64>,
     pub(crate) estimated_rows: Option<u64>,
+    pub(crate) stats: Option<DeltaScanFileStats>,
     pub(crate) modification_time_ms: Option<i64>,
     pub(crate) partition_values: BTreeMap<String, String>,
     pub(crate) deletion_vector: DeletionVectorMetadata,
     pub(crate) transform: KernelPhysicalToLogicalTransform,
+}
+
+#[allow(dead_code)]
+pub(crate) struct DeltaScanFileStats {
+    pub(crate) num_records: u64,
 }
 
 #[allow(dead_code)]
@@ -190,10 +196,15 @@ impl DeltaScanFileTask {
                 reason: "negative_file_size",
             })?;
 
+        let stats = file
+            .estimated_rows
+            .map(|num_records| DeltaScanFileStats { num_records });
+
         Ok(Self {
             path: file.path,
             estimated_bytes: Some(estimated_bytes),
-            estimated_rows: file.estimated_rows,
+            estimated_rows: stats.as_ref().map(|stats| stats.num_records),
+            stats,
             modification_time_ms: file.modification_time_ms,
             partition_values: file.partition_values,
             deletion_vector: DeletionVectorMetadata::from_kernel(file.deletion_vector),
@@ -236,11 +247,16 @@ mod tests {
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"hidden\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+    const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
 
     struct DeltaLogTable(PathBuf);
 
     impl DeltaLogTable {
-        fn new_with_adds(name: &str, adds: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
+        fn new_with_metadata_and_adds(
+            name: &str,
+            metadata: &str,
+            adds: &[String],
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let path = Path::new("target")
                 .join("delta-arrow-reader-planning-tests")
@@ -249,7 +265,7 @@ mod tests {
             fs::create_dir_all(&log_path)?;
             fs::write(
                 log_path.join("00000000000000000000.json"),
-                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n{}", adds.join("\n")),
+                format!("{PROTOCOL_JSON}\n{metadata}\n{}", adds.join("\n")),
             )?;
             Ok(Self(path))
         }
@@ -277,7 +293,18 @@ mod tests {
         (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
         Box<dyn std::error::Error>,
     > {
-        let table = DeltaLogTable::new_with_adds(name, adds)?;
+        loaded_snapshot_with_metadata_and_adds(name, METADATA_JSON, adds)
+    }
+
+    fn loaded_snapshot_with_metadata_and_adds(
+        name: &str,
+        metadata: &str,
+        adds: &[String],
+    ) -> Result<
+        (DeltaLogTable, crate::snapshot::LoadedDeltaTableSnapshot),
+        Box<dyn std::error::Error>,
+    > {
+        let table = DeltaLogTable::new_with_metadata_and_adds(name, metadata, adds)?;
         let snapshot = load_delta_table_snapshot_blocking(
             &table.0.to_string_lossy(),
             &DeltaStorageOptions::new(),
@@ -292,6 +319,21 @@ mod tests {
     }
 
     fn add_with_stats(path: &str, size: i64, stats: Option<&str>) -> String {
+        add_action(path, size, "{}", stats)
+    }
+
+    fn add_with_partition(path: &str, size: i64, rows: u64, region: &str) -> String {
+        let stats = format!(r#"{{"numRecords":{rows}}}"#);
+        let region = serde_json::to_string(region).expect("partition value is serializable");
+        add_action(
+            path,
+            size,
+            &format!(r#"{{"region":{region}}}"#),
+            Some(&stats),
+        )
+    }
+
+    fn add_action(path: &str, size: i64, partition_values: &str, stats: Option<&str>) -> String {
         let stats = stats.map_or_else(String::new, |stats| {
             format!(
                 ",\"stats\":{}",
@@ -299,7 +341,7 @@ mod tests {
             )
         });
         format!(
-            r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":{size},"modificationTime":1587968586000,"dataChange":true{stats}}}}}"#
+            r#"{{"add":{{"path":"{path}","partitionValues":{partition_values},"size":{size},"modificationTime":1587968586000,"dataChange":true{stats}}}}}"#
         )
     }
 
@@ -351,6 +393,7 @@ mod tests {
         assert_eq!(task.path, "part-00000.parquet");
         assert_eq!(task.estimated_bytes, Some(123));
         assert_eq!(task.estimated_rows, Some(7));
+        assert_eq!(task.stats.as_ref().map(|stats| stats.num_records), Some(7));
         assert_eq!(task.modification_time_ms, Some(1_587_968_586_000));
         assert_eq!(
             task.partition_values.into_iter().collect::<Vec<_>>(),
@@ -376,6 +419,7 @@ mod tests {
 
         assert_eq!(task.estimated_bytes, Some(0));
         assert_eq!(task.estimated_rows, None);
+        assert!(task.stats.is_none());
         assert!(!task.deletion_vector.is_present());
         assert!(!task.transform.is_required());
 
@@ -634,6 +678,77 @@ mod tests {
         assert_eq!(error.phase(), DeltaReaderPhase::Transform);
         assert!(!error.to_string().contains("secret_missing"));
         assert!(!format!("{error:?}").contains("secret_missing"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_preserves_partition_pruning_transform_and_grouping_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add_with_partition("east.parquet", 10, 1, "us-east"),
+            add_with_partition("west.parquet", 20, 2, "us-west"),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_metadata_and_adds(
+            "partition-transform",
+            PARTITIONED_METADATA_JSON,
+            &adds,
+        )?;
+        let predicate = DeltaPredicate::Compare {
+            column: "region".to_owned(),
+            op: DeltaComparison::Eq,
+            value: DeltaScalar::Utf8("us-west".to_owned()),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+        let projection = ["id".to_owned()];
+        let hidden = ["region".to_owned()];
+        let plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &hidden,
+            Some(kernel_predicate),
+            false,
+            Default::default(),
+        )?;
+
+        assert_eq!(field_names(&plan.logical_schema), ["id", "region"]);
+        assert_eq!(field_names(&plan.physical_schema), ["id"]);
+        assert_eq!(field_names(&plan.projected_schema), ["id"]);
+        assert!(plan.scan_metadata_exhausted);
+        assert_eq!(plan.files_filtered_during_planning, Some(1));
+        assert_eq!(plan.estimated_bytes, Some(20));
+        assert_eq!(plan.estimated_rows, Some(2));
+        assert!(Arc::ptr_eq(&plan.engine_context, snapshot.engine_context()));
+
+        let task = plan
+            .file_tasks
+            .first()
+            .ok_or("expected one selected task")?;
+        assert_eq!(task.path, "west.parquet");
+        assert_eq!(task.stats.as_ref().map(|stats| stats.num_records), Some(2));
+        assert_eq!(
+            task.partition_values.get("region").map(String::as_str),
+            Some("us-west")
+        );
+        assert!(task.transform.is_required());
+        let physical = RecordBatch::try_new(
+            Arc::clone(&plan.physical_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let logical = plan.apply_transform(task, physical)?;
+        let regions = logical
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected partition values")?;
+
+        assert_eq!(logical.schema(), plan.logical_schema);
+        assert_eq!(
+            regions.iter().collect::<Vec<_>>(),
+            [Some("us-west"), Some("us-west"),]
+        );
 
         Ok(())
     }
