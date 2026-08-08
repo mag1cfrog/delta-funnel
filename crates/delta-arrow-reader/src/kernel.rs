@@ -2,14 +2,20 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow::{array::Array as _, datatypes::SchemaRef, error::ArrowError};
+use arrow::{
+    array::Array as _, datatypes::SchemaRef, error::ArrowError, record_batch::RecordBatch,
+};
 use delta_kernel::{
     Engine, Snapshot, SnapshotRef,
-    engine::{arrow_conversion::TryIntoArrow, arrow_data::ArrowEngineData},
+    engine::{
+        arrow_conversion::TryIntoArrow,
+        arrow_data::{ArrowEngineData, EngineDataArrowExt},
+    },
     expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar},
     scan::ScanMetadata,
-    scan::state::{DvInfo, ScanFile},
+    scan::state::{DvInfo, ScanFile, transform_to_logical},
     scan::{Scan as DeltaKernelScan, StatsOptions},
+    schema::SchemaRef as KernelSchemaRef,
     table_features::{TABLE_FEATURES_MIN_READER_VERSION, TableFeature},
     try_parse_uri,
 };
@@ -63,8 +69,16 @@ pub(crate) struct KernelPhysicalToLogicalTransform(Option<ExpressionRef>);
 #[allow(dead_code)]
 pub(crate) struct KernelScan {
     scan: DeltaKernelScan,
+    schemas: KernelScanSchemas,
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct KernelScanSchemas {
+    logical: KernelSchemaRef,
+    physical: KernelSchemaRef,
 }
 
 #[allow(dead_code)]
@@ -82,6 +96,31 @@ impl KernelPhysicalToLogicalTransform {
     pub(crate) fn into_inner(self) -> Option<ExpressionRef> {
         self.0
     }
+
+    pub(crate) fn apply(
+        &self,
+        engine_context: &DeltaKernelEngineContext,
+        schemas: &KernelScanSchemas,
+        batch: RecordBatch,
+    ) -> delta_kernel::DeltaResult<RecordBatch> {
+        let Some(transform) = self.0.clone() else {
+            return Ok(batch);
+        };
+        let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::new(batch));
+        transform_to_logical(
+            engine_context.engine.as_ref(),
+            data,
+            &schemas.physical,
+            schemas.logical.as_ref(),
+            Some(transform),
+        )?
+        .try_into_record_batch()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_expression(expression: Expression) -> Self {
+        Self(Some(Arc::new(expression)))
+    }
 }
 
 #[allow(dead_code)]
@@ -92,6 +131,10 @@ impl KernelScan {
 
     pub(crate) fn physical_schema(&self) -> SchemaRef {
         Arc::clone(&self.physical_schema)
+    }
+
+    pub(crate) fn schemas(&self) -> KernelScanSchemas {
+        self.schemas.clone()
     }
 
     pub(crate) fn has_physical_predicate(&self) -> bool {
@@ -403,11 +446,16 @@ impl KernelSnapshot {
             builder = builder.with_stats(StatsOptions::all());
         }
         let scan = builder.build()?;
-        let logical_schema = Arc::new(scan.logical_schema().as_ref().try_into_arrow()?);
-        let physical_schema = Arc::new(scan.physical_schema().as_ref().try_into_arrow()?);
+        let schemas = KernelScanSchemas {
+            logical: Arc::clone(scan.logical_schema()),
+            physical: Arc::clone(scan.physical_schema()),
+        };
+        let logical_schema = Arc::new(schemas.logical.as_ref().try_into_arrow()?);
+        let physical_schema = Arc::new(schemas.physical.as_ref().try_into_arrow()?);
 
         Ok(KernelScan {
             scan,
+            schemas,
             logical_schema,
             physical_schema,
         })

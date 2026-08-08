@@ -14,7 +14,7 @@ use crate::{
     error::{InvalidProjectionSnafu, ScanPlanningSnafu},
     kernel::{
         DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
-        KernelScan, KernelScanFileMetadata,
+        KernelScan, KernelScanFileMetadata, KernelScanSchemas,
     },
     snapshot::LoadedDeltaTableSnapshot,
 };
@@ -26,6 +26,7 @@ pub(crate) struct DeltaScanPlan {
     pub(crate) logical_schema: SchemaRef,
     pub(crate) physical_schema: SchemaRef,
     pub(crate) projected_schema: SchemaRef,
+    pub(crate) kernel_schemas: KernelScanSchemas,
     pub(crate) file_tasks: Vec<DeltaScanFileTask>,
     pub(crate) scan_metadata_exhausted: bool,
     pub(crate) files_filtered_during_planning: Option<u64>,
@@ -99,6 +100,7 @@ pub(crate) fn plan_scan(
         logical_schema,
         physical_schema: scan.physical_schema(),
         projected_schema,
+        kernel_schemas: scan.schemas(),
         file_tasks,
         scan_metadata_exhausted: true,
         files_filtered_during_planning: metadata.files_filtered_during_planning,
@@ -210,13 +212,20 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::Schema,
+        record_batch::RecordBatch,
+    };
     use delta_kernel::{
         actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType},
         expressions::{ColumnName, Expression},
         scan::state::{DvInfo, ScanFile, Stats},
     };
 
-    use super::{DeltaScanFileTask, build_scan, exact_sum, plan_scan};
+    use super::{
+        DeltaScanFileTask, KernelPhysicalToLogicalTransform, build_scan, exact_sum, plan_scan,
+    };
     use crate::{
         DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
         DeltaStorageOptions,
@@ -549,6 +558,82 @@ mod tests {
         assert_eq!(field_names(&empty.logical_schema), ["hidden"]);
         assert_eq!(field_names(&empty.physical_schema), ["hidden"]);
         assert!(empty.projected_schema.fields().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scan_plan_applies_one_transform_without_copying_no_transform_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("part.parquet", 10, Some(3))];
+        let (_table, snapshot) = loaded_snapshot_with_adds("transforms", &adds)?;
+        let projection = ["id".to_owned(), "label".to_owned()];
+        let mut plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &[],
+            None,
+            false,
+            Default::default(),
+        )?;
+        let mut task = plan.file_tasks.pop().ok_or("expected one task")?;
+        let batch = || {
+            RecordBatch::try_new(
+                Arc::clone(&plan.physical_schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )
+        };
+
+        let physical = batch()?;
+        let first_column = Arc::clone(physical.column(0));
+        let unchanged = plan.apply_transform(&task, physical)?;
+        assert!(Arc::ptr_eq(&first_column, unchanged.column(0)));
+        assert_eq!(unchanged.schema(), plan.logical_schema);
+
+        let mismatch = plan
+            .apply_transform(&task, RecordBatch::new_empty(Arc::new(Schema::empty())))
+            .expect_err("wrong logical schema must fail");
+        assert_eq!(mismatch.as_str(), "physical_to_logical_transform");
+        assert_eq!(mismatch.phase(), DeltaReaderPhase::Transform);
+
+        task.transform =
+            KernelPhysicalToLogicalTransform::from_test_expression(Expression::struct_from([
+                Expression::Column(ColumnName::new(["id"])),
+                Expression::Literal(delta_kernel::expressions::Scalar::String(
+                    "transformed".to_owned(),
+                )),
+            ]));
+        let transformed = plan.apply_transform(&task, batch()?)?;
+        let labels = transformed
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected string labels")?;
+
+        assert_eq!(transformed.num_rows(), 3);
+        assert_eq!(transformed.schema(), plan.logical_schema);
+        assert_eq!(
+            labels.iter().collect::<Vec<_>>(),
+            [
+                Some("transformed"),
+                Some("transformed"),
+                Some("transformed"),
+            ]
+        );
+
+        task.transform = KernelPhysicalToLogicalTransform::from_test_expression(
+            Expression::Column(ColumnName::new(["secret_missing"])),
+        );
+        let error = plan
+            .apply_transform(&task, batch()?)
+            .expect_err("invalid transform must fail");
+        assert_eq!(error.as_str(), "physical_to_logical_transform");
+        assert_eq!(error.phase(), DeltaReaderPhase::Transform);
+        assert!(!error.to_string().contains("secret_missing"));
+        assert!(!format!("{error:?}").contains("secret_missing"));
 
         Ok(())
     }

@@ -9,6 +9,7 @@ mod planning;
 mod predicate;
 mod protocol;
 mod snapshot;
+mod transform;
 mod uri;
 
 pub use config::{
