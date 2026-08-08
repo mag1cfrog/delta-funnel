@@ -146,6 +146,15 @@ pub enum DeltaReaderError {
         #[snafu(source(from(exact)))]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+    /// Delta scan file tasks could not be grouped into partitions.
+    #[non_exhaustive]
+    #[snafu(display(
+        "delta reader error: phase=scan_planning error=scan_partition_planning reason={reason}"
+    ))]
+    ScanPartitionPlanning {
+        /// Fixed redacted reason category.
+        reason: &'static str,
+    },
     /// The requested reader backend is unavailable.
     #[non_exhaustive]
     #[snafu(display(
@@ -226,6 +235,7 @@ impl DeltaReaderError {
             Self::InvalidProjection { .. } => "invalid_projection",
             Self::UnsupportedPredicate { .. } => "unsupported_predicate",
             Self::ScanPlanning { .. } => "scan_planning",
+            Self::ScanPartitionPlanning { .. } => "scan_partition_planning",
             Self::UnsupportedBackend { .. } => "unsupported_backend",
             Self::DataFileRead { .. } => "data_file_read",
             Self::DeletionVectorRead { .. } => "deletion_vector_read",
@@ -247,7 +257,8 @@ impl DeltaReaderError {
             Self::SchemaConversion { .. } => DeltaReaderPhase::Schema,
             Self::InvalidProjection { .. }
             | Self::UnsupportedPredicate { .. }
-            | Self::ScanPlanning { .. } => DeltaReaderPhase::ScanPlanning,
+            | Self::ScanPlanning { .. }
+            | Self::ScanPartitionPlanning { .. } => DeltaReaderPhase::ScanPlanning,
             Self::UnsupportedBackend { .. } | Self::Cancelled { .. } => DeltaReaderPhase::Execution,
             Self::DataFileRead { .. } => DeltaReaderPhase::DataFileRead,
             Self::DeletionVectorRead { .. } => DeltaReaderPhase::DeletionVector,
@@ -370,6 +381,14 @@ mod tests {
                 "scan_planning",
                 DeltaReaderPhase::ScanPlanning,
                 true,
+            ),
+            (
+                DeltaReaderError::ScanPartitionPlanning {
+                    reason: "scan_partition_planning",
+                },
+                "scan_partition_planning",
+                DeltaReaderPhase::ScanPlanning,
+                false,
             ),
             (
                 DeltaReaderError::UnsupportedBackend {
