@@ -1,9 +1,9 @@
 use std::error::Error as _;
 
 use delta_arrow_reader::{
-    DeltaProtocolInfo, DeltaReadMetrics, DeltaReadMetricsSnapshot, DeltaReaderBackend,
-    DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase, DeltaSnapshotSelection,
-    DeltaStorageOptions,
+    DeltaComparison, DeltaPredicate, DeltaProtocolInfo, DeltaReadMetrics, DeltaReadMetricsSnapshot,
+    DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase,
+    DeltaScalar, DeltaSnapshotSelection, DeltaStorageOptions,
 };
 
 #[test]
@@ -54,4 +54,67 @@ fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> 
     assert!(error.source().is_none());
 
     Ok(())
+}
+
+#[test]
+fn exact_predicate_model_is_public() {
+    let comparisons = [
+        DeltaComparison::Eq,
+        DeltaComparison::NotEq,
+        DeltaComparison::Lt,
+        DeltaComparison::LtEq,
+        DeltaComparison::Gt,
+        DeltaComparison::GtEq,
+    ];
+    let copied_comparisons = comparisons;
+    assert_eq!(copied_comparisons, comparisons);
+
+    let scalars = vec![
+        DeltaScalar::Boolean(true),
+        DeltaScalar::Int8(1),
+        DeltaScalar::Int16(2),
+        DeltaScalar::Int32(3),
+        DeltaScalar::Int64(4),
+        DeltaScalar::Float32(5.0),
+        DeltaScalar::Float64(6.0),
+        DeltaScalar::Date32(7),
+        DeltaScalar::Decimal128 {
+            value: 8,
+            precision: 9,
+            scale: 1,
+        },
+        DeltaScalar::Utf8("utf8".into()),
+        DeltaScalar::LargeUtf8("large utf8".into()),
+        DeltaScalar::Binary(vec![10]),
+        DeltaScalar::LargeBinary(vec![11]),
+        DeltaScalar::FixedSizeBinary {
+            size: 2,
+            value: vec![12, 13],
+        },
+        DeltaScalar::TimestampMicrosecond {
+            value: 14,
+            timezone: Some("UTC".into()),
+        },
+    ];
+    assert_eq!(scalars, scalars.clone());
+
+    let predicates = vec![
+        DeltaPredicate::Boolean(true),
+        DeltaPredicate::Compare {
+            column: "id".into(),
+            op: DeltaComparison::Eq,
+            value: DeltaScalar::Int64(1),
+        },
+        DeltaPredicate::IsNull {
+            column: "optional".into(),
+        },
+        DeltaPredicate::IsNotNull {
+            column: "required".into(),
+        },
+        DeltaPredicate::And(Vec::new()),
+        DeltaPredicate::Or(Vec::new()),
+        DeltaPredicate::Not(Box::new(DeltaPredicate::Boolean(false))),
+    ];
+    assert_eq!(predicates, predicates.clone());
+    assert!(format!("{predicates:?}").contains("Compare"));
 }

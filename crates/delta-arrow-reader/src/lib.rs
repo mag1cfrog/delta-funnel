@@ -5,6 +5,7 @@ mod deletion_vector;
 mod error;
 mod kernel;
 mod metrics;
+mod predicate;
 mod protocol;
 mod snapshot;
 mod uri;
@@ -14,6 +15,7 @@ pub use config::{
 };
 pub use error::{DeltaReaderError, DeltaReaderPhase};
 pub use metrics::{DeltaReadMetrics, DeltaReadMetricsSnapshot};
+pub use predicate::{DeltaComparison, DeltaPredicate, DeltaScalar};
 pub use protocol::DeltaProtocolInfo;
 
 /// The crate version.

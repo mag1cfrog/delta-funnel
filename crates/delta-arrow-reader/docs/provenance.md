@@ -37,6 +37,7 @@ publish the candidate package.
 | DV masking portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV coordinate portions of `crates/delta-funnel/src/query_engine/datafusion/execution/native_async_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #477 |
+| DataFusion predicate-adapter portions of `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/predicate.rs` and `src/kernel.rs` | #484 |
 
 ## Test migration
 
@@ -47,3 +48,14 @@ publish the candidate package.
 - Parquet/backend/provider integration assertions remain in Delta Funnel for
   #464, #465, #482, and #483. Their movable coordinate and masking assertions
   are already covered here.
+- #484 adapts the focused comparison, scalar, Boolean, null, and Kernel
+  conversion assertions into the staged crate, then adds schema-validation,
+  three-valued residual, pruning-parity, concurrency, and redaction coverage.
+- Empty binary values remain accepted, while negative-scale decimal and
+  signed-zero float predicates fall back to residual-only when Kernel cannot
+  preserve their logical meaning. These #484 contract differences are covered
+  locally rather than retaining the old adapter outcomes.
+- DataFusion expression translation, including `IN`, `BETWEEN`, casts, and
+  qualified-expression rejection, remains with #467. Scan-level pruning and
+  residual integration remain with #463 and #466 because those layers do not
+  exist in the staged crate yet.
