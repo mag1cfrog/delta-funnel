@@ -3,7 +3,58 @@
 use arrow::{array::BooleanArray, compute::filter_record_batch, record_batch::RecordBatch};
 use snafu::ResultExt;
 
-use crate::{DeltaReadMetrics, DeltaReaderError, error::DeletionVectorReadSnafu};
+use crate::{
+    DeltaReadMetrics, DeltaReaderError, error::DeletionVectorReadSnafu,
+    kernel::KernelDeletionVectorHandle, snapshot::LoadedDeltaTableSnapshot,
+};
+
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct DeletionVectorMetadata(Option<KernelDeletionVectorHandle>);
+
+#[allow(dead_code)]
+impl DeletionVectorMetadata {
+    pub(crate) fn is_present(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn from_kernel(handle: Option<KernelDeletionVectorHandle>) -> Self {
+        Self(handle)
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn load_deletion_vector_selection(
+    snapshot: &LoadedDeltaTableSnapshot,
+    metadata: DeletionVectorMetadata,
+    metrics: &DeltaReadMetrics,
+) -> Result<Option<DeletionVectorSelection>, DeltaReaderError> {
+    let Some(handle) = metadata.0 else {
+        return Ok(None);
+    };
+    let engine_context = std::sync::Arc::clone(snapshot.engine_context());
+    let row_indexes = match tokio::task::spawn_blocking(move || {
+        engine_context.load_deletion_vector_row_indexes(&handle)
+    })
+    .await
+    {
+        Ok(Ok(row_indexes)) => row_indexes,
+        Ok(Err(source)) => {
+            metrics.record_deletion_vector_failure();
+            return Err(dependency_error(
+                "deletion_vector_payload_read_failed",
+                source,
+            ));
+        }
+        Err(source) => {
+            metrics.record_deletion_vector_failure();
+            return Err(dependency_error("deletion_vector_load_task_failed", source));
+        }
+    };
+
+    metrics.record_deletion_vector_payload_loaded();
+    DeletionVectorSelection::try_new(row_indexes, metrics.clone()).map(Some)
+}
 
 #[allow(dead_code)]
 pub(crate) struct DeletionVectorSelection {
@@ -302,27 +353,254 @@ impl DeletionVectorSelection {
 
 #[allow(dead_code)]
 fn rejection_error(reason: &'static str, detail: &'static str) -> DeltaReaderError {
-    Err::<(), _>(delta_kernel::Error::generic(detail))
+    dependency_error(reason, delta_kernel::Error::generic(detail))
+}
+
+fn dependency_error(
+    reason: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> DeltaReaderError {
+    Err::<(), _>(source)
         .boxed()
         .context(DeletionVectorReadSnafu { reason })
-        .expect_err("constructed deletion-vector rejection")
+        .expect_err("constructed deletion-vector error")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error as _, sync::Arc};
+    use std::{
+        error::Error as _,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use arrow::{
         array::{ArrayRef, Int32Array, StringArray},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
+    use delta_kernel::actions::deletion_vector::{
+        DeletionVectorDescriptor, DeletionVectorStorageType,
+    };
+    use delta_kernel::actions::deletion_vector_writer::{
+        KernelDeletionVector, StreamingDeletionVectorWriter,
+    };
+    use delta_kernel::scan::state::DvInfo;
 
-    use super::DeletionVectorSelection;
+    use super::{DeletionVectorMetadata, DeletionVectorSelection, load_deletion_vector_selection};
     use crate::{
         DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderPhase,
-        kernel::is_kernel_error, metrics::DeltaReadMetricsConfig,
+        DeltaSnapshotSelection, DeltaStorageOptions,
+        kernel::{is_kernel_error, preserve_deletion_vector},
+        metrics::DeltaReadMetricsConfig,
+        snapshot::{LoadedDeltaTableSnapshot, load_delta_table_snapshot_blocking},
     };
+
+    const INLINE_DV_DELETED_ROW_INDEXES: &[u64] = &[3, 4, 7, 11, 18, 29];
+    const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-dv-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+
+    struct DeltaLogTable(PathBuf);
+
+    impl DeltaLogTable {
+        fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let path = Path::new("target")
+                .join("delta-arrow-reader-deletion-vector-tests")
+                .join(unique_name(name)?);
+            let log_path = path.join("_delta_log");
+            fs::create_dir_all(&log_path)?;
+            fs::write(
+                log_path.join("00000000000000000000.json"),
+                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n"),
+            )?;
+            Ok(Self(path))
+        }
+
+        fn snapshot(&self) -> Result<LoadedDeltaTableSnapshot, DeltaReaderError> {
+            load_delta_table_snapshot_blocking(
+                &self.0.to_string_lossy(),
+                &DeltaStorageOptions::new(),
+                DeltaSnapshotSelection::Latest,
+            )
+        }
+    }
+
+    impl Drop for DeltaLogTable {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_name(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        Ok(format!("{}-{name}-{nanos}", std::process::id()))
+    }
+
+    fn metadata(descriptor: DeletionVectorDescriptor) -> DeletionVectorMetadata {
+        DeletionVectorMetadata::from_kernel(preserve_deletion_vector(descriptor.into()))
+    }
+
+    fn inline_metadata() -> Result<DeletionVectorMetadata, delta_kernel::Error> {
+        DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::Inline,
+            "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+            None,
+            44,
+            6,
+        )
+        .map(metadata)
+    }
+
+    fn write_relative_metadata(
+        table: &DeltaLogTable,
+        deleted_rows: impl IntoIterator<Item = u64>,
+    ) -> Result<DeletionVectorMetadata, Box<dyn std::error::Error>> {
+        const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+        const RELATIVE_DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
+
+        let mut buffer = Vec::new();
+        let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
+        let mut deletion_vector = KernelDeletionVector::new();
+        deletion_vector.add_deleted_row_indexes(deleted_rows);
+        let write_result = writer.write_deletion_vector(deletion_vector)?;
+        writer.finalize()?;
+        fs::write(table.0.join(RELATIVE_DV_FILE), buffer)?;
+
+        Ok(metadata(DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedRelative,
+            RELATIVE_DV_ID,
+            Some(write_result.offset),
+            write_result.size_in_bytes,
+            write_result.cardinality,
+        )?))
+    }
+
+    #[test]
+    fn lazy_loader_skips_absence_and_loads_inline_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("inline")?;
+        let snapshot = table.snapshot()?;
+        let engine_context = Arc::clone(snapshot.engine_context());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+
+        let absent_metrics = metrics();
+        let absent_metadata =
+            DeletionVectorMetadata::from_kernel(preserve_deletion_vector(DvInfo::default()));
+        let absent = runtime.block_on(load_deletion_vector_selection(
+            &snapshot,
+            absent_metadata,
+            &absent_metrics,
+        ))?;
+        assert!(absent.is_none());
+        assert_eq!(absent_metrics.snapshot().deletion_vector_payloads_loaded, 0);
+
+        let inline_metrics = metrics();
+        let inline_metadata = inline_metadata()?;
+        assert!(inline_metadata.is_present());
+        let selection = runtime
+            .block_on(load_deletion_vector_selection(
+                &snapshot,
+                inline_metadata,
+                &inline_metrics,
+            ))?
+            .expect("inline descriptor must produce a selection");
+        assert_eq!(
+            selection.deleted_row_indexes.as_ref(),
+            INLINE_DV_DELETED_ROW_INDEXES
+        );
+        let metrics = inline_metrics.snapshot();
+        assert_eq!(metrics.deletion_vector_payloads_loaded, 1);
+        assert_eq!(metrics.deletion_vector_failures, 0);
+        assert_eq!(metrics.deletion_vector_rejections, 0);
+        assert!(Arc::ptr_eq(&engine_context, snapshot.engine_context()));
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_loader_reads_relative_and_empty_kernel_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("relative")?;
+        let snapshot = table.snapshot()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+
+        let relative_metrics = metrics();
+        let relative_metadata = write_relative_metadata(&table, [0, 9])?;
+        let selection = runtime
+            .block_on(load_deletion_vector_selection(
+                &snapshot,
+                relative_metadata,
+                &relative_metrics,
+            ))?
+            .expect("relative descriptor must produce a selection");
+        assert_eq!(selection.deleted_row_indexes.as_ref(), [0, 9]);
+        assert_eq!(
+            relative_metrics.snapshot().deletion_vector_payloads_loaded,
+            1
+        );
+
+        let empty_metrics = metrics();
+        let empty_metadata = write_relative_metadata(&table, [])?;
+        let mut empty = runtime
+            .block_on(load_deletion_vector_selection(
+                &snapshot,
+                empty_metadata,
+                &empty_metrics,
+            ))?
+            .expect("empty present descriptor must produce a selection");
+        assert!(empty.deleted_row_indexes.is_empty());
+        empty.bind_physical_row_count(0)?;
+        empty.finish()?;
+        let metrics = empty_metrics.snapshot();
+        assert_eq!(metrics.deletion_vector_payloads_loaded, 1);
+        assert_eq!(metrics.deletion_vectors_applied, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_loader_maps_payload_failures_once_and_redacts_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MISSING_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+
+        let table = DeltaLogTable::new("secret-token")?;
+        let snapshot = table.snapshot()?;
+        let missing = metadata(DeletionVectorDescriptor::try_new(
+            DeletionVectorStorageType::PersistedRelative,
+            MISSING_DV_ID,
+            Some(1),
+            36,
+            2,
+        )?);
+        let metrics = metrics();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let error = runtime
+            .block_on(load_deletion_vector_selection(&snapshot, missing, &metrics))
+            .err()
+            .expect("missing payload must fail");
+
+        assert_eq!(error.as_str(), "deletion_vector_read");
+        assert_eq!(error.phase(), DeltaReaderPhase::DeletionVector);
+        assert!(error.source().is_some_and(is_kernel_error));
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=deletion_vector error=deletion_vector_read reason=deletion_vector_payload_read_failed"
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains(MISSING_DV_ID));
+        let metrics = metrics.snapshot();
+        assert_eq!(metrics.deletion_vector_payloads_loaded, 0);
+        assert_eq!(metrics.deletion_vector_failures, 1);
+        assert_eq!(metrics.deletion_vector_rejections, 0);
+        Ok(())
+    }
 
     fn metrics() -> DeltaReadMetrics {
         DeltaReadMetrics::new(DeltaReadMetricsConfig {
