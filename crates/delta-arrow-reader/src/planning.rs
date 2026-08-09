@@ -399,6 +399,8 @@ impl DeltaScanFileTask {
 
 #[cfg(test)]
 mod tests {
+    mod statistics_pruning;
+
     use std::{
         collections::HashMap,
         fs,
