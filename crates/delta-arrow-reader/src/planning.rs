@@ -351,6 +351,7 @@ fn validate_projection(
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct DeltaScanFileTask {
     pub(crate) path: String,
     pub(crate) estimated_bytes: Option<u64>,
@@ -363,6 +364,7 @@ pub(crate) struct DeltaScanFileTask {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct DeltaScanFileStats {
     pub(crate) num_records: u64,
 }
@@ -399,7 +401,7 @@ mod tests {
         collections::HashMap,
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -413,6 +415,7 @@ mod tests {
         expressions::{ColumnName, Expression},
         scan::state::{DvInfo, ScanFile, Stats},
     };
+    use futures_util::{FutureExt, StreamExt, stream};
 
     use super::{
         DeltaScanFileStats, DeltaScanFileTask, DeltaScanFileTaskPartition, DeltaScanPlan,
@@ -423,6 +426,10 @@ mod tests {
         DeltaStorageOptions,
         kernel::{KernelScanFileMetadata, delta_predicate_to_kernel_pruning},
         predicate::validate_predicate,
+        scheduling::{
+            DeltaScanExecution, FileAdmission, FileAdmissionFn, FileBatchStream, FileExecutor,
+            FileReadPermit,
+        },
         snapshot::load_delta_table_snapshot_blocking,
     };
 
@@ -594,6 +601,13 @@ mod tests {
         plan.partitions
             .iter()
             .flat_map(|partition| partition.file_tasks.iter())
+    }
+
+    fn execution_file_stream(permit: FileReadPermit, batch: RecordBatch) -> FileBatchStream {
+        Box::pin(stream::unfold(
+            (Some(batch), permit),
+            |(batch, permit)| async move { batch.map(|batch| (Ok(batch), (None, permit))) },
+        ))
     }
 
     fn plan_scan(
@@ -1267,6 +1281,97 @@ mod tests {
 
         plan.metrics.record_deletion_vector_failure();
         assert_eq!(retained_metrics.snapshot().deletion_vector_failures, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_execution_binds_plan_tasks_options_and_shared_metrics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add("part-0.parquet", 20, Some(2)),
+            add("part-1.parquet", 10, Some(1)),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("scan-execution", &adds)?;
+        let execution_options = crate::DeltaReaderExecutionOptions::new()
+            .with_native_async_prefetch_file_count_per_partition(0)?
+            .with_max_concurrent_file_reads_per_partition(1)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?
+            .with_output_buffer_capacity_per_partition(2)?;
+        let plan = Arc::new(super::plan_scan(
+            &snapshot,
+            None,
+            &[],
+            None,
+            true,
+            execution_options,
+            super::DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(2),
+                caller_target_partitions: None,
+            },
+        )?);
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let admission: FileAdmissionFn<DeltaScanFileTask> = Arc::new(|_| Ok(FileAdmission::Admit));
+        let executor: FileExecutor<DeltaScanFileTask, FileBatchStream> = {
+            let paths = Arc::clone(&paths);
+            let schema = Arc::clone(&plan.logical_schema);
+            Arc::new(move |task, permit, _| {
+                paths
+                    .lock()
+                    .expect("paths lock is available")
+                    .push(task.path);
+                let batch = RecordBatch::new_empty(Arc::clone(&schema));
+                async move { Ok(execution_file_stream(permit, batch)) }.boxed()
+            })
+        };
+        let execution = DeltaScanExecution::new(Arc::clone(&plan));
+
+        for partition in 0..plan.partitions.len() {
+            let batches = execution
+                .partition_stream(partition, Arc::clone(&admission), Arc::clone(&executor))?
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(batches.len(), 1);
+        }
+        let invalid = match execution.partition_stream(
+            plan.partitions.len(),
+            Arc::clone(&admission),
+            Arc::clone(&executor),
+        ) {
+            Ok(_) => return Err("out-of-range execution partition must fail".into()),
+            Err(error) => error,
+        };
+        assert_eq!(invalid.as_str(), "invalid_configuration");
+
+        let cancelled_execution = DeltaScanExecution::new(Arc::clone(&plan));
+        drop(cancelled_execution.partition_stream(
+            0,
+            Arc::clone(&admission),
+            Arc::clone(&executor),
+        )?);
+        let repeated_execution = DeltaScanExecution::new(Arc::clone(&plan));
+        let repeated = repeated_execution
+            .partition_stream(0, admission, executor)?
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(repeated.len(), 1);
+
+        let mut paths = paths.lock().expect("paths lock is available").clone();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["part-0.parquet", "part-0.parquet", "part-1.parquet"]
+        );
+        let metrics = plan.metrics.snapshot();
+        assert_eq!(metrics.scan_partitions_started, 3);
+        assert_eq!(metrics.scan_partitions_completed, 3);
+        assert_eq!(metrics.files_started, 3);
+        assert_eq!(metrics.files_completed, 3);
+        assert_eq!(metrics.batches_produced, 3);
+        assert_eq!(metrics.rows_produced, 0);
         Ok(())
     }
 

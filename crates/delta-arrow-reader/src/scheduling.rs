@@ -21,6 +21,7 @@ use tokio::{
 use crate::{
     DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
     error::{CancelledSnafu, InvalidConfigurationSnafu},
+    planning::{DeltaScanFileTask, DeltaScanPlan},
 };
 
 pub(crate) struct ScanReadLimiter {
@@ -105,6 +106,46 @@ pub(crate) struct PartitionStream {
     state: PartitionStreamState,
     cancellation: ScanCancellation,
     done: bool,
+}
+
+pub(crate) struct DeltaScanExecution {
+    plan: Arc<DeltaScanPlan>,
+    limiter: Arc<ScanReadLimiter>,
+    cancellation: ScanCancellation,
+}
+
+impl DeltaScanExecution {
+    pub(crate) fn new(plan: Arc<DeltaScanPlan>) -> Self {
+        let limiter = ScanReadLimiter::new(
+            plan.execution_options,
+            plan.partition_target_diagnostic.target_partitions,
+            plan.partitions.len(),
+        );
+        Self {
+            plan,
+            limiter,
+            cancellation: ScanCancellation::new(),
+        }
+    }
+
+    pub(crate) fn partition_stream(
+        &self,
+        partition: usize,
+        admission: FileAdmissionFn<DeltaScanFileTask>,
+        executor: FileExecutor<DeltaScanFileTask, FileBatchStream>,
+    ) -> Result<PartitionStream, DeltaReaderError> {
+        let partition_limiter = self.limiter.partition(partition)?;
+        let file_tasks = self.plan.partitions[partition].file_tasks.clone();
+        Ok(PartitionStream::new(
+            file_tasks,
+            partition_limiter,
+            self.plan.execution_options,
+            admission,
+            executor,
+            self.plan.metrics.clone(),
+            self.cancellation.clone(),
+        ))
+    }
 }
 
 impl ScanReadLimiter {

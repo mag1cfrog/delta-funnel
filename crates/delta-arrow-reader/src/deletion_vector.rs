@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[allow(dead_code)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct DeletionVectorMetadata(Option<KernelDeletionVectorHandle>);
 
 #[allow(dead_code)]
