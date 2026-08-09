@@ -4,6 +4,9 @@ mod config;
 mod deletion_vector;
 mod error;
 mod kernel;
+#[cfg(feature = "native-async")]
+#[allow(dead_code)]
+mod metered_object_store;
 mod metrics;
 mod partition_target;
 mod planning;

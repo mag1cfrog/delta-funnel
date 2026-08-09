@@ -226,6 +226,24 @@ impl DeltaReadMetrics {
     pub(crate) fn record_deletion_vector_rejection(&self) {
         saturating_fetch_add(&self.inner.deletion_vector_rejections, 1);
     }
+
+    #[cfg(feature = "native-async")]
+    pub(crate) fn record_parquet_data_file_range_get_operation(&self) {
+        saturating_fetch_add(&self.inner.parquet_data_file_range_get_operations, 1);
+    }
+
+    #[cfg(feature = "native-async")]
+    pub(crate) fn record_parquet_data_file_full_get_operation(&self) {
+        saturating_fetch_add(&self.inner.parquet_data_file_full_get_operations, 1);
+    }
+
+    #[cfg(feature = "native-async")]
+    pub(crate) fn record_parquet_data_file_bytes_received(&self, bytes: usize) {
+        saturating_fetch_add(
+            &self.inner.parquet_data_file_bytes_received,
+            usize_to_u64_saturating(bytes),
+        );
+    }
 }
 
 fn load(counter: &AtomicU64) -> u64 {
