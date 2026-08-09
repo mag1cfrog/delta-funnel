@@ -23,7 +23,13 @@ published package.
 
 ## Current boundary
 
-The #460 scaffold contains only package identity and version access. It adds no
-reader behavior, dependencies, production routing, or compatibility facade.
-Later [#447-family issues](https://github.com/mag1cfrog/delta-funnel/issues/447)
-own those decisions.
+Through #481, this crate owns reader configuration, errors, metrics, immutable
+snapshot/protocol/schema loading, deletion-vector handling, exact logical
+predicates, scan metadata and transforms, deterministic partition planning,
+and backend-neutral bounded scheduling.
+
+The crate does not yet contain a NativeAsync or OfficialKernel file reader, a
+public table-loading or scan-stream API, DataFusion integration, production
+routing, or a compatibility facade. Later
+[#447-family issues](https://github.com/mag1cfrog/delta-funnel/issues/447) own
+those remaining boundaries.
