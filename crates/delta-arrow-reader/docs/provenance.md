@@ -32,26 +32,45 @@ publish the candidate package.
 | `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/kernel.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/snapshot.rs` | `crates/delta-arrow-reader/src/snapshot.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/protocol.rs` | `crates/delta-arrow-reader/src/protocol.rs` | #462 |
+| Source-loading portions of `crates/delta-funnel/src/table_formats/delta.rs` | `crates/delta-arrow-reader/src/snapshot.rs` and `src/kernel.rs` | #462 |
+| Snapshot/protocol/schema fixtures from `crates/delta-funnel/src/table_formats/delta/test_support.rs` | Crate-local tests in `src/uri.rs`, `src/snapshot.rs`, and `src/protocol.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/deletion_vector.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV metadata portions of `crates/delta-funnel/src/table_formats/delta.rs` | `crates/delta-arrow-reader/src/kernel.rs` and `src/deletion_vector.rs` | #477 |
 | DV masking portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV coordinate portions of `crates/delta-funnel/src/query_engine/datafusion/execution/native_async_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #477 |
 | DataFusion predicate-adapter portions of `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/predicate.rs` and `src/kernel.rs` | #484 |
+| Scan-metadata and transform portions of `crates/delta-funnel/src/table_formats/delta.rs` | `crates/delta-arrow-reader/src/planning.rs`, `src/kernel.rs`, and `src/transform.rs` | #463 |
+| Scan/read-schema portions of `crates/delta-funnel/src/table_formats/delta/read.rs` | `crates/delta-arrow-reader/src/planning.rs` and `src/transform.rs` | #463 |
+| Scan/schema/metadata portions of `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/kernel.rs` and `src/planning.rs` | #463 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/file_task.rs` | `crates/delta-arrow-reader/src/planning.rs` | #463 |
+| Metadata/task portions of `crates/delta-funnel/src/query_engine/datafusion/planning/scan_plan.rs` | `crates/delta-arrow-reader/src/planning.rs` | #463 |
+| Scan-planning fixtures from `crates/delta-funnel/src/table_formats/delta/test_support.rs` | Crate-local tests in `src/planning.rs` | #463 |
 | `crates/delta-funnel/src/query_engine/datafusion/planning/partition_target.rs` | `crates/delta-arrow-reader/src/partition_target.rs` | #478 |
 | Host-diagnostic portions of `crates/delta-funnel/src/query_engine/datafusion/execution/environment.rs` | `crates/delta-arrow-reader/src/partition_target.rs` | #478 |
 | `crates/delta-funnel/src/query_engine/datafusion/planning/file_task_partition.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
 | Final partitioned-plan assembly portions of `crates/delta-funnel/src/query_engine/datafusion/planning/scan_plan.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
 | Planning-metrics initialization portions of `crates/delta-funnel/src/query_engine/datafusion/execution/planning_exec.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
+| `crates/delta-funnel/src/query_engine/datafusion/execution/async_scheduler.rs` | `crates/delta-arrow-reader/src/scheduling.rs` | #481 |
+| Limiter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/scheduling.rs` | `crates/delta-arrow-reader/src/config.rs` and `src/scheduling.rs` | #481 |
+| Permit/environment portions of `crates/delta-funnel/src/query_engine/datafusion/execution/environment.rs` | `crates/delta-arrow-reader/src/scheduling.rs` | #481 |
+| Handoff/cancellation portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `planning_exec.rs` | `crates/delta-arrow-reader/src/scheduling.rs` and `src/planning.rs` | #481 |
+| Execution-counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` and `src/scheduling.rs` | #481 |
 
 ## Test migration
 
+- #462 ports URI normalization, latest/fixed snapshot loading, protocol and
+  schema conversion, storage construction/context reuse, redaction, and
+  unsupported-protocol scan-boundary assertions into the staged crate.
 - #477 ports the focused deletion-vector metadata, payload, coordinate,
   masking, redaction, and metric assertions into the staged crate.
 - #463 ports scan-metadata, ordered file-task, schema, and transform
   preservation. #478 ports target selection, host diagnostics, deterministic
   grouping, final partitioned-plan assembly, and planning-metrics
   initialization over those tasks.
+- #481 ports limiter, lazy admission, ordered prefetch, bounded handoff,
+  first-error, cancellation, cleanup, and execution-counter assertions into
+  `src/scheduling.rs` and `src/planning.rs`.
 - Parquet/backend/provider integration assertions remain in Delta Funnel for
   #464, #465, #482, and #483. Their movable coordinate and masking assertions
   are already covered here.

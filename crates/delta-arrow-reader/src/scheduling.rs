@@ -694,9 +694,10 @@ mod tests {
     use std::future::{pending, poll_fn};
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::task::Poll;
+    use std::time::Duration;
 
     use arrow::{
         array::{Array, Int32Array},
@@ -704,7 +705,10 @@ mod tests {
         record_batch::RecordBatch,
     };
     use futures_util::{FutureExt, StreamExt, stream};
-    use tokio::sync::{Barrier, Notify};
+    use tokio::{
+        sync::{Barrier, Notify, mpsc},
+        time::timeout,
+    };
 
     use crate::{
         DeltaReadMetrics, DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaReaderPhase,
@@ -712,8 +716,8 @@ mod tests {
     };
 
     use super::{
-        FileAdmission, FileBatchStream, FileExecutor, FileReadPermit, FileScheduler,
-        PartitionStream, ScanCancellation, ScanReadLimiter,
+        BatchResult, FileAdmission, FileBatchStream, FileExecutor, FileReadPermit, FileScheduler,
+        PartitionStream, PartitionStreamState, ScanCancellation, ScanReadLimiter, send_first_error,
     };
 
     fn options(
@@ -1004,6 +1008,52 @@ mod tests {
         assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
         assert_eq!(limiter.active_file_reads(), 1);
 
+        drop(held);
+        assert_eq!(limiter.active_file_reads(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_partition_while_waiting_for_capacity_releases_every_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 2, 2);
+        let held = limiter.partition(0)?.acquire().await?;
+        let executor_calls = Arc::new(AtomicUsize::new(0));
+        let cancellation = ScanCancellation::new();
+        let mut stream = PartitionStream::new(
+            vec![1],
+            limiter.partition(1)?,
+            stream_options(1, 0)?,
+            Arc::new(|_| Ok(FileAdmission::Admit)),
+            batch_executor(BTreeMap::new(), Arc::clone(&executor_calls)),
+            metrics(),
+            cancellation.clone(),
+        );
+        let mut next = Box::pin(stream.next());
+        poll_fn(|context| {
+            assert!(matches!(next.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        timeout(Duration::from_secs(5), async {
+            while limiter.partition_active_file_reads(1) != Some(1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        drop(next);
+        drop(stream);
+        timeout(Duration::from_secs(5), async {
+            while limiter.partition_active_file_reads(1) != Some(0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(limiter.active_file_reads(), 1);
         drop(held);
         assert_eq!(limiter.active_file_reads(), 0);
         Ok(())
@@ -1558,7 +1608,10 @@ mod tests {
             cancellation.clone(),
         );
 
-        let results = tokio::join!(first.next(), second.next());
+        let results = timeout(Duration::from_secs(5), async {
+            tokio::join!(first.next(), second.next())
+        })
+        .await?;
         let mut errors = 0;
         let mut completed = 0;
         for result in [results.0, results.1] {
@@ -1582,6 +1635,45 @@ mod tests {
         assert_eq!(snapshot.scan_partitions_completed, 0);
         assert_eq!(snapshot.files_started, 2);
         assert_eq!(snapshot.files_completed, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_data_error_survives_later_scheduler_cleanup_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = ScanCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let (output, receiver) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            send_first_error(
+                &output,
+                &task_cancellation,
+                InvalidConfigurationSnafu {
+                    reason: "first_data_error",
+                }
+                .build(),
+            )
+            .await;
+            pending::<()>().await;
+        });
+        let abort = task.abort_handle();
+        let mut stream = PartitionStream {
+            state: PartitionStreamState::Running { receiver, task },
+            cancellation,
+            done: false,
+        };
+
+        let error = timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or("expected first data error")?
+            .expect_err("first item must be the data error");
+        assert_eq!(error.as_str(), "invalid_configuration");
+        abort.abort();
+        assert!(
+            timeout(Duration::from_secs(5), stream.next())
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -1688,6 +1780,79 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+        assert_eq!(limiter.active_file_reads(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn official_kernel_cancellation_waits_for_the_sync_safe_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limiter = ScanReadLimiter::new(options(1, 1)?, 1, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Notify::new());
+        let cancellation = ScanCancellation::new();
+        let executor: FileExecutor<i32, FileBatchStream> = {
+            let calls = Arc::clone(&calls);
+            let finished = Arc::clone(&finished);
+            let gate = Arc::clone(&gate);
+            Arc::new(move |_, permit, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let finished = Arc::clone(&finished);
+                let gate = Arc::clone(&gate);
+                async move {
+                    let (output, input) = mpsc::channel::<BatchResult>(1);
+                    tokio::spawn(async move {
+                        gate.notified().await;
+                        drop(permit);
+                        drop(output);
+                        finished.store(true, Ordering::SeqCst);
+                    });
+                    Ok(Box::pin(stream::unfold(input, |mut input| async move {
+                        input.recv().await.map(|batch| (batch, input))
+                    })) as FileBatchStream)
+                }
+                .boxed()
+            })
+        };
+        let official_options =
+            stream_options(1, 0)?.with_reader_backend(DeltaReaderBackend::OfficialKernel)?;
+        let mut stream = PartitionStream::new(
+            vec![1, 2],
+            limiter.partition(0)?,
+            official_options,
+            Arc::new(|_| Ok(FileAdmission::Admit)),
+            executor,
+            metrics(),
+            cancellation.clone(),
+        );
+        let mut next = Box::pin(stream.next());
+        poll_fn(|context| {
+            assert!(matches!(next.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        drop(next);
+        drop(stream);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(limiter.active_file_reads(), 1);
+        assert!(!finished.load(Ordering::SeqCst));
+        gate.notify_one();
+        timeout(Duration::from_secs(5), async {
+            while !finished.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(limiter.active_file_reads(), 0);
         Ok(())
     }

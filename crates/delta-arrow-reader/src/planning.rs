@@ -26,6 +26,7 @@ use crate::{
         delta_scan_partition_target_local_environment_diagnostic,
         derive_delta_scan_partition_target_diagnostic,
     },
+    protocol::validate_protocol,
     snapshot::LoadedDeltaTableSnapshot,
 };
 
@@ -61,6 +62,7 @@ pub(crate) fn build_scan(
     predicate: Option<DeltaKernelPredicate>,
     include_stats: bool,
 ) -> Result<KernelScan, DeltaReaderError> {
+    validate_protocol(snapshot.protocol_info())?;
     validate_projection(snapshot.schema().as_ref(), projection)?;
     snapshot
         .kernel_snapshot()
@@ -439,6 +441,7 @@ mod tests {
     };
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const UNSUPPORTED_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["madeUpFeature"],"writerFeatures":["madeUpFeature"]}}"#;
     const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"hidden\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
@@ -833,6 +836,33 @@ mod tests {
         assert_eq!(error.as_str(), "scan_planning");
         assert!(!error.to_string().contains("secret-invalid"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn scan_rejects_unsupported_protocol_before_metadata_expansion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "unsupported-protocol",
+            UNSUPPORTED_PROTOCOL_JSON,
+            METADATA_JSON,
+            &[add("secret-invalid.parquet", -1, Some(1))],
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+
+        let error = match plan_scan(&snapshot, None, &[], None, true, Default::default()) {
+            Ok(_) => return Err("unsupported protocol must fail before metadata expansion".into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.phase(), DeltaReaderPhase::Protocol);
+        assert_eq!(error.as_str(), "unsupported_protocol");
+        assert!(!error.to_string().contains("madeUpFeature"));
+        assert!(!error.to_string().contains("secret-invalid.parquet"));
         Ok(())
     }
 

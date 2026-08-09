@@ -291,7 +291,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, TimeUnit};
     use futures_util::future;
-    use object_store::{memory::InMemory, path::Path as ObjectStorePath};
+    use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectStorePath};
     use tracing::{
         Event, Level, Metadata, Subscriber,
         field::{Field, Visit},
@@ -306,7 +306,7 @@ mod tests {
     };
     use crate::{
         DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaStorageOptions,
-        kernel::{insert_url_handler, is_kernel_error},
+        kernel::{DeltaKernelEngineContext, insert_url_handler, is_kernel_error},
     };
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
@@ -803,6 +803,113 @@ mod tests {
         );
         assert!(!error.to_string().contains("secret-source-token"));
         assert!(!format!("{error:?}").contains("authorization"));
+        Ok(())
+    }
+
+    #[test]
+    fn s3_store_construction_accepts_implicit_and_documented_explicit_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table_url = url::Url::parse("s3://bucket/root")?;
+        let _implicit =
+            DeltaKernelEngineContext::build(table_url.clone(), &DeltaStorageOptions::new())?;
+        for (access_key, secret_key, token_key, region_key) in [
+            (
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_REGION",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "aws_region",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "region",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "AWS_DEFAULT_REGION",
+            ),
+            (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                "aws_default_region",
+            ),
+        ] {
+            let options = storage_options(&[
+                (access_key, "access"),
+                (secret_key, "secret"),
+                (token_key, "token"),
+                (region_key, "us-east-1"),
+            ]);
+            let context = DeltaKernelEngineContext::build(table_url.clone(), &options)?;
+            assert_eq!(context.table_url(), &table_url);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn successful_load_forwards_options_once_without_retaining_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scheme = format!(
+            "darstorage{}{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        );
+        let store = InMemory::new();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(
+            store.put(
+                &ObjectStorePath::from("root/_delta_log/00000000000000000000.json"),
+                format!("{PROTOCOL_JSON}\n{METADATA_JSON}\n")
+                    .into_bytes()
+                    .into(),
+            ),
+        )?;
+        let captured = Arc::new(Mutex::new(Vec::<DeltaStorageOptions>::new()));
+        let handler_capture = Arc::clone(&captured);
+        insert_url_handler(
+            &scheme,
+            Arc::new(move |_url, options| {
+                handler_capture
+                    .lock()
+                    .map_err(|_| object_store::Error::Generic {
+                        store: "capture",
+                        source: std::io::Error::other("capture lock poisoned").into(),
+                    })?
+                    .push(options.into_iter().collect());
+                Ok((Box::new(store.clone()), ObjectStorePath::from("root")))
+            }),
+        )?;
+        let options = storage_options(&[
+            ("authorization", "secret-source-token"),
+            ("region", "us-east-1"),
+        ]);
+        let loaded = load_delta_table_snapshot_blocking(
+            &format!("{scheme}://table/root"),
+            &options,
+            DeltaSnapshotSelection::Latest,
+        )?;
+
+        assert_eq!(loaded.version(), 0);
+        assert_eq!(
+            captured
+                .lock()
+                .map(|options| options.clone())
+                .unwrap_or_default(),
+            vec![options]
+        );
+        assert_eq!(loaded.schema().field(0).name(), "id");
         Ok(())
     }
 
