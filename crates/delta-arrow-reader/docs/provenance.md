@@ -32,6 +32,8 @@ publish the candidate package.
 | `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/kernel.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/snapshot.rs` | `crates/delta-arrow-reader/src/snapshot.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/protocol.rs` | `crates/delta-arrow-reader/src/protocol.rs` | #462 |
+| Source-loading portions of `crates/delta-funnel/src/table_formats/delta.rs` | `crates/delta-arrow-reader/src/snapshot.rs` and `src/kernel.rs` | #462 |
+| Snapshot/protocol/schema fixtures from `crates/delta-funnel/src/table_formats/delta/test_support.rs` | Crate-local tests in `src/uri.rs`, `src/snapshot.rs`, and `src/protocol.rs` | #462 |
 | `crates/delta-funnel/src/table_formats/delta/deletion_vector.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV metadata portions of `crates/delta-funnel/src/table_formats/delta.rs` | `crates/delta-arrow-reader/src/kernel.rs` and `src/deletion_vector.rs` | #477 |
 | DV masking portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
@@ -46,6 +48,9 @@ publish the candidate package.
 
 ## Test migration
 
+- #462 ports URI normalization, latest/fixed snapshot loading, protocol and
+  schema conversion, storage construction/context reuse, redaction, and
+  unsupported-protocol scan-boundary assertions into the staged crate.
 - #477 ports the focused deletion-vector metadata, payload, coordinate,
   masking, redaction, and metric assertions into the staged crate.
 - #463 ports scan-metadata, ordered file-task, schema, and transform
