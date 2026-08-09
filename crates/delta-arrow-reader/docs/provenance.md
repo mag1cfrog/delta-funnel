@@ -51,6 +51,11 @@ publish the candidate package.
 | `crates/delta-funnel/src/query_engine/datafusion/planning/file_task_partition.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
 | Final partitioned-plan assembly portions of `crates/delta-funnel/src/query_engine/datafusion/planning/scan_plan.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
 | Planning-metrics initialization portions of `crates/delta-funnel/src/query_engine/datafusion/execution/planning_exec.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
+| `crates/delta-funnel/src/query_engine/datafusion/execution/async_scheduler.rs` | `crates/delta-arrow-reader/src/scheduling.rs` | #481 |
+| Limiter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/scheduling.rs` | `crates/delta-arrow-reader/src/config.rs` and `src/scheduling.rs` | #481 |
+| Permit/environment portions of `crates/delta-funnel/src/query_engine/datafusion/execution/environment.rs` | `crates/delta-arrow-reader/src/scheduling.rs` | #481 |
+| Handoff/cancellation portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `planning_exec.rs` | `crates/delta-arrow-reader/src/scheduling.rs` and `src/planning.rs` | #481 |
+| Execution-counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` and `src/scheduling.rs` | #481 |
 
 ## Test migration
 
@@ -63,6 +68,9 @@ publish the candidate package.
   preservation. #478 ports target selection, host diagnostics, deterministic
   grouping, final partitioned-plan assembly, and planning-metrics
   initialization over those tasks.
+- #481 ports limiter, lazy admission, ordered prefetch, bounded handoff,
+  first-error, cancellation, cleanup, and execution-counter assertions into
+  `src/scheduling.rs` and `src/planning.rs`.
 - Parquet/backend/provider integration assertions remain in Delta Funnel for
   #464, #465, #482, and #483. Their movable coordinate and masking assertions
   are already covered here.
