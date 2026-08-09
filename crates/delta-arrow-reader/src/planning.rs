@@ -56,6 +56,23 @@ pub(crate) struct DeltaScanPlan {
 }
 
 #[allow(dead_code)]
+pub(crate) struct DeltaUnpartitionedScanPlan {
+    pub(crate) snapshot_version: u64,
+    pub(crate) engine_context: Arc<DeltaKernelEngineContext>,
+    pub(crate) logical_schema: SchemaRef,
+    pub(crate) physical_schema: SchemaRef,
+    pub(crate) projected_schema: SchemaRef,
+    pub(crate) kernel_schemas: KernelScanSchemas,
+    pub(crate) file_tasks: Vec<DeltaScanFileTask>,
+    pub(crate) scan_metadata_exhausted: bool,
+    pub(crate) files_filtered_during_planning: Option<u64>,
+    pub(crate) estimated_bytes: Option<u64>,
+    pub(crate) estimated_rows: Option<u64>,
+    pub(crate) physical_predicate: Option<DeltaKernelPredicate>,
+    pub(crate) execution_options: DeltaReaderExecutionOptions,
+}
+
+#[allow(dead_code)]
 pub(crate) fn build_scan(
     snapshot: &LoadedDeltaTableSnapshot,
     projection: Option<&[String]>,
@@ -85,6 +102,45 @@ pub(crate) fn plan_scan(
 ) -> Result<DeltaScanPlan, DeltaReaderError> {
     execution_options.validate()?;
     let partition_target_diagnostic = local_partition_target_diagnostic(partition_target_options)?;
+    let unpartitioned = build_unpartitioned_scan_plan(
+        snapshot,
+        projection,
+        hidden_columns,
+        kernel_predicate,
+        include_stats,
+        execution_options,
+    )?;
+    finalize_scan_plan(unpartitioned, partition_target_diagnostic)
+}
+
+#[allow(dead_code)]
+pub(crate) fn plan_unpartitioned_scan(
+    snapshot: &LoadedDeltaTableSnapshot,
+    projection: Option<&[String]>,
+    hidden_columns: &[String],
+    kernel_predicate: Option<DeltaKernelPredicate>,
+    include_stats: bool,
+    execution_options: DeltaReaderExecutionOptions,
+) -> Result<DeltaUnpartitionedScanPlan, DeltaReaderError> {
+    execution_options.validate()?;
+    build_unpartitioned_scan_plan(
+        snapshot,
+        projection,
+        hidden_columns,
+        kernel_predicate,
+        include_stats,
+        execution_options,
+    )
+}
+
+fn build_unpartitioned_scan_plan(
+    snapshot: &LoadedDeltaTableSnapshot,
+    projection: Option<&[String]>,
+    hidden_columns: &[String],
+    kernel_predicate: Option<DeltaKernelPredicate>,
+    include_stats: bool,
+    execution_options: DeltaReaderExecutionOptions,
+) -> Result<DeltaUnpartitionedScanPlan, DeltaReaderError> {
     let logical_projection =
         logical_projection(snapshot.schema().as_ref(), projection, hidden_columns)?;
     let scan = build_scan(
@@ -104,7 +160,6 @@ pub(crate) fn plan_scan(
         .into_iter()
         .map(DeltaScanFileTask::try_from_kernel)
         .collect::<Result<Vec<_>, _>>()?;
-    let files_planned = file_tasks.len();
     let estimated_bytes = checked_sum(
         file_tasks.iter().map(|task| task.estimated_bytes),
         "scan_estimated_bytes_overflow",
@@ -113,8 +168,6 @@ pub(crate) fn plan_scan(
         file_tasks.iter().map(|task| task.estimated_rows),
         "scan_estimated_rows_overflow",
     )?;
-    let partitions =
-        group_scan_file_tasks(file_tasks, partition_target_diagnostic.target_partitions)?;
     let logical_schema = scan.logical_schema();
     let physical_predicate = scan.physical_predicate();
     let projected_schema = match projection {
@@ -125,32 +178,58 @@ pub(crate) fn plan_scan(
         )),
     };
 
-    let metrics = DeltaReadMetrics::new(DeltaReadMetricsConfig {
-        snapshot_version: snapshot.version(),
-        reader_backend: execution_options.reader_backend(),
-        scan_metadata_exhausted: Some(true),
-        scan_partitions_planned: partitions.len(),
-        files_planned,
-        files_filtered_during_planning: metadata.files_filtered_during_planning,
-        estimated_rows,
-        estimated_bytes,
-    });
-
-    Ok(DeltaScanPlan {
+    Ok(DeltaUnpartitionedScanPlan {
         snapshot_version: snapshot.version(),
         engine_context: Arc::clone(snapshot.engine_context()),
         logical_schema,
         physical_schema: scan.physical_schema(),
         projected_schema,
         kernel_schemas: scan.schemas(),
-        partitions,
-        partition_target_diagnostic,
+        file_tasks,
         scan_metadata_exhausted: true,
         files_filtered_during_planning: metadata.files_filtered_during_planning,
         estimated_bytes,
         estimated_rows,
         physical_predicate,
         execution_options,
+    })
+}
+
+fn finalize_scan_plan(
+    unpartitioned: DeltaUnpartitionedScanPlan,
+    partition_target_diagnostic: DeltaScanPartitionTargetDiagnosticOutput,
+) -> Result<DeltaScanPlan, DeltaReaderError> {
+    let files_planned = unpartitioned.file_tasks.len();
+    let partitions = group_scan_file_tasks(
+        unpartitioned.file_tasks,
+        partition_target_diagnostic.target_partitions,
+    )?;
+    let metrics = DeltaReadMetrics::new(DeltaReadMetricsConfig {
+        snapshot_version: unpartitioned.snapshot_version,
+        reader_backend: unpartitioned.execution_options.reader_backend(),
+        scan_metadata_exhausted: Some(unpartitioned.scan_metadata_exhausted),
+        scan_partitions_planned: partitions.len(),
+        files_planned,
+        files_filtered_during_planning: unpartitioned.files_filtered_during_planning,
+        estimated_rows: unpartitioned.estimated_rows,
+        estimated_bytes: unpartitioned.estimated_bytes,
+    });
+
+    Ok(DeltaScanPlan {
+        snapshot_version: unpartitioned.snapshot_version,
+        engine_context: unpartitioned.engine_context,
+        logical_schema: unpartitioned.logical_schema,
+        physical_schema: unpartitioned.physical_schema,
+        projected_schema: unpartitioned.projected_schema,
+        kernel_schemas: unpartitioned.kernel_schemas,
+        partitions,
+        partition_target_diagnostic,
+        scan_metadata_exhausted: unpartitioned.scan_metadata_exhausted,
+        files_filtered_during_planning: unpartitioned.files_filtered_during_planning,
+        estimated_bytes: unpartitioned.estimated_bytes,
+        estimated_rows: unpartitioned.estimated_rows,
+        physical_predicate: unpartitioned.physical_predicate,
+        execution_options: unpartitioned.execution_options,
         metrics,
     })
 }
@@ -399,6 +478,9 @@ impl DeltaScanFileTask {
 
 #[cfg(test)]
 mod tests {
+    mod partition_pruning;
+    mod statistics_pruning;
+
     use std::{
         collections::HashMap,
         fs,
@@ -426,7 +508,8 @@ mod tests {
 
     use super::{
         DeltaScanFileStats, DeltaScanFileTask, DeltaScanFileTaskPartition, DeltaScanPlan,
-        KernelPhysicalToLogicalTransform, build_scan, checked_sum, group_scan_file_tasks,
+        DeltaUnpartitionedScanPlan, KernelPhysicalToLogicalTransform, build_scan, checked_sum,
+        group_scan_file_tasks,
     };
     use crate::{
         DeltaComparison, DeltaPredicate, DeltaReaderPhase, DeltaScalar, DeltaSnapshotSelection,
@@ -441,6 +524,7 @@ mod tests {
     };
 
     const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+    const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
     const UNSUPPORTED_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["madeUpFeature"],"writerFeatures":["madeUpFeature"]}}"#;
     const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
     const METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"label\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"hidden\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
@@ -553,6 +637,34 @@ mod tests {
         )
     }
 
+    fn dv_add_action(
+        path: &str,
+        size: i64,
+        partition_values: serde_json::Value,
+        stats: Option<&str>,
+    ) -> String {
+        let mut add = serde_json::json!({
+            "path": path,
+            "partitionValues": partition_values,
+            "size": size,
+            "modificationTime": 1587968586000_i64,
+            "dataChange": true,
+            "deletionVector": {
+                "storageType": "u",
+                "pathOrInlineDv": "vBn[lx{q8@P<9BNH/isA",
+                "offset": 1,
+                "sizeInBytes": 36,
+                "cardinality": 2
+            }
+        });
+        if let Some(stats) = stats {
+            add.as_object_mut()
+                .expect("add action is an object")
+                .insert("stats".to_owned(), serde_json::json!(stats));
+        }
+        serde_json::json!({"add": add}).to_string()
+    }
+
     fn field_names(schema: &arrow::datatypes::SchemaRef) -> Vec<&str> {
         schema
             .fields()
@@ -609,6 +721,12 @@ mod tests {
         plan.partitions
             .iter()
             .flat_map(|partition| partition.file_tasks.iter())
+    }
+
+    fn unpartitioned_tasks(
+        plan: &DeltaUnpartitionedScanPlan,
+    ) -> impl Iterator<Item = &DeltaScanFileTask> {
+        plan.file_tasks.iter()
     }
 
     fn execution_file_stream(permit: FileReadPermit, batch: RecordBatch) -> FileBatchStream {
@@ -816,6 +934,208 @@ mod tests {
         assert!(many.physical_predicate.is_none());
         assert_eq!(many.execution_options, Default::default());
 
+        Ok(())
+    }
+
+    #[test]
+    fn unpartitioned_plan_preserves_kernel_task_order_before_grouping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            add("first.parquet", 30, Some(3)),
+            add("second.parquet", 10, Some(1)),
+            add("third.parquet", 20, Some(2)),
+        ];
+        let (_table, snapshot) = loaded_snapshot_with_adds("ordered-handoff", &adds)?;
+
+        let plan =
+            super::plan_unpartitioned_scan(&snapshot, None, &[], None, true, Default::default())?;
+
+        assert_eq!(
+            unpartitioned_tasks(&plan)
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            ["first.parquet", "second.parquet", "third.parquet"]
+        );
+        assert_eq!(plan.file_tasks.len(), 3);
+        assert!(plan.scan_metadata_exhausted);
+        assert_eq!(plan.files_filtered_during_planning, Some(0));
+        assert_eq!(plan.estimated_bytes, Some(60));
+        assert_eq!(plan.estimated_rows, Some(6));
+        assert!(Arc::ptr_eq(&plan.engine_context, snapshot.engine_context()));
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_pruning_preserves_surviving_row_counts_and_deletion_vectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            dv_add_action(
+                "id-dv-impossible.parquet",
+                10,
+                serde_json::json!({}),
+                Some(
+                    r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":50},"nullCount":{"id":0}}"#,
+                ),
+            ),
+            dv_add_action(
+                "id-dv-possible.parquet",
+                12,
+                serde_json::json!({}),
+                Some(
+                    r#"{"numRecords":12,"minValues":{"id":101},"maxValues":{"id":150},"nullCount":{"id":0}}"#,
+                ),
+            ),
+            add_with_stats(
+                "id-plain-impossible.parquet",
+                10,
+                Some(
+                    r#"{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":50},"nullCount":{"id":0}}"#,
+                ),
+            ),
+            add("id-plain-missing-stats.parquet", 5, None),
+            dv_add_action(
+                "id-dv-missing-stats.parquet",
+                6,
+                serde_json::json!({}),
+                None,
+            ),
+        ];
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "stats-metadata-handoff",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            METADATA_JSON,
+            &adds,
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let predicate = DeltaPredicate::Compare {
+            column: "id".to_owned(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(100),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+
+        let plan = super::plan_unpartitioned_scan(
+            &snapshot,
+            None,
+            &[],
+            Some(kernel_predicate),
+            true,
+            Default::default(),
+        )?;
+
+        assert_eq!(
+            unpartitioned_tasks(&plan)
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "id-dv-possible.parquet",
+                "id-plain-missing-stats.parquet",
+                "id-dv-missing-stats.parquet",
+            ]
+        );
+        let possible = plan
+            .file_tasks
+            .iter()
+            .find(|task| task.path == "id-dv-possible.parquet")
+            .ok_or("expected surviving DV task")?;
+        assert_eq!(possible.estimated_rows, Some(12));
+        assert_eq!(
+            possible.stats.as_ref().map(|stats| stats.num_records),
+            Some(12)
+        );
+        assert!(possible.deletion_vector.is_present());
+        let missing_stats = plan
+            .file_tasks
+            .iter()
+            .find(|task| task.path == "id-dv-missing-stats.parquet")
+            .ok_or("expected surviving missing-stats DV task")?;
+        assert_eq!(missing_stats.estimated_rows, None);
+        assert!(missing_stats.stats.is_none());
+        assert!(missing_stats.deletion_vector.is_present());
+        let plain = plan
+            .file_tasks
+            .iter()
+            .find(|task| task.path == "id-plain-missing-stats.parquet")
+            .ok_or("expected surviving plain task")?;
+        assert!(!plain.deletion_vector.is_present());
+        assert_eq!(plan.files_filtered_during_planning, Some(2));
+        assert_eq!(plan.estimated_rows, None);
+        Ok(())
+    }
+
+    #[test]
+    fn partition_pruning_preserves_surviving_deletion_vectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [
+            dv_add_action(
+                "region-us-west-dv.parquet",
+                10,
+                serde_json::json!({"region": "us-west"}),
+                None,
+            ),
+            add_action(
+                "region-us-west-plain.parquet",
+                10,
+                r#"{"region":"us-west"}"#,
+                None,
+            ),
+            dv_add_action(
+                "region-us-east-dv.parquet",
+                10,
+                serde_json::json!({"region": "us-east"}),
+                None,
+            ),
+            add_action(
+                "region-us-east-plain.parquet",
+                10,
+                r#"{"region":"us-east"}"#,
+                None,
+            ),
+        ];
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "partition-metadata-handoff",
+            DELETION_VECTOR_PROTOCOL_JSON,
+            PARTITIONED_METADATA_JSON,
+            &adds,
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let predicate = DeltaPredicate::Compare {
+            column: "region".to_owned(),
+            op: DeltaComparison::Eq,
+            value: DeltaScalar::Utf8("us-west".to_owned()),
+        };
+        validate_predicate(&predicate, snapshot.schema().as_ref())?;
+        let kernel_predicate =
+            delta_predicate_to_kernel_pruning(&predicate).ok_or("expected Kernel predicate")?;
+
+        let plan = super::plan_unpartitioned_scan(
+            &snapshot,
+            None,
+            &[],
+            Some(kernel_predicate),
+            false,
+            Default::default(),
+        )?;
+
+        assert_eq!(
+            unpartitioned_tasks(&plan)
+                .map(|task| task.path.as_str())
+                .collect::<Vec<_>>(),
+            ["region-us-west-dv.parquet", "region-us-west-plain.parquet"]
+        );
+        assert!(plan.file_tasks[0].deletion_vector.is_present());
+        assert!(!plan.file_tasks[1].deletion_vector.is_present());
+        assert_eq!(plan.files_filtered_during_planning, Some(2));
         Ok(())
     }
 

@@ -200,6 +200,11 @@ impl DeltaKernelPredicate {
     pub(crate) fn into_inner(self) -> PredicateRef {
         self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_predicate(predicate: Predicate) -> Self {
+        Self(Arc::new(predicate))
+    }
 }
 
 #[allow(dead_code)]
