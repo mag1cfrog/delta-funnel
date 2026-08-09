@@ -50,6 +50,7 @@ pub(crate) struct DeltaKernelEngineContext {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KernelDeletionVectorHandle(DvInfo);
 
 #[allow(dead_code)]
@@ -64,6 +65,7 @@ pub(crate) struct KernelScanFileMetadata {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct KernelPhysicalToLogicalTransform(Option<ExpressionRef>);
 
 #[allow(dead_code)]

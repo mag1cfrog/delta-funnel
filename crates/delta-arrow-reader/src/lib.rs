@@ -9,6 +9,8 @@ mod partition_target;
 mod planning;
 mod predicate;
 mod protocol;
+#[allow(dead_code)]
+mod scheduling;
 mod snapshot;
 mod transform;
 mod uri;
