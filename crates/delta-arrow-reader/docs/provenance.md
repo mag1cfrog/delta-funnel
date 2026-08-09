@@ -40,6 +40,12 @@ publish the candidate package.
 | DV coordinate portions of `crates/delta-funnel/src/query_engine/datafusion/execution/native_async_reader.rs` | `crates/delta-arrow-reader/src/deletion_vector.rs` | #477 |
 | DV counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #477 |
 | DataFusion predicate-adapter portions of `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/predicate.rs` and `src/kernel.rs` | #484 |
+| Scan-metadata and transform portions of `crates/delta-funnel/src/table_formats/delta.rs` | `crates/delta-arrow-reader/src/planning.rs`, `src/kernel.rs`, and `src/transform.rs` | #463 |
+| Scan/read-schema portions of `crates/delta-funnel/src/table_formats/delta/read.rs` | `crates/delta-arrow-reader/src/planning.rs` and `src/transform.rs` | #463 |
+| Scan/schema/metadata portions of `crates/delta-funnel/src/table_formats/delta/kernel.rs` | `crates/delta-arrow-reader/src/kernel.rs` and `src/planning.rs` | #463 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/file_task.rs` | `crates/delta-arrow-reader/src/planning.rs` | #463 |
+| Metadata/task portions of `crates/delta-funnel/src/query_engine/datafusion/planning/scan_plan.rs` | `crates/delta-arrow-reader/src/planning.rs` | #463 |
+| Scan-planning fixtures from `crates/delta-funnel/src/table_formats/delta/test_support.rs` | Crate-local tests in `src/planning.rs` | #463 |
 | `crates/delta-funnel/src/query_engine/datafusion/planning/partition_target.rs` | `crates/delta-arrow-reader/src/partition_target.rs` | #478 |
 | Host-diagnostic portions of `crates/delta-funnel/src/query_engine/datafusion/execution/environment.rs` | `crates/delta-arrow-reader/src/partition_target.rs` | #478 |
 | `crates/delta-funnel/src/query_engine/datafusion/planning/file_task_partition.rs` | `crates/delta-arrow-reader/src/planning.rs` | #478 |
