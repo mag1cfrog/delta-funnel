@@ -399,6 +399,7 @@ impl DeltaScanFileTask {
 
 #[cfg(test)]
 mod tests {
+    mod partition_pruning;
     mod statistics_pruning;
 
     use std::{
