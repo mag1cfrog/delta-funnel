@@ -400,8 +400,13 @@ mod tests {
     use std::{
         collections::HashMap,
         fs,
+        future::{pending, poll_fn},
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -608,6 +613,13 @@ mod tests {
             (Some(batch), permit),
             |(batch, permit)| async move { batch.map(|batch| (Ok(batch), (None, permit))) },
         ))
+    }
+
+    fn pending_execution_file_stream(permit: FileReadPermit) -> FileBatchStream {
+        Box::pin(stream::once(async move {
+            let _permit = permit;
+            pending::<Result<RecordBatch, crate::DeltaReaderError>>().await
+        }))
     }
 
     fn plan_scan(
@@ -1372,6 +1384,86 @@ mod tests {
         assert_eq!(metrics.files_completed, 3);
         assert_eq!(metrics.batches_produced, 3);
         assert_eq!(metrics.rows_produced, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_scan_executions_share_only_the_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("part.parquet", 10, Some(1))];
+        let (_table, snapshot) = loaded_snapshot_with_adds("concurrent-executions", &adds)?;
+        let execution_options = crate::DeltaReaderExecutionOptions::new()
+            .with_native_async_prefetch_file_count_per_partition(0)?
+            .with_max_concurrent_file_reads_per_partition(1)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?;
+        let plan = Arc::new(super::plan_scan(
+            &snapshot,
+            None,
+            &[],
+            None,
+            true,
+            execution_options,
+            super::DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(1),
+                caller_target_partitions: None,
+            },
+        )?);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor: FileExecutor<DeltaScanFileTask, FileBatchStream> = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_, permit, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(pending_execution_file_stream(permit)) }.boxed()
+            })
+        };
+        let admission: FileAdmissionFn<DeltaScanFileTask> = Arc::new(|_| Ok(FileAdmission::Admit));
+        let first_execution = DeltaScanExecution::new(Arc::clone(&plan));
+        let second_execution = DeltaScanExecution::new(Arc::clone(&plan));
+        let mut first =
+            first_execution.partition_stream(0, Arc::clone(&admission), Arc::clone(&executor))?;
+        let mut second = second_execution.partition_stream(0, admission, executor)?;
+        let mut first_next = Box::pin(first.next());
+        poll_fn(|context| {
+            assert!(matches!(first_next.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut second_next = Box::pin(second.next());
+        poll_fn(|context| {
+            assert!(matches!(second_next.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        drop(first_next);
+        drop(first);
+        poll_fn(|context| {
+            assert!(matches!(second_next.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        drop(second_next);
+        drop(second);
+        let metrics = plan.metrics.snapshot();
+        assert_eq!(metrics.scan_partitions_started, 2);
+        assert_eq!(metrics.scan_partitions_completed, 0);
+        assert_eq!(metrics.files_started, 2);
+        assert_eq!(metrics.files_completed, 0);
         Ok(())
     }
 
