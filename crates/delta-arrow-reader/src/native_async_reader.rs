@@ -1940,6 +1940,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_file_stream_holds_exactly_one_admission_permit_until_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-buffer-permit-bound")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_dv_table(&root, &parquet_bytes)?;
+        let plan = pipeline_plan(&root, Some(parquet_bytes.len()))?;
+        let reader = Arc::new(NativeAsyncFileReader::new(
+            Arc::clone(&plan.engine_context),
+            plan.execution_options,
+            plan.metrics.clone(),
+        ));
+        let limiter = one_file_limiter(plan.execution_options)?;
+        let partition = limiter.partition(0)?;
+        let permit = partition.acquire().await?;
+        let request = file_read_request(
+            &plan,
+            plan.partitions[0].file_tasks[0].clone(),
+            permit,
+            ScanCancellation::new(),
+        );
+        let file = reader.open_logical_file_stream(request).await?;
+
+        let mut next_permit = Box::pin(partition.acquire());
+        assert!(matches!(
+            futures_util::poll!(&mut next_permit),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            plan.metrics
+                .snapshot()
+                .parquet_data_file_full_get_operations,
+            Some(1)
+        );
+        drop(file);
+        drop(next_permit.await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn opens_projected_parquet_stream_with_configured_batch_size()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = TestDir::new("native-projected-stream")?;
@@ -2474,6 +2520,10 @@ mod tests {
         assert_eq!(dv_metrics.files_started, 1);
         assert_eq!(dv_metrics.files_completed, 0);
         assert_eq!(dv_metrics.deletion_vector_failures, 1);
+        assert_eq!(
+            dv_metrics.parquet_data_file_opened_bytes,
+            Some(u64::try_from(parquet_bytes.len())?)
+        );
 
         let transform_root = TestDir::new("native-transform-errors")?;
         write_partitioned_dv_table(&transform_root, &parquet_bytes)?;
