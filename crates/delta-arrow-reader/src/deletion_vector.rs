@@ -49,25 +49,41 @@ pub(crate) async fn load_deletion_vector_selection_from_engine_context(
     metadata: DeletionVectorMetadata,
     metrics: &DeltaReadMetrics,
 ) -> Result<Option<DeletionVectorSelection>, DeltaReaderError> {
-    let Some(handle) = metadata.0 else {
-        return Ok(None);
-    };
-    let row_indexes = match tokio::task::spawn_blocking(move || {
-        engine_context.load_deletion_vector_row_indexes(&handle)
+    let metrics_for_task = metrics.clone();
+    match tokio::task::spawn_blocking(move || {
+        load_deletion_vector_selection_blocking(
+            engine_context.as_ref(),
+            metadata,
+            &metrics_for_task,
+        )
     })
     .await
     {
-        Ok(Ok(row_indexes)) => row_indexes,
-        Ok(Err(source)) => {
+        Ok(result) => result,
+        Err(source) => {
+            metrics.record_deletion_vector_failure();
+            Err(dependency_error("deletion_vector_load_task_failed", source))
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_deletion_vector_selection_blocking(
+    engine_context: &DeltaKernelEngineContext,
+    metadata: DeletionVectorMetadata,
+    metrics: &DeltaReadMetrics,
+) -> Result<Option<DeletionVectorSelection>, DeltaReaderError> {
+    let Some(handle) = metadata.0 else {
+        return Ok(None);
+    };
+    let row_indexes = match engine_context.load_deletion_vector_row_indexes(&handle) {
+        Ok(row_indexes) => row_indexes,
+        Err(source) => {
             metrics.record_deletion_vector_failure();
             return Err(dependency_error(
                 "deletion_vector_payload_read_failed",
                 source,
             ));
-        }
-        Err(source) => {
-            metrics.record_deletion_vector_failure();
-            return Err(dependency_error("deletion_vector_load_task_failed", source));
         }
     };
 

@@ -186,7 +186,7 @@ impl ScanReadLimiter {
     }
 
     #[cfg(test)]
-    fn active_file_reads(&self) -> usize {
+    pub(crate) fn active_file_reads(&self) -> usize {
         self.scan_capacity
             .saturating_sub(self.scan_permits.available_permits())
     }

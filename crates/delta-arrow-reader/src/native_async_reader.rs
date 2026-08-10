@@ -1220,6 +1220,8 @@ mod tests {
         NativeAsyncFileReadRequest, NativeAsyncFileReader, data_file_error,
         native_async_file_executor,
     };
+    #[cfg(feature = "official-kernel")]
+    use crate::official_kernel_reader::official_kernel_file_executor;
     use crate::{
         DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
         DeltaSnapshotSelection, DeltaStorageOptions,
@@ -1577,39 +1579,60 @@ mod tests {
         root: &TestDir,
         parquet_bytes: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        write_partitioned_table(root, parquet_bytes, true)
+        write_partitioned_table(root, parquet_bytes, TestDeletionVector::Relative)
     }
 
     fn write_partitioned_non_dv_table(
         root: &TestDir,
         parquet_bytes: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        write_partitioned_table(root, parquet_bytes, false)
+        write_partitioned_table(root, parquet_bytes, TestDeletionVector::None)
+    }
+
+    fn write_partitioned_inline_dv_table(
+        root: &TestDir,
+        parquet_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        write_partitioned_table(root, parquet_bytes, TestDeletionVector::Inline)
+    }
+
+    enum TestDeletionVector {
+        None,
+        Relative,
+        Inline,
     }
 
     fn write_partitioned_table(
         root: &TestDir,
         parquet_bytes: &[u8],
-        with_deletion_vector: bool,
+        deletion_vector: TestDeletionVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
         fs::write(root.path().join("part.parquet"), parquet_bytes)?;
-        let deletion_vector = if with_deletion_vector {
-            let mut dv_bytes = Vec::new();
-            let mut writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
-            let mut deletion_vector = KernelDeletionVector::new();
-            deletion_vector.add_deleted_row_indexes([4]);
-            let result = writer.write_deletion_vector(deletion_vector)?;
-            writer.finalize()?;
-            fs::write(root.path().join(DV_FILE), dv_bytes)?;
-            Some(serde_json::json!({
-                "storageType": "u",
-                "pathOrInlineDv": DV_ID,
-                "offset": result.offset,
-                "sizeInBytes": result.size_in_bytes,
-                "cardinality": result.cardinality
-            }))
-        } else {
-            None
+        let deletion_vector = match deletion_vector {
+            TestDeletionVector::None => None,
+            TestDeletionVector::Relative => {
+                let mut dv_bytes = Vec::new();
+                let mut writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
+                let mut deletion_vector = KernelDeletionVector::new();
+                deletion_vector.add_deleted_row_indexes([4]);
+                let result = writer.write_deletion_vector(deletion_vector)?;
+                writer.finalize()?;
+                fs::write(root.path().join(DV_FILE), dv_bytes)?;
+                Some(serde_json::json!({
+                    "storageType": "u",
+                    "pathOrInlineDv": DV_ID,
+                    "offset": result.offset,
+                    "sizeInBytes": result.size_in_bytes,
+                    "cardinality": result.cardinality
+                }))
+            }
+            TestDeletionVector::Inline => Some(serde_json::json!({
+                "storageType": "i",
+                "pathOrInlineDv": "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L",
+                "offset": 0,
+                "sizeInBytes": 44,
+                "cardinality": 6
+            })),
         };
 
         let log = root.path().join("_delta_log");
@@ -1664,28 +1687,140 @@ mod tests {
         Ok(())
     }
 
+    fn remove_all_data_files_from_log(root: &TestDir) -> Result<(), Box<dyn std::error::Error>> {
+        let path = root
+            .path()
+            .join("_delta_log")
+            .join("00000000000000000000.json");
+        let contents = fs::read_to_string(&path)?;
+        let contents = contents
+            .lines()
+            .filter(|line| !line.contains("\"add\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{contents}\n"))?;
+        Ok(())
+    }
+
+    fn add_second_partition_file(
+        root: &TestDir,
+        parquet_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(root.path().join("part-east.parquet"), parquet_bytes)?;
+        let path = root
+            .path()
+            .join("_delta_log")
+            .join("00000000000000000000.json");
+        let mut contents = fs::read_to_string(&path)?;
+        let stats = serde_json::json!({
+            "numRecords": 6,
+            "minValues": {"id": 7},
+            "maxValues": {"id": 12},
+            "nullCount": {"id": 0}
+        });
+        let add = serde_json::json!({
+            "add": {
+                "path": "part-east.parquet",
+                "partitionValues": {"region": "east"},
+                "size": parquet_bytes.len(),
+                "modificationTime": 1587968587000_i64,
+                "dataChange": true,
+                "stats": stats.to_string()
+            }
+        });
+        contents.push_str(&format!("{add}\n"));
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
     fn pipeline_plan(
         root: &TestDir,
         full_file_threshold: Option<usize>,
+    ) -> Result<Arc<crate::planning::DeltaScanPlan>, Box<dyn std::error::Error>> {
+        pipeline_plan_for_backend(
+            root,
+            full_file_threshold,
+            Some(64 * 1024),
+            DeltaReaderBackend::NativeAsync,
+            true,
+        )
+    }
+
+    fn pipeline_plan_for_backend(
+        root: &TestDir,
+        full_file_threshold: Option<usize>,
+        metadata_size_hint: Option<usize>,
+        backend: DeltaReaderBackend,
+        with_predicate: bool,
+    ) -> Result<Arc<crate::planning::DeltaScanPlan>, Box<dyn std::error::Error>> {
+        pipeline_plan_for_backend_at(
+            root,
+            full_file_threshold,
+            metadata_size_hint,
+            backend,
+            with_predicate,
+            DeltaSnapshotSelection::Latest,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_plan_for_backend_at(
+        root: &TestDir,
+        full_file_threshold: Option<usize>,
+        metadata_size_hint: Option<usize>,
+        backend: DeltaReaderBackend,
+        with_predicate: bool,
+        selection: DeltaSnapshotSelection,
+        target_partitions: usize,
+    ) -> Result<Arc<crate::planning::DeltaScanPlan>, Box<dyn std::error::Error>> {
+        let snapshot = load_delta_table_snapshot_blocking(
+            &root.path().to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            selection,
+        )?;
+        let options = DeltaReaderExecutionOptions::new()
+            .with_parquet_full_file_read_threshold(full_file_threshold)?
+            .with_parquet_metadata_size_hint(metadata_size_hint)?
+            .with_reader_backend(backend)?;
+        let predicate = with_predicate.then(|| {
+            DeltaKernelPredicate::from_test_predicate(Predicate::gt(
+                Expression::Column(ColumnName::new(["id"])),
+                Expression::Literal(Scalar::Integer(3)),
+            ))
+        });
+        Ok(Arc::new(plan_scan(
+            &snapshot,
+            Some(&["id".to_owned()]),
+            &["region".to_owned()],
+            predicate,
+            true,
+            options,
+            DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(target_partitions),
+                caller_target_partitions: None,
+            },
+        )?))
+    }
+
+    #[cfg(feature = "official-kernel")]
+    fn predicate_pipeline_plan_for_backend(
+        root: &TestDir,
+        backend: DeltaReaderBackend,
+        predicate: Predicate,
     ) -> Result<Arc<crate::planning::DeltaScanPlan>, Box<dyn std::error::Error>> {
         let snapshot = load_delta_table_snapshot_blocking(
             &root.path().to_string_lossy(),
             &DeltaStorageOptions::new(),
             DeltaSnapshotSelection::Latest,
         )?;
-        let options = DeltaReaderExecutionOptions::new()
-            .with_parquet_full_file_read_threshold(full_file_threshold)?;
-        let predicate = DeltaKernelPredicate::from_test_predicate(Predicate::gt(
-            Expression::Column(ColumnName::new(["id"])),
-            Expression::Literal(Scalar::Integer(3)),
-        ));
         Ok(Arc::new(plan_scan(
             &snapshot,
             Some(&["id".to_owned()]),
             &["region".to_owned()],
-            Some(predicate),
+            Some(DeltaKernelPredicate::from_test_predicate(predicate)),
             true,
-            options,
+            DeltaReaderExecutionOptions::new().with_reader_backend(backend)?,
             DeltaScanPartitionTargetOptions {
                 explicit_target_partitions: Some(1),
                 caller_target_partitions: None,
@@ -1721,13 +1856,53 @@ mod tests {
     ) -> Result<Vec<RecordBatch>, DeltaReaderError> {
         let execution = DeltaScanExecution::new(Arc::clone(&plan));
         let executor = native_async_file_executor(&plan, Some(2));
-        let mut stream =
-            execution.partition_stream(0, Arc::new(|_| Ok(FileAdmission::Admit)), executor)?;
         let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
+        for partition in 0..plan.partitions.len() {
+            let mut stream = execution.partition_stream(
+                partition,
+                Arc::new(|_| Ok(FileAdmission::Admit)),
+                Arc::clone(&executor),
+            )?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
+            }
         }
         Ok(batches)
+    }
+
+    #[cfg(feature = "official-kernel")]
+    async fn execute_official_plan(
+        plan: Arc<crate::planning::DeltaScanPlan>,
+    ) -> Result<Vec<RecordBatch>, DeltaReaderError> {
+        let execution = DeltaScanExecution::new(Arc::clone(&plan));
+        let executor = official_kernel_file_executor(&plan);
+        let mut batches = Vec::new();
+        for partition in 0..plan.partitions.len() {
+            let mut stream = execution.partition_stream(
+                partition,
+                Arc::new(|_| Ok(FileAdmission::Admit)),
+                Arc::clone(&executor),
+            )?;
+            while let Some(batch) = stream.next().await {
+                batches.push(batch?);
+            }
+        }
+        Ok(batches)
+    }
+
+    fn int32_ids(batches: &[RecordBatch]) -> Result<Vec<i32>, &'static str> {
+        batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .map(|ids| ids.values().to_vec())
+                    .ok_or("expected Int32 ids")
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|ids| ids.into_iter().flatten().collect())
     }
 
     async fn gated_file_reader(
@@ -2459,6 +2634,693 @@ mod tests {
             buffered_metrics.parquet_data_file_opened_bytes,
             direct_metrics.parquet_data_file_opened_bytes
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_matches_native_for_transform_relative_dv_and_controls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-native-relative-dv-parity")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_dv_table(&root, &parquet_bytes)?;
+
+        let native_plan = pipeline_plan_for_backend(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::NativeAsync,
+            false,
+        )?;
+        let native = execute_pipeline_plan(native_plan).await?;
+        let official_default_plan = pipeline_plan_for_backend(
+            &root,
+            None,
+            None,
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        let official_default_metrics = official_default_plan.metrics.clone();
+        let official_default = execute_official_plan(official_default_plan).await?;
+        let official_tuned_plan = pipeline_plan_for_backend(
+            &root,
+            Some(parquet_bytes.len()),
+            Some(1),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        let official_tuned_metrics = official_tuned_plan.metrics.clone();
+        let official_tuned = execute_official_plan(official_tuned_plan).await?;
+
+        let rows = |batches: &[RecordBatch]| -> Result<Vec<(i32, String)>, &'static str> {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or("expected Int32 ids")?;
+                let regions = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or("expected Utf8 regions")?;
+                rows.extend(
+                    (0..batch.num_rows())
+                        .map(|index| (ids.value(index), regions.value(index).to_owned())),
+                );
+            }
+            Ok(rows)
+        };
+        let expected = vec![
+            (1, "west".to_owned()),
+            (2, "west".to_owned()),
+            (3, "west".to_owned()),
+            (4, "west".to_owned()),
+            (6, "west".to_owned()),
+        ];
+        assert_eq!(rows(&native)?, expected);
+        assert_eq!(rows(&official_default)?, expected);
+        assert_eq!(rows(&official_tuned)?, expected);
+        assert!(
+            native
+                .iter()
+                .chain(official_default.iter())
+                .chain(official_tuned.iter())
+                .all(|batch| batch.schema().fields()[0].name() == "id"
+                    && batch.schema().fields()[1].name() == "region")
+        );
+        let expected_batches = u64::try_from(official_default.len())?;
+        assert_eq!(official_tuned.len(), official_default.len());
+
+        for metrics in [
+            official_default_metrics.snapshot(),
+            official_tuned_metrics.snapshot(),
+        ] {
+            assert_eq!(metrics.reader_backend, DeltaReaderBackend::OfficialKernel);
+            assert_eq!(metrics.scan_partitions_started, 1);
+            assert_eq!(metrics.scan_partitions_completed, 1);
+            assert_eq!(metrics.files_started, 1);
+            assert_eq!(metrics.files_completed, 1);
+            assert_eq!(metrics.batches_produced, expected_batches);
+            assert_eq!(metrics.rows_produced, 5);
+            assert_eq!(metrics.deletion_vector_payloads_loaded, 1);
+            assert_eq!(metrics.deletion_vectors_applied, 1);
+            assert_eq!(metrics.deletion_vector_rows_deleted, 1);
+            assert_eq!(metrics.parquet_data_file_range_get_operations, None);
+            assert_eq!(metrics.parquet_data_file_full_get_operations, None);
+            assert_eq!(metrics.parquet_data_file_bytes_received, None);
+            assert_eq!(metrics.parquet_data_file_opened_bytes, None);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_dv_predicate_fallback_preserves_rows_for_residual_filtering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-dv-predicate-fallback")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_dv_table(&root, &parquet_bytes)?;
+
+        let native = execute_pipeline_plan(pipeline_plan_for_backend(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::NativeAsync,
+            true,
+        )?)
+        .await?;
+        let official = execute_official_plan(pipeline_plan_for_backend(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            true,
+        )?)
+        .await?;
+        let ids = |batches: &[RecordBatch]| -> Result<Vec<i32>, &'static str> {
+            batches
+                .iter()
+                .map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .map(|ids| ids.values().to_vec())
+                        .ok_or("expected Int32 ids")
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|ids| ids.into_iter().flatten().collect())
+        };
+        let native_ids = ids(&native)?;
+        let official_ids = ids(&official)?;
+
+        assert_eq!(native_ids, [4, 6]);
+        assert_eq!(official_ids, [1, 2, 3, 4, 6]);
+        assert_eq!(
+            official_ids
+                .into_iter()
+                .filter(|id| *id > 3)
+                .collect::<Vec<_>>(),
+            native_ids
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_matches_native_for_snapshots_projection_and_non_dv_predicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-native-snapshot-predicate-parity")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_non_dv_table(&root, &parquet_bytes)?;
+
+        for selection in [
+            DeltaSnapshotSelection::Latest,
+            DeltaSnapshotSelection::Version(0),
+        ] {
+            let native = execute_pipeline_plan(pipeline_plan_for_backend_at(
+                &root,
+                None,
+                Some(64 * 1024),
+                DeltaReaderBackend::NativeAsync,
+                true,
+                selection,
+                1,
+            )?)
+            .await?;
+            let official = execute_official_plan(pipeline_plan_for_backend_at(
+                &root,
+                Some(parquet_bytes.len()),
+                Some(1),
+                DeltaReaderBackend::OfficialKernel,
+                true,
+                selection,
+                1,
+            )?)
+            .await?;
+
+            assert_eq!(int32_ids(&native)?, [4, 5, 6]);
+            assert_eq!(int32_ids(&official)?, [4, 5, 6]);
+            assert!(
+                native
+                    .iter()
+                    .chain(official.iter())
+                    .all(|batch| batch.schema().field(0).name() == "id"
+                        && batch.schema().field(1).name() == "region")
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_matches_native_for_partition_statistics_and_zero_file_predicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-native-pruning-parity")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let west = parquet_bytes_for(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(1..=6))],
+        )?;
+        let east = parquet_bytes_for(schema, vec![Arc::new(Int32Array::from_iter_values(7..=12))])?;
+        write_partitioned_non_dv_table(&root, &west)?;
+        add_second_partition_file(&root, &east)?;
+
+        let cases = [
+            (
+                Predicate::eq(
+                    Expression::Column(ColumnName::new(["region"])),
+                    Expression::Literal(Scalar::String("east".to_owned())),
+                ),
+                (7..=12).collect::<Vec<_>>(),
+                1,
+            ),
+            (
+                Predicate::lt(
+                    Expression::Column(ColumnName::new(["id"])),
+                    Expression::Literal(Scalar::Integer(7)),
+                ),
+                (1..=6).collect(),
+                1,
+            ),
+            (
+                Predicate::gt(
+                    Expression::Column(ColumnName::new(["id"])),
+                    Expression::Literal(Scalar::Integer(100)),
+                ),
+                Vec::new(),
+                0,
+            ),
+        ];
+
+        for (predicate, expected, expected_files) in cases {
+            let native_plan = predicate_pipeline_plan_for_backend(
+                &root,
+                DeltaReaderBackend::NativeAsync,
+                predicate.clone(),
+            )?;
+            let official_plan = predicate_pipeline_plan_for_backend(
+                &root,
+                DeltaReaderBackend::OfficialKernel,
+                predicate,
+            )?;
+            for plan in [&native_plan, &official_plan] {
+                assert_eq!(
+                    plan.partitions
+                        .iter()
+                        .map(|partition| partition.file_tasks.len())
+                        .sum::<usize>(),
+                    expected_files
+                );
+            }
+            let native = execute_pipeline_plan(native_plan).await?;
+            let official = execute_official_plan(official_plan).await?;
+            assert_eq!(int32_ids(&native)?, expected);
+            assert_eq!(int32_ids(&official)?, expected);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_matches_native_for_inline_deletion_vectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-native-inline-dv-parity")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes =
+            parquet_bytes_for(schema, vec![Arc::new(Int32Array::from_iter_values(1..=30))])?;
+        write_partitioned_inline_dv_table(&root, &parquet_bytes)?;
+
+        let native = execute_pipeline_plan(pipeline_plan_for_backend(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::NativeAsync,
+            false,
+        )?)
+        .await?;
+        let official = execute_official_plan(pipeline_plan_for_backend(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?)
+        .await?;
+        let expected = (1..=30)
+            .filter(|id| ![4, 5, 8, 12, 19, 30].contains(id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(int32_ids(&native)?, expected);
+        assert_eq!(int32_ids(&official)?, expected);
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_matches_native_for_empty_and_multiple_partitions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty_root = TestDir::new("official-native-empty-parity")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let empty_bytes = parquet_bytes_for(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        )?;
+        write_partitioned_non_dv_table(&empty_root, &empty_bytes)?;
+        remove_all_data_files_from_log(&empty_root)?;
+        let native_empty_plan = pipeline_plan_for_backend_at(
+            &empty_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::NativeAsync,
+            false,
+            DeltaSnapshotSelection::Latest,
+            2,
+        )?;
+        let official_empty_plan = pipeline_plan_for_backend_at(
+            &empty_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+            DeltaSnapshotSelection::Latest,
+            2,
+        )?;
+        assert!(native_empty_plan.partitions.is_empty());
+        assert!(official_empty_plan.partitions.is_empty());
+        let official_empty_metrics = official_empty_plan.metrics.clone();
+        assert!(execute_pipeline_plan(native_empty_plan).await?.is_empty());
+        assert!(execute_official_plan(official_empty_plan).await?.is_empty());
+        assert_eq!(official_empty_metrics.snapshot().scan_partitions_started, 0);
+        assert_eq!(official_empty_metrics.snapshot().files_started, 0);
+
+        let root = TestDir::new("official-native-multi-partition-parity")?;
+        let west = parquet_bytes_for(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(1..=6))],
+        )?;
+        let east = parquet_bytes_for(schema, vec![Arc::new(Int32Array::from_iter_values(7..=12))])?;
+        write_partitioned_non_dv_table(&root, &west)?;
+        add_second_partition_file(&root, &east)?;
+        let native_plan = pipeline_plan_for_backend_at(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::NativeAsync,
+            false,
+            DeltaSnapshotSelection::Latest,
+            2,
+        )?;
+        let official_first_plan = pipeline_plan_for_backend_at(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+            DeltaSnapshotSelection::Latest,
+            2,
+        )?;
+        let official_second_plan = pipeline_plan_for_backend_at(
+            &root,
+            Some(east.len()),
+            Some(1),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+            DeltaSnapshotSelection::Latest,
+            2,
+        )?;
+        assert_eq!(native_plan.partitions.len(), 2);
+        assert_eq!(official_first_plan.partitions.len(), 2);
+        assert_eq!(official_second_plan.partitions.len(), 2);
+
+        let official_first_metrics = official_first_plan.metrics.clone();
+        let official_second_metrics = official_second_plan.metrics.clone();
+        let native = execute_pipeline_plan(native_plan).await?;
+        let (official_first, official_second) = tokio::try_join!(
+            execute_official_plan(official_first_plan),
+            execute_official_plan(official_second_plan)
+        )?;
+        assert_eq!(int32_ids(&native)?, int32_ids(&official_first)?);
+        assert_eq!(int32_ids(&official_first)?, int32_ids(&official_second)?);
+        assert_eq!(int32_ids(&official_first)?.len(), 12);
+        for metrics in [
+            official_first_metrics.snapshot(),
+            official_second_metrics.snapshot(),
+        ] {
+            assert_eq!(metrics.scan_partitions_started, 2);
+            assert_eq!(metrics.scan_partitions_completed, 2);
+            assert_eq!(metrics.files_started, 2);
+            assert_eq!(metrics.files_completed, 2);
+            assert_eq!(metrics.rows_produced, 12);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_partition_drop_before_first_poll_starts_no_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-drop-before-poll")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes =
+            parquet_bytes_for(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
+        write_partitioned_non_dv_table(&root, &parquet_bytes)?;
+        let plan = pipeline_plan_for_backend(
+            &root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        let execution = DeltaScanExecution::new(Arc::clone(&plan));
+        let stream = execution.partition_stream(
+            0,
+            Arc::new(|_| Ok(FileAdmission::Admit)),
+            official_kernel_file_executor(&plan),
+        )?;
+
+        drop(stream);
+        tokio::task::yield_now().await;
+        let metrics = plan.metrics.snapshot();
+        assert_eq!(metrics.scan_partitions_started, 0);
+        assert_eq!(metrics.scan_partitions_completed, 0);
+        assert_eq!(metrics.files_started, 0);
+        assert_eq!(metrics.files_completed, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_matches_native_for_column_mapping_transform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("official-native-column-mapping-parity")?;
+        let field = Field::new("phys_id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_owned(),
+            "1".to_owned(),
+        )]));
+        let parquet_bytes = parquet_bytes_for(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        fs::write(root.path().join("part.parquet"), &parquet_bytes)?;
+        let log = root.path().join("_delta_log");
+        fs::create_dir_all(&log)?;
+        let protocol = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping"],
+                "writerFeatures": ["columnMapping"]
+            }
+        });
+        let schema = serde_json::json!({
+            "type": "struct",
+            "fields": [{
+                "name": "id",
+                "type": "integer",
+                "nullable": false,
+                "metadata": {
+                    "delta.columnMapping.id": 1,
+                    "delta.columnMapping.physicalName": "phys_id"
+                }
+            }]
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "official-native-column-mapping-parity",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema.to_string(),
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "name",
+                    "delta.columnMapping.maxColumnId": "1"
+                },
+                "createdTime": 1587968585495_i64
+            }
+        });
+        let add = serde_json::json!({
+            "add": {
+                "path": "part.parquet",
+                "partitionValues": {},
+                "size": parquet_bytes.len(),
+                "modificationTime": 1587968586000_i64,
+                "dataChange": true
+            }
+        });
+        fs::write(
+            log.join("00000000000000000000.json"),
+            format!("{protocol}\n{metadata}\n{add}\n"),
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &root.path().to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let plan = |backend| {
+            plan_scan(
+                &snapshot,
+                None,
+                &[],
+                None,
+                false,
+                DeltaReaderExecutionOptions::new().with_reader_backend(backend)?,
+                DeltaScanPartitionTargetOptions {
+                    explicit_target_partitions: Some(1),
+                    caller_target_partitions: None,
+                },
+            )
+            .map(Arc::new)
+        };
+        let native = execute_pipeline_plan(plan(DeltaReaderBackend::NativeAsync)?).await?;
+        let official = execute_official_plan(plan(DeltaReaderBackend::OfficialKernel)?).await?;
+
+        assert_eq!(int32_ids(&native)?, [1, 2, 3]);
+        assert_eq!(int32_ids(&official)?, [1, 2, 3]);
+        assert!(
+            native
+                .iter()
+                .chain(official.iter())
+                .all(|batch| batch.schema().field(0).name() == "id")
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "official-kernel")]
+    #[tokio::test]
+    async fn official_kernel_reports_redacted_file_dv_transform_and_schema_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let assert_failed_metrics = |metrics: &crate::DeltaReadMetricsSnapshot,
+                                     deletion_vector_failures| {
+            assert_eq!(metrics.scan_partitions_started, 1);
+            assert_eq!(metrics.scan_partitions_completed, 0);
+            assert_eq!(metrics.files_started, 1);
+            assert_eq!(metrics.files_completed, 0);
+            assert_eq!(metrics.batches_produced, 0);
+            assert_eq!(metrics.rows_produced, 0);
+            assert_eq!(metrics.deletion_vector_failures, deletion_vector_failures);
+            assert_eq!(metrics.parquet_data_file_range_get_operations, None);
+            assert_eq!(metrics.parquet_data_file_full_get_operations, None);
+            assert_eq!(metrics.parquet_data_file_bytes_received, None);
+            assert_eq!(metrics.parquet_data_file_opened_bytes, None);
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_for(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+
+        let metadata_root = TestDir::new("official-metadata-failure")?;
+        write_partitioned_non_dv_table(&metadata_root, &parquet_bytes)?;
+        let mut metadata_plan = pipeline_plan_for_backend(
+            &metadata_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        Arc::get_mut(&mut metadata_plan)
+            .ok_or("expected unique metadata plan")?
+            .partitions[0]
+            .file_tasks[0]
+            .estimated_bytes = None;
+        let metadata_metrics = metadata_plan.metrics.clone();
+        let error = execute_official_plan(metadata_plan)
+            .await
+            .expect_err("missing size must fail");
+        assert_eq!(error.as_str(), "data_file_read");
+        assert_failed_metrics(&metadata_metrics.snapshot(), 0);
+        assert!(
+            !error
+                .to_string()
+                .contains(metadata_root.path().to_string_lossy().as_ref())
+        );
+
+        let parquet_root = TestDir::new("official-parquet-failure")?;
+        write_partitioned_non_dv_table(&parquet_root, &parquet_bytes)?;
+        let parquet_plan = pipeline_plan_for_backend(
+            &parquet_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        let parquet_metrics = parquet_plan.metrics.clone();
+        fs::write(
+            parquet_root.path().join("part.parquet"),
+            vec![0; parquet_bytes.len()],
+        )?;
+        let error = execute_official_plan(parquet_plan)
+            .await
+            .expect_err("corrupt Parquet must fail");
+        assert_eq!(error.as_str(), "data_file_read");
+        assert_failed_metrics(&parquet_metrics.snapshot(), 0);
+        assert!(!error.to_string().contains("part.parquet"));
+
+        let dv_root = TestDir::new("official-dv-failure")?;
+        write_partitioned_dv_table(&dv_root, &parquet_bytes)?;
+        let dv_plan = pipeline_plan_for_backend(
+            &dv_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        let dv_metrics = dv_plan.metrics.clone();
+        fs::remove_file(dv_root.path().join(DV_FILE))?;
+        let error = execute_official_plan(dv_plan)
+            .await
+            .expect_err("missing DV must fail");
+        assert_eq!(error.as_str(), "deletion_vector_read");
+        assert_failed_metrics(&dv_metrics.snapshot(), 1);
+
+        let transform_root = TestDir::new("official-transform-failure")?;
+        write_partitioned_non_dv_table(&transform_root, &parquet_bytes)?;
+        let mut transform_plan = pipeline_plan_for_backend(
+            &transform_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        Arc::get_mut(&mut transform_plan)
+            .ok_or("expected unique transform plan")?
+            .partitions[0]
+            .file_tasks[0]
+            .transform = KernelPhysicalToLogicalTransform::from_test_expression(
+            Expression::Column(ColumnName::new(["sensitive_missing_column"])),
+        );
+        let transform_metrics = transform_plan.metrics.clone();
+        let error = execute_official_plan(transform_plan)
+            .await
+            .expect_err("invalid transform must fail");
+        assert_eq!(error.as_str(), "physical_to_logical_transform");
+        assert_failed_metrics(&transform_metrics.snapshot(), 0);
+        assert!(!error.to_string().contains("sensitive_missing_column"));
+
+        let schema_root = TestDir::new("official-schema-failure")?;
+        write_partitioned_non_dv_table(&schema_root, &parquet_bytes)?;
+        let mut schema_plan = pipeline_plan_for_backend(
+            &schema_root,
+            None,
+            Some(64 * 1024),
+            DeltaReaderBackend::OfficialKernel,
+            false,
+        )?;
+        Arc::get_mut(&mut schema_plan)
+            .ok_or("expected unique schema plan")?
+            .logical_schema = Arc::new(Schema::empty());
+        let schema_metrics = schema_plan.metrics.clone();
+        let error = execute_official_plan(schema_plan)
+            .await
+            .expect_err("wrong logical schema must fail");
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=data_file_read error=data_file_read reason=backend_logical_schema_mismatch"
+        );
+        assert_failed_metrics(&schema_metrics.snapshot(), 0);
         Ok(())
     }
 

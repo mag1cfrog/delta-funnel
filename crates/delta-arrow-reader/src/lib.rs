@@ -14,6 +14,9 @@ mod native_async_reader;
 #[cfg(feature = "native-async")]
 #[allow(dead_code)]
 mod native_async_row_group_pruning;
+#[cfg(feature = "official-kernel")]
+#[allow(dead_code)]
+mod official_kernel_reader;
 mod partition_target;
 mod planning;
 mod predicate;

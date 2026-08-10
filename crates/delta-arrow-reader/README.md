@@ -4,8 +4,8 @@ This is the temporary staging crate for extracting Delta Funnel's read-only
 Delta Lake to Arrow implementation. It currently contains the reader foundation,
 snapshot and protocol loading, deletion-vector handling, predicates, scan
 planning, partition grouping, backend-neutral scheduling, and the private
-NativeAsync Parquet file executor. It is not published or used by Delta Funnel
-production code.
+NativeAsync and OfficialKernel file executors. It is not published or used by
+Delta Funnel production code.
 
 The crate exists only on the
 [`refactor/delta-arrow-reader-staging`](https://github.com/mag1cfrog/delta-funnel/tree/refactor/delta-arrow-reader-staging)
@@ -14,9 +14,8 @@ owns this scaffold, and
 [issue #447](https://github.com/mag1cfrog/delta-funnel/issues/447) owns the
 extraction lifecycle.
 
-No public table-loading or scan-stream API exists yet. The OfficialKernel file
-reader, direct API, and DataFusion integration belong to later #447-family
-issues.
+No public table-loading or scan-stream API exists yet. The direct API and
+DataFusion integration belong to later #447-family issues.
 
 ## Validate the staging crate
 
@@ -28,6 +27,8 @@ cargo check -p delta-arrow-reader --no-default-features --all-targets
 cargo check -p delta-arrow-reader --all-features --all-targets
 cargo clippy -p delta-arrow-reader --all-targets --all-features -- -D warnings
 cargo test -p delta-arrow-reader --no-default-features
+cargo test -p delta-arrow-reader --no-default-features --features official-kernel
+cargo test -p delta-arrow-reader --features official-kernel
 cargo test -p delta-arrow-reader --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc -p delta-arrow-reader --all-features --no-deps
 cargo package -p delta-arrow-reader --allow-dirty

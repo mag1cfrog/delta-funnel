@@ -83,6 +83,13 @@ pub(crate) struct KernelScanSchemas {
     physical: KernelSchemaRef,
 }
 
+impl KernelScanSchemas {
+    #[cfg(feature = "official-kernel")]
+    pub(crate) fn physical(&self) -> KernelSchemaRef {
+        Arc::clone(&self.physical)
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct KernelScanMetadata {
     pub(crate) files: Vec<KernelScanFileMetadata>,
@@ -108,15 +115,22 @@ impl KernelPhysicalToLogicalTransform {
         let Some(transform) = self.0.clone() else {
             return Ok(batch);
         };
+        let physical_rows = batch.num_rows();
         let data: Box<dyn delta_kernel::EngineData> = Box::new(ArrowEngineData::new(batch));
-        transform_to_logical(
+        let batch = transform_to_logical(
             engine_context.engine.as_ref(),
             data,
             &schemas.physical,
             schemas.logical.as_ref(),
             Some(transform),
         )?
-        .try_into_record_batch()
+        .try_into_record_batch()?;
+        if batch.num_rows() != physical_rows {
+            return Err(delta_kernel::Error::generic(
+                "physical-to-logical transform changed the row count",
+            ));
+        }
+        Ok(batch)
     }
 
     #[cfg(test)]
@@ -397,6 +411,11 @@ impl DeltaKernelEngineContext {
 
     pub(crate) fn table_url(&self) -> &Url {
         &self.table_url
+    }
+
+    #[cfg(feature = "official-kernel")]
+    pub(crate) fn engine(&self) -> &(dyn Engine + Send + Sync) {
+        self.engine.as_ref()
     }
 
     #[allow(dead_code)]
