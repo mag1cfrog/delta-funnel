@@ -1191,8 +1191,8 @@ mod tests {
 
     use arrow::{
         array::{
-            Array, ArrayRef, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
-            TimestampMicrosecondArray, TimestampNanosecondArray,
+            Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, ListArray, MapArray,
+            StringArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
         },
         buffer::{NullBuffer, OffsetBuffer, ScalarBuffer},
         datatypes::{DataType, Field, Schema, TimeUnit},
@@ -1578,14 +1578,40 @@ mod tests {
         root: &TestDir,
         parquet_bytes: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        write_partitioned_table(root, parquet_bytes, true)
+    }
+
+    fn write_partitioned_non_dv_table(
+        root: &TestDir,
+        parquet_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        write_partitioned_table(root, parquet_bytes, false)
+    }
+
+    fn write_partitioned_table(
+        root: &TestDir,
+        parquet_bytes: &[u8],
+        with_deletion_vector: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         fs::write(root.path().join("part.parquet"), parquet_bytes)?;
-        let mut dv_bytes = Vec::new();
-        let mut writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
-        let mut deletion_vector = KernelDeletionVector::new();
-        deletion_vector.add_deleted_row_indexes([4]);
-        let result = writer.write_deletion_vector(deletion_vector)?;
-        writer.finalize()?;
-        fs::write(root.path().join(DV_FILE), dv_bytes)?;
+        let deletion_vector = if with_deletion_vector {
+            let mut dv_bytes = Vec::new();
+            let mut writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
+            let mut deletion_vector = KernelDeletionVector::new();
+            deletion_vector.add_deleted_row_indexes([4]);
+            let result = writer.write_deletion_vector(deletion_vector)?;
+            writer.finalize()?;
+            fs::write(root.path().join(DV_FILE), dv_bytes)?;
+            Some(serde_json::json!({
+                "storageType": "u",
+                "pathOrInlineDv": DV_ID,
+                "offset": result.offset,
+                "sizeInBytes": result.size_in_bytes,
+                "cardinality": result.cardinality
+            }))
+        } else {
+            None
+        };
 
         let log = root.path().join("_delta_log");
         fs::create_dir_all(&log)?;
@@ -1620,23 +1646,18 @@ mod tests {
             "maxValues": {"id": 6},
             "nullCount": {"id": 0}
         });
-        let add = serde_json::json!({
-            "add": {
-                "path": "part.parquet",
-                "partitionValues": {"region": "west"},
-                "size": parquet_bytes.len(),
-                "modificationTime": 1587968586000_i64,
-                "dataChange": true,
-                "stats": stats.to_string(),
-                "deletionVector": {
-                    "storageType": "u",
-                    "pathOrInlineDv": DV_ID,
-                    "offset": result.offset,
-                    "sizeInBytes": result.size_in_bytes,
-                    "cardinality": result.cardinality
-                }
-            }
+        let mut add = serde_json::json!({
+            "path": "part.parquet",
+            "partitionValues": {"region": "west"},
+            "size": parquet_bytes.len(),
+            "modificationTime": 1587968586000_i64,
+            "dataChange": true,
+            "stats": stats.to_string()
         });
+        if let Some(deletion_vector) = deletion_vector {
+            add["deletionVector"] = deletion_vector;
+        }
+        let add = serde_json::json!({"add": add});
         fs::write(
             log.join("00000000000000000000.json"),
             format!("{protocol}\n{metadata}\n{add}\n"),
@@ -1666,6 +1687,29 @@ mod tests {
             Some(predicate),
             true,
             options,
+            DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(1),
+                caller_target_partitions: None,
+            },
+        )?))
+    }
+
+    fn non_dv_plan(
+        root: &TestDir,
+        projection: Option<&[String]>,
+    ) -> Result<Arc<crate::planning::DeltaScanPlan>, Box<dyn std::error::Error>> {
+        let snapshot = load_delta_table_snapshot_blocking(
+            &root.path().to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        Ok(Arc::new(plan_scan(
+            &snapshot,
+            projection,
+            &[],
+            None,
+            false,
+            DeltaReaderExecutionOptions::new(),
             DeltaScanPartitionTargetOptions {
                 explicit_target_partitions: Some(1),
                 caller_target_partitions: None,
@@ -1893,6 +1937,46 @@ mod tests {
             .expect_err("missing size must fail");
         assert_eq!(error.as_str(), "data_file_read");
         assert!(!error.to_string().contains("secret-file"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_and_reads_remote_like_memory_object_store_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table_url = url::Url::parse("memory:///table/root/")?;
+        let engine_context = Arc::new(DeltaKernelEngineContext::build(
+            table_url,
+            &DeltaStorageOptions::default(),
+        )?);
+        let store = engine_context.object_store();
+        let reader = NativeAsyncFileReader::new(
+            engine_context,
+            DeltaReaderExecutionOptions::new(),
+            metrics(),
+        );
+        let bytes = parquet_bytes()?;
+        let task = task("part-00000.parquet", Some(u64::try_from(bytes.len())?))?;
+        let object = reader.resolve_parquet_object(&task)?;
+
+        assert_eq!(object.path.as_ref(), "table/root/part-00000.parquet");
+        store.put(&object.path, bytes.into()).await?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut stream = reader
+            .open_parquet_stream(&task, schema, None, None, false)
+            .await?;
+        let batch = stream.next_batch().await?.ok_or("expected one batch")?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected Int32Array")?;
+
+        assert_eq!(ids.values(), &[1, 2, 3]);
+        assert!(stream.next_batch().await?.is_none());
         Ok(())
     }
 
@@ -2248,6 +2332,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_group_pruning_preserves_negative_fixed_len_decimal_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-row-group-negative-decimal")?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+        let amounts =
+            Decimal128Array::from(vec![Some(-100), Some(100)]).with_precision_and_scale(10, 2)?;
+        let bytes = parquet_bytes_with_properties(
+            Arc::clone(&schema),
+            vec![Arc::new(amounts)],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(1))
+                .build(),
+        )?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let predicate = DeltaKernelPredicate::from_test_predicate(Predicate::lt(
+            Expression::Column(ColumnName::new(["amount"])),
+            Expression::Literal(Scalar::decimal(0, 10, 2)?),
+        ));
+        let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
+        let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+        let mut stream = reader
+            .open_parquet_stream(&task, schema, None, Some(&predicate), false)
+            .await?;
+        let batch = stream.next_batch().await?.ok_or("expected one batch")?;
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or("expected Decimal128Array")?;
+
+        assert_eq!(amounts.values(), &[-100]);
+        assert!(stream.next_batch().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scheduler_pipeline_applies_transform_then_dv_and_preserves_hidden_columns()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = TestDir::new("native-scheduler-pipeline")?;
@@ -2332,6 +2456,57 @@ mod tests {
         assert_eq!(
             buffered_metrics.parquet_data_file_opened_bytes,
             direct_metrics.parquet_data_file_opened_bytes
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_reads_full_and_projected_non_dv_logical_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-non-dv-logical-read")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes =
+            parquet_bytes_for(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
+        write_partitioned_non_dv_table(&root, &parquet_bytes)?;
+
+        let full_plan = non_dv_plan(&root, None)?;
+        assert!(
+            !full_plan.partitions[0].file_tasks[0]
+                .deletion_vector
+                .is_present()
+        );
+        let full = execute_pipeline_plan(full_plan).await?;
+        let ids = full
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("planned Int32Array")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, [1, 2, 3]);
+        assert!(full.iter().all(|batch| {
+            batch.num_columns() == 2
+                && batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .is_some_and(|regions| {
+                        (0..regions.len()).all(|index| regions.value(index) == "west")
+                    })
+        }));
+
+        let projection = ["id".to_owned()];
+        let projected = execute_pipeline_plan(non_dv_plan(&root, Some(&projection))?).await?;
+        assert!(
+            projected
+                .iter()
+                .all(|batch| batch.num_columns() == 1 && batch.schema().field(0).name() == "id")
         );
         Ok(())
     }
