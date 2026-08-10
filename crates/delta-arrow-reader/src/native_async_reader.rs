@@ -2,13 +2,21 @@
 
 use std::sync::Arc;
 
+use arrow::{
+    array::{ArrayRef, new_null_array},
+    compute::cast,
+    datatypes::{DataType, Field, SchemaRef},
+    record_batch::RecordBatch,
+};
+use futures_util::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::{
-    ProjectionMask,
+    PARQUET_FIELD_ID_META_KEY, ProjectionMask,
     async_reader::{
         ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
     },
 };
+use parquet::schema::types::{SchemaDescriptor, TypePtr};
 use snafu::ResultExt;
 
 use crate::{
@@ -28,6 +36,46 @@ pub(crate) struct NativeAsyncParquetObject {
     pub(crate) store: Arc<dyn ObjectStore>,
     pub(crate) path: Path,
     pub(crate) file_size: u64,
+}
+
+pub(crate) struct NativeAsyncFileReadStream {
+    stream: ParquetRecordBatchStream<ParquetObjectReader>,
+    schema_match: NativeAsyncSchemaMatch,
+}
+
+#[derive(Clone)]
+struct NativeAsyncSchemaMatch {
+    provider_schema: SchemaRef,
+    projected_roots: Vec<usize>,
+    provider_columns: Vec<NativeAsyncProviderColumn>,
+    needs_batch_reshape: bool,
+}
+
+#[derive(Clone)]
+enum NativeAsyncProviderColumn {
+    ProjectedStreamColumn {
+        stream_index: usize,
+        field_plan: NativeAsyncFieldPlan,
+    },
+    Null,
+}
+
+#[derive(Clone)]
+enum NativeAsyncFieldPlan {
+    Identity,
+    Cast { target_type: DataType },
+}
+
+impl NativeAsyncFieldPlan {
+    fn is_identity(&self) -> bool {
+        matches!(self, Self::Identity)
+    }
+}
+
+#[derive(Clone)]
+struct NativeAsyncRootMatch {
+    parquet_root_index: usize,
+    field_plan: NativeAsyncFieldPlan,
 }
 
 impl NativeAsyncFileReader {
@@ -55,12 +103,12 @@ impl NativeAsyncFileReader {
         self.buffer_small_parquet_object(object).await
     }
 
-    async fn open_projected_parquet_stream(
+    async fn open_file_stream(
         &self,
         task: &DeltaScanFileTask,
-        projected_roots: &[usize],
+        provider_schema: SchemaRef,
         output_batch_size: Option<usize>,
-    ) -> Result<ParquetRecordBatchStream<ParquetObjectReader>, DeltaReaderError> {
+    ) -> Result<NativeAsyncFileReadStream, DeltaReaderError> {
         let object = self.parquet_object_for_task(task).await?;
         let reader =
             ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
@@ -74,20 +122,31 @@ impl NativeAsyncFileReader {
             .context(DataFileReadSnafu {
                 reason: "parquet_read_setup_failed",
             })?;
+        let schema_match = build_native_async_schema_match(
+            builder.parquet_schema(),
+            builder.schema(),
+            provider_schema,
+        )
+        .map_err(|error| data_file_error("parquet_schema_match_failed", error))?;
         let projection =
-            ProjectionMask::roots(builder.parquet_schema(), projected_roots.iter().copied());
+            ProjectionMask::roots(builder.parquet_schema(), schema_match.projected_roots());
         let builder = match output_batch_size {
             Some(batch_size) => builder.with_batch_size(batch_size),
             None => builder,
         };
 
-        builder
+        let stream = builder
             .with_projection(projection)
             .build()
             .boxed()
             .context(DataFileReadSnafu {
                 reason: "parquet_read_setup_failed",
-            })
+            })?;
+
+        Ok(NativeAsyncFileReadStream {
+            stream,
+            schema_match,
+        })
     }
 
     fn resolve_parquet_object(
@@ -161,6 +220,307 @@ impl NativeAsyncFileReader {
     }
 }
 
+impl NativeAsyncFileReadStream {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaReaderError> {
+        let Some(batch) = self.stream.next().await else {
+            return Ok(None);
+        };
+        let batch = batch.boxed().context(DataFileReadSnafu {
+            reason: "parquet_batch_read_failed",
+        })?;
+        if !self.schema_match.needs_batch_reshape {
+            return Ok(Some(batch));
+        }
+
+        self.schema_match
+            .reshape_batch_to_provider_schema(batch)
+            .map(Some)
+            .map_err(|error| data_file_error("parquet_batch_reshape_failed", error))
+    }
+}
+
+impl NativeAsyncSchemaMatch {
+    fn projected_roots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.projected_roots.iter().copied()
+    }
+
+    fn reshape_batch_to_provider_schema(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch, delta_kernel::Error> {
+        let columns = self
+            .provider_columns
+            .iter()
+            .zip(self.provider_schema.fields())
+            .map(|(column, field)| match column {
+                NativeAsyncProviderColumn::ProjectedStreamColumn {
+                    stream_index,
+                    field_plan,
+                } => reshape_array_to_provider_field(
+                    Arc::clone(batch.column(*stream_index)),
+                    field,
+                    field_plan,
+                ),
+                NativeAsyncProviderColumn::Null => {
+                    Ok(new_null_array(field.data_type(), batch.num_rows()))
+                }
+            })
+            .collect::<Result<Vec<ArrayRef>, _>>()?;
+
+        RecordBatch::try_new(Arc::clone(&self.provider_schema), columns)
+            .map_err(delta_kernel::Error::from)
+    }
+}
+
+fn build_native_async_schema_match(
+    parquet_schema: &SchemaDescriptor,
+    parquet_arrow_schema: &SchemaRef,
+    provider_schema: SchemaRef,
+) -> Result<NativeAsyncSchemaMatch, delta_kernel::Error> {
+    let root_matches = provider_schema
+        .fields()
+        .iter()
+        .map(|provider_field| {
+            match_provider_field_to_parquet_root(
+                provider_field,
+                parquet_schema.root_schema().get_fields(),
+                parquet_arrow_schema,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut projected_roots = root_matches
+        .iter()
+        .filter_map(|root_match| {
+            root_match
+                .as_ref()
+                .map(|root_match| root_match.parquet_root_index)
+        })
+        .collect::<Vec<_>>();
+    projected_roots.sort_unstable();
+    projected_roots.dedup();
+    let provider_columns = root_matches
+        .iter()
+        .zip(provider_schema.fields())
+        .map(|(root_match, provider_field)| match root_match {
+            Some(root_match) => projected_roots
+                .iter()
+                .position(|root| *root == root_match.parquet_root_index)
+                .map(
+                    |stream_index| NativeAsyncProviderColumn::ProjectedStreamColumn {
+                        stream_index,
+                        field_plan: root_match.field_plan.clone(),
+                    },
+                )
+                .ok_or_else(|| {
+                    delta_kernel::Error::generic("matched Parquet root was not projected")
+                }),
+            None if provider_field.is_nullable() => Ok(NativeAsyncProviderColumn::Null),
+            None => Err(delta_kernel::Error::generic(format!(
+                "non-nullable provider field '{}' is missing from the Parquet file",
+                provider_field.name()
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let needs_batch_reshape = provider_columns
+        .iter()
+        .zip(provider_schema.fields())
+        .enumerate()
+        .any(|(provider_index, (column, provider_field))| match column {
+            NativeAsyncProviderColumn::ProjectedStreamColumn {
+                stream_index,
+                field_plan,
+            } => {
+                *stream_index != provider_index
+                    || !field_plan.is_identity()
+                    || projected_roots
+                        .get(*stream_index)
+                        .and_then(|root| parquet_arrow_schema.fields().get(*root))
+                        .is_none_or(|file_field| file_field.name() != provider_field.name())
+            }
+            NativeAsyncProviderColumn::Null => true,
+        });
+
+    Ok(NativeAsyncSchemaMatch {
+        provider_schema,
+        projected_roots,
+        provider_columns,
+        needs_batch_reshape,
+    })
+}
+
+fn match_provider_field_to_parquet_root(
+    provider_field: &Field,
+    parquet_roots: &[TypePtr],
+    parquet_arrow_schema: &SchemaRef,
+) -> Result<Option<NativeAsyncRootMatch>, delta_kernel::Error> {
+    if let Some(field_id) = arrow_field_id(provider_field)? {
+        let matches = parquet_roots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, root)| (parquet_field_id(root) == Some(field_id)).then_some(index))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [index] => {
+                return Ok(Some(NativeAsyncRootMatch {
+                    parquet_root_index: *index,
+                    field_plan: build_matched_field_plan(
+                        provider_field,
+                        parquet_arrow_schema.field(*index),
+                        provider_field.name(),
+                    )?,
+                }));
+            }
+            [] => {}
+            _ => {
+                return Err(delta_kernel::Error::generic(format!(
+                    "multiple Parquet fields matched provider field id {field_id}"
+                )));
+            }
+        }
+    }
+
+    let Some((index, file_field)) = parquet_arrow_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, file_field)| file_field.name() == provider_field.name())
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(NativeAsyncRootMatch {
+        parquet_root_index: index,
+        field_plan: build_matched_field_plan(provider_field, file_field, provider_field.name())?,
+    }))
+}
+
+fn build_matched_field_plan(
+    provider_field: &Field,
+    file_field: &Field,
+    path: &str,
+) -> Result<NativeAsyncFieldPlan, delta_kernel::Error> {
+    if file_field
+        .data_type()
+        .equals_datatype(provider_field.data_type())
+    {
+        return Ok(NativeAsyncFieldPlan::Identity);
+    }
+    if matches!(
+        provider_field.data_type(),
+        DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _)
+    ) || matches!(
+        file_field.data_type(),
+        DataType::Struct(_) | DataType::List(_) | DataType::Map(_, _)
+    ) {
+        return Err(incompatible_parquet_type(
+            path,
+            provider_field.data_type(),
+            file_field.data_type(),
+        ));
+    }
+
+    native_async_leaf_cast_plan(provider_field.data_type(), file_field.data_type())
+        .map(|target_type| match target_type {
+            Some(target_type) => NativeAsyncFieldPlan::Cast { target_type },
+            None => NativeAsyncFieldPlan::Identity,
+        })
+        .map_err(|()| {
+            incompatible_parquet_type(path, provider_field.data_type(), file_field.data_type())
+        })
+}
+
+fn incompatible_parquet_type(
+    path: &str,
+    provider_type: &DataType,
+    file_type: &DataType,
+) -> delta_kernel::Error {
+    delta_kernel::Error::generic(format!(
+        "provider field '{path}' expected Parquet type {provider_type} but found {file_type}"
+    ))
+}
+
+fn native_async_leaf_cast_plan(
+    provider_type: &DataType,
+    file_type: &DataType,
+) -> Result<Option<DataType>, ()> {
+    use DataType::{Date32, Decimal128, Float32, Float64, Int8, Int16, Int32, Int64, Timestamp};
+
+    if file_type.equals_datatype(provider_type) {
+        return Ok(None);
+    }
+    match (file_type, provider_type) {
+        (Timestamp(_, _), Timestamp(_, _)) => Ok(Some(provider_type.clone())),
+        (Int8, Int16 | Int32 | Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Int16, Int32 | Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Int32, Int64 | Float64) => Ok(Some(provider_type.clone())),
+        (Float32, Float64) => Ok(Some(provider_type.clone())),
+        (source_type, Decimal128(precision, scale))
+            if native_async_can_upcast_to_decimal(source_type, *precision, *scale) =>
+        {
+            Ok(Some(provider_type.clone()))
+        }
+        (Date32, Timestamp(_, None)) => Ok(Some(provider_type.clone())),
+        (Int32, Date32) => Ok(Some(provider_type.clone())),
+        (Int64, Timestamp(arrow::datatypes::TimeUnit::Microsecond, _)) => {
+            Ok(Some(provider_type.clone()))
+        }
+        _ => Err(()),
+    }
+}
+
+fn native_async_can_upcast_to_decimal(
+    source_type: &DataType,
+    target_precision: u8,
+    target_scale: i8,
+) -> bool {
+    use DataType::{Decimal128, Int8, Int16, Int32, Int64};
+
+    let (source_precision, source_scale) = match source_type {
+        Decimal128(precision, scale) => (*precision, *scale),
+        Int8 => (3, 0),
+        Int16 => (5, 0),
+        Int32 => (10, 0),
+        Int64 => (20, 0),
+        _ => return false,
+    };
+    target_precision >= source_precision
+        && target_scale >= source_scale
+        && target_precision - source_precision >= (target_scale - source_scale) as u8
+}
+
+fn arrow_field_id(field: &Field) -> Result<Option<i32>, delta_kernel::Error> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .map(|field_id| {
+            field_id.parse::<i32>().map_err(|error| {
+                delta_kernel::Error::generic(format!(
+                    "invalid provider field id metadata on '{}': {error}",
+                    field.name()
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn parquet_field_id(parquet_field: &TypePtr) -> Option<i32> {
+    let basic_info = parquet_field.get_basic_info();
+    basic_info.has_id().then(|| basic_info.id())
+}
+
+fn reshape_array_to_provider_field(
+    array: ArrayRef,
+    _provider_field: &Field,
+    field_plan: &NativeAsyncFieldPlan,
+) -> Result<ArrayRef, delta_kernel::Error> {
+    match field_plan {
+        NativeAsyncFieldPlan::Identity => Ok(array),
+        NativeAsyncFieldPlan::Cast { target_type } => {
+            cast(array.as_ref(), target_type).map_err(delta_kernel::Error::from)
+        }
+    }
+}
+
 fn data_file_error(
     reason: &'static str,
     source: impl std::error::Error + Send + Sync + 'static,
@@ -182,14 +542,16 @@ mod tests {
     };
 
     use arrow::{
-        array::{Array, Int32Array, StringArray},
-        datatypes::{DataType, Field, Schema},
+        array::{
+            Array, ArrayRef, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+            TimestampNanosecondArray,
+        },
+        datatypes::{DataType, Field, Schema, TimeUnit},
         record_batch::RecordBatch,
     };
     use delta_kernel::scan::state::{DvInfo, ScanFile};
-    use futures_util::StreamExt;
     use object_store::ObjectStoreExt;
-    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use super::{NativeAsyncFileReader, data_file_error};
     use crate::{
@@ -271,21 +633,35 @@ mod tests {
         Ok(task)
     }
 
+    fn parquet_bytes_for(
+        schema: Arc<Schema>,
+        columns: Vec<ArrayRef>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
+        writer.write(&batch)?;
+        Ok(writer.into_inner()?)
+    }
+
     fn parquet_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
+        parquet_bytes_for(
+            schema,
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
                 Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
             ],
-        )?;
-        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
-        writer.write(&batch)?;
-        Ok(writer.into_inner()?)
+        )
+    }
+
+    fn field_with_id(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_owned(),
+            id.to_string(),
+        )]))
     }
 
     #[tokio::test]
@@ -377,12 +753,13 @@ mod tests {
         fs::write(root.path().join("part.parquet"), &bytes)?;
         let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
         let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+        let provider_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let mut stream = reader
-            .open_projected_parquet_stream(&task, &[1], Some(2))
+            .open_file_stream(&task, provider_schema, Some(2))
             .await?;
         let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch?);
+        while let Some(batch) = stream.next_batch().await? {
+            batches.push(batch);
         }
 
         assert_eq!(
@@ -423,8 +800,12 @@ mod tests {
                 DeltaReaderExecutionOptions::new().with_parquet_metadata_size_hint(hint)?;
             let reader = reader(&root, options, metrics.clone())?;
             let task = task("part.parquet", Some(file_size))?;
+            let provider_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
             let _stream = reader
-                .open_projected_parquet_stream(&task, &[0, 1], None)
+                .open_file_stream(&task, provider_schema, None)
                 .await?;
             snapshots.push(metrics.snapshot());
         }
@@ -442,6 +823,119 @@ mod tests {
                 .parquet_data_file_bytes_received
                 .map(|bytes| bytes + 1)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matches_top_level_fields_by_id_reorders_casts_and_null_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-top-level-schema-match")?;
+        let file_schema = Arc::new(Schema::new(vec![
+            field_with_id("stale_name", DataType::Utf8, true, 2),
+            field_with_id("stale_id", DataType::Int32, false, 1),
+        ]));
+        let bytes = parquet_bytes_for(
+            file_schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let provider_schema = Arc::new(Schema::new(vec![
+            field_with_id("id", DataType::Int64, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
+            Field::new("added", DataType::Utf8, true),
+        ]));
+        let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
+        let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+        let mut stream = reader
+            .open_file_stream(&task, provider_schema, None)
+            .await?;
+        let batch = stream.next_batch().await?.ok_or("expected one batch")?;
+
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "added"]
+        );
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or("expected cast Int64Array")?
+                .values(),
+            &[1, 2, 3]
+        );
+        assert_eq!(batch.column(2).null_count(), 3);
+        assert!(stream.next_batch().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn casts_top_level_timestamp_and_rejects_incompatible_or_missing_required_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-top-level-casts")?;
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "event_ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let bytes = parquet_bytes_for(
+            file_schema,
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                Some(1_704_067_200_000_000_000),
+                None,
+            ]))],
+        )?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
+        let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+        let timestamp_schema = Arc::new(Schema::new(vec![Field::new(
+            "event_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+        let mut stream = reader
+            .open_file_stream(&task, timestamp_schema, None)
+            .await?;
+        let batch = stream.next_batch().await?.ok_or("expected one batch")?;
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or("expected TimestampMicrosecondArray")?;
+        assert_eq!(timestamps.timezone(), Some("UTC"));
+        assert_eq!(timestamps.value(0), 1_704_067_200_000_000);
+        assert!(timestamps.is_null(1));
+
+        for provider_schema in [
+            Arc::new(Schema::new(vec![Field::new(
+                "event_ts",
+                DataType::Utf8,
+                true,
+            )])),
+            Arc::new(Schema::new(vec![Field::new(
+                "required",
+                DataType::Int32,
+                false,
+            )])),
+        ] {
+            let error = match reader.open_file_stream(&task, provider_schema, None).await {
+                Ok(_) => return Err("unsupported schema must fail".into()),
+                Err(error) => error,
+            };
+            assert_eq!(error.as_str(), "data_file_read");
+            assert_eq!(
+                error.to_string(),
+                "delta reader error: phase=data_file_read error=data_file_read reason=parquet_schema_match_failed"
+            );
+        }
         Ok(())
     }
 }
