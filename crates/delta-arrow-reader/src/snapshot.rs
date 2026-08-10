@@ -43,6 +43,10 @@ impl LoadedDeltaTableSnapshot {
         Arc::clone(&self.schema)
     }
 
+    pub(crate) fn schema_ref(&self) -> &SchemaRef {
+        &self.schema
+    }
+
     pub(crate) fn engine_context(&self) -> &Arc<DeltaKernelEngineContext> {
         &self.engine_context
     }

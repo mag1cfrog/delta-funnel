@@ -65,6 +65,7 @@ publish the candidate package.
 | OfficialKernel file-correctness portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `reader_backend.rs` | `crates/delta-arrow-reader/src/official_kernel_reader.rs`, `src/deletion_vector.rs`, and `src/kernel.rs` | #465 |
 | OfficialKernel blocking-producer portions of `crates/delta-funnel/src/query_engine/datafusion/execution/scheduling.rs` and `planning_exec.rs` | `crates/delta-arrow-reader/src/official_kernel_reader.rs` over `src/scheduling.rs` | #465 |
 | OfficialKernel metric-availability portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #465 |
+| Direct table-loading, scan-building, and Arrow stream composition over the extracted services | `crates/delta-arrow-reader/src/direct.rs` | #466 |
 
 ## Test migration
 
@@ -84,8 +85,8 @@ publish the candidate package.
   metadata prefetch, per-file buffering, physical projection and schema
   matching, conservative row-group pruning, original row indexes, DV and
   transform pipeline, cancellation, resource lifetime, errors, and focused
-  scheduler integration assertions. Public direct certification remains with
-  #482, and DataFusion adaptation and certification remain with #483.
+  scheduler integration assertions. Full public direct certification remains
+  with #482, and DataFusion adaptation and certification remain with #483.
 - #465 ports OfficialKernel data-file reads, the bounded blocking handoff,
   projection, predicates, transforms, ordered DV masking, capability fallback,
   cancellation-safe cleanup, errors, metrics availability, and focused parity
@@ -100,5 +101,7 @@ publish the candidate package.
   locally rather than retaining the old adapter outcomes.
 - DataFusion expression translation, including `IN`, `BETWEEN`, casts, and
   qualified-expression rejection, remains with #467. Scan-level pruning and
-  residual integration remain with #463 and #466 because those layers do not
-  exist in the staged crate yet.
+  residual integration are covered by #463 and #466.
+- #466 adds external signature and deterministic end-to-end tests for the
+  direct load, projection, predicate, limit, partition merge, backend parity,
+  error, drop, redaction, and retained-metrics contracts.

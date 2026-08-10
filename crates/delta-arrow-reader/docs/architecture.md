@@ -23,7 +23,7 @@ published package.
 
 ## Current boundary
 
-Through #465, this crate owns reader configuration, errors, metrics, immutable
+Through #466, this crate owns reader configuration, errors, metrics, immutable
 snapshot/protocol/schema loading, deletion-vector handling, exact logical
 predicates, scan metadata and transforms, deterministic partition planning,
 backend-neutral bounded scheduling, and the private NativeAsync and
@@ -38,7 +38,13 @@ direct and DataFusion surfaces. Dropping a scan stops future scheduling and
 closes the handoff deterministically, but already-running synchronous Kernel
 dependency work can finish only at its next safe handoff boundary.
 
-The crate does not yet contain a public table-loading or scan-stream API,
-DataFusion integration, production routing, or a compatibility facade. Later
+The public direct API composes those services into an immutable table handle,
+a single-use scan plan, and a pull-driven Arrow batch stream. It applies exact
+residual predicates, removes hidden predicate columns, enforces a global output
+limit, merges partitions deterministically, and keeps scan metrics accessible
+after stream drop.
+
+The crate does not yet contain DataFusion integration, production routing, or
+a compatibility facade. Later
 [#447-family issues](https://github.com/mag1cfrog/delta-funnel/issues/447) own
 those remaining boundaries.

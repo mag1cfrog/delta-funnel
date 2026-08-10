@@ -1,14 +1,18 @@
 use std::error::Error as _;
 
+use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use delta_arrow_reader::{
-    DeltaComparison, DeltaPredicate, DeltaProtocolInfo, DeltaReadMetrics, DeltaReadMetricsSnapshot,
-    DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase,
-    DeltaScalar, DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
+    DeltaBatchStream, DeltaComparison, DeltaPredicate, DeltaProtocolInfo, DeltaReadMetrics,
+    DeltaReadMetricsSnapshot, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
+    DeltaReaderPhase, DeltaScalar, DeltaScan, DeltaScanBuilder,
+    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSnapshotSelection,
-    DeltaStorageOptions, delta_scan_partition_target_local_environment_diagnostic,
+    DeltaStorageOptions, DeltaTable, DeltaTableBuilder,
+    delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic,
 };
+use futures_util::Stream;
 
 #[test]
 fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> {
@@ -171,4 +175,100 @@ fn exact_predicate_model_is_public() {
     ];
     assert_eq!(predicates, predicates.clone());
     assert!(format!("{predicates:?}").contains("Compare"));
+}
+
+#[test]
+fn direct_reader_contract_is_public() {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_batch_stream<T: Stream<Item = Result<RecordBatch, DeltaReaderError>>>() {}
+    const fn table_version(table: &DeltaTable) -> u64 {
+        table.version()
+    }
+    const fn scan_partition_count(scan: &DeltaScan) -> usize {
+        scan.partition_count()
+    }
+
+    assert_send_sync::<DeltaTable>();
+    assert_send::<DeltaBatchStream>();
+    assert_batch_stream::<DeltaBatchStream>();
+
+    let builder = DeltaTableBuilder::new("file:///tmp/table")
+        .with_storage_options(DeltaStorageOptions::new())
+        .with_snapshot_selection(DeltaSnapshotSelection::Version(1))
+        .with_execution_options(DeltaReaderExecutionOptions::new());
+    let _: DeltaTableBuilder = builder;
+    let load: fn(DeltaTableBuilder) -> Result<DeltaTable, DeltaReaderError> =
+        DeltaTableBuilder::load;
+    let _ = load;
+    let _ = DeltaTableBuilder::load_async;
+
+    let version: fn(&DeltaTable) -> u64 = DeltaTable::version;
+    let schema: for<'a> fn(&'a DeltaTable) -> &'a SchemaRef = DeltaTable::schema;
+    let protocol: for<'a> fn(&'a DeltaTable) -> &'a DeltaProtocolInfo = DeltaTable::protocol;
+    let table_uri: for<'a> fn(&'a DeltaTable) -> &'a str = DeltaTable::table_uri;
+    let validate_protocol: fn(&DeltaTable) -> Result<(), DeltaReaderError> =
+        DeltaTable::validate_protocol;
+    let scan: for<'a> fn(&'a DeltaTable) -> DeltaScanBuilder<'a> = DeltaTable::scan;
+    let _ = (
+        version,
+        table_version,
+        schema,
+        protocol,
+        table_uri,
+        validate_protocol,
+        scan,
+    );
+
+    fn configure_scan<'a>(
+        builder: DeltaScanBuilder<'a>,
+        predicate: DeltaPredicate,
+        options: DeltaReaderExecutionOptions,
+    ) -> Result<DeltaScanBuilder<'a>, DeltaReaderError> {
+        builder
+            .with_projection(vec!["id".into()])
+            .with_predicate(predicate)
+            .with_limit(1)
+            .with_target_partitions(1)?
+            .with_execution_options(options)
+    }
+    let _ = configure_scan;
+    let _ = DeltaScanBuilder::build;
+
+    let scan_schema: for<'a> fn(&'a DeltaScan) -> &'a SchemaRef = DeltaScan::schema;
+    let partition_count: fn(&DeltaScan) -> usize = DeltaScan::partition_count;
+    let _ = (
+        scan_schema,
+        partition_count,
+        scan_partition_count,
+        DeltaScan::execute,
+    );
+
+    let stream_schema: for<'a> fn(&'a DeltaBatchStream) -> &'a SchemaRef = DeltaBatchStream::schema;
+    let metrics: fn(&DeltaBatchStream) -> DeltaReadMetrics = DeltaBatchStream::metrics;
+    let _ = (stream_schema, metrics);
+}
+
+#[cfg(not(feature = "native-async"))]
+#[test]
+fn disabled_native_backend_fails_before_uri_access() {
+    let error = DeltaTableBuilder::new("this URI must never be inspected")
+        .load()
+        .expect_err("disabled default backend must fail");
+    assert_eq!(error.phase(), DeltaReaderPhase::Configuration);
+    assert_eq!(error.as_str(), "unsupported_backend");
+}
+
+#[cfg(not(feature = "official-kernel"))]
+#[test]
+fn disabled_official_backend_fails_before_uri_access() -> Result<(), DeltaReaderError> {
+    let options = DeltaReaderExecutionOptions::new()
+        .with_reader_backend(DeltaReaderBackend::OfficialKernel)?;
+    let error = DeltaTableBuilder::new("this URI must never be inspected")
+        .with_execution_options(options)
+        .load()
+        .expect_err("disabled official backend must fail");
+    assert_eq!(error.phase(), DeltaReaderPhase::Configuration);
+    assert_eq!(error.as_str(), "unsupported_backend");
+    Ok(())
 }
