@@ -224,6 +224,13 @@ fn ids(batches: &[RecordBatch]) -> Vec<i32> {
         .collect()
 }
 
+#[cfg(all(feature = "native-async", feature = "official-kernel"))]
+fn sorted_ids(batches: &[RecordBatch]) -> Vec<i32> {
+    let mut values = ids(batches);
+    values.sort_unstable();
+    values
+}
+
 #[cfg(feature = "native-async")]
 fn labels(batches: &[RecordBatch]) -> Vec<Option<String>> {
     batches
@@ -287,6 +294,29 @@ fn table_loads_match_and_public_state_is_redacted() -> TestResult {
 
 #[test]
 #[cfg(feature = "native-async")]
+fn local_end_to_end_example_reads_without_sql() -> TestResult {
+    runtime()?.block_on(async {
+        let fixture = TestTable::two_versions("local-example")?;
+        let table = DeltaTableBuilder::new(fixture.uri())
+            .with_snapshot_selection(DeltaSnapshotSelection::Version(0))
+            .load_async()
+            .await?;
+        let scan = table
+            .scan()
+            .with_projection(vec!["id".into(), "label".into()])
+            .with_limit(3)
+            .build()
+            .await?;
+        let (batches, _) = collect_scan(scan).await?;
+
+        assert_eq!(ids(&batches), [1, 2, 3]);
+        println!("read 3 rows from deterministic Delta snapshot 0");
+        Ok::<_, Box<dyn Error>>(())
+    })
+}
+
+#[test]
+#[cfg(feature = "native-async")]
 fn unsupported_protocol_is_inspectable_but_never_scannable() -> TestResult {
     let fixture = TestTable::unsupported("unsupported")?;
     let table = DeltaTableBuilder::new(fixture.uri()).load()?;
@@ -298,6 +328,12 @@ fn unsupported_protocol_is_inspectable_but_never_scannable() -> TestResult {
     let build = runtime()?.block_on(table.scan().build());
     let error = match build {
         Ok(_) => panic!("unsupported protocol built a scan"),
+        Err(error) => error,
+    };
+    assert_eq!(error.phase(), DeltaReaderPhase::Protocol);
+    let build = runtime()?.block_on(table.scan().with_projection(vec!["missing".into()]).build());
+    let error = match build {
+        Ok(_) => panic!("unsupported protocol built another scan"),
         Err(error) => error,
     };
     assert_eq!(error.phase(), DeltaReaderPhase::Protocol);
@@ -449,6 +485,29 @@ fn projection_predicate_limit_partition_and_metrics_contracts_hold() -> TestResu
         assert_eq!(zero_snapshot.files_started, 0);
         assert_eq!(zero_snapshot.batches_produced, 0);
 
+        let early_options = DeltaReaderExecutionOptions::new()
+            .with_native_async_prefetch_file_count_per_partition(0)?
+            .with_max_concurrent_file_reads_per_partition(1)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?
+            .with_output_buffer_capacity_per_partition(1)?;
+        let early = table
+            .scan()
+            .with_target_partitions(1)?
+            .with_execution_options(early_options)?
+            .with_limit(1)
+            .build()
+            .await?;
+        let (early_batches, early_metrics) = collect_scan(early).await?;
+        assert_eq!(ids(&early_batches), full_ids[..1]);
+        let early_snapshot = early_metrics.snapshot();
+        assert_eq!(early_snapshot.files_planned, 2);
+        assert_eq!(early_snapshot.files_started, 1);
+        assert_eq!(early_snapshot.files_completed, 0);
+        assert_eq!(early_snapshot.batches_produced, 1);
+        assert_eq!(early_snapshot.rows_produced, 2);
+        tokio::task::yield_now().await;
+        assert_eq!(early_metrics.snapshot(), early_snapshot);
+
         let error = match table.scan().with_target_partitions(0) {
             Ok(_) => panic!("zero partition target was accepted"),
             Err(error) => error,
@@ -522,10 +581,12 @@ fn official_kernel_matches_native_direct_results() -> TestResult {
             )
             .load_async()
             .await?;
+        let official_options = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(DeltaReaderBackend::OfficialKernel)?;
         let predicate = DeltaPredicate::Compare {
             column: "id".into(),
             op: DeltaComparison::GtEq,
-            value: DeltaScalar::Int32(3),
+            value: DeltaScalar::Int32(5),
         };
         let native_scan = native
             .scan()
@@ -544,13 +605,54 @@ fn official_kernel_matches_native_direct_results() -> TestResult {
         let (native_batches, native_metrics) = collect_scan(native_scan).await?;
         let (official_batches, official_metrics) = collect_scan(official_scan).await?;
 
-        assert_eq!(ids(&official_batches), ids(&native_batches));
+        assert_eq!(sorted_ids(&native_batches), [5, 6, 7, 8]);
+        assert_eq!(sorted_ids(&official_batches), sorted_ids(&native_batches));
+        assert_eq!(native_metrics.snapshot().files_planned, 1);
+        assert_eq!(official_metrics.snapshot().files_planned, 1);
         assert_eq!(
             native_metrics.snapshot().reader_backend,
             DeltaReaderBackend::NativeAsync
         );
         assert_eq!(
             official_metrics.snapshot().reader_backend,
+            DeltaReaderBackend::OfficialKernel
+        );
+
+        let residual = DeltaPredicate::Compare {
+            column: "score".into(),
+            op: DeltaComparison::Eq,
+            value: DeltaScalar::Float64(-0.0),
+        };
+        let native_residual = native
+            .scan()
+            .with_projection(vec!["id".into()])
+            .with_predicate(residual.clone())
+            .build()
+            .await?;
+        let official_residual = official
+            .scan()
+            .with_projection(vec!["id".into()])
+            .with_predicate(residual)
+            .build()
+            .await?;
+        let (native_residual, native_residual_metrics) = collect_scan(native_residual).await?;
+        let (official_residual, official_residual_metrics) =
+            collect_scan(official_residual).await?;
+        assert_eq!(sorted_ids(&native_residual), [1]);
+        assert_eq!(sorted_ids(&official_residual), sorted_ids(&native_residual));
+        assert_eq!(native_residual_metrics.snapshot().rows_produced, 8);
+        assert_eq!(official_residual_metrics.snapshot().rows_produced, 8);
+
+        let per_scan_override = native
+            .scan()
+            .with_projection(vec!["id".into()])
+            .with_execution_options(official_options)?
+            .build()
+            .await?;
+        let (override_batches, override_metrics) = collect_scan(per_scan_override).await?;
+        assert_eq!(sorted_ids(&override_batches), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            override_metrics.snapshot().reader_backend,
             DeltaReaderBackend::OfficialKernel
         );
         Ok::<_, Box<dyn Error>>(())

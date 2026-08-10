@@ -325,6 +325,25 @@ impl<'table> DeltaScanBuilder<'table> {
 }
 
 /// One immutable, single-use direct Delta scan plan.
+///
+/// A scan cannot be cloned or executed twice.
+///
+/// ```compile_fail
+/// use delta_arrow_reader::DeltaScan;
+///
+/// async fn execute_twice(scan: DeltaScan) {
+///     let _ = scan.execute().await;
+///     let _ = scan.execute().await;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use delta_arrow_reader::DeltaScan;
+///
+/// fn clone_scan(scan: DeltaScan) {
+///     let _ = scan.clone();
+/// }
+/// ```
 pub struct DeltaScan {
     plan: Arc<DeltaScanPlan>,
     predicate: Option<DeltaPredicate>,
@@ -387,6 +406,17 @@ impl DeltaScan {
 }
 
 /// Pull-driven stream of finalized logical Arrow batches from one Delta scan.
+///
+/// The stream has no inherent whole-result collection method. Callers that
+/// intentionally materialize a result must opt into a stream extension trait.
+///
+/// ```compile_fail
+/// use delta_arrow_reader::DeltaBatchStream;
+///
+/// fn collect_without_opt_in(stream: DeltaBatchStream) {
+///     let _ = stream.collect();
+/// }
+/// ```
 pub struct DeltaBatchStream {
     schema: SchemaRef,
     metrics: DeltaReadMetrics,
@@ -677,27 +707,55 @@ fn trace_execution_dropped(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::VecDeque,
+        future::pending,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
+    use arrow::{
+        array::Int32Array,
+        datatypes::{DataType, Field, Schema, SchemaRef},
+        record_batch::RecordBatch,
+    };
+    use futures_util::{FutureExt, StreamExt, stream};
+    use tokio::{sync::Notify, time::timeout};
     use tracing::{
-        Event, Metadata, Subscriber,
+        Event, Level, Metadata, Subscriber,
         span::{Attributes, Id, Record},
-        subscriber::with_default,
+        subscriber::{Interest, with_default},
     };
 
     use super::{
-        trace_execution_completed, trace_execution_dropped, trace_execution_failed,
-        trace_execution_started, trace_planning_completed, trace_planning_failed,
-        trace_planning_started,
+        DeltaBatchStream, trace_execution_completed, trace_execution_dropped,
+        trace_execution_failed, trace_execution_started, trace_planning_completed,
+        trace_planning_failed, trace_planning_started,
     };
-    use crate::{DeltaReaderBackend, error::InvalidConfigurationSnafu};
+    use crate::{
+        DeltaReadMetrics, DeltaReaderBackend, DeltaReaderExecutionOptions,
+        error::InvalidConfigurationSnafu,
+        metrics::DeltaReadMetricsConfig,
+        scheduling::{
+            FileAdmission, FileAdmissionFn, FileBatchStream, FileExecutor, FileReadPermit,
+            PartitionStream, ScanCancellation, ScanReadLimiter,
+        },
+    };
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct EventFields(Arc<Mutex<Vec<Vec<String>>>>);
 
     impl Subscriber for EventFields {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
+        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+            if metadata.target() == "delta_arrow_reader" && *metadata.level() == Level::DEBUG {
+                Interest::always()
+            } else {
+                Interest::sometimes()
+            }
+        }
+
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "delta_arrow_reader" && *metadata.level() == Level::DEBUG
         }
 
         fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
@@ -725,13 +783,169 @@ mod tests {
         fn exit(&self, _span: &Id) {}
     }
 
+    struct ControlledMerge {
+        stream: DeltaBatchStream,
+        limiter: Arc<ScanReadLimiter>,
+        cancellation: ScanCancellation,
+        metrics: DeltaReadMetrics,
+        first_partition_gate: Arc<Notify>,
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn batch(id: i32) -> RecordBatch {
+        RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(vec![id]))])
+            .expect("valid test batch")
+    }
+
+    fn batch_id(batch: &RecordBatch) -> i32 {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id")
+            .value(0)
+    }
+
+    fn execution_options() -> Result<DeltaReaderExecutionOptions, crate::DeltaReaderError> {
+        DeltaReaderExecutionOptions::new()
+            .with_native_async_prefetch_file_count_per_partition(0)?
+            .with_max_concurrent_file_reads_per_partition(1)?
+            .with_max_concurrent_file_reads_per_scan(Some(2))?
+            .with_output_buffer_capacity_per_partition(1)
+    }
+
+    fn metrics() -> DeltaReadMetrics {
+        DeltaReadMetrics::new(DeltaReadMetricsConfig {
+            snapshot_version: 7,
+            reader_backend: DeltaReaderBackend::NativeAsync,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: 2,
+            files_planned: 2,
+            files_filtered_during_planning: Some(0),
+            estimated_rows: Some(4),
+            estimated_bytes: Some(4),
+        })
+    }
+
+    fn file_stream(permit: FileReadPermit, batches: Vec<RecordBatch>) -> FileBatchStream {
+        Box::pin(stream::unfold(
+            (VecDeque::from(batches), permit),
+            |(mut batches, permit)| async move {
+                batches
+                    .pop_front()
+                    .map(|batch| (Ok(batch), (batches, permit)))
+            },
+        ))
+    }
+
+    fn gated_file_stream(
+        permit: FileReadPermit,
+        batches: Vec<RecordBatch>,
+        gate: Arc<Notify>,
+    ) -> FileBatchStream {
+        Box::pin(stream::unfold(
+            (false, VecDeque::from(batches), permit, gate),
+            |(wait, mut batches, permit, gate)| async move {
+                let batch = batches.pop_front()?;
+                if wait {
+                    gate.notified().await;
+                }
+                Some((Ok(batch), (true, batches, permit, gate)))
+            },
+        ))
+    }
+
+    fn direct_stream(
+        partitions: VecDeque<PartitionStream>,
+        metrics: DeltaReadMetrics,
+    ) -> DeltaBatchStream {
+        DeltaBatchStream {
+            schema: schema(),
+            metrics,
+            partitions,
+            predicate: None,
+            projection: None,
+            remaining: None,
+            snapshot_version: 7,
+            backend: DeltaReaderBackend::NativeAsync,
+            partition_count: 2,
+            started: false,
+            done: false,
+        }
+    }
+
+    fn controlled_merge() -> Result<ControlledMerge, Box<dyn std::error::Error>> {
+        let options = execution_options()?;
+        let limiter = ScanReadLimiter::new(options, 2, 2);
+        let cancellation = ScanCancellation::new();
+        let metrics = metrics();
+        let first_partition_gate = Arc::new(Notify::new());
+        let executor: FileExecutor<i32, FileBatchStream> = {
+            let gate = Arc::clone(&first_partition_gate);
+            Arc::new(move |task, permit, _| {
+                let gate = Arc::clone(&gate);
+                async move {
+                    let batches = vec![batch(task), batch(task * 2)];
+                    Ok(if task == 1 {
+                        gated_file_stream(permit, batches, gate)
+                    } else {
+                        file_stream(permit, batches)
+                    })
+                }
+                .boxed()
+            })
+        };
+        let admission: FileAdmissionFn<i32> = Arc::new(|_: &i32| Ok(FileAdmission::Admit));
+        let first = PartitionStream::new(
+            vec![1],
+            limiter.partition(0)?,
+            options,
+            admission.clone(),
+            Arc::clone(&executor),
+            metrics.clone(),
+            cancellation.clone(),
+        );
+        let second = PartitionStream::new(
+            vec![10],
+            limiter.partition(1)?,
+            options,
+            admission,
+            executor,
+            metrics.clone(),
+            cancellation.clone(),
+        );
+
+        Ok(ControlledMerge {
+            stream: direct_stream(VecDeque::from([first, second]), metrics.clone()),
+            limiter,
+            cancellation,
+            metrics,
+            first_partition_gate,
+        })
+    }
+
+    async fn wait_for_batches(metrics: &DeltaReadMetrics, expected: u64) {
+        timeout(Duration::from_secs(5), async {
+            while metrics.snapshot().batches_produced < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("batch production reached expected bound");
+    }
+
     #[test]
     fn lifecycle_tracing_has_only_bounded_fields() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let subscriber = EventFields(Arc::clone(&events));
         let error = InvalidConfigurationSnafu { reason: "test" }.build();
 
+        let _ = tracing::subscriber::set_global_default(EventFields::default());
         with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
             trace_planning_started(7, DeltaReaderBackend::NativeAsync);
             trace_planning_completed(7, DeltaReaderBackend::NativeAsync, 2);
             trace_planning_failed(7, DeltaReaderBackend::NativeAsync, &error);
@@ -740,6 +954,7 @@ mod tests {
             trace_execution_failed(7, DeltaReaderBackend::NativeAsync, 2, &error);
             trace_execution_dropped(7, DeltaReaderBackend::NativeAsync, 2);
         });
+        tracing::callsite::rebuild_interest_cache();
 
         let events = events.lock().expect("event lock");
         assert_eq!(events.len(), 7);
@@ -760,5 +975,131 @@ mod tests {
             assert!(fields.contains(&"partition_count".to_owned()));
             assert!(fields.contains(&"outcome".to_owned()));
         }
+    }
+
+    #[tokio::test]
+    async fn merged_stream_is_ordered_and_bounds_later_partition_queues()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ControlledMerge {
+            mut stream,
+            limiter,
+            metrics,
+            first_partition_gate,
+            ..
+        } = controlled_merge()?;
+
+        let first = stream.next().await.ok_or("first batch missing")??;
+        assert_eq!(batch_id(&first), 1);
+        wait_for_batches(&metrics, 2).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metrics.snapshot().batches_produced, 2);
+        assert_eq!(limiter.active_file_reads(), 2);
+
+        first_partition_gate.notify_one();
+        let mut ids = vec![batch_id(
+            &stream.next().await.ok_or("second batch missing")??,
+        )];
+        while let Some(batch) = stream.next().await {
+            ids.push(batch_id(&batch?));
+        }
+        assert_eq!(ids, [2, 10, 20]);
+        assert_eq!(metrics.snapshot().batches_produced, 4);
+        assert_eq!(metrics.snapshot().scan_partitions_completed, 2);
+        assert_eq!(limiter.active_file_reads(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_stream_drop_cancels_blocked_partitions_and_releases_permits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ControlledMerge {
+            mut stream,
+            limiter,
+            cancellation,
+            metrics,
+            ..
+        } = controlled_merge()?;
+
+        let first = stream.next().await.ok_or("first batch missing")??;
+        assert_eq!(batch_id(&first), 1);
+        wait_for_batches(&metrics, 2).await;
+        assert_eq!(limiter.active_file_reads(), 2);
+        drop(stream);
+
+        assert!(cancellation.is_cancelled());
+        timeout(Duration::from_secs(5), async {
+            while limiter.active_file_reads() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(metrics.snapshot().batches_produced, 2);
+        assert_eq!(metrics.snapshot().scan_partitions_completed, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_stream_forwards_one_concurrent_error_and_releases_permits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = execution_options()?;
+        let limiter = ScanReadLimiter::new(options, 2, 2);
+        let cancellation = ScanCancellation::new();
+        let metrics = metrics();
+        let executor: FileExecutor<i32, FileBatchStream> = Arc::new(|task, permit, _| {
+            async move {
+                Ok(if task == 1 {
+                    Box::pin(stream::once(async move {
+                        let _permit = permit;
+                        pending::<Result<RecordBatch, crate::DeltaReaderError>>().await
+                    })) as FileBatchStream
+                } else {
+                    Box::pin(stream::once(async move {
+                        let _permit = permit;
+                        Err(InvalidConfigurationSnafu {
+                            reason: "controlled_partition_failure",
+                        }
+                        .build())
+                    })) as FileBatchStream
+                })
+            }
+            .boxed()
+        });
+        let admission = Arc::new(|_: &i32| Ok(FileAdmission::Admit));
+        let first = PartitionStream::new(
+            vec![1],
+            limiter.partition(0)?,
+            options,
+            admission.clone(),
+            Arc::clone(&executor),
+            metrics.clone(),
+            cancellation.clone(),
+        );
+        let second = PartitionStream::new(
+            vec![2],
+            limiter.partition(1)?,
+            options,
+            admission,
+            executor,
+            metrics.clone(),
+            cancellation.clone(),
+        );
+        let mut stream = direct_stream(VecDeque::from([first, second]), metrics);
+
+        let error = timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or("error item missing")?
+            .expect_err("controlled partition must fail");
+        assert_eq!(error.as_str(), "invalid_configuration");
+        assert!(stream.next().await.is_none());
+        assert!(cancellation.is_cancelled());
+        timeout(Duration::from_secs(5), async {
+            while limiter.active_file_reads() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
     }
 }

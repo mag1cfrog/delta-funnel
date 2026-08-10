@@ -1,4 +1,4 @@
-use std::error::Error as _;
+use std::{error::Error as _, future::Future};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use delta_arrow_reader::{
@@ -181,7 +181,9 @@ fn exact_predicate_model_is_public() {
 fn direct_reader_contract_is_public() {
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_clone<T: Clone>() {}
     fn assert_batch_stream<T: Stream<Item = Result<RecordBatch, DeltaReaderError>>>() {}
+    fn assert_future<T>(_: impl Future<Output = T>) {}
     const fn table_version(table: &DeltaTable) -> u64 {
         table.version()
     }
@@ -190,6 +192,7 @@ fn direct_reader_contract_is_public() {
     }
 
     assert_send_sync::<DeltaTable>();
+    assert_clone::<DeltaTable>();
     assert_send::<DeltaBatchStream>();
     assert_batch_stream::<DeltaBatchStream>();
 
@@ -197,11 +200,10 @@ fn direct_reader_contract_is_public() {
         .with_storage_options(DeltaStorageOptions::new())
         .with_snapshot_selection(DeltaSnapshotSelection::Version(1))
         .with_execution_options(DeltaReaderExecutionOptions::new());
-    let _: DeltaTableBuilder = builder;
+    assert_future::<Result<DeltaTable, DeltaReaderError>>(builder.load_async());
     let load: fn(DeltaTableBuilder) -> Result<DeltaTable, DeltaReaderError> =
         DeltaTableBuilder::load;
     let _ = load;
-    let _ = DeltaTableBuilder::load_async;
 
     let version: fn(&DeltaTable) -> u64 = DeltaTable::version;
     let schema: for<'a> fn(&'a DeltaTable) -> &'a SchemaRef = DeltaTable::schema;
@@ -232,17 +234,16 @@ fn direct_reader_contract_is_public() {
             .with_target_partitions(1)?
             .with_execution_options(options)
     }
+    fn assert_scan_futures(builder: DeltaScanBuilder<'_>, scan: DeltaScan) {
+        assert_future::<Result<DeltaScan, DeltaReaderError>>(builder.build());
+        assert_future::<Result<DeltaBatchStream, DeltaReaderError>>(scan.execute());
+    }
     let _ = configure_scan;
-    let _ = DeltaScanBuilder::build;
+    let _ = assert_scan_futures;
 
     let scan_schema: for<'a> fn(&'a DeltaScan) -> &'a SchemaRef = DeltaScan::schema;
     let partition_count: fn(&DeltaScan) -> usize = DeltaScan::partition_count;
-    let _ = (
-        scan_schema,
-        partition_count,
-        scan_partition_count,
-        DeltaScan::execute,
-    );
+    let _ = (scan_schema, partition_count, scan_partition_count);
 
     let stream_schema: for<'a> fn(&'a DeltaBatchStream) -> &'a SchemaRef = DeltaBatchStream::schema;
     let metrics: fn(&DeltaBatchStream) -> DeltaReadMetrics = DeltaBatchStream::metrics;

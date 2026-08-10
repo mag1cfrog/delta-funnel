@@ -49,6 +49,13 @@ while let Some(batch) = batches.try_next().await? {
 # }
 ```
 
+Run the deterministic local end-to-end example, which creates its own Delta
+table and reads it through only the public API:
+
+```console
+cargo test -p delta-arrow-reader --test direct_reader local_end_to_end_example_reads_without_sql -- --exact --nocapture
+```
+
 ## Validate the staging crate
 
 Run these commands from the Delta Funnel repository root:
