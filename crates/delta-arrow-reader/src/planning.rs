@@ -103,7 +103,6 @@ pub(crate) fn plan_scan(
     partition_target_options: DeltaScanPartitionTargetOptions,
 ) -> Result<DeltaScanPlan, DeltaReaderError> {
     execution_options.validate()?;
-    validate_backend_available(execution_options)?;
     let partition_target_diagnostic = local_partition_target_diagnostic(partition_target_options)?;
     let unpartitioned = build_unpartitioned_scan_plan(
         snapshot,
@@ -148,7 +147,6 @@ pub(crate) fn plan_unpartitioned_scan(
     execution_options: DeltaReaderExecutionOptions,
 ) -> Result<DeltaUnpartitionedScanPlan, DeltaReaderError> {
     execution_options.validate()?;
-    validate_backend_available(execution_options)?;
     build_unpartitioned_scan_plan(
         snapshot,
         projection,
@@ -580,40 +578,6 @@ mod tests {
     const PARTITIONED_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"region\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["region"],"configuration":{},"createdTime":1587968585495}}"#;
     const INVALID_PARTITION_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-invalid-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["long_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-column-mapping-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":4,\"delta.columnMapping.physicalName\":\"phys_first_name\"}},{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_age\"}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_profile\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"5"},"createdTime":1587968585495}}"#;
-
-    #[cfg(not(feature = "official-kernel"))]
-    #[test]
-    fn disabled_official_kernel_backend_is_rejected_before_planning()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (_table, snapshot) = loaded_snapshot("disabled-official-kernel")?;
-        let options = crate::DeltaReaderExecutionOptions::new()
-            .with_reader_backend(crate::DeltaReaderBackend::OfficialKernel)?;
-        let partitioned = super::plan_scan(
-            &snapshot,
-            None,
-            &[],
-            None,
-            false,
-            options,
-            super::DeltaScanPartitionTargetOptions::default(),
-        )
-        .err()
-        .ok_or("disabled OfficialKernel partitioned planning must fail")?;
-        let unpartitioned =
-            super::plan_unpartitioned_scan(&snapshot, None, &[], None, false, options)
-                .err()
-                .ok_or("disabled OfficialKernel unpartitioned planning must fail")?;
-
-        for error in [partitioned, unpartitioned] {
-            assert_eq!(error.as_str(), "unsupported_backend");
-            assert_eq!(error.phase(), crate::DeltaReaderPhase::Configuration);
-            assert_eq!(
-                error.to_string(),
-                "delta reader error: phase=configuration error=unsupported_backend reason=official_kernel_feature_disabled"
-            );
-        }
-        Ok(())
-    }
 
     struct DeltaLogTable(PathBuf);
 

@@ -481,12 +481,6 @@ impl Drop for PartitionStream {
             return;
         }
         self.cancellation.cancel();
-        match &self.state {
-            PartitionStreamState::Running { task, .. } | PartitionStreamState::Finishing(task) => {
-                task.abort()
-            }
-            PartitionStreamState::NotStarted(_) | PartitionStreamState::Done => {}
-        }
     }
 }
 

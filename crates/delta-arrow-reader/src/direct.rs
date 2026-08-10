@@ -16,7 +16,7 @@ use crate::{
     DeltaPredicate, DeltaProtocolInfo, DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError,
     DeltaReaderExecutionOptions, DeltaSnapshotSelection, DeltaStorageOptions,
     error::{DataFileReadSnafu, InvalidConfigurationSnafu, ScanPlanningSnafu},
-    kernel::delta_predicate_to_kernel_pruning,
+    kernel::{delta_predicate_kernel_pruning_is_exact, delta_predicate_to_kernel_pruning},
     planning::{
         DeltaScanPartitionTargetOptions, DeltaScanPlan, plan_scan, validate_backend_available,
     },
@@ -289,6 +289,9 @@ impl<'table> DeltaScanBuilder<'table> {
             .as_ref()
             .map(referenced_columns)
             .unwrap_or_default();
+        let enforce_physical_predicate_rows = predicate
+            .as_ref()
+            .is_some_and(delta_predicate_kernel_pruning_is_exact);
         let kernel_predicate = predicate
             .as_ref()
             .and_then(delta_predicate_to_kernel_pruning);
@@ -324,6 +327,7 @@ impl<'table> DeltaScanBuilder<'table> {
                     plan: Arc::new(plan),
                     predicate,
                     limit: self.limit,
+                    enforce_physical_predicate_rows,
                 })
             }
             Err(error) => {
@@ -359,6 +363,7 @@ pub struct DeltaScan {
     predicate: Option<DeltaPredicate>,
     limit: Option<usize>,
     partition_count: usize,
+    enforce_physical_predicate_rows: bool,
 }
 
 impl DeltaScan {
@@ -387,7 +392,13 @@ impl DeltaScan {
             let execution = DeltaScanExecution::new(Arc::clone(&self.plan));
             let admission: FileAdmissionFn<_> = Arc::new(|_| Ok(FileAdmission::Admit));
             let executor = match backend {
-                DeltaReaderBackend::NativeAsync => native_async_executor(&self.plan, None, None)?,
+                DeltaReaderBackend::NativeAsync => native_async_executor(
+                    &self.plan,
+                    None,
+                    self.enforce_physical_predicate_rows
+                        .then(|| self.plan.physical_predicate.clone())
+                        .flatten(),
+                )?,
                 DeltaReaderBackend::OfficialKernel => official_kernel_executor(&self.plan)?,
             };
             for partition in 0..partition_count {
