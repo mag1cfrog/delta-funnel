@@ -56,6 +56,11 @@ publish the candidate package.
 | Permit/environment portions of `crates/delta-funnel/src/query_engine/datafusion/execution/environment.rs` | `crates/delta-arrow-reader/src/scheduling.rs` | #481 |
 | Handoff/cancellation portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `planning_exec.rs` | `crates/delta-arrow-reader/src/scheduling.rs` and `src/planning.rs` | #481 |
 | Execution-counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` and `src/scheduling.rs` | #481 |
+| `crates/delta-funnel/src/query_engine/datafusion/execution/native_async_reader.rs` | `crates/delta-arrow-reader/src/native_async_reader.rs` | #464 |
+| `crates/delta-funnel/src/query_engine/datafusion/execution/native_async_row_group_pruning.rs` | `crates/delta-arrow-reader/src/native_async_row_group_pruning.rs` | #464 |
+| `crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs` | `crates/delta-arrow-reader/src/metered_object_store.rs` | #464 |
+| NativeAsync file-producer and default-backend portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `reader_backend.rs` | `crates/delta-arrow-reader/src/native_async_reader.rs` and `src/config.rs` | #464 |
+| NativeAsync Parquet I/O counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metered_object_store.rs`, `src/metrics.rs`, and `src/native_async_reader.rs` | #464 |
 
 ## Test migration
 
@@ -71,9 +76,14 @@ publish the candidate package.
 - #481 ports limiter, lazy admission, ordered prefetch, bounded handoff,
   first-error, cancellation, cleanup, and execution-counter assertions into
   `src/scheduling.rs` and `src/planning.rs`.
-- Parquet/backend/provider integration assertions remain in Delta Funnel for
-  #464, #465, #482, and #483. Their movable coordinate and masking assertions
-  are already covered here.
+- #464 ports the NativeAsync async Parquet reader, object-store metering,
+  metadata prefetch, per-file buffering, physical projection and schema
+  matching, conservative row-group pruning, original row indexes, DV and
+  transform pipeline, cancellation, resource lifetime, errors, and focused
+  scheduler integration assertions. DataFusion-only NativeAsync adaptation
+  remains with #482.
+- OfficialKernel and its DataFusion adaptation remain in Delta Funnel for #465
+  and #483.
 - #484 adapts the focused comparison, scalar, Boolean, null, and Kernel
   conversion assertions into the staged crate, then adds schema-validation,
   three-valued residual, pruning-parity, concurrency, and redaction coverage.
