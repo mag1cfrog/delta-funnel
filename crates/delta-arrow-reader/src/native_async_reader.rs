@@ -1203,9 +1203,10 @@ mod tests {
     };
     use futures_util::{StreamExt, stream::BoxStream};
     use object_store::{
-        CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
-        ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
-        PutResult, RenameOptions, Result as ObjectStoreResult, memory::InMemory, path::Path,
+        CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, GetResultPayload,
+        ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
+        memory::InMemory, path::Path,
     };
     use parquet::arrow::{
         ArrowWriter, PARQUET_FIELD_ID_META_KEY, ProjectionMask,
@@ -1271,6 +1272,7 @@ mod tests {
         gate_full_get: bool,
         range_target: AtomicUsize,
         fail_range_target: AtomicUsize,
+        corrupt_range_target: AtomicUsize,
         range_calls: AtomicUsize,
         started: tokio::sync::Semaphore,
         release: tokio::sync::Semaphore,
@@ -1288,6 +1290,7 @@ mod tests {
                 gate_full_get,
                 range_target: AtomicUsize::new(range_target),
                 fail_range_target: AtomicUsize::new(0),
+                corrupt_range_target: AtomicUsize::new(0),
                 range_calls: AtomicUsize::new(0),
                 started: tokio::sync::Semaphore::new(0),
                 release: tokio::sync::Semaphore::new(0),
@@ -1316,6 +1319,13 @@ mod tests {
 
         fn fail_next_range(&self) {
             self.fail_range_target.store(
+                self.range_calls.load(Ordering::Acquire) + 1,
+                Ordering::Release,
+            );
+        }
+
+        fn corrupt_next_range(&self) {
+            self.corrupt_range_target.store(
                 self.range_calls.load(Ordering::Acquire) + 1,
                 Ordering::Release,
             );
@@ -1406,7 +1416,32 @@ mod tests {
                     .forget();
                 guard.completed = true;
             }
-            self.inner.get_opts(location, options).await
+            let result = self.inner.get_opts(location, options).await?;
+            if !range_call
+                .is_some_and(|call| self.corrupt_range_target.load(Ordering::Acquire) == call)
+            {
+                return Ok(result);
+            }
+
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let mut bytes = result.bytes().await?.to_vec();
+            bytes.fill(0);
+            let chunk = PutPayload::from(bytes).into_iter().next().ok_or_else(|| {
+                ObjectStoreError::Generic {
+                    store: "gated-test-store",
+                    source: io::Error::other("missing corrupted range payload").into(),
+                }
+            })?;
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    futures_util::stream::once(async move { Ok(chunk) }).boxed(),
+                ),
+                meta,
+                range,
+                attributes,
+            })
         }
 
         fn delete_stream(
@@ -2469,6 +2504,7 @@ mod tests {
         let limiter = one_file_limiter(plan.execution_options)?;
         let partition = limiter.partition(0)?;
         let permit = partition.acquire().await?;
+        let decode_task = task.clone();
         let request = file_read_request(&plan, task, permit, ScanCancellation::new());
         let mut file = reader.open_logical_file_stream(request).await?;
         let before = plan.metrics.snapshot();
@@ -2493,7 +2529,31 @@ mod tests {
             before.parquet_data_file_bytes_received
         );
         drop(file);
-        drop(tokio::time::timeout(std::time::Duration::from_secs(5), partition.acquire()).await??);
+        let permit =
+            tokio::time::timeout(std::time::Duration::from_secs(5), partition.acquire()).await??;
+        let request = file_read_request(&plan, decode_task, permit, ScanCancellation::new());
+        let mut file = reader.open_logical_file_stream(request).await?;
+        let before = plan.metrics.snapshot();
+        gated.corrupt_next_range();
+        let error = file
+            .next_batch()
+            .await
+            .expect_err("corrupt Parquet data must fail decoding");
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=data_file_read error=data_file_read reason=parquet_batch_read_failed"
+        );
+        let after = plan.metrics.snapshot();
+        assert_eq!(
+            after.parquet_data_file_range_get_operations,
+            before
+                .parquet_data_file_range_get_operations
+                .map(|operations| operations + 1)
+        );
+        assert!(
+            after.parquet_data_file_bytes_received > before.parquet_data_file_bytes_received,
+            "delivered corrupt bytes must remain visible after a decode error"
+        );
         Ok(())
     }
 
