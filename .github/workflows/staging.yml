@@ -49,6 +49,21 @@ jobs:
           cargo package -p delta-arrow-reader --allow-dirty
           git diff --check
 
+      - name: Check downstream consumption
+        run: cargo test -p delta-funnel --test delta_arrow_reader_downstream
+
+      - name: Check standalone copy
+        run: |
+          standalone_dir="$(mktemp -d)"
+          trap 'rm -rf "$standalone_dir"' EXIT
+          cp -R crates/delta-arrow-reader/. "$standalone_dir"
+          cd "$standalone_dir"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cargo check --all-targets --all-features
+          cargo test --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+          cargo package --allow-dirty
+
       - name: Inspect release-plz selection
         id: release-plz
         uses: release-plz/action@v0.5

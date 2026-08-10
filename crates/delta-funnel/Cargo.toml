@@ -10,6 +10,7 @@ description = "Lightweight, fast Delta Lake to SQL Server loads with DataFusion 
 readme = "../../README.md"
 keywords = ["delta", "arrow", "mssql", "sql-server"]
 categories = ["database"]
+exclude = ["tests/delta_arrow_reader_downstream.rs"]
 
 [[bin]]
 name = "delta-funnel-perfetto"
@@ -73,6 +74,7 @@ url = "2"
 zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
+delta-arrow-reader = { path = "../delta-arrow-reader", features = ["datafusion"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]

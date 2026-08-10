@@ -1351,6 +1351,7 @@ dependencies = [
  "chrono",
  "clap",
  "datafusion",
+ "delta-arrow-reader",
  "delta_kernel",
  "delta_kernel_default_engine",
  "flate2",
