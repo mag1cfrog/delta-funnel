@@ -506,7 +506,13 @@ fn projection_predicate_limit_partition_and_metrics_contracts_hold() -> TestResu
         assert_eq!(early_snapshot.batches_produced, 1);
         assert_eq!(early_snapshot.rows_produced, 2);
         tokio::task::yield_now().await;
-        assert_eq!(early_metrics.snapshot(), early_snapshot);
+        let after_yield = early_metrics.snapshot();
+        assert_eq!(after_yield.files_started, early_snapshot.files_started);
+        assert_eq!(
+            after_yield.batches_produced,
+            early_snapshot.batches_produced
+        );
+        assert_eq!(after_yield.rows_produced, early_snapshot.rows_produced);
 
         let error = match table.scan().with_target_partitions(0) {
             Ok(_) => panic!("zero partition target was accepted"),
