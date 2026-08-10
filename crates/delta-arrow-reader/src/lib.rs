@@ -8,6 +8,9 @@ mod kernel;
 #[allow(dead_code)]
 mod metered_object_store;
 mod metrics;
+#[cfg(feature = "native-async")]
+#[allow(dead_code)]
+mod native_async_reader;
 mod partition_target;
 mod planning;
 mod predicate;
