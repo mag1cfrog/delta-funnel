@@ -33,6 +33,7 @@ pub(crate) struct DataFusionFilterDecision {
 pub(crate) struct DataFusionFilterPlan {
     pub(crate) decisions: Vec<DataFusionFilterDecision>,
     pub(crate) predicate: Option<DeltaPredicate>,
+    pub(crate) row_predicate: Option<DeltaPredicate>,
     pub(crate) referenced_columns: Vec<String>,
     pub(crate) has_unresolved_predicate: bool,
 }
@@ -215,6 +216,19 @@ fn plan_filters(
         .filter_map(|decision| decision.predicate.clone())
         .collect::<Vec<_>>();
     let predicate = and_predicates(predicates);
+    let row_predicate = and_predicates(
+        decisions
+            .iter()
+            .filter(|decision| decision.pushdown == TableProviderFilterPushDown::Exact)
+            .filter(|decision| {
+                decision
+                    .referenced_columns
+                    .iter()
+                    .all(|column| !partition_columns.contains(column))
+            })
+            .filter_map(|decision| decision.predicate.clone())
+            .collect(),
+    );
     let mut referenced_columns = Vec::new();
     for column in decisions
         .iter()
@@ -248,6 +262,7 @@ fn plan_filters(
     DataFusionFilterPlan {
         decisions,
         predicate,
+        row_predicate,
         referenced_columns,
         has_unresolved_predicate,
     }
@@ -336,11 +351,10 @@ fn translate_filter_for_pushdown(
 }
 
 fn filter_column_names(filter: &Expr, schema: &Schema) -> Option<Vec<String>> {
-    if filter
-        .column_refs()
-        .iter()
-        .any(|column| column.name.starts_with("__delta_funnel_"))
-    {
+    if filter.column_refs().iter().any(|column| {
+        column.name.starts_with("__delta_arrow_reader_")
+            || column.name.starts_with("__delta_funnel_")
+    }) {
         return None;
     }
     let mut columns = filter
@@ -1253,11 +1267,13 @@ mod tests {
             plan.filters.predicate,
             Some(DeltaPredicate::And(vec![expected.clone(), expected]))
         );
+        assert!(plan.filters.row_predicate.is_none());
         assert!(plan.filters.has_unresolved_predicate);
 
         let empty = plan_scan(&schema, &HashSet::new(), None, &[], false);
         assert!(empty.filters.decisions.is_empty());
         assert!(empty.filters.predicate.is_none());
+        assert!(empty.filters.row_predicate.is_none());
         assert!(empty.filters.referenced_columns.is_empty());
         assert!(!empty.filters.has_unresolved_predicate);
     }
@@ -1392,6 +1408,7 @@ mod tests {
             );
         }
         assert!(!plan.filters.has_unresolved_predicate);
+        assert!(plan.filters.row_predicate.is_none());
         assert_eq!(
             plan.filters
                 .decisions
@@ -1506,6 +1523,7 @@ mod tests {
                 .iter()
                 .all(|pushdown| *pushdown == TableProviderFilterPushDown::Exact)
         );
+        assert!(exact.filters.row_predicate.is_some());
         assert!(!exact.filters.has_unresolved_predicate);
     }
 

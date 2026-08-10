@@ -14,7 +14,7 @@ use crate::{
     deletion_vector::DeletionVectorMetadata,
     error::{
         InvalidConfigurationSnafu, InvalidProjectionSnafu, ScanPartitionPlanningSnafu,
-        ScanPlanningSnafu,
+        ScanPlanningSnafu, UnsupportedPredicateSnafu,
     },
     kernel::{
         DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
@@ -43,6 +43,7 @@ pub(crate) struct DeltaScanPlan {
     pub(crate) logical_schema: SchemaRef,
     pub(crate) physical_schema: SchemaRef,
     pub(crate) projected_schema: SchemaRef,
+    pub(crate) partition_columns: Vec<String>,
     pub(crate) kernel_schemas: KernelScanSchemas,
     pub(crate) partitions: Vec<DeltaScanFileTaskPartition>,
     pub(crate) partition_target_diagnostic: DeltaScanPartitionTargetDiagnosticOutput,
@@ -62,6 +63,7 @@ pub(crate) struct DeltaUnpartitionedScanPlan {
     pub(crate) logical_schema: SchemaRef,
     pub(crate) physical_schema: SchemaRef,
     pub(crate) projected_schema: SchemaRef,
+    pub(crate) partition_columns: Vec<String>,
     pub(crate) kernel_schemas: KernelScanSchemas,
     pub(crate) file_tasks: Vec<DeltaScanFileTask>,
     pub(crate) scan_metadata_exhausted: bool,
@@ -112,6 +114,28 @@ pub(crate) fn plan_scan(
         execution_options,
     )?;
     finalize_scan_plan(unpartitioned, partition_target_diagnostic)
+}
+
+#[allow(dead_code)]
+pub(crate) fn plan_row_predicate(
+    snapshot: &LoadedDeltaTableSnapshot,
+    projection: Option<&[String]>,
+    hidden_columns: &[String],
+    predicate: Option<DeltaKernelPredicate>,
+) -> Result<Option<DeltaKernelPredicate>, DeltaReaderError> {
+    let Some(predicate) = predicate else {
+        return Ok(None);
+    };
+    let projection = logical_projection(snapshot.schema().as_ref(), projection, hidden_columns)?;
+    let predicate =
+        build_scan(snapshot, projection.as_deref(), Some(predicate), false)?.physical_predicate();
+    match predicate {
+        Some(predicate) => Ok(Some(predicate)),
+        None => UnsupportedPredicateSnafu {
+            reason: "exact_row_predicate_not_physical",
+        }
+        .fail(),
+    }
 }
 
 #[allow(dead_code)]
@@ -200,6 +224,7 @@ fn build_unpartitioned_scan_plan(
         logical_schema,
         physical_schema: scan.physical_schema(),
         projected_schema,
+        partition_columns: snapshot.partition_columns().to_vec(),
         kernel_schemas: scan.schemas(),
         file_tasks,
         scan_metadata_exhausted: true,
@@ -237,6 +262,7 @@ fn finalize_scan_plan(
         logical_schema: unpartitioned.logical_schema,
         physical_schema: unpartitioned.physical_schema,
         projected_schema: unpartitioned.projected_schema,
+        partition_columns: unpartitioned.partition_columns,
         kernel_schemas: unpartitioned.kernel_schemas,
         partitions,
         partition_target_diagnostic,
@@ -2153,6 +2179,57 @@ mod tests {
         );
         assert_eq!(ages.iter().collect::<Vec<_>>(), [Some(30), None]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn row_predicate_planning_maps_logical_columns_to_physical_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adds = [add("mapped.parquet", 10, Some(3))];
+        let table = DeltaLogTable::new_with_protocol_metadata_and_adds(
+            "column-mapping-row-predicate",
+            COLUMN_MAPPING_PROTOCOL_JSON,
+            COLUMN_MAPPING_METADATA_JSON,
+            &adds,
+        )?;
+        let snapshot = load_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let predicate = delta_predicate_to_kernel_pruning(&DeltaPredicate::Compare {
+            column: "id".to_owned(),
+            op: DeltaComparison::Gt,
+            value: DeltaScalar::Int32(1),
+        })
+        .ok_or("expected Kernel predicate")?;
+        let projection = ["id".to_owned()];
+        let predicate =
+            super::plan_row_predicate(&snapshot, Some(&projection), &[], Some(predicate))?
+                .ok_or("expected physical row predicate")?;
+        let plan = plan_scan(
+            &snapshot,
+            Some(&projection),
+            &[],
+            None,
+            false,
+            Default::default(),
+        )?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&plan.physical_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let selection = snapshot.engine_context().evaluate_predicate(
+            &plan.kernel_schemas,
+            &predicate,
+            batch,
+        )?;
+
+        assert_eq!(field_names(&plan.physical_schema), ["phys_id"]);
+        assert_eq!(
+            selection.iter().collect::<Vec<_>>(),
+            [Some(false), Some(true), Some(true)]
+        );
         Ok(())
     }
 

@@ -54,6 +54,10 @@ impl LoadedDeltaTableSnapshot {
     pub(crate) fn kernel_snapshot(&self) -> &KernelSnapshot {
         &self.snapshot
     }
+
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        self.snapshot.partition_columns()
+    }
 }
 
 pub(crate) fn load_delta_table_snapshot_blocking(

@@ -2,6 +2,12 @@
 
 mod config;
 #[cfg(feature = "datafusion")]
+mod datafusion_dynamic_filters;
+#[cfg(feature = "datafusion")]
+mod datafusion_dynamic_partition_pruning;
+#[cfg(feature = "datafusion")]
+mod datafusion_execution;
+#[cfg(feature = "datafusion")]
 mod datafusion_planning;
 mod deletion_vector;
 mod direct;
@@ -32,6 +38,10 @@ mod uri;
 
 pub use config::{
     DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaSnapshotSelection, DeltaStorageOptions,
+};
+#[cfg(feature = "datafusion")]
+pub use datafusion_execution::{
+    DeltaDataFusionMetrics, DeltaDataFusionMetricsSnapshot, collect_delta_datafusion_metrics,
 };
 pub use direct::{DeltaBatchStream, DeltaScan, DeltaScanBuilder, DeltaTable, DeltaTableBuilder};
 pub use error::{DeltaReaderError, DeltaReaderPhase};
