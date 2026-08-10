@@ -6,6 +6,7 @@ rust-version = "1.88"
 license = "Apache-2.0"
 publish = false
 exclude = [
+    "tests/datafusion_provider.rs",
     "tests/portable_fixtures.rs",
     "tests/support/**",
 ]

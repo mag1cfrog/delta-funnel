@@ -71,6 +71,13 @@ publish the candidate package.
 | `crates/delta-funnel/src/query_engine/datafusion/planning/filters/analysis.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` | #467 |
 | `crates/delta-funnel/src/query_engine/datafusion/planning/filters/partition_pushdown.rs` and `stats_pushdown.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` over the #484 predicate and Kernel-pruning boundary | #467 |
 | Static filter-normalization and scan-planning portions of `crates/delta-funnel/src/query_engine/datafusion/catalog/provider.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` | #467 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/dynamic_filters.rs` | `crates/delta-arrow-reader/src/datafusion_dynamic_filters.rs` | #480 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/dynamic_partition_pruning.rs` | `crates/delta-arrow-reader/src/datafusion_dynamic_partition_pruning.rs` | #480 |
+| Dynamic-filter execution portions of `crates/delta-funnel/src/query_engine/datafusion/execution/planning_exec.rs` | `crates/delta-arrow-reader/src/datafusion_execution.rs` | #480 |
+| Provider and physical-plan portions of `crates/delta-funnel/src/query_engine/datafusion/catalog/provider.rs` and `execution/planning_exec.rs` | `crates/delta-arrow-reader/src/datafusion_provider.rs` and `src/datafusion_execution.rs` | #468 |
+| Single-table registration portions of `crates/delta-funnel/src/query_engine/datafusion/catalog/registration.rs` | `crates/delta-arrow-reader/src/datafusion_provider.rs` | #468 |
+| Frozen public provider and execution fixtures | `crates/delta-arrow-reader/tests/support/real_parquet_delta_table.rs` | #469 |
+| Applicable public assertions from `catalog/provider_tests.rs`, `catalog/registration.rs`, and `execution/planning_exec.rs` | `crates/delta-arrow-reader/tests/datafusion_provider.rs` | #483 |
 
 ## Test migration
 
@@ -128,3 +135,15 @@ publish the candidate package.
   SQL plans, DataFusion error wrapping, provider statistics, and optimizer
   assertions remain with #483. Delta Funnel workflow and reporting consumers
   remain in Delta Funnel.
+- #483 inventories all 626 tests in the frozen DataFusion tree, including the
+  193 provider, 11 registration, and 102 physical-execution tests. Its external
+  provider suite preserves the applicable public SQL, projection, static and
+  dynamic filtering, residual, registration, option, metric, error,
+  cancellation, backend, and repeated-execution assertions. The exact private
+  projection and static-filter matrices remain mechanically represented by
+  #467, dynamic classification and snapshot evaluation by #480, scheduler and
+  reader mechanics by #481 and #482, and snapshot/schema behavior by #462.
+  Atomic multi-source registration and rollback, custom catalog/schema routing,
+  profiling, operator activity, session workflow, and reporting remain Delta
+  Funnel-owned because the standalone public boundary has no corresponding
+  orchestration API.
