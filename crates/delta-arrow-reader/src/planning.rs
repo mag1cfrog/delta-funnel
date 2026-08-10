@@ -162,6 +162,13 @@ pub(crate) fn plan_unpartitioned_scan(
 pub(crate) fn validate_backend_available(
     execution_options: DeltaReaderExecutionOptions,
 ) -> Result<(), DeltaReaderError> {
+    #[cfg(not(feature = "native-async"))]
+    if execution_options.reader_backend() == crate::DeltaReaderBackend::NativeAsync {
+        return crate::error::UnsupportedBackendSnafu {
+            reason: "native_async_feature_disabled",
+        }
+        .fail();
+    }
     #[cfg(not(feature = "official-kernel"))]
     if execution_options.reader_backend() == crate::DeltaReaderBackend::OfficialKernel {
         return crate::error::UnsupportedBackendSnafu {

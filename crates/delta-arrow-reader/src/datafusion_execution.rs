@@ -554,7 +554,7 @@ fn adapter_error(reason: &'static str) -> DataFusionError {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-async"))]
 mod tests {
     use std::{
         collections::HashSet,
@@ -785,7 +785,7 @@ mod tests {
             &hidden_columns,
             row_predicate,
         )?;
-        let include_stats = kernel_predicate.is_some();
+        let include_stats = planning.filters.requires_statistics;
         let core = plan_scan(
             table.snapshot(),
             physical_projection.as_deref(),

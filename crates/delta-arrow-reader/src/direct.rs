@@ -563,13 +563,6 @@ fn validate_direct_execution_options(
 ) -> Result<(), DeltaReaderError> {
     options.validate()?;
     validate_backend_available(options)?;
-    #[cfg(not(feature = "native-async"))]
-    if options.reader_backend() == DeltaReaderBackend::NativeAsync {
-        return crate::error::UnsupportedBackendSnafu {
-            reason: "native_async_feature_disabled",
-        }
-        .fail();
-    }
     Ok(())
 }
 
