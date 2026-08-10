@@ -263,6 +263,10 @@ pub(crate) fn delta_predicate_to_kernel_pruning(
         .map(|converted| DeltaKernelPredicate(Arc::new(converted.predicate)))
 }
 
+pub(crate) fn delta_predicate_kernel_pruning_is_exact(predicate: &DeltaPredicate) -> bool {
+    convert_predicate(predicate).is_some_and(|converted| converted.exact)
+}
+
 struct ConvertedPredicate {
     predicate: Predicate,
     exact: bool,
@@ -819,5 +823,16 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn row_filtering_requires_exact_kernel_conversion() {
+        let safe = compare("id", DeltaComparison::Gt, DeltaScalar::Int32(1));
+        let unsupported = compare("score", DeltaComparison::NotEq, DeltaScalar::Float64(0.0));
+
+        assert!(delta_predicate_kernel_pruning_is_exact(&safe));
+        assert!(!delta_predicate_kernel_pruning_is_exact(
+            &DeltaPredicate::And(vec![safe, unsupported])
+        ));
     }
 }

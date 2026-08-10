@@ -117,3 +117,14 @@ publish the candidate package.
 - #466 adds external signature and deterministic end-to-end tests for the
   direct load, projection, predicate, limit, partition merge, backend parity,
   error, drop, redaction, and retained-metrics contracts.
+- #482 carries the remaining frozen direct/backend contract through the public
+  API. It preserves the 24 frozen NativeAsync/OfficialKernel equivalence cases
+  against static expected rows, plus four additional backend comparisons among
+  the nine deletion-vector predicate/boundary/failure cases. It also preserves
+  four missing-required-field failures and seven ordering/error/resource cases
+  from `planning_exec.rs`. The #469 portability test remains constructor-only;
+  #482 executes only fixtures used by those frozen cases. Focused internal
+  mechanics remain with their earlier #464, #465, #477, and #481 ports, while
+  SQL plans, DataFusion error wrapping, provider statistics, and optimizer
+  assertions remain with #483. Delta Funnel workflow and reporting consumers
+  remain in Delta Funnel.

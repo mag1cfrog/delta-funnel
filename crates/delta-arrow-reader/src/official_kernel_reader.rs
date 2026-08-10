@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
+use arrow::{compute::cast, record_batch::RecordBatch};
 use delta_kernel::{FileMeta, engine::arrow_data::EngineDataArrowExt};
 use futures_util::stream;
 use snafu::ResultExt;
@@ -145,14 +145,49 @@ fn read_file(
             .context(PhysicalToLogicalTransformSnafu {
                 reason: "physical_to_logical_transform_failed",
             })?;
-        if batch.schema().as_ref() != plan.logical_schema.as_ref() {
+        let batch = if batch.schema().as_ref() == plan.logical_schema.as_ref() {
+            batch
+        } else if batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(plan.logical_schema.fields())
+            .all(|(actual, expected)| {
+                actual.name() == expected.name()
+                    && actual.is_nullable() == expected.is_nullable()
+                    && actual.data_type().equals_datatype(expected.data_type())
+            })
+            && batch.num_columns() == plan.logical_schema.fields().len()
+        {
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(plan.logical_schema.fields())
+                .map(|(column, field)| {
+                    if column.data_type() == field.data_type() {
+                        Ok(Arc::clone(column))
+                    } else {
+                        cast(column.as_ref(), field.data_type())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .boxed()
+                .context(DataFileReadSnafu {
+                    reason: "backend_logical_schema_mismatch",
+                })?;
+            RecordBatch::try_new(Arc::clone(&plan.logical_schema), columns)
+                .boxed()
+                .context(DataFileReadSnafu {
+                    reason: "backend_logical_schema_mismatch",
+                })?
+        } else {
             return Err(data_file_error(
                 "backend_logical_schema_mismatch",
                 delta_kernel::Error::generic(
                     "OfficialKernel output does not match the planned logical schema",
                 ),
             ));
-        }
+        };
         let batch = match deletion_vector.as_mut() {
             Some(deletion_vector) => deletion_vector.mask_ordered_batch(batch)?,
             None => batch,
