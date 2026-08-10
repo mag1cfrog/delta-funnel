@@ -3,6 +3,12 @@
 use std::sync::Arc;
 
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+use parquet::arrow::{
+    ProjectionMask,
+    async_reader::{
+        ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+    },
+};
 use snafu::ResultExt;
 
 use crate::{
@@ -47,6 +53,41 @@ impl NativeAsyncFileReader {
     ) -> Result<NativeAsyncParquetObject, DeltaReaderError> {
         let object = self.resolve_parquet_object(task)?;
         self.buffer_small_parquet_object(object).await
+    }
+
+    async fn open_projected_parquet_stream(
+        &self,
+        task: &DeltaScanFileTask,
+        projected_roots: &[usize],
+        output_batch_size: Option<usize>,
+    ) -> Result<ParquetRecordBatchStream<ParquetObjectReader>, DeltaReaderError> {
+        let object = self.parquet_object_for_task(task).await?;
+        let reader =
+            ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
+        let reader = match self.execution_options.parquet_metadata_size_hint() {
+            Some(hint) => reader.with_footer_size_hint(hint),
+            None => reader,
+        };
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .boxed()
+            .context(DataFileReadSnafu {
+                reason: "parquet_read_setup_failed",
+            })?;
+        let projection =
+            ProjectionMask::roots(builder.parquet_schema(), projected_roots.iter().copied());
+        let builder = match output_batch_size {
+            Some(batch_size) => builder.with_batch_size(batch_size),
+            None => builder,
+        };
+
+        builder
+            .with_projection(projection)
+            .build()
+            .boxed()
+            .context(DataFileReadSnafu {
+                reason: "parquet_read_setup_failed",
+            })
     }
 
     fn resolve_parquet_object(
@@ -140,8 +181,15 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use arrow::{
+        array::{Array, Int32Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
     use delta_kernel::scan::state::{DvInfo, ScanFile};
+    use futures_util::StreamExt;
     use object_store::ObjectStoreExt;
+    use parquet::arrow::ArrowWriter;
 
     use super::{NativeAsyncFileReader, data_file_error};
     use crate::{
@@ -223,6 +271,23 @@ mod tests {
         Ok(task)
     }
 
+    fn parquet_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            ],
+        )?;
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
+        writer.write(&batch)?;
+        Ok(writer.into_inner()?)
+    }
+
     #[tokio::test]
     async fn resolves_table_relative_paths_and_requires_file_size()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -301,6 +366,82 @@ mod tests {
                 "{name}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn opens_projected_parquet_stream_with_configured_batch_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-projected-stream")?;
+        let bytes = parquet_bytes()?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
+        let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+        let mut stream = reader
+            .open_projected_parquet_stream(&task, &[1], Some(2))
+            .await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.schema().field(0).name() == "name")
+        );
+        let names = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("expected projected StringArray")?;
+        assert_eq!(names.value(0), "a");
+        assert!(names.is_null(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn footer_hint_controls_metadata_request_count_and_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-footer-hint")?;
+        let bytes = parquet_bytes()?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let file_size = u64::try_from(bytes.len())?;
+        let mut snapshots = Vec::new();
+
+        for hint in [Some(65_536), None, Some(9)] {
+            let metrics = metrics();
+            let options =
+                DeltaReaderExecutionOptions::new().with_parquet_metadata_size_hint(hint)?;
+            let reader = reader(&root, options, metrics.clone())?;
+            let task = task("part.parquet", Some(file_size))?;
+            let _stream = reader
+                .open_projected_parquet_stream(&task, &[0, 1], None)
+                .await?;
+            snapshots.push(metrics.snapshot());
+        }
+
+        assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(1));
+        assert_eq!(
+            snapshots[0].parquet_data_file_bytes_received,
+            Some(file_size)
+        );
+        assert_eq!(snapshots[1].parquet_data_file_range_get_operations, Some(2));
+        assert_eq!(snapshots[2].parquet_data_file_range_get_operations, Some(2));
+        assert_eq!(
+            snapshots[2].parquet_data_file_bytes_received,
+            snapshots[1]
+                .parquet_data_file_bytes_received
+                .map(|bytes| bytes + 1)
+        );
         Ok(())
     }
 }
