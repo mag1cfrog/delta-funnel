@@ -22,7 +22,6 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::{SessionConfig, SessionContext},
 };
-#[cfg(feature = "official-kernel")]
 use delta_arrow_reader::DeltaReaderBackend;
 use delta_arrow_reader::{
     DeltaDataFusionScanOptions, DeltaReaderExecutionOptions, DeltaReaderPhase, DeltaTableBuilder,
@@ -249,6 +248,38 @@ async fn options_protocol_schema_pushdown_and_debug_match_the_provider_contract(
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].source_name(), None);
 
+    let explicit_target = DeltaTableProvider::try_new(
+        table.clone(),
+        DeltaDataFusionScanOptions {
+            target_partitions: Some(1),
+            ..Default::default()
+        },
+    )?;
+    let one_partition = explicit_target
+        .scan(&context.state(), None, &[], None)
+        .await?;
+    assert_eq!(
+        one_partition
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        1
+    );
+
+    for projection in [vec![2], vec![0, 0]] {
+        let error = provider
+            .scan(&context.state(), Some(&projection), &[], None)
+            .await
+            .expect_err("invalid projection must fail");
+        let datafusion::common::DataFusionError::External(source) = error else {
+            return Err("projection error did not preserve DeltaReaderError".into());
+        };
+        let reader = source
+            .downcast_ref::<delta_arrow_reader::DeltaReaderError>()
+            .ok_or("external source was not DeltaReaderError")?;
+        assert_eq!(reader.phase(), DeltaReaderPhase::ScanPlanning);
+    }
+
     let projection = vec![1, 0];
     let projected = provider
         .scan(&context.state(), Some(&projection), &[], None)
@@ -276,7 +307,7 @@ async fn options_protocol_schema_pushdown_and_debug_match_the_provider_contract(
     );
 
     let zero_target = DeltaTableProvider::try_new(
-        table,
+        table.clone(),
         DeltaDataFusionScanOptions {
             target_partitions: Some(0),
             ..Default::default()
@@ -284,6 +315,21 @@ async fn options_protocol_schema_pushdown_and_debug_match_the_provider_contract(
     )
     .expect_err("zero target must fail");
     assert_eq!(zero_target.phase(), DeltaReaderPhase::Configuration);
+
+    #[cfg(not(feature = "official-kernel"))]
+    {
+        let execution_options = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(DeltaReaderBackend::OfficialKernel)?;
+        let unavailable = DeltaTableProvider::try_new(
+            table,
+            DeltaDataFusionScanOptions {
+                execution_options,
+                target_partitions: None,
+            },
+        )
+        .expect_err("disabled backend must fail");
+        assert_eq!(unavailable.phase(), DeltaReaderPhase::Configuration);
+    }
 
     let unsupported_fixture = TestTable::unsupported("unsupported-provider")?;
     let unsupported = DeltaTableBuilder::new(unsupported_fixture.uri()).load()?;
