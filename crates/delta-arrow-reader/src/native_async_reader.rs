@@ -1177,9 +1177,12 @@ fn data_file_error(
 mod tests {
     use std::{
         collections::HashMap,
-        fs,
+        fmt, fs, io,
         path::{Path as FsPath, PathBuf},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1192,27 +1195,41 @@ mod tests {
         datatypes::{DataType, Field, Schema, TimeUnit},
         record_batch::RecordBatch,
     };
+    use async_trait::async_trait;
     use delta_kernel::scan::state::{DvInfo, ScanFile};
     use delta_kernel::{
         actions::deletion_vector_writer::{KernelDeletionVector, StreamingDeletionVectorWriter},
         expressions::{ColumnName, Expression, Predicate, Scalar},
     };
-    use futures_util::StreamExt;
-    use object_store::ObjectStoreExt;
+    use futures_util::{StreamExt, stream::BoxStream};
+    use object_store::{
+        CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+        ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult, RenameOptions, Result as ObjectStoreResult, memory::InMemory, path::Path,
+    };
     use parquet::arrow::{
         ArrowWriter, PARQUET_FIELD_ID_META_KEY, ProjectionMask,
         arrow_reader::ParquetRecordBatchReaderBuilder,
     };
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-    use super::{NativeAsyncFileReader, data_file_error, native_async_file_executor};
+    use super::{
+        NativeAsyncFileReadRequest, NativeAsyncFileReader, data_file_error,
+        native_async_file_executor,
+    };
     use crate::{
         DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
         DeltaSnapshotSelection, DeltaStorageOptions,
-        kernel::{DeltaKernelEngineContext, DeltaKernelPredicate, KernelScanFileMetadata},
+        kernel::{
+            DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
+            KernelScanFileMetadata,
+        },
+        metered_object_store::MeteredParquetObjectStore,
         metrics::DeltaReadMetricsConfig,
         planning::{DeltaScanFileTask, DeltaScanPartitionTargetOptions, plan_scan},
-        scheduling::{DeltaScanExecution, FileAdmission},
+        scheduling::{
+            DeltaScanExecution, FileAdmission, FileReadPermit, ScanCancellation, ScanReadLimiter,
+        },
         snapshot::load_delta_table_snapshot_blocking,
     };
 
@@ -1240,6 +1257,200 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GateRequest {
+        FullGet,
+        Range(usize),
+    }
+
+    struct GatedObjectStore {
+        inner: Arc<dyn ObjectStore>,
+        gate_full_get: bool,
+        range_target: AtomicUsize,
+        fail_range_target: AtomicUsize,
+        range_calls: AtomicUsize,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl GatedObjectStore {
+        fn new(inner: Arc<dyn ObjectStore>, request: GateRequest) -> Arc<Self> {
+            let (gate_full_get, range_target) = match request {
+                GateRequest::FullGet => (true, 0),
+                GateRequest::Range(target) => (false, target),
+            };
+            Arc::new(Self {
+                inner,
+                gate_full_get,
+                range_target: AtomicUsize::new(range_target),
+                fail_range_target: AtomicUsize::new(0),
+                range_calls: AtomicUsize::new(0),
+                started: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })
+        }
+
+        async fn wait_started(&self) {
+            self.started
+                .acquire()
+                .await
+                .expect("gate remains open")
+                .forget();
+        }
+
+        fn was_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+
+        fn gate_next_range(&self) {
+            self.range_target.store(
+                self.range_calls.load(Ordering::Acquire) + 1,
+                Ordering::Release,
+            );
+        }
+
+        fn fail_next_range(&self) {
+            self.fail_range_target.store(
+                self.range_calls.load(Ordering::Acquire) + 1,
+                Ordering::Release,
+            );
+        }
+    }
+
+    impl fmt::Debug for GatedObjectStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("GatedObjectStore")
+        }
+    }
+
+    impl fmt::Display for GatedObjectStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("GatedObjectStore")
+        }
+    }
+
+    struct GateGuard {
+        cancelled: Arc<AtomicBool>,
+        completed: bool,
+    }
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GatedObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            let range_call = (!options.head)
+                .then(|| {
+                    options
+                        .range
+                        .as_ref()
+                        .map(|_| self.range_calls.fetch_add(1, Ordering::AcqRel) + 1)
+                })
+                .flatten();
+            if range_call.is_some_and(|call| self.fail_range_target.load(Ordering::Acquire) == call)
+            {
+                return Err(ObjectStoreError::Generic {
+                    store: "gated-test-store",
+                    source: io::Error::other("injected range failure").into(),
+                });
+            }
+            let should_gate = if options.head {
+                false
+            } else if let Some(call) = range_call {
+                !self.gate_full_get && self.range_target.load(Ordering::Acquire) == call
+            } else {
+                self.gate_full_get
+            };
+            if should_gate {
+                let mut guard = GateGuard {
+                    cancelled: Arc::clone(&self.cancelled),
+                    completed: false,
+                };
+                self.started.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .expect("gate remains open")
+                    .forget();
+                guard.completed = true;
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.inner.rename_opts(from, to, options).await
         }
     }
 
@@ -1436,6 +1647,65 @@ mod tests {
             batches.push(batch?);
         }
         Ok(batches)
+    }
+
+    async fn gated_file_reader(
+        plan: &Arc<crate::planning::DeltaScanPlan>,
+        parquet_bytes: &[u8],
+        gate_request: GateRequest,
+    ) -> Result<
+        (
+            Arc<NativeAsyncFileReader>,
+            Arc<GatedObjectStore>,
+            DeltaScanFileTask,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let task = plan.partitions[0].file_tasks[0].clone();
+        let mut reader = NativeAsyncFileReader::new(
+            Arc::clone(&plan.engine_context),
+            plan.execution_options,
+            plan.metrics.clone(),
+        );
+        let object = reader.resolve_parquet_object(&task)?;
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(&object.path, parquet_bytes.to_vec().into())
+            .await?;
+        let gated = GatedObjectStore::new(inner, gate_request);
+        reader.store = Arc::new(MeteredParquetObjectStore::new(
+            Arc::clone(&gated) as Arc<dyn ObjectStore>,
+            plan.metrics.clone(),
+        ));
+        Ok((Arc::new(reader), gated, task))
+    }
+
+    fn file_read_request(
+        plan: &Arc<crate::planning::DeltaScanPlan>,
+        task: DeltaScanFileTask,
+        permit: FileReadPermit,
+        cancellation: ScanCancellation,
+    ) -> NativeAsyncFileReadRequest {
+        NativeAsyncFileReadRequest {
+            task,
+            physical_schema: Arc::clone(&plan.physical_schema),
+            logical_schema: Arc::clone(&plan.logical_schema),
+            kernel_schemas: plan.kernel_schemas.clone(),
+            physical_predicate: plan.physical_predicate.clone(),
+            output_batch_size: Some(2),
+            permit,
+            cancellation,
+        }
+    }
+
+    fn one_file_limiter(
+        options: DeltaReaderExecutionOptions,
+    ) -> Result<Arc<ScanReadLimiter>, DeltaReaderError> {
+        let options = options
+            .with_native_async_prefetch_file_count_per_partition(1)?
+            .with_max_concurrent_file_reads_per_partition(1)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?;
+        Ok(ScanReadLimiter::new(options, 1, 1))
     }
 
     fn field_with_id(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
@@ -1791,6 +2061,11 @@ mod tests {
             Expression::Column(ColumnName::new(["id"])),
             Expression::Literal(Scalar::Integer(3)),
         ));
+        let incompatible_stats_predicate =
+            DeltaKernelPredicate::from_test_predicate(Predicate::gt(
+                Expression::Column(ColumnName::new(["id"])),
+                Expression::Literal(Scalar::String("not-an-integer".to_owned())),
+            ));
         let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
 
         for (path, file_size, predicate, expected) in [
@@ -1810,6 +2085,12 @@ mod tests {
                 "without-stats.parquet",
                 no_stats_bytes.len(),
                 Some(&predicate),
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                "with-stats.parquet",
+                bytes.len(),
+                Some(&incompatible_stats_predicate),
                 vec![1, 2, 3, 4, 5, 6],
             ),
         ] {
@@ -1934,6 +2215,272 @@ mod tests {
         assert_eq!(
             buffered_metrics.parquet_data_file_opened_bytes,
             direct_metrics.parquet_data_file_opened_bytes
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_metadata_and_full_gets_and_releases_permits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (name, threshold, gate_request) in [
+            ("metadata", None, GateRequest::Range(1)),
+            ("full-get", Some(usize::MAX), GateRequest::FullGet),
+        ] {
+            let root = TestDir::new(&format!("native-cancel-{name}"))?;
+            let parquet_bytes = parquet_bytes()?;
+            write_partitioned_dv_table(&root, &parquet_bytes)?;
+            let plan = pipeline_plan(&root, threshold)?;
+            let (reader, gated, task) =
+                gated_file_reader(&plan, &parquet_bytes, gate_request).await?;
+            let limiter = one_file_limiter(plan.execution_options)?;
+            let partition = limiter.partition(0)?;
+            let permit = partition.acquire().await?;
+            let cancellation = ScanCancellation::new();
+            let request = file_read_request(&plan, task, permit, cancellation.clone());
+            let job = tokio::spawn(async move { reader.open_logical_file_stream(request).await });
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), gated.wait_started()).await?;
+            assert!(cancellation.cancel());
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), job).await??;
+            let error = match result {
+                Ok(_) => return Err(format!("{name} cancellation must fail the file read").into()),
+                Err(error) => error,
+            };
+            assert_eq!(error.as_str(), "cancelled");
+            assert!(gated.was_cancelled(), "{name} request was not dropped");
+            drop(
+                tokio::time::timeout(std::time::Duration::from_secs(5), partition.acquire())
+                    .await??,
+            );
+
+            let metrics = plan.metrics.snapshot();
+            assert_eq!(metrics.parquet_data_file_bytes_received, Some(0));
+            match gate_request {
+                GateRequest::FullGet => {
+                    assert_eq!(metrics.parquet_data_file_full_get_operations, Some(1));
+                    assert_eq!(metrics.parquet_data_file_range_get_operations, Some(0));
+                }
+                GateRequest::Range(_) => {
+                    assert_eq!(metrics.parquet_data_file_full_get_operations, Some(0));
+                    assert_eq!(metrics.parquet_data_file_range_get_operations, Some(1));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_batch_range_read_and_releases_permit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-cancel-batch")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_dv_table(&root, &parquet_bytes)?;
+        let plan = pipeline_plan(&root, None)?;
+        let (reader, gated, task) =
+            gated_file_reader(&plan, &parquet_bytes, GateRequest::Range(usize::MAX)).await?;
+        let limiter = one_file_limiter(plan.execution_options)?;
+        let partition = limiter.partition(0)?;
+        let permit = partition.acquire().await?;
+        let cancellation = ScanCancellation::new();
+        let request = file_read_request(&plan, task, permit, cancellation.clone());
+        let mut file = reader.open_logical_file_stream(request).await?;
+        let before = plan.metrics.snapshot();
+        gated.gate_next_range();
+        let job = tokio::spawn(async move { file.next_batch().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), gated.wait_started()).await?;
+        assert!(cancellation.cancel());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), job).await??;
+        let error = match result {
+            Ok(_) => return Err("batch cancellation must fail the file read".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.as_str(), "cancelled");
+        assert!(gated.was_cancelled());
+        drop(tokio::time::timeout(std::time::Duration::from_secs(5), partition.acquire()).await??);
+
+        let after = plan.metrics.snapshot();
+        assert_eq!(
+            after.parquet_data_file_range_get_operations,
+            before
+                .parquet_data_file_range_get_operations
+                .map(|operations| operations + 1)
+        );
+        assert_eq!(
+            after.parquet_data_file_bytes_received,
+            before.parquet_data_file_bytes_received
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_redacted_setup_full_get_and_batch_read_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let corrupt_root = TestDir::new("native-corrupt-setup")?;
+        fs::write(corrupt_root.path().join("secret.parquet"), b"not parquet")?;
+        let corrupt_metrics = metrics();
+        let corrupt_reader = reader(
+            &corrupt_root,
+            DeltaReaderExecutionOptions::new(),
+            corrupt_metrics.clone(),
+        )?;
+        let corrupt_task = task("secret.parquet", Some(11))?;
+        let error = match corrupt_reader
+            .open_parquet_stream(&corrupt_task, Arc::new(Schema::empty()), None, None, false)
+            .await
+        {
+            Ok(_) => return Err("corrupt Parquet setup must fail".into()),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=data_file_read error=data_file_read reason=parquet_read_setup_failed"
+        );
+        assert!(!error.to_string().contains("secret.parquet"));
+        assert_eq!(
+            corrupt_metrics
+                .snapshot()
+                .parquet_data_file_range_get_operations,
+            Some(1)
+        );
+
+        let missing_root = TestDir::new("native-missing-full-get")?;
+        let missing_metrics = metrics();
+        let missing_reader = reader(
+            &missing_root,
+            DeltaReaderExecutionOptions::new().with_parquet_full_file_read_threshold(Some(64))?,
+            missing_metrics.clone(),
+        )?;
+        let error = missing_reader
+            .parquet_object_for_task(&task("secret-missing.parquet", Some(12))?)
+            .await
+            .expect_err("missing full GET must fail");
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=data_file_read error=data_file_read reason=parquet_full_file_read_failed"
+        );
+        assert!(!error.to_string().contains("secret-missing.parquet"));
+        assert_eq!(
+            missing_metrics
+                .snapshot()
+                .parquet_data_file_full_get_operations,
+            Some(1)
+        );
+
+        let range_root = TestDir::new("native-batch-range-error")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_dv_table(&range_root, &parquet_bytes)?;
+        let plan = pipeline_plan(&range_root, None)?;
+        let (reader, gated, task) =
+            gated_file_reader(&plan, &parquet_bytes, GateRequest::Range(usize::MAX)).await?;
+        let limiter = one_file_limiter(plan.execution_options)?;
+        let partition = limiter.partition(0)?;
+        let permit = partition.acquire().await?;
+        let request = file_read_request(&plan, task, permit, ScanCancellation::new());
+        let mut file = reader.open_logical_file_stream(request).await?;
+        let before = plan.metrics.snapshot();
+        gated.fail_next_range();
+        let error = file
+            .next_batch()
+            .await
+            .expect_err("injected batch range failure must fail");
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=data_file_read error=data_file_read reason=parquet_batch_read_failed"
+        );
+        let after = plan.metrics.snapshot();
+        assert_eq!(
+            after.parquet_data_file_range_get_operations,
+            before
+                .parquet_data_file_range_get_operations
+                .map(|operations| operations + 1)
+        );
+        assert_eq!(
+            after.parquet_data_file_bytes_received,
+            before.parquet_data_file_bytes_received
+        );
+        drop(file);
+        drop(tokio::time::timeout(std::time::Duration::from_secs(5), partition.acquire()).await??);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logical_pipeline_reports_dv_transform_and_schema_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dv_root = TestDir::new("native-dv-error")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .build(),
+        )?;
+        write_partitioned_dv_table(&dv_root, &parquet_bytes)?;
+        let dv_plan = pipeline_plan(&dv_root, None)?;
+        fs::remove_file(dv_root.path().join(DV_FILE))?;
+        let error = execute_pipeline_plan(Arc::clone(&dv_plan))
+            .await
+            .expect_err("missing deletion vector must fail");
+        assert_eq!(error.as_str(), "deletion_vector_read");
+        let dv_metrics = dv_plan.metrics.snapshot();
+        assert_eq!(dv_metrics.files_started, 1);
+        assert_eq!(dv_metrics.files_completed, 0);
+        assert_eq!(dv_metrics.deletion_vector_failures, 1);
+
+        let transform_root = TestDir::new("native-transform-errors")?;
+        write_partitioned_dv_table(&transform_root, &parquet_bytes)?;
+        let plan = pipeline_plan(&transform_root, None)?;
+        let (reader, _gated, task) =
+            gated_file_reader(&plan, &parquet_bytes, GateRequest::Range(usize::MAX)).await?;
+        let limiter = one_file_limiter(plan.execution_options)?;
+        let partition = limiter.partition(0)?;
+
+        let mut invalid_transform_task = task.clone();
+        invalid_transform_task.transform = KernelPhysicalToLogicalTransform::from_test_expression(
+            Expression::Column(ColumnName::new(["secret_missing"])),
+        );
+        let permit = partition.acquire().await?;
+        let request = file_read_request(
+            &plan,
+            invalid_transform_task,
+            permit,
+            ScanCancellation::new(),
+        );
+        let mut file = reader.open_logical_file_stream(request).await?;
+        let error = file
+            .next_batch()
+            .await
+            .expect_err("invalid transform must fail");
+        assert_eq!(error.as_str(), "physical_to_logical_transform");
+        assert!(!error.to_string().contains("secret_missing"));
+        drop(file);
+
+        let permit = partition.acquire().await?;
+        let mut request = file_read_request(&plan, task, permit, ScanCancellation::new());
+        request.logical_schema = Arc::new(Schema::empty());
+        let mut file = reader.open_logical_file_stream(request).await?;
+        let error = file
+            .next_batch()
+            .await
+            .expect_err("wrong logical schema must fail");
+        assert_eq!(
+            error.to_string(),
+            "delta reader error: phase=data_file_read error=data_file_read reason=backend_logical_schema_mismatch"
         );
         Ok(())
     }
