@@ -244,6 +244,11 @@ impl DeltaReadMetrics {
             usize_to_u64_saturating(bytes),
         );
     }
+
+    #[cfg(feature = "native-async")]
+    pub(crate) fn record_parquet_data_file_opened_bytes(&self, bytes: u64) {
+        saturating_fetch_add(&self.inner.parquet_data_file_opened_bytes, bytes);
+    }
 }
 
 fn load(counter: &AtomicU64) -> u64 {

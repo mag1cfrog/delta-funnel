@@ -3,15 +3,16 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{Array, ArrayRef, ListArray, MapArray, StructArray, new_null_array},
+    array::{Array, ArrayRef, Int64Array, ListArray, MapArray, StructArray, new_null_array},
     compute::cast,
     datatypes::{DataType, Field, Fields, SchemaRef},
     record_batch::RecordBatch,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::{
-    PARQUET_FIELD_ID_META_KEY, ProjectionMask,
+    PARQUET_FIELD_ID_META_KEY, ProjectionMask, RowNumber,
+    arrow_reader::ArrowReaderOptions,
     async_reader::{
         ParquetObjectReader, ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
     },
@@ -19,16 +20,29 @@ use parquet::arrow::{
 use parquet::schema::types::{SchemaDescriptor, TypePtr};
 use snafu::ResultExt;
 
+const ORIGINAL_ROW_INDEX_COLUMN: &str = "__delta_arrow_reader_original_row_index";
+
 use crate::{
-    DeltaReadMetrics, DeltaReaderError, DeltaReaderExecutionOptions, error::DataFileReadSnafu,
-    kernel::DeltaKernelEngineContext, metered_object_store::MeteredParquetObjectStore,
-    planning::DeltaScanFileTask,
+    DeltaReadMetrics, DeltaReaderError, DeltaReaderExecutionOptions,
+    deletion_vector::{
+        DeletionVectorSelection, load_deletion_vector_selection_from_engine_context,
+    },
+    error::{CancelledSnafu, DataFileReadSnafu, PhysicalToLogicalTransformSnafu},
+    kernel::{
+        DeltaKernelEngineContext, DeltaKernelPredicate, KernelPhysicalToLogicalTransform,
+        KernelScanSchemas,
+    },
+    metered_object_store::MeteredParquetObjectStore,
+    native_async_row_group_pruning::native_async_pruned_row_groups,
+    planning::{DeltaScanFileTask, DeltaScanPlan},
+    scheduling::{FileBatchStream, FileExecutor, FileReadPermit, ScanCancellation},
 };
 
 pub(crate) struct NativeAsyncFileReader {
     engine_context: Arc<DeltaKernelEngineContext>,
     store: Arc<dyn ObjectStore>,
     execution_options: DeltaReaderExecutionOptions,
+    metrics: DeltaReadMetrics,
 }
 
 #[derive(Debug)]
@@ -38,9 +52,32 @@ pub(crate) struct NativeAsyncParquetObject {
     pub(crate) file_size: u64,
 }
 
-pub(crate) struct NativeAsyncFileReadStream {
+struct NativeAsyncParquetStream {
     stream: ParquetRecordBatchStream<ParquetObjectReader>,
     schema_match: NativeAsyncSchemaMatch,
+    include_original_row_index: bool,
+}
+
+pub(crate) struct NativeAsyncFileReadStream {
+    parquet: NativeAsyncParquetStream,
+    engine_context: Arc<DeltaKernelEngineContext>,
+    kernel_schemas: KernelScanSchemas,
+    logical_schema: SchemaRef,
+    transform: KernelPhysicalToLogicalTransform,
+    deletion_vector: Option<DeletionVectorSelection>,
+    cancellation: ScanCancellation,
+    _permit: FileReadPermit,
+}
+
+struct NativeAsyncFileReadRequest {
+    task: DeltaScanFileTask,
+    physical_schema: SchemaRef,
+    logical_schema: SchemaRef,
+    kernel_schemas: KernelScanSchemas,
+    physical_predicate: Option<DeltaKernelPredicate>,
+    output_batch_size: Option<usize>,
+    permit: FileReadPermit,
+    cancellation: ScanCancellation,
 }
 
 #[derive(Clone)]
@@ -107,12 +144,13 @@ impl NativeAsyncFileReader {
     ) -> Self {
         let store = Arc::new(MeteredParquetObjectStore::new(
             engine_context.object_store(),
-            metrics,
+            metrics.clone(),
         ));
         Self {
             engine_context,
             store,
             execution_options,
+            metrics,
         }
     }
 
@@ -124,12 +162,14 @@ impl NativeAsyncFileReader {
         self.buffer_small_parquet_object(object).await
     }
 
-    async fn open_file_stream(
+    async fn open_parquet_stream(
         &self,
         task: &DeltaScanFileTask,
         provider_schema: SchemaRef,
         output_batch_size: Option<usize>,
-    ) -> Result<NativeAsyncFileReadStream, DeltaReaderError> {
+        physical_predicate: Option<&DeltaKernelPredicate>,
+        include_original_row_index: bool,
+    ) -> Result<NativeAsyncParquetStream, DeltaReaderError> {
         let object = self.parquet_object_for_task(task).await?;
         let reader =
             ParquetObjectReader::new(object.store, object.path).with_file_size(object.file_size);
@@ -137,7 +177,12 @@ impl NativeAsyncFileReader {
             Some(hint) => reader.with_footer_size_hint(hint),
             None => reader,
         };
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        let reader_options = native_async_arrow_reader_options(include_original_row_index)
+            .boxed()
+            .context(DataFileReadSnafu {
+                reason: "parquet_row_index_setup_failed",
+            })?;
+        let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options)
             .await
             .boxed()
             .context(DataFileReadSnafu {
@@ -151,6 +196,11 @@ impl NativeAsyncFileReader {
         .map_err(|error| data_file_error("parquet_schema_match_failed", error))?;
         let projection =
             ProjectionMask::roots(builder.parquet_schema(), schema_match.projected_roots());
+        let row_groups = native_async_pruned_row_groups(builder.metadata(), physical_predicate);
+        let builder = match row_groups {
+            Some(row_groups) => builder.with_row_groups(row_groups),
+            None => builder,
+        };
         let builder = match output_batch_size {
             Some(batch_size) => builder.with_batch_size(batch_size),
             None => builder,
@@ -164,9 +214,48 @@ impl NativeAsyncFileReader {
                 reason: "parquet_read_setup_failed",
             })?;
 
-        Ok(NativeAsyncFileReadStream {
+        Ok(NativeAsyncParquetStream {
             stream,
             schema_match,
+            include_original_row_index,
+        })
+    }
+
+    async fn open_logical_file_stream(
+        self: &Arc<Self>,
+        request: NativeAsyncFileReadRequest,
+    ) -> Result<NativeAsyncFileReadStream, DeltaReaderError> {
+        let include_original_row_index = request.task.deletion_vector.is_present();
+        let parquet = tokio::select! {
+            biased;
+            () = request.cancellation.cancelled() => return Err(cancelled_error()),
+            result = self.open_parquet_stream(
+                &request.task,
+                request.physical_schema,
+                request.output_batch_size,
+                request.physical_predicate.as_ref(),
+                include_original_row_index,
+            ) => result?,
+        };
+        let deletion_vector = tokio::select! {
+            biased;
+            () = request.cancellation.cancelled() => return Err(cancelled_error()),
+            result = load_deletion_vector_selection_from_engine_context(
+                Arc::clone(&self.engine_context),
+                request.task.deletion_vector.clone(),
+                &self.metrics,
+            ) => result?,
+        };
+
+        Ok(NativeAsyncFileReadStream {
+            parquet,
+            engine_context: Arc::clone(&self.engine_context),
+            kernel_schemas: request.kernel_schemas,
+            logical_schema: request.logical_schema,
+            transform: request.task.transform,
+            deletion_vector,
+            cancellation: request.cancellation,
+            _permit: request.permit,
         })
     }
 
@@ -241,23 +330,160 @@ impl NativeAsyncFileReader {
     }
 }
 
-impl NativeAsyncFileReadStream {
+pub(crate) fn native_async_file_executor(
+    plan: &Arc<DeltaScanPlan>,
+    output_batch_size: Option<usize>,
+) -> FileExecutor<DeltaScanFileTask, FileBatchStream> {
+    let reader = Arc::new(NativeAsyncFileReader::new(
+        Arc::clone(&plan.engine_context),
+        plan.execution_options,
+        plan.metrics.clone(),
+    ));
+    let physical_schema = Arc::clone(&plan.physical_schema);
+    let logical_schema = Arc::clone(&plan.logical_schema);
+    let kernel_schemas = plan.kernel_schemas.clone();
+    let physical_predicate = plan.physical_predicate.clone();
+
+    Arc::new(move |task, permit, cancellation| {
+        if let Some(bytes) = task.estimated_bytes {
+            reader.metrics.record_parquet_data_file_opened_bytes(bytes);
+        }
+        let reader = Arc::clone(&reader);
+        let physical_schema = Arc::clone(&physical_schema);
+        let logical_schema = Arc::clone(&logical_schema);
+        let kernel_schemas = kernel_schemas.clone();
+        let physical_predicate = physical_predicate.clone();
+        Box::pin(async move {
+            let file = reader
+                .open_logical_file_stream(NativeAsyncFileReadRequest {
+                    task,
+                    physical_schema,
+                    logical_schema,
+                    kernel_schemas,
+                    physical_predicate,
+                    output_batch_size,
+                    permit,
+                    cancellation,
+                })
+                .await?;
+            let batches = stream::try_unfold(file, |mut file| async move {
+                file.next_batch()
+                    .await
+                    .map(|batch| batch.map(|batch| (batch, file)))
+            });
+            Ok(Box::pin(batches) as FileBatchStream)
+        })
+    })
+}
+
+impl NativeAsyncParquetStream {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaReaderError> {
+        self.next_batch_with_original_row_indexes()
+            .await
+            .map(|batch| batch.map(|(batch, _)| batch))
+    }
+
+    async fn next_batch_with_original_row_indexes(
+        &mut self,
+    ) -> Result<Option<(RecordBatch, Option<Int64Array>)>, DeltaReaderError> {
         let Some(batch) = self.stream.next().await else {
             return Ok(None);
         };
         let batch = batch.boxed().context(DataFileReadSnafu {
             reason: "parquet_batch_read_failed",
         })?;
-        if !self.schema_match.needs_batch_reshape {
-            return Ok(Some(batch));
-        }
+        let row_indexes = if self.include_original_row_index {
+            let index = batch
+                .schema()
+                .index_of(ORIGINAL_ROW_INDEX_COLUMN)
+                .map_err(|error| data_file_error("parquet_row_index_missing", error))?;
+            Some(
+                batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        data_file_error(
+                            "parquet_row_index_type_mismatch",
+                            delta_kernel::Error::generic("original row index is not Int64"),
+                        )
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let batch = if self.include_original_row_index || self.schema_match.needs_batch_reshape {
+            self.schema_match
+                .reshape_batch_to_provider_schema(batch)
+                .map_err(|error| data_file_error("parquet_batch_reshape_failed", error))?
+        } else {
+            batch
+        };
 
-        self.schema_match
-            .reshape_batch_to_provider_schema(batch)
-            .map(Some)
-            .map_err(|error| data_file_error("parquet_batch_reshape_failed", error))
+        Ok(Some((batch, row_indexes)))
     }
+}
+
+impl NativeAsyncFileReadStream {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, DeltaReaderError> {
+        let next = tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => return Err(cancelled_error()),
+            result = self.parquet.next_batch_with_original_row_indexes() => result?,
+        };
+        let Some((physical_batch, original_row_indexes)) = next else {
+            if let Some(deletion_vector) = self.deletion_vector.as_mut() {
+                deletion_vector.finish()?;
+            }
+            return Ok(None);
+        };
+        let logical_batch = self
+            .transform
+            .apply(
+                self.engine_context.as_ref(),
+                &self.kernel_schemas,
+                physical_batch,
+            )
+            .boxed()
+            .context(PhysicalToLogicalTransformSnafu {
+                reason: "physical_to_logical_transform_failed",
+            })?;
+        if logical_batch.schema().as_ref() != self.logical_schema.as_ref() {
+            return Err(data_file_error(
+                "backend_logical_schema_mismatch",
+                delta_kernel::Error::generic(
+                    "NativeAsync output does not match the planned logical schema",
+                ),
+            ));
+        }
+        let logical_batch = match self.deletion_vector.as_mut() {
+            Some(deletion_vector) => deletion_vector
+                .mask_original_row_indexes(logical_batch, original_row_indexes.as_ref())?,
+            None => logical_batch,
+        };
+        Ok(Some(logical_batch))
+    }
+}
+
+fn native_async_arrow_reader_options(
+    include_original_row_index: bool,
+) -> parquet::errors::Result<ArrowReaderOptions> {
+    if !include_original_row_index {
+        return Ok(ArrowReaderOptions::new());
+    }
+    let row_number_field = Arc::new(
+        Field::new(ORIGINAL_ROW_INDEX_COLUMN, DataType::Int64, false)
+            .with_extension_type(RowNumber),
+    );
+    ArrowReaderOptions::new().with_virtual_columns(vec![row_number_field])
+}
+
+fn cancelled_error() -> DeltaReaderError {
+    CancelledSnafu {
+        reason: "scan_execution_cancelled",
+    }
+    .build()
 }
 
 impl NativeAsyncSchemaMatch {
@@ -967,20 +1193,31 @@ mod tests {
         record_batch::RecordBatch,
     };
     use delta_kernel::scan::state::{DvInfo, ScanFile};
+    use delta_kernel::{
+        actions::deletion_vector_writer::{KernelDeletionVector, StreamingDeletionVectorWriter},
+        expressions::{ColumnName, Expression, Predicate, Scalar},
+    };
+    use futures_util::StreamExt;
     use object_store::ObjectStoreExt;
     use parquet::arrow::{
         ArrowWriter, PARQUET_FIELD_ID_META_KEY, ProjectionMask,
         arrow_reader::ParquetRecordBatchReaderBuilder,
     };
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-    use super::{NativeAsyncFileReader, data_file_error};
+    use super::{NativeAsyncFileReader, data_file_error, native_async_file_executor};
     use crate::{
         DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
-        DeltaStorageOptions,
-        kernel::{DeltaKernelEngineContext, KernelScanFileMetadata},
+        DeltaSnapshotSelection, DeltaStorageOptions,
+        kernel::{DeltaKernelEngineContext, DeltaKernelPredicate, KernelScanFileMetadata},
         metrics::DeltaReadMetricsConfig,
-        planning::DeltaScanFileTask,
+        planning::{DeltaScanFileTask, DeltaScanPartitionTargetOptions, plan_scan},
+        scheduling::{DeltaScanExecution, FileAdmission},
+        snapshot::load_delta_table_snapshot_blocking,
     };
+
+    const DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
+    const DV_FILE: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
 
     struct TestDir(PathBuf);
 
@@ -1063,6 +1300,17 @@ mod tests {
         Ok(writer.into_inner()?)
     }
 
+    fn parquet_bytes_with_properties(
+        schema: Arc<Schema>,
+        columns: Vec<ArrayRef>,
+        properties: WriterProperties,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(properties))?;
+        writer.write(&batch)?;
+        Ok(writer.into_inner()?)
+    }
+
     fn parquet_bytes() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1075,6 +1323,119 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
             ],
         )
+    }
+
+    fn write_partitioned_dv_table(
+        root: &TestDir,
+        parquet_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(root.path().join("part.parquet"), parquet_bytes)?;
+        let mut dv_bytes = Vec::new();
+        let mut writer = StreamingDeletionVectorWriter::new(&mut dv_bytes);
+        let mut deletion_vector = KernelDeletionVector::new();
+        deletion_vector.add_deleted_row_indexes([4]);
+        let result = writer.write_deletion_vector(deletion_vector)?;
+        writer.finalize()?;
+        fs::write(root.path().join(DV_FILE), dv_bytes)?;
+
+        let log = root.path().join("_delta_log");
+        fs::create_dir_all(&log)?;
+        let protocol = serde_json::json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["deletionVectors"],
+                "writerFeatures": ["deletionVectors"]
+            }
+        });
+        let schema = serde_json::json!({
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "integer", "nullable": false, "metadata": {}},
+                {"name": "region", "type": "string", "nullable": true, "metadata": {}}
+            ]
+        });
+        let metadata = serde_json::json!({
+            "metaData": {
+                "id": "native-async-pipeline-test",
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema.to_string(),
+                "partitionColumns": ["region"],
+                "configuration": {},
+                "createdTime": 1587968585495_i64
+            }
+        });
+        let stats = serde_json::json!({
+            "numRecords": 6,
+            "minValues": {"id": 1},
+            "maxValues": {"id": 6},
+            "nullCount": {"id": 0}
+        });
+        let add = serde_json::json!({
+            "add": {
+                "path": "part.parquet",
+                "partitionValues": {"region": "west"},
+                "size": parquet_bytes.len(),
+                "modificationTime": 1587968586000_i64,
+                "dataChange": true,
+                "stats": stats.to_string(),
+                "deletionVector": {
+                    "storageType": "u",
+                    "pathOrInlineDv": DV_ID,
+                    "offset": result.offset,
+                    "sizeInBytes": result.size_in_bytes,
+                    "cardinality": result.cardinality
+                }
+            }
+        });
+        fs::write(
+            log.join("00000000000000000000.json"),
+            format!("{protocol}\n{metadata}\n{add}\n"),
+        )?;
+        Ok(())
+    }
+
+    fn pipeline_plan(
+        root: &TestDir,
+        full_file_threshold: Option<usize>,
+    ) -> Result<Arc<crate::planning::DeltaScanPlan>, Box<dyn std::error::Error>> {
+        let snapshot = load_delta_table_snapshot_blocking(
+            &root.path().to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+        let options = DeltaReaderExecutionOptions::new()
+            .with_parquet_full_file_read_threshold(full_file_threshold)?;
+        let predicate = DeltaKernelPredicate::from_test_predicate(Predicate::gt(
+            Expression::Column(ColumnName::new(["id"])),
+            Expression::Literal(Scalar::Integer(3)),
+        ));
+        Ok(Arc::new(plan_scan(
+            &snapshot,
+            Some(&["id".to_owned()]),
+            &["region".to_owned()],
+            Some(predicate),
+            true,
+            options,
+            DeltaScanPartitionTargetOptions {
+                explicit_target_partitions: Some(1),
+                caller_target_partitions: None,
+            },
+        )?))
+    }
+
+    async fn execute_pipeline_plan(
+        plan: Arc<crate::planning::DeltaScanPlan>,
+    ) -> Result<Vec<RecordBatch>, DeltaReaderError> {
+        let execution = DeltaScanExecution::new(Arc::clone(&plan));
+        let executor = native_async_file_executor(&plan, Some(2));
+        let mut stream =
+            execution.partition_stream(0, Arc::new(|_| Ok(FileAdmission::Admit)), executor)?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        Ok(batches)
     }
 
     fn field_with_id(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
@@ -1287,7 +1648,7 @@ mod tests {
         let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
         let provider_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let mut stream = reader
-            .open_file_stream(&task, provider_schema, Some(2))
+            .open_parquet_stream(&task, provider_schema, Some(2), None, false)
             .await?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.next_batch().await? {
@@ -1318,6 +1679,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_full_ordered_and_empty_physical_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-projection-shapes")?;
+        let bytes = parquet_bytes()?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
+        let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+
+        for (schema, names, columns) in [
+            (
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("name", DataType::Utf8, true),
+                ])),
+                vec!["id", "name"],
+                2,
+            ),
+            (
+                Arc::new(Schema::new(vec![
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("id", DataType::Int32, false),
+                ])),
+                vec!["name", "id"],
+                2,
+            ),
+            (Arc::new(Schema::empty()), Vec::new(), 0),
+        ] {
+            let mut stream = reader
+                .open_parquet_stream(&task, schema, None, None, false)
+                .await?;
+            let mut rows = 0;
+            while let Some(batch) = stream.next_batch().await? {
+                rows += batch.num_rows();
+                assert_eq!(batch.num_columns(), columns);
+                assert_eq!(
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .collect::<Vec<_>>(),
+                    names
+                );
+            }
+            assert_eq!(rows, 3);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn footer_hint_controls_metadata_request_count_and_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = TestDir::new("native-footer-hint")?;
@@ -1337,7 +1748,7 @@ mod tests {
                 Field::new("name", DataType::Utf8, true),
             ]));
             let _stream = reader
-                .open_file_stream(&task, provider_schema, None)
+                .open_parquet_stream(&task, provider_schema, None, None, false)
                 .await?;
             snapshots.push(metrics.snapshot());
         }
@@ -1354,6 +1765,175 @@ mod tests {
             snapshots[1]
                 .parquet_data_file_bytes_received
                 .map(|bytes| bytes + 1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn row_group_pruning_is_conservative_and_preserves_rows_when_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-row-group-pruning")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let columns = || vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef];
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let bytes = parquet_bytes_with_properties(Arc::clone(&schema), columns(), properties)?;
+        fs::write(root.path().join("with-stats.parquet"), &bytes)?;
+        let no_stats_properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let no_stats_bytes =
+            parquet_bytes_with_properties(Arc::clone(&schema), columns(), no_stats_properties)?;
+        fs::write(root.path().join("without-stats.parquet"), &no_stats_bytes)?;
+        let predicate = DeltaKernelPredicate::from_test_predicate(Predicate::gt(
+            Expression::Column(ColumnName::new(["id"])),
+            Expression::Literal(Scalar::Integer(3)),
+        ));
+        let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
+
+        for (path, file_size, predicate, expected) in [
+            (
+                "with-stats.parquet",
+                bytes.len(),
+                Some(&predicate),
+                vec![4, 5, 6],
+            ),
+            (
+                "with-stats.parquet",
+                bytes.len(),
+                None,
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+            (
+                "without-stats.parquet",
+                no_stats_bytes.len(),
+                Some(&predicate),
+                vec![1, 2, 3, 4, 5, 6],
+            ),
+        ] {
+            let task = task(path, Some(u64::try_from(file_size)?))?;
+            let mut stream = reader
+                .open_parquet_stream(&task, Arc::clone(&schema), None, predicate, false)
+                .await?;
+            let mut ids = Vec::new();
+            while let Some(batch) = stream.next_batch().await? {
+                ids.extend_from_slice(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or("expected Int32Array")?
+                        .values(),
+                );
+            }
+            assert_eq!(ids, expected, "{path}");
+        }
+
+        let task = task("with-stats.parquet", Some(u64::try_from(bytes.len())?))?;
+        let mut stream = reader
+            .open_parquet_stream(&task, Arc::clone(&schema), None, Some(&predicate), true)
+            .await?;
+        let mut original_indexes = Vec::new();
+        while let Some((_batch, indexes)) = stream.next_batch_with_original_row_indexes().await? {
+            original_indexes.extend(
+                indexes
+                    .ok_or("expected original row indexes")?
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        assert_eq!(original_indexes, [3, 4, 5]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_pipeline_applies_transform_then_dv_and_preserves_hidden_columns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-scheduler-pipeline")?;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let parquet_bytes = parquet_bytes_with_properties(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+            properties,
+        )?;
+        write_partitioned_dv_table(&root, &parquet_bytes)?;
+
+        let direct_plan = pipeline_plan(&root, None)?;
+        let direct_metrics = direct_plan.metrics.clone();
+        let direct = execute_pipeline_plan(direct_plan).await?;
+        let buffered_plan = pipeline_plan(&root, Some(parquet_bytes.len()))?;
+        let buffered_metrics = buffered_plan.metrics.clone();
+        let buffered = execute_pipeline_plan(buffered_plan).await?;
+
+        for batches in [&direct, &buffered] {
+            let ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("planned id Int32Array")
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, [4, 6]);
+            assert!(batches.iter().all(|batch| {
+                batch.schema().fields()[0].name() == "id"
+                    && batch.schema().fields()[1].name() == "region"
+                    && batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .is_some_and(|regions| {
+                            (0..regions.len()).all(|index| regions.value(index) == "west")
+                        })
+            }));
+        }
+        assert_eq!(direct, buffered);
+
+        let direct_metrics = direct_metrics.snapshot();
+        assert_eq!(direct_metrics.files_started, 1);
+        assert_eq!(direct_metrics.files_completed, 1);
+        assert_eq!(
+            direct_metrics.parquet_data_file_opened_bytes,
+            Some(u64::try_from(parquet_bytes.len())?)
+        );
+        assert_eq!(direct_metrics.deletion_vector_payloads_loaded, 1);
+        assert_eq!(direct_metrics.deletion_vectors_applied, 1);
+        assert_eq!(direct_metrics.deletion_vector_rows_deleted, 1);
+        assert_eq!(
+            direct_metrics.parquet_data_file_full_get_operations,
+            Some(0)
+        );
+        assert!(
+            direct_metrics
+                .parquet_data_file_range_get_operations
+                .is_some_and(|count| count > 0)
+        );
+        let buffered_metrics = buffered_metrics.snapshot();
+        assert_eq!(
+            buffered_metrics.parquet_data_file_full_get_operations,
+            Some(1)
+        );
+        assert_eq!(
+            buffered_metrics.parquet_data_file_range_get_operations,
+            Some(0)
+        );
+        assert_eq!(
+            buffered_metrics.parquet_data_file_bytes_received,
+            Some(u64::try_from(parquet_bytes.len())?)
+        );
+        assert_eq!(
+            buffered_metrics.parquet_data_file_opened_bytes,
+            direct_metrics.parquet_data_file_opened_bytes
         );
         Ok(())
     }
@@ -3099,7 +3679,7 @@ mod tests {
         let reader = reader(&root, DeltaReaderExecutionOptions::new(), metrics())?;
         let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
         let mut stream = reader
-            .open_file_stream(&task, provider_schema, None)
+            .open_parquet_stream(&task, provider_schema, None, None, false)
             .await?;
         let batch = stream.next_batch().await?.ok_or("expected one batch")?;
 
@@ -3151,7 +3731,7 @@ mod tests {
             true,
         )]));
         let mut stream = reader
-            .open_file_stream(&task, timestamp_schema, None)
+            .open_parquet_stream(&task, timestamp_schema, None, None, false)
             .await?;
         let batch = stream.next_batch().await?.ok_or("expected one batch")?;
         let timestamps = batch
@@ -3175,7 +3755,10 @@ mod tests {
                 false,
             )])),
         ] {
-            let error = match reader.open_file_stream(&task, provider_schema, None).await {
+            let error = match reader
+                .open_parquet_stream(&task, provider_schema, None, None, false)
+                .await
+            {
                 Ok(_) => return Err("unsupported schema must fail".into()),
                 Err(error) => error,
             };

@@ -285,7 +285,7 @@ impl ScanCancellation {
         self.inner.cancelled.load(Ordering::Acquire)
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         if self.is_cancelled() {
             return;
         }

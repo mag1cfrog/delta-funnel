@@ -8,8 +8,10 @@ use arrow::{
 use snafu::ResultExt;
 
 use crate::{
-    DeltaReadMetrics, DeltaReaderError, error::DeletionVectorReadSnafu,
-    kernel::KernelDeletionVectorHandle, snapshot::LoadedDeltaTableSnapshot,
+    DeltaReadMetrics, DeltaReaderError,
+    error::DeletionVectorReadSnafu,
+    kernel::{DeltaKernelEngineContext, KernelDeletionVectorHandle},
+    snapshot::LoadedDeltaTableSnapshot,
 };
 
 #[allow(dead_code)]
@@ -33,10 +35,23 @@ pub(crate) async fn load_deletion_vector_selection(
     metadata: DeletionVectorMetadata,
     metrics: &DeltaReadMetrics,
 ) -> Result<Option<DeletionVectorSelection>, DeltaReaderError> {
+    load_deletion_vector_selection_from_engine_context(
+        std::sync::Arc::clone(snapshot.engine_context()),
+        metadata,
+        metrics,
+    )
+    .await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn load_deletion_vector_selection_from_engine_context(
+    engine_context: std::sync::Arc<DeltaKernelEngineContext>,
+    metadata: DeletionVectorMetadata,
+    metrics: &DeltaReadMetrics,
+) -> Result<Option<DeletionVectorSelection>, DeltaReaderError> {
     let Some(handle) = metadata.0 else {
         return Ok(None);
     };
-    let engine_context = std::sync::Arc::clone(snapshot.engine_context());
     let row_indexes = match tokio::task::spawn_blocking(move || {
         engine_context.load_deletion_vector_row_indexes(&handle)
     })

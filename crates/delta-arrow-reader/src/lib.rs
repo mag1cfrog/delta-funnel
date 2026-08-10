@@ -11,6 +11,9 @@ mod metrics;
 #[cfg(feature = "native-async")]
 #[allow(dead_code)]
 mod native_async_reader;
+#[cfg(feature = "native-async")]
+#[allow(dead_code)]
+mod native_async_row_group_pruning;
 mod partition_target;
 mod planning;
 mod predicate;
