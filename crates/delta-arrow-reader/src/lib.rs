@@ -9,6 +9,8 @@ mod datafusion_dynamic_partition_pruning;
 mod datafusion_execution;
 #[cfg(feature = "datafusion")]
 mod datafusion_planning;
+#[cfg(feature = "datafusion")]
+mod datafusion_provider;
 mod deletion_vector;
 mod direct;
 mod error;
@@ -42,6 +44,10 @@ pub use config::{
 #[cfg(feature = "datafusion")]
 pub use datafusion_execution::{
     DeltaDataFusionMetrics, DeltaDataFusionMetricsSnapshot, collect_delta_datafusion_metrics,
+};
+#[cfg(feature = "datafusion")]
+pub use datafusion_provider::{
+    DeltaDataFusionScanOptions, DeltaTableProvider, RegisteredDeltaTable, register_delta_table,
 };
 pub use direct::{DeltaBatchStream, DeltaScan, DeltaScanBuilder, DeltaTable, DeltaTableBuilder};
 pub use error::{DeltaReaderError, DeltaReaderPhase};

@@ -34,6 +34,7 @@ pub(crate) struct DataFusionFilterPlan {
     pub(crate) decisions: Vec<DataFusionFilterDecision>,
     pub(crate) predicate: Option<DeltaPredicate>,
     pub(crate) row_predicate: Option<DeltaPredicate>,
+    pub(crate) requires_statistics: bool,
     pub(crate) referenced_columns: Vec<String>,
     pub(crate) has_unresolved_predicate: bool,
 }
@@ -58,13 +59,22 @@ pub(crate) fn plan_datafusion_scan(
     capabilities: DataFusionFilterCapabilities,
 ) -> Result<DataFusionScanPlanning, DeltaReaderError> {
     validate_projection(schema, projection)?;
-    let filter_plan = plan_filters(schema, partition_columns, filters, capabilities);
+    let filter_plan = plan_datafusion_filters(schema, partition_columns, filters, capabilities);
     validate_inexact_residual_projection(schema, projection, &filter_plan)?;
     let projection_plan = plan_projection(schema, projection, &filter_plan.referenced_columns)?;
     Ok(DataFusionScanPlanning {
         projection: projection_plan,
         filters: filter_plan,
     })
+}
+
+pub(crate) fn plan_datafusion_filters(
+    schema: &SchemaRef,
+    partition_columns: &HashSet<String>,
+    filters: &[&Expr],
+    capabilities: DataFusionFilterCapabilities,
+) -> DataFusionFilterPlan {
+    plan_filters(schema, partition_columns, filters, capabilities)
 }
 
 fn validate_inexact_residual_projection(
@@ -181,6 +191,7 @@ fn plan_filters(
     filters: &[&Expr],
     capabilities: DataFusionFilterCapabilities,
 ) -> DataFusionFilterPlan {
+    let mut requires_statistics = false;
     let decisions = filters
         .iter()
         .map(|filter| {
@@ -204,6 +215,7 @@ fn plan_filters(
                     TableProviderFilterPushDown::Inexact
                 }
             };
+            requires_statistics |= !matches!(translation.kind, TranslatedFilterKind::Partition);
             DataFusionFilterDecision {
                 predicate: Some(translation.predicate),
                 pushdown,
@@ -263,6 +275,7 @@ fn plan_filters(
         decisions,
         predicate,
         row_predicate,
+        requires_statistics,
         referenced_columns,
         has_unresolved_predicate,
     }
@@ -1409,6 +1422,7 @@ mod tests {
         }
         assert!(!plan.filters.has_unresolved_predicate);
         assert!(plan.filters.row_predicate.is_none());
+        assert!(!plan.filters.requires_statistics);
         assert_eq!(
             plan.filters
                 .decisions
@@ -1516,6 +1530,7 @@ mod tests {
             );
         }
         assert!(inexact.filters.has_unresolved_predicate);
+        assert!(inexact.filters.requires_statistics);
 
         let exact = plan_scan(&schema, &HashSet::new(), None, &refs, true);
         assert!(
@@ -1524,6 +1539,7 @@ mod tests {
                 .all(|pushdown| *pushdown == TableProviderFilterPushDown::Exact)
         );
         assert!(exact.filters.row_predicate.is_some());
+        assert!(exact.filters.requires_statistics);
         assert!(!exact.filters.has_unresolved_predicate);
     }
 
@@ -1607,6 +1623,7 @@ mod tests {
         );
         assert!(plan.projection.hidden_columns.is_empty());
         assert!(plan.filters.has_unresolved_predicate);
+        assert!(plan.filters.requires_statistics);
     }
 
     #[test]

@@ -283,6 +283,36 @@ fn datafusion_metrics_contract_is_public() {
     let _ = (source_name, snapshot, collect, inspect);
 }
 
+#[cfg(feature = "datafusion")]
+#[test]
+fn datafusion_provider_contract_is_public() {
+    use delta_arrow_reader::{
+        DeltaDataFusionScanOptions, DeltaReaderError, DeltaTable, DeltaTableProvider,
+        RegisteredDeltaTable, register_delta_table,
+    };
+
+    fn assert_clone<T: Clone>() {}
+    fn assert_debug_clone<T: std::fmt::Debug + Clone>() {}
+    fn assert_result_traits<T: std::fmt::Debug + Clone + PartialEq + Eq>() {}
+
+    assert_debug_clone::<DeltaDataFusionScanOptions>();
+    assert_clone::<DeltaTableProvider>();
+    assert_result_traits::<RegisteredDeltaTable>();
+    let construct: fn(
+        DeltaTable,
+        DeltaDataFusionScanOptions,
+    ) -> Result<DeltaTableProvider, DeltaReaderError> = DeltaTableProvider::try_new;
+    fn register(
+        context: &datafusion::execution::context::SessionContext,
+        name: String,
+        table: DeltaTable,
+        options: DeltaDataFusionScanOptions,
+    ) -> Result<RegisteredDeltaTable, DeltaReaderError> {
+        register_delta_table(context, name, table, options)
+    }
+    let _ = (construct, register);
+}
+
 #[cfg(not(feature = "native-async"))]
 #[test]
 fn disabled_native_backend_fails_before_uri_access() {
