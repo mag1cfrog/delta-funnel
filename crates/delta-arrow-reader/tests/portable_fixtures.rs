@@ -12,7 +12,7 @@ use arrow::{
 };
 #[cfg(feature = "native-async")]
 use delta_arrow_reader::{
-    DeltaBatchStream, DeltaComparison, DeltaPredicate, DeltaReadMetricsSnapshot,
+    DeltaBatchStream, DeltaComparison, DeltaPredicate, DeltaReadMetrics, DeltaReadMetricsSnapshot,
     DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions, DeltaReaderPhase,
     DeltaScalar, DeltaTableBuilder,
 };
@@ -529,6 +529,16 @@ fn native_options(capacity: usize, prefetch: usize) -> TestResult<DeltaReaderExe
         .with_max_concurrent_file_reads_per_scan(Some(capacity))?
         .with_output_buffer_capacity_per_partition(1)?
         .with_native_async_prefetch_file_count_per_partition(prefetch)?)
+}
+
+#[cfg(feature = "native-async")]
+async fn wait_for_delivered_batch_metrics(metrics: &DeltaReadMetrics) {
+    for _ in 0..1000 {
+        if metrics.snapshot().batches_produced > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 }
 
 #[cfg(feature = "native-async")]
@@ -1233,7 +1243,7 @@ fn native_stream_drop_stops_future_file_scheduling() -> TestResult {
 
         assert_eq!(batch_ids(&first)?.first().copied(), Some(1));
         drop(stream);
-        tokio::task::yield_now().await;
+        wait_for_delivered_batch_metrics(&metrics).await;
 
         let metrics = metrics.snapshot();
         assert_eq!(metrics.reader_backend, DeltaReaderBackend::NativeAsync);
@@ -1265,7 +1275,7 @@ fn native_deletion_vector_stream_drop_preserves_partial_metrics() -> TestResult 
         assert!(!first_ids.contains(&1));
         assert!(!first_ids.contains(&8_192));
         drop(stream);
-        tokio::task::yield_now().await;
+        wait_for_delivered_batch_metrics(&metrics).await;
 
         let metrics = metrics.snapshot();
         assert_eq!(metrics.reader_backend, DeltaReaderBackend::NativeAsync);
