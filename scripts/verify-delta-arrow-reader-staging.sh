@@ -30,6 +30,19 @@ if cargo tree -p delta-arrow-reader -e normal --prefix none |
     exit 1
 fi
 
+if cargo tree -p delta-funnel -e normal --prefix none |
+    grep -Eq '^delta-arrow-reader([[:space:]]|$)' ||
+    grep -R -Eq 'delta_arrow_reader|delta-arrow-reader' crates/delta-funnel/src; then
+    echo "temporary package is reachable from Delta Funnel production code" >&2
+    exit 1
+fi
+
+if cargo package -p delta-funnel --allow-dirty --no-verify --list |
+    grep -Fx 'tests/delta_arrow_reader_downstream.rs' >/dev/null; then
+    echo "staging-only downstream test is included in the Delta Funnel package" >&2
+    exit 1
+fi
+
 direct_source=crates/delta-arrow-reader/src/direct.rs
 if grep -Eq 'block_on|tokio::runtime|Runtime::|try_collect|pub (async )?fn (collect|execute_again)' "$direct_source"; then
     echo "direct reader exposes materialization, repeat execution, or runtime ownership" >&2

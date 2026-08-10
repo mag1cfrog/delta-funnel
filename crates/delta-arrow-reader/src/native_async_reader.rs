@@ -36,6 +36,7 @@ use crate::{
     native_async_row_group_pruning::native_async_pruned_row_groups,
     planning::{DeltaScanFileTask, DeltaScanPlan},
     scheduling::{FileBatchStream, FileExecutor, FileReadPermit, ScanCancellation},
+    transform::align_batch_to_logical_schema,
 };
 
 struct NativeAsyncFileReader {
@@ -502,14 +503,11 @@ impl NativeAsyncFileReadStream {
             .context(PhysicalToLogicalTransformSnafu {
                 reason: "physical_to_logical_transform_failed",
             })?;
-        if logical_batch.schema().as_ref() != self.logical_schema.as_ref() {
-            return Err(data_file_error(
-                "backend_logical_schema_mismatch",
-                delta_kernel::Error::generic(
-                    "NativeAsync output does not match the planned logical schema",
-                ),
-            ));
-        }
+        let logical_batch = align_batch_to_logical_schema(
+            logical_batch,
+            &self.logical_schema,
+            "NativeAsync output does not match the planned logical schema",
+        )?;
         let logical_batch = match self.deletion_vector.as_mut() {
             Some(deletion_vector) => deletion_vector
                 .mask_original_row_indexes(logical_batch, original_row_indexes.as_ref())?,

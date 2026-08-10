@@ -728,11 +728,9 @@ fn native_async_scan_partition_stream(
                         return Err(DataFusionError::from(error));
                     }
                 };
-                let rows = batch.num_rows();
-                if output.send(Ok(batch)).await.is_err() {
+                if !send_produced_batch(&output, batch, read_stats.as_ref()).await {
                     return Ok(());
                 }
-                read_stats.record_batch_produced(rows);
             }
             if output.is_closed() {
                 return Ok(());
@@ -744,6 +742,19 @@ fn native_async_scan_partition_stream(
     });
 
     project_scan_output_stream(builder.build(), schema)
+}
+
+async fn send_produced_batch(
+    output: &Sender<DataFusionResult<RecordBatch>>,
+    batch: RecordBatch,
+    read_stats: &DeltaProviderReadStats,
+) -> bool {
+    let Ok(permit) = output.reserve().await else {
+        return false;
+    };
+    read_stats.record_batch_produced(batch.num_rows());
+    permit.send(Ok(batch));
+    true
 }
 
 type NativeAsyncPartitionScheduler = DeltaProviderAsyncPartitionReadScheduler<
@@ -869,11 +880,9 @@ async fn drain_native_async_current_file_with_prefetch(
                 return Err(DataFusionError::from(error));
             }
         };
-        let rows = batch.num_rows();
-        if output.send(Ok(batch)).await.is_err() {
+        if !send_produced_batch(output, batch, read_stats).await {
             return Ok(NativeAsyncFileDrainResult::OutputClosed);
         }
-        read_stats.record_batch_produced(rows);
     }
 
     Ok(NativeAsyncFileDrainResult::OutputClosed)
@@ -5416,6 +5425,7 @@ mod tests {
                 .value(0),
             1
         );
+        assert!(scans[0].read_stats_snapshot().rows_produced >= u64::try_from(first.num_rows())?);
 
         drop(stream);
 
