@@ -131,6 +131,17 @@ impl DeltaScanExecution {
         }
     }
 
+    pub(crate) fn with_shared_limiter(
+        plan: Arc<DeltaScanPlan>,
+        limiter: Arc<ScanReadLimiter>,
+    ) -> Self {
+        Self {
+            plan,
+            limiter,
+            cancellation: ScanCancellation::new(),
+        }
+    }
+
     pub(crate) fn partition_stream(
         &self,
         partition: usize,

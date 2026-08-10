@@ -331,6 +331,11 @@ impl DeletionVectorSelection {
         Ok(())
     }
 
+    pub(crate) fn finish_original_row_indexes(&mut self) -> Result<(), DeltaReaderError> {
+        self.select_mode(DeletionVectorAccessMode::OriginalRowIndex)?;
+        self.finish()
+    }
+
     fn require_open(&self) -> Result<(), DeltaReaderError> {
         if self.closed {
             self.reject(
@@ -781,6 +786,17 @@ mod tests {
             [false, true, true]
         );
         selection.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn original_index_mode_can_finish_without_observing_rows() -> Result<(), DeltaReaderError> {
+        let metrics = metrics();
+        let mut selection = DeletionVectorSelection::try_new(vec![4], metrics.clone())?;
+
+        selection.finish_original_row_indexes()?;
+
+        assert_eq!(metrics.snapshot().deletion_vector_rejections, 0);
         Ok(())
     }
 

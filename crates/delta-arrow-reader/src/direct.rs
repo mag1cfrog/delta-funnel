@@ -183,6 +183,16 @@ impl DeltaTable {
         self.snapshot.table_uri()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        self.snapshot.partition_columns()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot(&self) -> &LoadedDeltaTableSnapshot {
+        self.snapshot.as_ref()
+    }
+
     /// Validates the loaded snapshot against the supported reader protocol.
     pub fn validate_protocol(&self) -> Result<(), DeltaReaderError> {
         validate_protocol(self.protocol())
@@ -377,7 +387,7 @@ impl DeltaScan {
             let execution = DeltaScanExecution::new(Arc::clone(&self.plan));
             let admission: FileAdmissionFn<_> = Arc::new(|_| Ok(FileAdmission::Admit));
             let executor = match backend {
-                DeltaReaderBackend::NativeAsync => native_async_executor(&self.plan)?,
+                DeltaReaderBackend::NativeAsync => native_async_executor(&self.plan, None, None)?,
                 DeltaReaderBackend::OfficialKernel => official_kernel_executor(&self.plan)?,
             };
             for partition in 0..partition_count {
@@ -564,17 +574,23 @@ fn validate_direct_execution_options(
 }
 
 #[cfg(feature = "native-async")]
-fn native_async_executor(
+pub(crate) fn native_async_executor(
     plan: &Arc<DeltaScanPlan>,
+    output_batch_size: Option<usize>,
+    row_predicate: Option<crate::kernel::DeltaKernelPredicate>,
 ) -> Result<FileExecutor<crate::planning::DeltaScanFileTask, FileBatchStream>, DeltaReaderError> {
     Ok(crate::native_async_reader::native_async_file_executor(
-        plan, None,
+        plan,
+        output_batch_size,
+        row_predicate,
     ))
 }
 
 #[cfg(not(feature = "native-async"))]
-fn native_async_executor(
+pub(crate) fn native_async_executor(
     _plan: &Arc<DeltaScanPlan>,
+    _output_batch_size: Option<usize>,
+    _row_predicate: Option<crate::kernel::DeltaKernelPredicate>,
 ) -> Result<FileExecutor<crate::planning::DeltaScanFileTask, FileBatchStream>, DeltaReaderError> {
     crate::error::UnsupportedBackendSnafu {
         reason: "native_async_feature_disabled",
@@ -583,14 +599,14 @@ fn native_async_executor(
 }
 
 #[cfg(feature = "official-kernel")]
-fn official_kernel_executor(
+pub(crate) fn official_kernel_executor(
     plan: &Arc<DeltaScanPlan>,
 ) -> Result<FileExecutor<crate::planning::DeltaScanFileTask, FileBatchStream>, DeltaReaderError> {
     Ok(crate::official_kernel_reader::official_kernel_file_executor(plan))
 }
 
 #[cfg(not(feature = "official-kernel"))]
-fn official_kernel_executor(
+pub(crate) fn official_kernel_executor(
     _plan: &Arc<DeltaScanPlan>,
 ) -> Result<FileExecutor<crate::planning::DeltaScanFileTask, FileBatchStream>, DeltaReaderError> {
     crate::error::UnsupportedBackendSnafu {

@@ -250,6 +250,39 @@ fn direct_reader_contract_is_public() {
     let _ = (stream_schema, metrics);
 }
 
+#[cfg(feature = "datafusion")]
+#[test]
+fn datafusion_metrics_contract_is_public() {
+    use delta_arrow_reader::{
+        DeltaDataFusionMetrics, DeltaDataFusionMetricsSnapshot, collect_delta_datafusion_metrics,
+    };
+
+    fn assert_clone<T: Clone>() {}
+    fn assert_snapshot_traits<T: std::fmt::Debug + Clone + PartialEq + Eq>() {}
+    fn inspect(snapshot: DeltaDataFusionMetricsSnapshot) {
+        let _: DeltaReadMetricsSnapshot = snapshot.reader;
+        let _: Option<u64> = snapshot.output_batch_size;
+        let _: u64 = snapshot.dynamic_partition_files_pruned;
+        let _: u64 = snapshot.dynamic_partition_files_kept;
+        let _: u64 = snapshot.dynamic_filters_received;
+        let _: u64 = snapshot.dynamic_filters_accepted;
+        let _: u64 = snapshot.dynamic_filters_unsupported;
+        let _: u64 = snapshot.dynamic_filter_snapshots;
+        let _: u64 = snapshot.dynamic_files_not_pruned_missing_metadata;
+        let _: u64 = snapshot.dynamic_files_not_pruned_unsupported_expression;
+    }
+
+    assert_clone::<DeltaDataFusionMetrics>();
+    assert_snapshot_traits::<DeltaDataFusionMetricsSnapshot>();
+    let source_name: for<'a> fn(&'a DeltaDataFusionMetrics) -> Option<&'a str> =
+        DeltaDataFusionMetrics::source_name;
+    let snapshot: fn(&DeltaDataFusionMetrics) -> DeltaDataFusionMetricsSnapshot =
+        DeltaDataFusionMetrics::snapshot;
+    let collect: fn(&dyn datafusion::physical_plan::ExecutionPlan) -> Vec<DeltaDataFusionMetrics> =
+        collect_delta_datafusion_metrics;
+    let _ = (source_name, snapshot, collect, inspect);
+}
+
 #[cfg(not(feature = "native-async"))]
 #[test]
 fn disabled_native_backend_fails_before_uri_access() {

@@ -2,6 +2,8 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+#[cfg(any(feature = "native-async", test))]
+use arrow::array::BooleanArray;
 use arrow::{
     array::Array as _, datatypes::SchemaRef, error::ArrowError, record_batch::RecordBatch,
 };
@@ -65,7 +67,7 @@ pub(crate) struct KernelScanFileMetadata {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct KernelPhysicalToLogicalTransform(Option<ExpressionRef>);
 
 #[allow(dead_code)]
@@ -423,6 +425,32 @@ impl DeltaKernelEngineContext {
         Arc::clone(&self.object_store)
     }
 
+    #[cfg(any(feature = "native-async", test))]
+    pub(crate) fn evaluate_predicate(
+        &self,
+        schemas: &KernelScanSchemas,
+        predicate: &DeltaKernelPredicate,
+        batch: RecordBatch,
+    ) -> delta_kernel::DeltaResult<BooleanArray> {
+        let evaluator = self.engine.evaluation_handler().new_predicate_evaluator(
+            Arc::clone(&schemas.physical),
+            Arc::clone(predicate.as_ref()),
+        )?;
+        let selection = evaluator
+            .evaluate(&ArrowEngineData::new(batch))?
+            .try_into_record_batch()?;
+        selection
+            .columns()
+            .first()
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .cloned()
+            .ok_or_else(|| {
+                delta_kernel::Error::generic(
+                    "physical predicate evaluator did not return a BooleanArray",
+                )
+            })
+    }
+
     pub(crate) fn load_snapshot(
         &self,
         version: Option<u64>,
@@ -452,6 +480,10 @@ pub(crate) struct KernelSnapshot(SnapshotRef);
 impl KernelSnapshot {
     pub(crate) fn version(&self) -> u64 {
         self.0.version()
+    }
+
+    pub(crate) fn partition_columns(&self) -> &[String] {
+        self.0.table_configuration().metadata().partition_columns()
     }
 
     pub(crate) fn build_scan(
