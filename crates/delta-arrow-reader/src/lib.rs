@@ -4,7 +4,16 @@ mod config;
 mod deletion_vector;
 mod error;
 mod kernel;
+#[cfg(feature = "native-async")]
+#[allow(dead_code)]
+mod metered_object_store;
 mod metrics;
+#[cfg(feature = "native-async")]
+#[allow(dead_code)]
+mod native_async_reader;
+#[cfg(feature = "native-async")]
+#[allow(dead_code)]
+mod native_async_row_group_pruning;
 mod partition_target;
 mod planning;
 mod predicate;
