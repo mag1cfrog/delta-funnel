@@ -23,7 +23,7 @@ published package.
 
 ## Current boundary
 
-Through #466, this crate owns reader configuration, errors, metrics, immutable
+Through #467, this crate owns reader configuration, errors, metrics, immutable
 snapshot/protocol/schema loading, deletion-vector handling, exact logical
 predicates, scan metadata and transforms, deterministic partition planning,
 backend-neutral bounded scheduling, and the private NativeAsync and
@@ -44,7 +44,15 @@ residual predicates, removes hidden predicate columns, enforces a global output
 limit, merges partitions deterministically, and keeps scan metrics accessible
 after stream drop.
 
-The crate does not yet contain DataFusion integration, production routing, or
-a compatibility facade. Later
+The optional private DataFusion planning adapter preserves the frozen provider
+policy: it validates projection indexes, rejects duplicates, expands physical
+reads with accepted predicate columns, normalizes relation-qualified top-level
+columns, and applies the existing partition and data-statistics filter matrices.
+Inexact filters retain their complete DataFusion residual and require all
+residual columns in the scan output. The adapter does not derive optimizer
+statistics or apply DataFusion's advisory scan limit.
+
+The crate does not yet contain a DataFusion provider or physical plan,
+production routing, or a compatibility facade. Later
 [#447-family issues](https://github.com/mag1cfrog/delta-funnel/issues/447) own
 those remaining boundaries.

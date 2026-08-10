@@ -66,6 +66,11 @@ publish the candidate package.
 | OfficialKernel blocking-producer portions of `crates/delta-funnel/src/query_engine/datafusion/execution/scheduling.rs` and `planning_exec.rs` | `crates/delta-arrow-reader/src/official_kernel_reader.rs` over `src/scheduling.rs` | #465 |
 | OfficialKernel metric-availability portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #465 |
 | Direct table-loading, scan-building, and Arrow stream composition over the extracted services | `crates/delta-arrow-reader/src/direct.rs` | #466 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/projection.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` | #467 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/filters.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` | #467 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/filters/analysis.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` | #467 |
+| `crates/delta-funnel/src/query_engine/datafusion/planning/filters/partition_pushdown.rs` and `stats_pushdown.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` over the #484 predicate and Kernel-pruning boundary | #467 |
+| Static filter-normalization and scan-planning portions of `crates/delta-funnel/src/query_engine/datafusion/catalog/provider.rs` | `crates/delta-arrow-reader/src/datafusion_planning.rs` | #467 |
 
 ## Test migration
 
@@ -99,9 +104,16 @@ publish the candidate package.
   signed-zero float predicates fall back to residual-only when Kernel cannot
   preserve their logical meaning. These #484 contract differences are covered
   locally rather than retaining the old adapter outcomes.
-- DataFusion expression translation, including `IN`, `BETWEEN`, casts, and
-  qualified-expression rejection, remains with #467. Scan-level pruning and
-  residual integration are covered by #463 and #466.
+- #467 ports and adapts ordered, empty, rejected-duplicate, invalid, hostile,
+  accepted-predicate-column, and residual-column projection coverage. Its
+  table-driven parity tests preserve the existing partition and data-statistics
+  type/operator matrices, reversed comparisons, qualifier normalization,
+  rejection policy, exactness capability, mixed-AND pruning, and three-valued
+  partition `IN`/`BETWEEN` behavior. Equivalent Utf8/LargeUtf8,
+  Binary/LargeBinary, and timestamp representations are normalized to the
+  Arrow field type because #484 predicates require exact scalar types.
+  DataFusion optimizer statistics stay unknown, and its advisory scan limit
+  remains outside core planning.
 - #466 adds external signature and deterministic end-to-end tests for the
   direct load, projection, predicate, limit, partition merge, backend parity,
   error, drop, redaction, and retained-metrics contracts.
