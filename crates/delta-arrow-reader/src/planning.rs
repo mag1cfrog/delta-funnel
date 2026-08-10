@@ -101,6 +101,7 @@ pub(crate) fn plan_scan(
     partition_target_options: DeltaScanPartitionTargetOptions,
 ) -> Result<DeltaScanPlan, DeltaReaderError> {
     execution_options.validate()?;
+    validate_backend_available(execution_options)?;
     let partition_target_diagnostic = local_partition_target_diagnostic(partition_target_options)?;
     let unpartitioned = build_unpartitioned_scan_plan(
         snapshot,
@@ -123,6 +124,7 @@ pub(crate) fn plan_unpartitioned_scan(
     execution_options: DeltaReaderExecutionOptions,
 ) -> Result<DeltaUnpartitionedScanPlan, DeltaReaderError> {
     execution_options.validate()?;
+    validate_backend_available(execution_options)?;
     build_unpartitioned_scan_plan(
         snapshot,
         projection,
@@ -131,6 +133,20 @@ pub(crate) fn plan_unpartitioned_scan(
         include_stats,
         execution_options,
     )
+}
+
+fn validate_backend_available(
+    execution_options: DeltaReaderExecutionOptions,
+) -> Result<(), DeltaReaderError> {
+    #[cfg(not(feature = "official-kernel"))]
+    if execution_options.reader_backend() == crate::DeltaReaderBackend::OfficialKernel {
+        return crate::error::UnsupportedBackendSnafu {
+            reason: "official_kernel_feature_disabled",
+        }
+        .fail();
+    }
+    let _ = execution_options;
+    Ok(())
 }
 
 fn build_unpartitioned_scan_plan(
@@ -532,6 +548,40 @@ mod tests {
     const INVALID_PARTITION_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-invalid-partition-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"long_part\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["long_part"],"configuration":{},"createdTime":1587968585495}}"#;
     const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"scan-planning-column-mapping-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"first_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":4,\"delta.columnMapping.physicalName\":\"phys_first_name\"}},{\"name\":\"age\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"phys_age\"}}]},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"phys_profile\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"5"},"createdTime":1587968585495}}"#;
 
+    #[cfg(not(feature = "official-kernel"))]
+    #[test]
+    fn disabled_official_kernel_backend_is_rejected_before_planning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_table, snapshot) = loaded_snapshot("disabled-official-kernel")?;
+        let options = crate::DeltaReaderExecutionOptions::new()
+            .with_reader_backend(crate::DeltaReaderBackend::OfficialKernel)?;
+        let partitioned = super::plan_scan(
+            &snapshot,
+            None,
+            &[],
+            None,
+            false,
+            options,
+            super::DeltaScanPartitionTargetOptions::default(),
+        )
+        .err()
+        .ok_or("disabled OfficialKernel partitioned planning must fail")?;
+        let unpartitioned =
+            super::plan_unpartitioned_scan(&snapshot, None, &[], None, false, options)
+                .err()
+                .ok_or("disabled OfficialKernel unpartitioned planning must fail")?;
+
+        for error in [partitioned, unpartitioned] {
+            assert_eq!(error.as_str(), "unsupported_backend");
+            assert_eq!(error.phase(), crate::DeltaReaderPhase::Configuration);
+            assert_eq!(
+                error.to_string(),
+                "delta reader error: phase=configuration error=unsupported_backend reason=official_kernel_feature_disabled"
+            );
+        }
+        Ok(())
+    }
+
     struct DeltaLogTable(PathBuf);
 
     impl DeltaLogTable {
@@ -837,18 +887,20 @@ mod tests {
     fn file_task_planning_exhausts_empty_single_and_multi_batch_scans()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_empty_table, empty_snapshot) = loaded_snapshot("empty-files")?;
-        let execution_options = crate::DeltaReaderExecutionOptions::default()
-            .with_reader_backend(crate::DeltaReaderBackend::OfficialKernel)?;
+        let execution_options = crate::DeltaReaderExecutionOptions::default();
+        #[cfg(feature = "official-kernel")]
+        let execution_options =
+            execution_options.with_reader_backend(crate::DeltaReaderBackend::OfficialKernel)?;
+        let expected_backend = execution_options.reader_backend();
+        let expected_parquet_metric =
+            (expected_backend == crate::DeltaReaderBackend::NativeAsync).then_some(0);
         let empty = plan_scan(&empty_snapshot, None, &[], None, true, execution_options)?;
         assert!(empty.partitions.is_empty());
         assert_eq!(empty.estimated_bytes, Some(0));
         assert_eq!(empty.estimated_rows, Some(0));
         let empty_metrics = empty.metrics.snapshot();
         assert_eq!(empty_metrics.snapshot_version, empty.snapshot_version);
-        assert_eq!(
-            empty_metrics.reader_backend,
-            crate::DeltaReaderBackend::OfficialKernel
-        );
+        assert_eq!(empty_metrics.reader_backend, expected_backend);
         assert_eq!(empty_metrics.scan_metadata_exhausted, Some(true));
         assert_eq!(empty_metrics.scan_partitions_planned, 0);
         assert_eq!(empty_metrics.files_planned, 0);
@@ -869,10 +921,22 @@ mod tests {
         assert_eq!(empty_metrics.deletion_vector_rows_deleted, 0);
         assert_eq!(empty_metrics.deletion_vector_failures, 0);
         assert_eq!(empty_metrics.deletion_vector_rejections, 0);
-        assert_eq!(empty_metrics.parquet_data_file_range_get_operations, None);
-        assert_eq!(empty_metrics.parquet_data_file_full_get_operations, None);
-        assert_eq!(empty_metrics.parquet_data_file_bytes_received, None);
-        assert_eq!(empty_metrics.parquet_data_file_opened_bytes, None);
+        assert_eq!(
+            empty_metrics.parquet_data_file_range_get_operations,
+            expected_parquet_metric
+        );
+        assert_eq!(
+            empty_metrics.parquet_data_file_full_get_operations,
+            expected_parquet_metric
+        );
+        assert_eq!(
+            empty_metrics.parquet_data_file_bytes_received,
+            expected_parquet_metric
+        );
+        assert_eq!(
+            empty_metrics.parquet_data_file_opened_bytes,
+            expected_parquet_metric
+        );
 
         let single_add = [add("single.parquet", 0, None)];
         let (_single_table, single_snapshot) =

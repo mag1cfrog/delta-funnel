@@ -61,6 +61,10 @@ publish the candidate package.
 | `crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs` | `crates/delta-arrow-reader/src/metered_object_store.rs` | #464 |
 | NativeAsync file-producer and default-backend portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `reader_backend.rs` | `crates/delta-arrow-reader/src/native_async_reader.rs` and `src/config.rs` | #464 |
 | NativeAsync Parquet I/O counter portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metered_object_store.rs`, `src/metrics.rs`, and `src/native_async_reader.rs` | #464 |
+| OfficialKernel data-file portions of `crates/delta-funnel/src/table_formats/delta/read.rs` | `crates/delta-arrow-reader/src/official_kernel_reader.rs` and `src/kernel.rs` | #465 |
+| OfficialKernel file-correctness portions of `crates/delta-funnel/src/query_engine/datafusion/execution/file_reader.rs` and `reader_backend.rs` | `crates/delta-arrow-reader/src/official_kernel_reader.rs`, `src/deletion_vector.rs`, and `src/kernel.rs` | #465 |
+| OfficialKernel blocking-producer portions of `crates/delta-funnel/src/query_engine/datafusion/execution/scheduling.rs` and `planning_exec.rs` | `crates/delta-arrow-reader/src/official_kernel_reader.rs` over `src/scheduling.rs` | #465 |
+| OfficialKernel metric-availability portions of `crates/delta-funnel/src/query_engine/datafusion/execution/read_stats.rs` | `crates/delta-arrow-reader/src/metrics.rs` | #465 |
 
 ## Test migration
 
@@ -80,10 +84,13 @@ publish the candidate package.
   metadata prefetch, per-file buffering, physical projection and schema
   matching, conservative row-group pruning, original row indexes, DV and
   transform pipeline, cancellation, resource lifetime, errors, and focused
-  scheduler integration assertions. DataFusion-only NativeAsync adaptation
-  remains with #482.
-- OfficialKernel and its DataFusion adaptation remain in Delta Funnel for #465
-  and #483.
+  scheduler integration assertions. Public direct certification remains with
+  #482, and DataFusion adaptation and certification remain with #483.
+- #465 ports OfficialKernel data-file reads, the bounded blocking handoff,
+  projection, predicates, transforms, ordered DV masking, capability fallback,
+  cancellation-safe cleanup, errors, metrics availability, and focused parity
+  assertions against NativeAsync. Full public direct certification remains with
+  #482, and DataFusion adaptation and certification remain with #483.
 - #484 adapts the focused comparison, scalar, Boolean, null, and Kernel
   conversion assertions into the staged crate, then adds schema-validation,
   three-valued residual, pruning-parity, concurrency, and redaction coverage.

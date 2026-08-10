@@ -158,7 +158,7 @@ pub enum DeltaReaderError {
     /// The requested reader backend is unavailable.
     #[non_exhaustive]
     #[snafu(display(
-        "delta reader error: phase=execution error=unsupported_backend reason={reason}"
+        "delta reader error: phase=configuration error=unsupported_backend reason={reason}"
     ))]
     UnsupportedBackend {
         /// Fixed redacted reason category.
@@ -259,7 +259,8 @@ impl DeltaReaderError {
             | Self::UnsupportedPredicate { .. }
             | Self::ScanPlanning { .. }
             | Self::ScanPartitionPlanning { .. } => DeltaReaderPhase::ScanPlanning,
-            Self::UnsupportedBackend { .. } | Self::Cancelled { .. } => DeltaReaderPhase::Execution,
+            Self::UnsupportedBackend { .. } => DeltaReaderPhase::Configuration,
+            Self::Cancelled { .. } => DeltaReaderPhase::Execution,
             Self::DataFileRead { .. } => DeltaReaderPhase::DataFileRead,
             Self::DeletionVectorRead { .. } => DeltaReaderPhase::DeletionVector,
             Self::PhysicalToLogicalTransform { .. } => DeltaReaderPhase::Transform,
@@ -395,7 +396,7 @@ mod tests {
                     reason: "unsupported_backend",
                 },
                 "unsupported_backend",
-                DeltaReaderPhase::Execution,
+                DeltaReaderPhase::Configuration,
                 false,
             ),
             (
