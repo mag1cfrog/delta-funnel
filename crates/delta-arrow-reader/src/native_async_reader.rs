@@ -237,15 +237,18 @@ impl NativeAsyncFileReader {
                 include_original_row_index,
             ) => result?,
         };
-        let deletion_vector = tokio::select! {
-            biased;
-            () = request.cancellation.cancelled() => return Err(cancelled_error()),
-            result = load_deletion_vector_selection_from_engine_context(
-                Arc::clone(&self.engine_context),
-                request.task.deletion_vector.clone(),
-                &self.metrics,
-            ) => result?,
-        };
+        if request.cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let deletion_vector = load_deletion_vector_selection_from_engine_context(
+            Arc::clone(&self.engine_context),
+            request.task.deletion_vector.clone(),
+            &self.metrics,
+        )
+        .await?;
+        if request.cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
 
         Ok(NativeAsyncFileReadStream {
             parquet,
