@@ -38,18 +38,17 @@ use crate::{
     scheduling::{FileBatchStream, FileExecutor, FileReadPermit, ScanCancellation},
 };
 
-pub(crate) struct NativeAsyncFileReader {
+struct NativeAsyncFileReader {
     engine_context: Arc<DeltaKernelEngineContext>,
     store: Arc<dyn ObjectStore>,
     execution_options: DeltaReaderExecutionOptions,
     metrics: DeltaReadMetrics,
 }
 
-#[derive(Debug)]
-pub(crate) struct NativeAsyncParquetObject {
-    pub(crate) store: Arc<dyn ObjectStore>,
-    pub(crate) path: Path,
-    pub(crate) file_size: u64,
+struct NativeAsyncParquetObject {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
 }
 
 struct NativeAsyncParquetStream {
@@ -58,7 +57,7 @@ struct NativeAsyncParquetStream {
     include_original_row_index: bool,
 }
 
-pub(crate) struct NativeAsyncFileReadStream {
+struct NativeAsyncFileReadStream {
     parquet: NativeAsyncParquetStream,
     engine_context: Arc<DeltaKernelEngineContext>,
     kernel_schemas: KernelScanSchemas,
@@ -137,7 +136,7 @@ struct NativeAsyncRootMatch {
 }
 
 impl NativeAsyncFileReader {
-    pub(crate) fn new(
+    fn new(
         engine_context: Arc<DeltaKernelEngineContext>,
         execution_options: DeltaReaderExecutionOptions,
         metrics: DeltaReadMetrics,
@@ -154,7 +153,7 @@ impl NativeAsyncFileReader {
         }
     }
 
-    pub(crate) async fn parquet_object_for_task(
+    async fn parquet_object_for_task(
         &self,
         task: &DeltaScanFileTask,
     ) -> Result<NativeAsyncParquetObject, DeltaReaderError> {
@@ -1931,10 +1930,13 @@ mod tests {
             Some(1)
         );
 
-        let error = reader
+        let error = match reader
             .parquet_object_for_task(&task("secret-file.parquet", None)?)
             .await
-            .expect_err("missing size must fail");
+        {
+            Ok(_) => return Err("missing size must fail".into()),
+            Err(error) => error,
+        };
         assert_eq!(error.as_str(), "data_file_read");
         assert!(!error.to_string().contains("secret-file"));
         Ok(())
@@ -2503,6 +2505,19 @@ mod tests {
 
         let projection = ["id".to_owned()];
         let projected = execute_pipeline_plan(non_dv_plan(&root, Some(&projection))?).await?;
+        let projected_ids = projected
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("planned Int32Array")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected_ids, [1, 2, 3]);
         assert!(
             projected
                 .iter()
@@ -2650,10 +2665,13 @@ mod tests {
             DeltaReaderExecutionOptions::new().with_parquet_full_file_read_threshold(Some(64))?,
             missing_metrics.clone(),
         )?;
-        let error = missing_reader
+        let error = match missing_reader
             .parquet_object_for_task(&task("secret-missing.parquet", Some(12))?)
             .await
-            .expect_err("missing full GET must fail");
+        {
+            Ok(_) => return Err("missing full GET must fail".into()),
+            Err(error) => error,
+        };
         assert_eq!(
             error.to_string(),
             "delta reader error: phase=data_file_read error=data_file_read reason=parquet_full_file_read_failed"
