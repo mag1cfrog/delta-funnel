@@ -135,7 +135,7 @@ pub(crate) fn plan_unpartitioned_scan(
     )
 }
 
-fn validate_backend_available(
+pub(crate) fn validate_backend_available(
     execution_options: DeltaReaderExecutionOptions,
 ) -> Result<(), DeltaReaderError> {
     #[cfg(not(feature = "official-kernel"))]

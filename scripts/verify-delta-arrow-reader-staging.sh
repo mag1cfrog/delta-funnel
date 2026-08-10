@@ -24,6 +24,18 @@ if grep -Eq 'workspace[[:space:]]*=[[:space:]]*true|delta[-_]funnel' "$crate_man
     exit 1
 fi
 
+if cargo tree -p delta-arrow-reader -e normal --prefix none |
+    grep -Eq '^datafusion([[:space:]]|$)'; then
+    echo "temporary package enables DataFusion in its default dependency graph" >&2
+    exit 1
+fi
+
+direct_source=crates/delta-arrow-reader/src/direct.rs
+if grep -Eq 'block_on|tokio::runtime|Runtime::|try_collect|pub (async )?fn (collect|execute_again)' "$direct_source"; then
+    echo "direct reader exposes materialization, repeat execution, or runtime ownership" >&2
+    exit 1
+fi
+
 grep -Fx '    "crates/delta-arrow-reader",' Cargo.toml >/dev/null
 
 workspace_release=$(

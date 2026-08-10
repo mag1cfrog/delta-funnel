@@ -2,6 +2,7 @@
 
 mod config;
 mod deletion_vector;
+mod direct;
 mod error;
 mod kernel;
 #[cfg(feature = "native-async")]
@@ -30,6 +31,7 @@ mod uri;
 pub use config::{
     DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaSnapshotSelection, DeltaStorageOptions,
 };
+pub use direct::{DeltaBatchStream, DeltaScan, DeltaScanBuilder, DeltaTable, DeltaTableBuilder};
 pub use error::{DeltaReaderError, DeltaReaderPhase};
 pub use metrics::{DeltaReadMetrics, DeltaReadMetricsSnapshot};
 #[doc(hidden)]

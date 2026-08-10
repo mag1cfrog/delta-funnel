@@ -152,6 +152,31 @@ pub(crate) fn evaluate_predicate(
         .map_err(|_| unsupported_predicate("predicate_evaluation"))
 }
 
+pub(crate) fn referenced_columns(predicate: &DeltaPredicate) -> Vec<String> {
+    fn visit(predicate: &DeltaPredicate, columns: &mut Vec<String>) {
+        match predicate {
+            DeltaPredicate::Boolean(_) => {}
+            DeltaPredicate::Compare { column, .. }
+            | DeltaPredicate::IsNull { column }
+            | DeltaPredicate::IsNotNull { column } => {
+                if !columns.contains(column) {
+                    columns.push(column.clone());
+                }
+            }
+            DeltaPredicate::And(children) | DeltaPredicate::Or(children) => {
+                for child in children {
+                    visit(child, columns);
+                }
+            }
+            DeltaPredicate::Not(child) => visit(child, columns),
+        }
+    }
+
+    let mut columns = Vec::new();
+    visit(predicate, &mut columns);
+    columns
+}
+
 fn predicate_selection(
     batch: &RecordBatch,
     predicate: &DeltaPredicate,

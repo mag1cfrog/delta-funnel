@@ -401,6 +401,22 @@ impl PartitionStream {
             done: false,
         }
     }
+
+    pub(crate) fn start(&mut self) {
+        let PartitionStreamState::NotStarted(start) = &mut self.state else {
+            return;
+        };
+        let Some(start) = start.take() else {
+            self.state = PartitionStreamState::Done;
+            self.done = true;
+            return;
+        };
+        let (output, receiver) = mpsc::channel(start.output_capacity);
+        self.state = PartitionStreamState::Running {
+            receiver,
+            task: (start.start)(output),
+        };
+    }
 }
 
 impl Stream for PartitionStream {
@@ -409,18 +425,7 @@ impl Stream for PartitionStream {
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match &mut self.state {
-                PartitionStreamState::NotStarted(start) => {
-                    let Some(start) = start.take() else {
-                        self.state = PartitionStreamState::Done;
-                        self.done = true;
-                        return Poll::Ready(None);
-                    };
-                    let (output, receiver) = mpsc::channel(start.output_capacity);
-                    self.state = PartitionStreamState::Running {
-                        receiver,
-                        task: (start.start)(output),
-                    };
-                }
+                PartitionStreamState::NotStarted(_) => self.start(),
                 PartitionStreamState::Running { receiver, .. } => {
                     match receiver.poll_recv(context) {
                         Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),

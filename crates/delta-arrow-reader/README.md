@@ -1,11 +1,11 @@
 # delta-arrow-reader
 
 This is the temporary staging crate for extracting Delta Funnel's read-only
-Delta Lake to Arrow implementation. It currently contains the reader foundation,
-snapshot and protocol loading, deletion-vector handling, predicates, scan
-planning, partition grouping, backend-neutral scheduling, and the private
-NativeAsync and OfficialKernel file executors. It is not published or used by
-Delta Funnel production code.
+Delta Lake to Arrow implementation. It contains the reader foundation, snapshot
+and protocol loading, deletion-vector handling, predicates, scan planning,
+partition grouping, backend-neutral scheduling, NativeAsync and OfficialKernel
+file executors, and the public DataFusion-independent streaming reader. It is
+not published or used by Delta Funnel production code.
 
 The crate exists only on the
 [`refactor/delta-arrow-reader-staging`](https://github.com/mag1cfrog/delta-funnel/tree/refactor/delta-arrow-reader-staging)
@@ -14,8 +14,47 @@ owns this scaffold, and
 [issue #447](https://github.com/mag1cfrog/delta-funnel/issues/447) owns the
 extraction lifecycle.
 
-No public table-loading or scan-stream API exists yet. The direct API and
-DataFusion integration belong to later #447-family issues.
+DataFusion integration belongs to later #447-family issues.
+
+## Read a table without SQL
+
+The caller owns the Tokio runtime and pulls batches from the returned stream.
+The reader does not collect the full result in memory.
+
+```rust,no_run
+use delta_arrow_reader::{DeltaComparison, DeltaPredicate, DeltaScalar, DeltaTableBuilder};
+use futures_util::TryStreamExt;
+
+# async fn read_table() -> Result<(), Box<dyn std::error::Error>> {
+let table = DeltaTableBuilder::new("/tmp/example-delta-table")
+    .load_async()
+    .await?;
+let scan = table
+    .scan()
+    .with_projection(vec!["id".into(), "name".into()])
+    .with_predicate(DeltaPredicate::Compare {
+        column: "id".into(),
+        op: DeltaComparison::GtEq,
+        value: DeltaScalar::Int64(10),
+    })
+    .with_limit(100)
+    .build()
+    .await?;
+let mut batches = scan.execute().await?;
+
+while let Some(batch) = batches.try_next().await? {
+    println!("rows={}", batch.num_rows());
+}
+# Ok(())
+# }
+```
+
+Run the deterministic local end-to-end example, which creates its own Delta
+table and reads it through only the public API:
+
+```console
+cargo test -p delta-arrow-reader --test direct_reader local_end_to_end_example_reads_without_sql -- --exact --nocapture
+```
 
 ## Validate the staging crate
 
