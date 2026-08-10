@@ -5,7 +5,10 @@ Delta Lake to Arrow implementation. It contains the reader foundation, snapshot
 and protocol loading, deletion-vector handling, predicates, scan planning,
 partition grouping, backend-neutral scheduling, NativeAsync and OfficialKernel
 file executors, and the public DataFusion-independent streaming reader. It is
-not published or used by Delta Funnel production code.
+not published or used by Delta Funnel production code. Behind the optional
+`datafusion` feature, it also contains the private static projection and filter
+adapter that preserves Delta Funnel's existing partition and data-statistics
+pushdown policy for the later provider and physical-plan slices.
 
 The crate exists only on the
 [`refactor/delta-arrow-reader-staging`](https://github.com/mag1cfrog/delta-funnel/tree/refactor/delta-arrow-reader-staging)
@@ -14,7 +17,8 @@ owns this scaffold, and
 [issue #447](https://github.com/mag1cfrog/delta-funnel/issues/447) owns the
 extraction lifecycle.
 
-DataFusion integration belongs to later #447-family issues.
+DataFusion provider registration and physical execution belong to later
+#447-family issues.
 
 ## Read a table without SQL
 

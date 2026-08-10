@@ -1,6 +1,8 @@
 //! Read-only Delta Lake to Arrow support.
 
 mod config;
+#[cfg(feature = "datafusion")]
+mod datafusion_planning;
 mod deletion_vector;
 mod direct;
 mod error;
