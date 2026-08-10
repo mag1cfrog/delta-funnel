@@ -297,7 +297,7 @@ impl NativeAsyncFileReader {
         let should_buffer = self
             .execution_options
             .parquet_full_file_read_threshold()
-            .and_then(|threshold| u64::try_from(threshold).ok())
+            .map(|threshold| u64::try_from(threshold).unwrap_or(u64::MAX))
             .is_some_and(|threshold| object.file_size <= threshold);
         if !should_buffer {
             return Ok(object);
@@ -1909,6 +1909,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_store_is_owned_only_by_its_file_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = TestDir::new("native-file-local-buffer")?;
+        let bytes = parquet_bytes()?;
+        fs::write(root.path().join("part.parquet"), &bytes)?;
+        let metrics = metrics();
+        let reader = reader(
+            &root,
+            DeltaReaderExecutionOptions::new()
+                .with_parquet_full_file_read_threshold(Some(bytes.len()))?,
+            metrics.clone(),
+        )?;
+        let task = task("part.parquet", Some(u64::try_from(bytes.len())?))?;
+
+        let object = reader.parquet_object_for_task(&task).await?;
+        let buffered_store = Arc::downgrade(&object.store);
+        assert_eq!(Arc::strong_count(&object.store), 1);
+        drop(object);
+        assert!(buffered_store.upgrade().is_none());
+
+        let second = reader.parquet_object_for_task(&task).await?;
+        assert_eq!(Arc::strong_count(&second.store), 1);
+        assert_eq!(
+            metrics.snapshot().parquet_data_file_full_get_operations,
+            Some(2)
+        );
+        drop(second);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn opens_projected_parquet_stream_with_configured_batch_size()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = TestDir::new("native-projected-stream")?;
@@ -2007,10 +2038,12 @@ mod tests {
         let file_size = u64::try_from(bytes.len())?;
         let mut snapshots = Vec::new();
 
-        for hint in [Some(65_536), None, Some(9)] {
+        for options in [
+            DeltaReaderExecutionOptions::new(),
+            DeltaReaderExecutionOptions::new().with_parquet_metadata_size_hint(None)?,
+            DeltaReaderExecutionOptions::new().with_parquet_metadata_size_hint(Some(9))?,
+        ] {
             let metrics = metrics();
-            let options =
-                DeltaReaderExecutionOptions::new().with_parquet_metadata_size_hint(hint)?;
             let reader = reader(&root, options, metrics.clone())?;
             let task = task("part.parquet", Some(file_size))?;
             let provider_schema = Arc::new(Schema::new(vec![
