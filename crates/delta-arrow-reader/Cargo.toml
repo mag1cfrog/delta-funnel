@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 publish = false
+exclude = [
+    "tests/portable_fixtures.rs",
+    "tests/support/**",
+]
 
 [features]
 default = ["native-async"]
