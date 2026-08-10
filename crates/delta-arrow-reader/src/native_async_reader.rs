@@ -1419,8 +1419,8 @@ mod tests {
                 guard.completed = true;
             }
             let result = self.inner.get_opts(location, options).await?;
-            if !range_call
-                .is_some_and(|call| self.corrupt_range_target.load(Ordering::Acquire) == call)
+            if range_call
+                .is_none_or(|call| self.corrupt_range_target.load(Ordering::Acquire) != call)
             {
                 return Ok(result);
             }
