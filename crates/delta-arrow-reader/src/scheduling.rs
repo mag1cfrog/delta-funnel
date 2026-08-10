@@ -657,16 +657,17 @@ where
             Err(error) => return DrainFile::Error(error),
         };
         let rows = batch.num_rows();
-        let sent = tokio::select! {
+        let permit = tokio::select! {
             biased;
             () = cancellation.cancelled() => return DrainFile::Cancelled,
-            sent = output.send(Ok(batch)) => sent,
+            permit = output.reserve() => permit,
         };
-        if sent.is_err() {
+        let Ok(permit) = permit else {
             cancellation.cancel();
             return DrainFile::Cancelled;
-        }
+        };
         metrics.record_batch_produced(rows);
+        permit.send(Ok(batch));
     }
 }
 
