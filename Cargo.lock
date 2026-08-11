@@ -1320,6 +1320,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "delta-arrow-reader"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e75b1cda3e8a3450bd6653175abb83f272b0cdba5abda1fff62146f4d96385e"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "futures-util",
+ "libc",
+ "object_store",
+ "parquet",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "delta-funnel"
 version = "0.5.0"
 dependencies = [
@@ -1329,6 +1352,7 @@ dependencies = [
  "chrono",
  "clap",
  "datafusion",
+ "delta-arrow-reader",
  "delta_kernel",
  "delta_kernel_default_engine",
  "flate2",
