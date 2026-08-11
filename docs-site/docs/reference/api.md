@@ -60,6 +60,7 @@ class ProviderScanOptions(TypedDict, total=False):
     native_async_prefetch_file_count_per_partition: int
     parquet_metadata_size_hint: int | None
     parquet_full_file_read_threshold: int | None
+    use_view_types: bool
 ```
 
 Reports are JSON-compatible Python dictionaries. See
@@ -184,7 +185,7 @@ SQL Server defaults.
 | `default_mssql_connection_string` | Default ADO-style connection string for outputs that do not provide one. |
 | `target_partitions` | Positive DataFusion execution partition target. `None` preserves the DataFusion default. |
 | `output_batch_size` | Positive target row count for output batches. `None` preserves the DataFusion default. |
-| `provider_scan_options` | Delta scan concurrency, buffering, and Parquet metadata prefetch overrides. |
+| `provider_scan_options` | Delta scan concurrency, buffering, Parquet reads, and Arrow representation overrides. |
 | `validation_options` | Target validation and dry-run scan-summary behavior. |
 | `schema_options` | Arrow-to-SQL Server type mapping policies. |
 
@@ -202,6 +203,12 @@ All option mappings reject unknown keys.
 | `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
 | `parquet_metadata_size_hint` | Positive Parquet file-tail size in bytes; `None` disables footer metadata prefetch | `65536` (64 KiB) |
 | `parquet_full_file_read_threshold` | Positive maximum Parquet file size in bytes; `None` disables buffered full-file reads | `None` |
+| `use_view_types` | Boolean selecting Arrow Utf8View and BinaryView data columns | `False` |
+
+Delta Funnel defaults to ordinary Arrow Utf8 and Binary arrays because they
+perform better in its transformation-heavy workflows. Set `use_view_types` to
+`True` for scan-heavy workloads that benefit from view arrays. Partition string
+and binary columns remain dictionary encoded in either mode.
 
 For an eligible file, the native async reader performs one full object-store
 GET and serves that file's later Parquet metadata and data range reads from a

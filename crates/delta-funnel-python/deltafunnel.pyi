@@ -22,6 +22,7 @@ class ProviderScanOptions(TypedDict, total=False):
     native_async_prefetch_file_count_per_partition: int
     parquet_metadata_size_hint: int | None
     parquet_full_file_read_threshold: int | None
+    use_view_types: bool
 
 
 def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...

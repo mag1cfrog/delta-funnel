@@ -763,6 +763,7 @@ mod tests {
                 parquet_data_file_bytes_received: Some(0),
                 parquet_data_file_opened_bytes: Some(0),
             },
+            use_view_types: false,
             output_batch_size: None,
             dynamic_partition_files_pruned,
             dynamic_partition_files_kept: 0,

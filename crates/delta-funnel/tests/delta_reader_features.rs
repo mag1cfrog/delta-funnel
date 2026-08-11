@@ -114,6 +114,7 @@ async fn published_reader_uses_workspace_arrow_datafusion_and_async_types()
         DeltaDataFusionScanOptions {
             execution_options: official_options,
             target_partitions: Some(1),
+            use_view_types: true,
         },
     )?;
     let target =

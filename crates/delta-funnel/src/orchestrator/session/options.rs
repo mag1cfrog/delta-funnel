@@ -12,6 +12,7 @@ use crate::{
 pub struct SessionOptions {
     query_options: QueryOptions,
     provider_scan_options: DeltaReaderExecutionOptions,
+    provider_use_view_types: bool,
     mssql_schema_options: MssqlSchemaPlanOptions,
     mssql_write_backend: MssqlWriteBackend,
     mssql_workflow_options: MssqlWorkflowWriteOptions,
@@ -24,6 +25,7 @@ impl Default for SessionOptions {
         Self {
             query_options: QueryOptions::default(),
             provider_scan_options: DeltaReaderExecutionOptions::default(),
+            provider_use_view_types: false,
             mssql_schema_options: MssqlSchemaPlanOptions::default(),
             mssql_write_backend: default_mssql_write_backend(),
             mssql_workflow_options: MssqlWorkflowWriteOptions::default(),
@@ -54,6 +56,13 @@ impl SessionOptions {
         provider_scan_options: DeltaReaderExecutionOptions,
     ) -> Self {
         self.provider_scan_options = provider_scan_options;
+        self
+    }
+
+    /// Selects Arrow view arrays for Delta provider string and binary data columns.
+    #[must_use]
+    pub const fn with_provider_use_view_types(mut self, use_view_types: bool) -> Self {
+        self.provider_use_view_types = use_view_types;
         self
     }
 
@@ -116,6 +125,12 @@ impl SessionOptions {
         self.provider_scan_options
     }
 
+    /// Returns whether Delta providers use Arrow view arrays for string and binary data columns.
+    #[must_use]
+    pub const fn provider_use_view_types(&self) -> bool {
+        self.provider_use_view_types
+    }
+
     /// Returns SQL Server schema planning options.
     #[must_use]
     pub const fn mssql_schema_options(&self) -> MssqlSchemaPlanOptions {
@@ -171,6 +186,7 @@ impl fmt::Debug for SessionOptions {
             .debug_struct("SessionOptions")
             .field("query_options", &self.query_options)
             .field("provider_scan_options", &self.provider_scan_options)
+            .field("provider_use_view_types", &self.provider_use_view_types)
             .field("mssql_schema_options", &self.mssql_schema_options)
             .field("mssql_write_backend", &self.mssql_write_backend)
             .field("mssql_workflow_options", &self.mssql_workflow_options)
@@ -202,6 +218,7 @@ mod tests {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
 
         assert_eq!(session.options().query_options(), QueryOptions::default());
+        assert!(!session.options().provider_use_view_types());
         assert!(
             session
                 .options()
@@ -213,6 +230,15 @@ mod tests {
             datafusion::prelude::SessionConfig::new().target_partitions()
         );
         assert_eq!(session.next_table_id(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn session_can_enable_provider_view_types() -> Result<(), DeltaFunnelError> {
+        let session =
+            DeltaFunnelSession::new(SessionOptions::new().with_provider_use_view_types(true))?;
+
+        assert!(session.options().provider_use_view_types());
         Ok(())
     }
 

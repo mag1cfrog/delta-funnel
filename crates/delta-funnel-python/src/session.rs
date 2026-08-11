@@ -66,9 +66,12 @@ impl PySession {
             target_partitions,
             output_batch_size,
         });
-        if let Some(provider_scan_options) = parse_provider_scan_options(py, provider_scan_options)?
+        if let Some((provider_scan_options, use_view_types)) =
+            parse_provider_scan_options(py, provider_scan_options)?
         {
-            options = options.with_provider_scan_options(provider_scan_options);
+            options = options
+                .with_provider_scan_options(provider_scan_options)
+                .with_provider_use_view_types(use_view_types);
         }
         options =
             options.with_validation_options(parse_validation_options(py, validation_options)?);
@@ -712,7 +715,7 @@ fn optional_usize_arg(value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<O
 fn parse_provider_scan_options(
     py: Python<'_>,
     provider_scan_options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Option<delta_arrow_reader::DeltaReaderExecutionOptions>> {
+) -> PyResult<Option<(delta_arrow_reader::DeltaReaderExecutionOptions, bool)>> {
     let Some(provider_scan_options) = provider_scan_options else {
         return Ok(None);
     };
@@ -725,6 +728,7 @@ fn parse_provider_scan_options(
         defaults.native_async_prefetch_file_count_per_partition();
     let mut parquet_metadata_size_hint = defaults.parquet_metadata_size_hint();
     let mut parquet_full_file_read_threshold = defaults.parquet_full_file_read_threshold();
+    let mut use_view_types = false;
 
     for (key, value) in option_entries(py, provider_scan_options)? {
         match key.as_str() {
@@ -746,6 +750,9 @@ fn parse_provider_scan_options(
             }
             "parquet_full_file_read_threshold" => {
                 parquet_full_file_read_threshold = optional_usize_arg(&value, key.as_str())?;
+            }
+            "use_view_types" => {
+                use_view_types = bool_option(py, &value, key.as_str())?;
             }
             _ => {
                 return Err(unknown_option_error(py, "provider scan", key.as_str()));
@@ -771,7 +778,7 @@ fn parse_provider_scan_options(
             native_async_prefetch_file_count_per_partition,
         )
         .map_err(|error| config_error_to_py(py, error))?;
-    Ok(Some(options))
+    Ok(Some((options, use_view_types)))
 }
 
 fn parse_validation_options(
@@ -1448,6 +1455,7 @@ mod tests {
         let stub = include_str!("../deltafunnel.pyi");
         assert!(stub.contains("class ProviderScanOptions(TypedDict, total=False):"));
         assert!(stub.contains("    parquet_full_file_read_threshold: int | None"));
+        assert!(stub.contains("    use_view_types: bool"));
         assert!(stub.contains("        provider_scan_options: ProviderScanOptions | None = None,"));
     }
 
@@ -3968,6 +3976,7 @@ union all select cast(902 as bigint) as order_id",),
             provider_scan_options.set_item("native_async_prefetch_file_count_per_partition", 1)?;
             provider_scan_options.set_item("parquet_metadata_size_hint", 16_384)?;
             provider_scan_options.set_item("parquet_full_file_read_threshold", 2_097_152)?;
+            provider_scan_options.set_item("use_view_types", true)?;
 
             let session = PySession::new(
                 py,
@@ -3986,6 +3995,7 @@ union all select cast(902 as bigint) as order_id",),
             assert_eq!(options.native_async_prefetch_file_count_per_partition(), 1);
             assert_eq!(options.parquet_metadata_size_hint(), Some(16_384));
             assert_eq!(options.parquet_full_file_read_threshold(), Some(2_097_152));
+            assert!(session.inner.options().provider_use_view_types());
 
             Ok(())
         })
@@ -4023,6 +4033,7 @@ union all select cast(902 as bigint) as order_id",),
                     .max_concurrent_file_reads_per_scan()
                     .is_none()
             );
+            assert!(!session.inner.options().provider_use_view_types());
 
             Ok(())
         })
@@ -4126,6 +4137,33 @@ union all select cast(902 as bigint) as order_id",),
             assert_eq!(
                 error.value(py).getattr("message")?.extract::<String>()?,
                 "unknown provider scan option `reader_backend`"
+            );
+
+            let provider_scan_options = PyDict::new(py);
+            provider_scan_options.set_item("use_view_types", 1)?;
+            let error = match PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            ) {
+                Ok(_) => {
+                    return Err(PyAssertionError::new_err(
+                        "expected provider view type option error",
+                    ));
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.value(py).getattr("kind")?.extract::<String>()?,
+                "invalid_option_value"
+            );
+            assert_eq!(
+                error.value(py).getattr("message")?.extract::<String>()?,
+                "`use_view_types` must be a bool"
             );
 
             Ok(())

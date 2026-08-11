@@ -34,7 +34,7 @@ pub use catalog::registration::{
     register_delta_sources_with_scan_execution_options,
 };
 pub(crate) use catalog::registration::{
-    register_delta_source_with_scan_execution_options, reject_existing_delta_registration_name,
+    register_delta_source_with_scan_options, reject_existing_delta_registration_name,
     validate_delta_table_snapshot_protocol,
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
