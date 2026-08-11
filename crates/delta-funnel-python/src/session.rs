@@ -318,7 +318,7 @@ impl PySession {
         name: String,
         source_uri: String,
         version: Option<u64>,
-        storage_options: delta_funnel::DeltaStorageOptions,
+        storage_options: delta_arrow_reader::DeltaStorageOptions,
         progress: Option<&PythonProgress>,
     ) -> PyResult<delta_funnel::LazyTable> {
         let source = delta_source_config(name, source_uri, version, storage_options);
@@ -526,7 +526,7 @@ struct PendingDeltaSource {
     session: Py<PySession>,
     source_uri: String,
     version: Option<u64>,
-    storage_options: delta_funnel::DeltaStorageOptions,
+    storage_options: delta_arrow_reader::DeltaStorageOptions,
 }
 
 impl PendingDeltaSource {
@@ -602,11 +602,24 @@ fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> Py
     }
 }
 
+fn config_error_to_py(py: Python<'_>, error: impl std::fmt::Display) -> PyErr {
+    rust_error_to_py(
+        py,
+        delta_funnel::DeltaFunnelError::Config {
+            message: error.to_string(),
+        },
+    )
+}
+
+fn provider_scan_bound_error_to_py(py: Python<'_>, option_name: &str) -> PyErr {
+    config_error_to_py(py, format!("{option_name} must be greater than zero"))
+}
+
 fn delta_source_config(
     name: String,
     source_uri: String,
     version: Option<u64>,
-    storage_options: delta_funnel::DeltaStorageOptions,
+    storage_options: delta_arrow_reader::DeltaStorageOptions,
 ) -> delta_funnel::DeltaSourceConfig {
     delta_funnel::DeltaSourceConfig::new(name, source_uri)
         .with_version(version)
@@ -653,8 +666,8 @@ fn parse_delta_version(
 fn parse_storage_options(
     py: Python<'_>,
     storage_options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<delta_funnel::DeltaStorageOptions> {
-    let mut parsed = delta_funnel::DeltaStorageOptions::default();
+) -> PyResult<delta_arrow_reader::DeltaStorageOptions> {
+    let mut parsed = delta_arrow_reader::DeltaStorageOptions::default();
     let Some(storage_options) = storage_options else {
         return Ok(parsed);
     };
@@ -699,36 +712,40 @@ fn optional_usize_arg(value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<O
 fn parse_provider_scan_options(
     py: Python<'_>,
     provider_scan_options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Option<delta_funnel::DeltaProviderScanExecutionOptions>> {
-    let mut options = delta_funnel::DeltaProviderScanExecutionOptions::default();
+) -> PyResult<Option<delta_arrow_reader::DeltaReaderExecutionOptions>> {
     let Some(provider_scan_options) = provider_scan_options else {
         return Ok(None);
     };
+    let defaults = delta_arrow_reader::DeltaReaderExecutionOptions::default();
+    let mut max_concurrent_file_reads_per_scan = defaults.max_concurrent_file_reads_per_scan();
+    let mut max_concurrent_file_reads_per_partition =
+        defaults.max_concurrent_file_reads_per_partition();
+    let mut output_buffer_capacity_per_partition = defaults.output_buffer_capacity_per_partition();
+    let mut native_async_prefetch_file_count_per_partition =
+        defaults.native_async_prefetch_file_count_per_partition();
+    let mut parquet_metadata_size_hint = defaults.parquet_metadata_size_hint();
+    let mut parquet_full_file_read_threshold = defaults.parquet_full_file_read_threshold();
 
     for (key, value) in option_entries(py, provider_scan_options)? {
         match key.as_str() {
             "max_concurrent_file_reads_per_scan" => {
-                options.max_concurrent_file_reads_per_scan =
-                    Some(usize_option(py, &value, key.as_str())?);
+                max_concurrent_file_reads_per_scan = Some(usize_option(py, &value, key.as_str())?);
             }
             "max_concurrent_file_reads_per_partition" => {
-                options.max_concurrent_file_reads_per_partition =
-                    usize_option(py, &value, key.as_str())?;
+                max_concurrent_file_reads_per_partition = usize_option(py, &value, key.as_str())?;
             }
             "output_buffer_capacity_per_partition" => {
-                options.output_buffer_capacity_per_partition =
-                    usize_option(py, &value, key.as_str())?;
+                output_buffer_capacity_per_partition = usize_option(py, &value, key.as_str())?;
             }
             "native_async_prefetch_file_count_per_partition" => {
-                options.native_async_prefetch_file_count_per_partition =
+                native_async_prefetch_file_count_per_partition =
                     usize_option(py, &value, key.as_str())?;
             }
             "parquet_metadata_size_hint" => {
-                options.parquet_metadata_size_hint = optional_usize_arg(&value, key.as_str())?;
+                parquet_metadata_size_hint = optional_usize_arg(&value, key.as_str())?;
             }
             "parquet_full_file_read_threshold" => {
-                options.parquet_full_file_read_threshold =
-                    optional_usize_arg(&value, key.as_str())?;
+                parquet_full_file_read_threshold = optional_usize_arg(&value, key.as_str())?;
             }
             _ => {
                 return Err(unknown_option_error(py, "provider scan", key.as_str()));
@@ -736,9 +753,24 @@ fn parse_provider_scan_options(
         }
     }
 
-    options
-        .validate()
-        .map_err(|error| rust_error_to_py(py, error))?;
+    // Apply values in the legacy validation order after parsing the whole mapping.
+    let options = defaults
+        .with_max_concurrent_file_reads_per_scan(max_concurrent_file_reads_per_scan)
+        .map_err(|_| provider_scan_bound_error_to_py(py, "max_concurrent_file_reads_per_scan"))?
+        .with_max_concurrent_file_reads_per_partition(max_concurrent_file_reads_per_partition)
+        .map_err(|_| {
+            provider_scan_bound_error_to_py(py, "max_concurrent_file_reads_per_partition")
+        })?
+        .with_output_buffer_capacity_per_partition(output_buffer_capacity_per_partition)
+        .map_err(|_| provider_scan_bound_error_to_py(py, "output_buffer_capacity_per_partition"))?
+        .with_parquet_metadata_size_hint(parquet_metadata_size_hint)
+        .map_err(|_| provider_scan_bound_error_to_py(py, "parquet_metadata_size_hint"))?
+        .with_parquet_full_file_read_threshold(parquet_full_file_read_threshold)
+        .map_err(|_| provider_scan_bound_error_to_py(py, "parquet_full_file_read_threshold"))?
+        .with_native_async_prefetch_file_count_per_partition(
+            native_async_prefetch_file_count_per_partition,
+        )
+        .map_err(|error| config_error_to_py(py, error))?;
     Ok(Some(options))
 }
 
@@ -1291,11 +1323,11 @@ mod tests {
         test_support::python_state,
     };
     use delta_funnel::{
-        DeltaProviderScanExecutionOptions, DryRunScanSummaryMode, ExecutionProfileMode,
-        MssqlBinaryPolicy, MssqlDate64Policy, MssqlDecimal256Policy, MssqlDecimalPolicy,
-        MssqlFloatPolicy, MssqlNanosecondPolicy, MssqlSchemaPlanOptions, MssqlStringPolicy,
-        MssqlTableName, MssqlTimestampPolicy, MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions,
-        TargetValidationMode, connect_mssql_client_from_ado_string,
+        DryRunScanSummaryMode, ExecutionProfileMode, MssqlBinaryPolicy, MssqlDate64Policy,
+        MssqlDecimal256Policy, MssqlDecimalPolicy, MssqlFloatPolicy, MssqlNanosecondPolicy,
+        MssqlSchemaPlanOptions, MssqlStringPolicy, MssqlTableName, MssqlTimestampPolicy,
+        MssqlTimezonePolicy, MssqlUInt64Policy, QueryOptions, TargetValidationMode,
+        connect_mssql_client_from_ado_string,
     };
     use pyo3::exceptions::{PyAssertionError, PyKeyError, PyTypeError};
     use pyo3::prelude::*;
@@ -3947,18 +3979,13 @@ union all select cast(902 as bigint) as order_id",),
                 None,
             )?;
 
-            assert_eq!(
-                session.inner.options().provider_scan_options(),
-                DeltaProviderScanExecutionOptions {
-                    max_concurrent_file_reads_per_scan: Some(8),
-                    max_concurrent_file_reads_per_partition: 2,
-                    output_buffer_capacity_per_partition: 4,
-                    native_async_prefetch_file_count_per_partition: 1,
-                    parquet_metadata_size_hint: Some(16_384),
-                    parquet_full_file_read_threshold: Some(2_097_152),
-                    ..DeltaProviderScanExecutionOptions::default()
-                }
-            );
+            let options = session.inner.options().provider_scan_options();
+            assert_eq!(options.max_concurrent_file_reads_per_scan(), Some(8));
+            assert_eq!(options.max_concurrent_file_reads_per_partition(), 2);
+            assert_eq!(options.output_buffer_capacity_per_partition(), 4);
+            assert_eq!(options.native_async_prefetch_file_count_per_partition(), 1);
+            assert_eq!(options.parquet_metadata_size_hint(), Some(16_384));
+            assert_eq!(options.parquet_full_file_read_threshold(), Some(2_097_152));
 
             Ok(())
         })
@@ -3985,7 +4012,7 @@ union all select cast(902 as bigint) as order_id",),
                     .inner
                     .options()
                     .provider_scan_options()
-                    .max_concurrent_file_reads_per_partition,
+                    .max_concurrent_file_reads_per_partition(),
                 2
             );
             assert!(
@@ -3993,7 +4020,7 @@ union all select cast(902 as bigint) as order_id",),
                     .inner
                     .options()
                     .provider_scan_options()
-                    .max_concurrent_file_reads_per_scan
+                    .max_concurrent_file_reads_per_scan()
                     .is_none()
             );
 
@@ -4022,7 +4049,7 @@ union all select cast(902 as bigint) as order_id",),
                     .inner
                     .options()
                     .provider_scan_options()
-                    .parquet_metadata_size_hint,
+                    .parquet_metadata_size_hint(),
                 None
             );
 
@@ -4066,6 +4093,12 @@ union all select cast(902 as bigint) as order_id",),
                     error.value(py).getattr("phase")?.extract::<String>()?,
                     "config"
                 );
+                if key != "unknown_option" {
+                    assert_eq!(
+                        error.value(py).getattr("message")?.extract::<String>()?,
+                        format!("configuration error: {key} must be greater than zero")
+                    );
+                }
             }
 
             let provider_scan_options = PyDict::new(py);
@@ -4095,6 +4128,39 @@ union all select cast(902 as bigint) as order_id",),
                 "unknown provider scan option `reader_backend`"
             );
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn provider_scan_option_validation_keeps_the_legacy_field_order() -> PyResult<()> {
+        Python::attach(|py| {
+            let provider_scan_options = PyDict::new(py);
+            provider_scan_options.set_item("output_buffer_capacity_per_partition", 0)?;
+            provider_scan_options.set_item("max_concurrent_file_reads_per_scan", 0)?;
+
+            let error = match PySession::new(
+                py,
+                None,
+                None,
+                None,
+                Some(&provider_scan_options),
+                None,
+                None,
+            ) {
+                Ok(_) => {
+                    return Err(PyAssertionError::new_err(
+                        "expected provider scan option error",
+                    ));
+                }
+                Err(error) => error,
+            };
+            let message = error.value(py).getattr("message")?.extract::<String>()?;
+
+            assert_eq!(
+                message,
+                "configuration error: max_concurrent_file_reads_per_scan must be greater than zero"
+            );
             Ok(())
         })
     }

@@ -1,16 +1,17 @@
 use std::fmt;
 
+use delta_arrow_reader::DeltaReaderExecutionOptions;
+
 use crate::{
-    DeltaFunnelError, DeltaProviderScanExecutionOptions, MssqlConnectionConfig,
-    MssqlSchemaPlanOptions, MssqlWorkflowWriteOptions, MssqlWriteBackend, QueryOptions,
-    ValidationOptions, default_mssql_write_backend,
+    DeltaFunnelError, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlWorkflowWriteOptions,
+    MssqlWriteBackend, QueryOptions, ValidationOptions, default_mssql_write_backend,
 };
 
 /// Session-wide options for lazy query-load orchestration.
 #[derive(Clone)]
 pub struct SessionOptions {
     query_options: QueryOptions,
-    provider_scan_options: DeltaProviderScanExecutionOptions,
+    provider_scan_options: DeltaReaderExecutionOptions,
     mssql_schema_options: MssqlSchemaPlanOptions,
     mssql_write_backend: MssqlWriteBackend,
     mssql_workflow_options: MssqlWorkflowWriteOptions,
@@ -22,7 +23,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             query_options: QueryOptions::default(),
-            provider_scan_options: DeltaProviderScanExecutionOptions::default(),
+            provider_scan_options: DeltaReaderExecutionOptions::default(),
             mssql_schema_options: MssqlSchemaPlanOptions::default(),
             mssql_write_backend: default_mssql_write_backend(),
             mssql_workflow_options: MssqlWorkflowWriteOptions::default(),
@@ -50,7 +51,7 @@ impl SessionOptions {
     #[must_use]
     pub const fn with_provider_scan_options(
         mut self,
-        provider_scan_options: DeltaProviderScanExecutionOptions,
+        provider_scan_options: DeltaReaderExecutionOptions,
     ) -> Self {
         self.provider_scan_options = provider_scan_options;
         self
@@ -111,7 +112,7 @@ impl SessionOptions {
 
     /// Returns Delta provider scan execution options.
     #[must_use]
-    pub const fn provider_scan_options(&self) -> DeltaProviderScanExecutionOptions {
+    pub const fn provider_scan_options(&self) -> DeltaReaderExecutionOptions {
         self.provider_scan_options
     }
 
@@ -153,7 +154,11 @@ impl SessionOptions {
     /// local validation options.
     pub fn validate(&self) -> Result<(), DeltaFunnelError> {
         self.query_options.validate()?;
-        self.provider_scan_options.validate()?;
+        self.provider_scan_options
+            .validate()
+            .map_err(|error| DeltaFunnelError::Config {
+                message: error.to_string(),
+            })?;
         self.mssql_workflow_options.validate()?;
         self.validation_options.validate()?;
         Ok(())
@@ -184,10 +189,10 @@ impl fmt::Debug for SessionOptions {
 #[cfg(test)]
 mod tests {
     use crate::{
-        BatchPipelinePhase, DeltaFunnelError, DeltaProviderReaderBackend,
-        DeltaProviderScanExecutionOptions, MssqlConnectionConfig, MssqlWorkflowWriteOptions,
+        BatchPipelinePhase, DeltaFunnelError, MssqlConnectionConfig, MssqlWorkflowWriteOptions,
         QueryOptions,
     };
+    use delta_arrow_reader::{DeltaReaderBackend, DeltaReaderExecutionOptions};
 
     use super::SessionOptions;
     use crate::orchestrator::DeltaFunnelSession;
@@ -243,20 +248,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_option_validation_failure_reaches_session_construction() {
-        let error = DeltaFunnelSession::new(SessionOptions::new().with_provider_scan_options(
-            DeltaProviderScanExecutionOptions {
-                reader_backend: DeltaProviderReaderBackend::OfficialKernel,
-                max_concurrent_file_reads_per_scan: Some(1),
-                max_concurrent_file_reads_per_partition: 1,
-                output_buffer_capacity_per_partition: 0,
-                native_async_prefetch_file_count_per_partition: 0,
-                parquet_metadata_size_hint: None,
-                parquet_full_file_read_threshold: None,
-            },
-        ));
+    fn provider_option_validation_rejects_invalid_values_before_session_construction() {
+        let error = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(DeltaReaderBackend::OfficialKernel)
+            .and_then(|options| options.with_output_buffer_capacity_per_partition(0));
 
-        assert!(matches!(error, Err(DeltaFunnelError::Config { .. })));
+        assert!(error.is_err());
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Internal tracing vocabulary for DeltaFunnel workflow observability.
 
+use delta_arrow_reader::{DeltaDataFusionMetricsSnapshot, DeltaReaderBackend};
+
 use crate::{
-    DeltaFunnelError, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, LoadMode,
-    MssqlBatchShapingReport, MssqlTargetTable, QueryExecutionMetricValue, QueryExecutionOutcome,
-    QueryExecutionProfile, RunMode, ValidationStatus,
+    DeltaFunnelError, LoadMode, MssqlBatchShapingReport, MssqlTargetTable,
+    QueryExecutionMetricValue, QueryExecutionOutcome, QueryExecutionProfile, RunMode,
+    ValidationStatus,
     support::{sanitize_text_for_display, sanitize_uri_for_display},
     usize_to_u64_saturating,
 };
@@ -81,11 +83,12 @@ enum ParquetIoMetrics {
 
 /// Emits one bounded terminal Parquet I/O summary for a Delta provider scan.
 pub(crate) fn delta_provider_parquet_io_summary(
-    snapshot: &DeltaProviderReadStatsSnapshot,
+    source_name: Option<&str>,
+    snapshot: &DeltaDataFusionMetricsSnapshot,
     outcome: DeltaProviderScanOutcome,
 ) {
-    let source_name = sanitize_observability_summary(&snapshot.source_name);
-    let reader_backend = provider_reader_backend_as_str(snapshot.reader_backend);
+    let source_name = sanitize_observability_summary(source_name.unwrap_or(""));
+    let reader_backend = provider_reader_backend_as_str(snapshot.reader.reader_backend);
     let outcome = outcome.as_str();
 
     match parquet_io_metrics(snapshot) {
@@ -98,7 +101,7 @@ pub(crate) fn delta_provider_parquet_io_summary(
             target: TRACING_TARGET,
             telemetry_event = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT,
             source_name,
-            snapshot_version = snapshot.snapshot_version,
+            snapshot_version = snapshot.reader.snapshot_version,
             reader_backend,
             outcome,
             metrics_available = true,
@@ -112,7 +115,7 @@ pub(crate) fn delta_provider_parquet_io_summary(
             target: TRACING_TARGET,
             telemetry_event = DELTA_PROVIDER_PARQUET_IO_SUMMARY_EVENT,
             source_name,
-            snapshot_version = snapshot.snapshot_version,
+            snapshot_version = snapshot.reader.snapshot_version,
             reader_backend,
             outcome,
             metrics_available = false,
@@ -169,12 +172,12 @@ pub(crate) fn query_execution_profile_terminal(profile: &QueryExecutionProfile) 
     );
 }
 
-fn parquet_io_metrics(snapshot: &DeltaProviderReadStatsSnapshot) -> ParquetIoMetrics {
+fn parquet_io_metrics(snapshot: &DeltaDataFusionMetricsSnapshot) -> ParquetIoMetrics {
     match (
-        snapshot.parquet_data_file_range_get_operations,
-        snapshot.parquet_data_file_full_get_operations,
-        snapshot.parquet_data_file_bytes_received,
-        snapshot.parquet_data_file_opened_bytes,
+        snapshot.reader.parquet_data_file_range_get_operations,
+        snapshot.reader.parquet_data_file_full_get_operations,
+        snapshot.reader.parquet_data_file_bytes_received,
+        snapshot.reader.parquet_data_file_opened_bytes,
     ) {
         (Some(range), Some(full), Some(received), Some(opened)) => ParquetIoMetrics::Available {
             range_get_operations: range,
@@ -187,10 +190,10 @@ fn parquet_io_metrics(snapshot: &DeltaProviderReadStatsSnapshot) -> ParquetIoMet
     }
 }
 
-const fn provider_reader_backend_as_str(backend: DeltaProviderReaderBackend) -> &'static str {
+const fn provider_reader_backend_as_str(backend: DeltaReaderBackend) -> &'static str {
     match backend {
-        DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
-        DeltaProviderReaderBackend::NativeAsync => "native_async",
+        DeltaReaderBackend::OfficialKernel => "official_kernel",
+        DeltaReaderBackend::NativeAsync => "native_async",
     }
 }
 
@@ -751,6 +754,7 @@ pub(crate) mod test_capture {
     pub(crate) struct CapturedSpan {
         pub(crate) id: u64,
         pub(crate) parent_id: Option<u64>,
+        pub(crate) follows_from_ids: Vec<u64>,
         pub(crate) target: &'static str,
         pub(crate) name: &'static str,
         pub(crate) level: Level,
@@ -833,6 +837,7 @@ pub(crate) mod test_capture {
                     .span(id)
                     .and_then(|span| span.parent())
                     .map(|parent| parent.id().clone().into_u64()),
+                follows_from_ids: Vec::new(),
                 target: attrs.metadata().target(),
                 name: attrs.metadata().name(),
                 level: *attrs.metadata().level(),
@@ -856,6 +861,12 @@ pub(crate) mod test_capture {
                 };
                 values.record(&mut visitor);
                 span.fields = visitor.fields;
+            });
+        }
+
+        fn on_follows_from(&self, id: &Id, follows: &Id, _ctx: Context<'_, S>) {
+            self.events.update_span(id, |span| {
+                span.follows_from_ids.push(follows.clone().into_u64());
             });
         }
 
@@ -999,6 +1010,7 @@ mod tests {
             MssqlBatchShapingReport::completed(2, 5, 2, 5),
         );
         delta_provider_parquet_io_summary(
+            Some("orders"),
             &provider_stats_snapshot(),
             DeltaProviderScanOutcome::Success,
         );
@@ -1125,6 +1137,7 @@ mod tests {
                 aggregated_metrics,
                 Vec::new(),
                 None,
+                None,
             )
         };
         let profile = QueryExecutionProfile::preview(
@@ -1218,6 +1231,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 None,
+                None,
             )],
         );
 
@@ -1260,20 +1274,20 @@ mod tests {
         );
 
         let mut unavailable = available.clone();
-        unavailable.parquet_data_file_range_get_operations = None;
-        unavailable.parquet_data_file_full_get_operations = None;
-        unavailable.parquet_data_file_bytes_received = None;
-        unavailable.parquet_data_file_opened_bytes = None;
+        unavailable.reader.parquet_data_file_range_get_operations = None;
+        unavailable.reader.parquet_data_file_full_get_operations = None;
+        unavailable.reader.parquet_data_file_bytes_received = None;
+        unavailable.reader.parquet_data_file_opened_bytes = None;
         assert_eq!(
             parquet_io_metrics(&unavailable),
             ParquetIoMetrics::Unavailable
         );
 
-        unavailable.parquet_data_file_range_get_operations = Some(0);
+        unavailable.reader.parquet_data_file_range_get_operations = Some(0);
         assert_eq!(parquet_io_metrics(&unavailable), ParquetIoMetrics::Mixed);
 
         let mut mixed = available;
-        mixed.parquet_data_file_bytes_received = None;
+        mixed.reader.parquet_data_file_bytes_received = None;
         assert_eq!(parquet_io_metrics(&mixed), ParquetIoMetrics::Mixed);
     }
 
@@ -1286,7 +1300,7 @@ mod tests {
                 DeltaProviderScanOutcome::Error,
                 DeltaProviderScanOutcome::Cancelled,
             ] {
-                delta_provider_parquet_io_summary(&snapshot, outcome);
+                delta_provider_parquet_io_summary(Some("orders"), &snapshot, outcome);
             }
         })
         .events();
@@ -1316,17 +1330,25 @@ mod tests {
     #[test]
     fn unavailable_and_mixed_summaries_emit_no_numeric_subset() {
         let mut unavailable = provider_stats_snapshot();
-        unavailable.reader_backend = DeltaProviderReaderBackend::OfficialKernel;
-        unavailable.parquet_data_file_range_get_operations = None;
-        unavailable.parquet_data_file_full_get_operations = None;
-        unavailable.parquet_data_file_bytes_received = None;
-        unavailable.parquet_data_file_opened_bytes = None;
+        unavailable.reader.reader_backend = DeltaReaderBackend::OfficialKernel;
+        unavailable.reader.parquet_data_file_range_get_operations = None;
+        unavailable.reader.parquet_data_file_full_get_operations = None;
+        unavailable.reader.parquet_data_file_bytes_received = None;
+        unavailable.reader.parquet_data_file_opened_bytes = None;
         let mut mixed = provider_stats_snapshot();
-        mixed.parquet_data_file_bytes_received = None;
+        mixed.reader.parquet_data_file_bytes_received = None;
 
         let events = capture_events(|| {
-            delta_provider_parquet_io_summary(&unavailable, DeltaProviderScanOutcome::Success);
-            delta_provider_parquet_io_summary(&mixed, DeltaProviderScanOutcome::Error);
+            delta_provider_parquet_io_summary(
+                Some("orders"),
+                &unavailable,
+                DeltaProviderScanOutcome::Success,
+            );
+            delta_provider_parquet_io_summary(
+                Some("orders"),
+                &mixed,
+                DeltaProviderScanOutcome::Error,
+            );
         })
         .events();
 
@@ -1468,14 +1490,20 @@ mod tests {
 
     #[test]
     fn provider_io_summary_sanitizes_hostile_source_names() {
-        let mut uri = provider_stats_snapshot();
-        uri.source_name = "s3://user:password@example.com/table?token=secret#debug".to_owned();
-        let mut control = provider_stats_snapshot();
-        control.source_name = "orders\nsource".to_owned();
+        let uri = provider_stats_snapshot();
+        let control = provider_stats_snapshot();
 
         let events = capture_events(|| {
-            delta_provider_parquet_io_summary(&uri, DeltaProviderScanOutcome::Success);
-            delta_provider_parquet_io_summary(&control, DeltaProviderScanOutcome::Success);
+            delta_provider_parquet_io_summary(
+                Some("s3://user:password@example.com/table?token=secret#debug"),
+                &uri,
+                DeltaProviderScanOutcome::Success,
+            );
+            delta_provider_parquet_io_summary(
+                Some("orders\nsource"),
+                &control,
+                DeltaProviderScanOutcome::Success,
+            );
         })
         .events();
 
@@ -2102,53 +2130,57 @@ mod tests {
         Ok(())
     }
 
-    fn provider_stats_snapshot() -> DeltaProviderReadStatsSnapshot {
-        DeltaProviderReadStatsSnapshot {
-            source_name: "orders".to_owned(),
-            snapshot_version: 3,
-            reader_backend: DeltaProviderReaderBackend::NativeAsync,
-            scan_metadata_exhausted: Some(true),
-            scan_partitions_planned: 1,
-            files_planned: 2,
-            files_filtered_during_planning: Some(4),
-            estimated_rows: Some(10),
-            estimated_bytes: Some(2048),
-            parquet_data_file_range_get_operations: Some(0),
-            parquet_data_file_full_get_operations: Some(2),
-            parquet_data_file_bytes_received: Some(512),
-            parquet_data_file_opened_bytes: Some(2048),
-            datafusion_output_batch_size: Some(8192),
-            scan_partitions_started: 1,
-            scan_partitions_completed: 1,
-            files_started: 2,
-            files_completed: 2,
+    fn provider_stats_snapshot() -> DeltaDataFusionMetricsSnapshot {
+        DeltaDataFusionMetricsSnapshot {
+            reader: delta_arrow_reader::DeltaReadMetricsSnapshot {
+                snapshot_version: 3,
+                reader_backend: DeltaReaderBackend::NativeAsync,
+                scan_metadata_exhausted: Some(true),
+                scan_partitions_planned: 1,
+                files_planned: 2,
+                files_filtered_during_planning: Some(4),
+                estimated_rows: Some(10),
+                estimated_bytes: Some(2048),
+                scan_partitions_started: 1,
+                scan_partitions_completed: 1,
+                files_started: 2,
+                files_completed: 2,
+                batches_produced: 1,
+                rows_produced: 10,
+                deletion_vector_payloads_loaded: 0,
+                deletion_vectors_applied: 0,
+                deletion_vector_rows_deleted: 0,
+                deletion_vector_failures: 0,
+                deletion_vector_rejections: 0,
+                parquet_data_file_range_get_operations: Some(0),
+                parquet_data_file_full_get_operations: Some(2),
+                parquet_data_file_bytes_received: Some(512),
+                parquet_data_file_opened_bytes: Some(2048),
+            },
+            output_batch_size: Some(8192),
             dynamic_partition_files_pruned: 0,
             dynamic_partition_files_kept: 2,
             dynamic_filters_received: 0,
             dynamic_filters_accepted: 0,
             dynamic_filters_unsupported: 0,
             dynamic_filter_snapshots: 0,
-            dynamic_partition_files_not_pruned_missing_metadata: 0,
-            dynamic_partition_files_not_pruned_unsupported_expression: 0,
-            batches_produced: 1,
-            rows_produced: 10,
-            deletion_vector_payloads_loaded: 0,
-            deletion_vectors_applied: 0,
-            deletion_vector_rows_deleted: 0,
-            deletion_vector_failures: 0,
-            deletion_vector_rejections: 0,
+            dynamic_files_not_pruned_missing_metadata: 0,
+            dynamic_files_not_pruned_unsupported_expression: 0,
         }
     }
 
     fn native_async_session(
         query_options: crate::QueryOptions,
     ) -> Result<crate::DeltaFunnelSession, DeltaFunnelError> {
-        let provider_scan_options =
-            crate::DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-                DeltaProviderReaderBackend::NativeAsync,
-                1,
-                1,
-            )?;
+        let provider_scan_options = delta_arrow_reader::DeltaReaderExecutionOptions::new()
+            .with_max_concurrent_file_reads_per_scan(Some(1))
+            .map_err(|error| DeltaFunnelError::Config {
+                message: error.to_string(),
+            })?
+            .with_max_concurrent_file_reads_per_partition(1)
+            .map_err(|error| DeltaFunnelError::Config {
+                message: error.to_string(),
+            })?;
         crate::DeltaFunnelSession::new(
             crate::SessionOptions::new()
                 .with_query_options(query_options)

@@ -2006,20 +2006,27 @@ mod tests {
         trace_context.record_process_result("ok");
         drop(trace_context);
         let spans = capture.captured().spans();
-        let planning_spans = spans
+        let planning = spans
             .iter()
-            .filter(|span| span.name == "DataFusion planning activity")
-            .collect::<Vec<_>>();
-        assert!(
-            planning_spans
+            .find(|span| span.name == "DataFusion query planning")
+            .ok_or("expected DataFusion query planning span")?;
+        assert_eq!(planning.fields["query_scope"], "write_all_cache_alias");
+        assert_eq!(planning.fields["query_owner"], "cache_alias");
+        let delta_planning = spans
+            .iter()
+            .find(|span| {
+                span.target == "delta_arrow_reader::profile" && span.name == "Delta scan planning"
+            })
+            .ok_or("expected Delta scan planning span")?;
+        let mut parent_id = delta_planning.parent_id;
+        while parent_id.is_some() && parent_id != Some(planning.id) {
+            parent_id = spans
                 .iter()
-                .any(|span| span.fields["planning_activity_name"] == "Delta scan planning")
-        );
-        assert!(planning_spans.iter().all(|span| {
-            span.fields["query_scope"] == "write_all_cache_alias"
-                && span.fields["query_owner"] == "cache_alias"
-        }));
-        let planning_query_id = &planning_spans[0].fields["query_execution_id"];
+                .find(|parent| Some(parent.id) == parent_id)
+                .and_then(|parent| parent.parent_id);
+        }
+        assert_eq!(parent_id, Some(planning.id));
+        let planning_query_id = &planning.fields["query_execution_id"];
         assert!(spans.iter().any(|span| {
             span.name == "DataFusion operator activity"
                 && &span.fields["query_execution_id"] == planning_query_id

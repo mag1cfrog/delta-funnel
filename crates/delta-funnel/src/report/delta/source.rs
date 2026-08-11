@@ -1,9 +1,12 @@
 use std::fmt;
 
+use delta_arrow_reader::{
+    DeltaDataFusionMetricsSnapshot, DeltaReaderBackend, DeltaReaderExecutionOptions,
+};
+
 use crate::{
-    DeltaProtocolReport, DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend,
-    DeltaProviderScanExecutionOptions, FileCount, PhaseTimingReport, QueryOptions,
-    ReportReasonCode, support::sanitize_uri_for_display,
+    DeltaProtocolReport, FileCount, PhaseTimingReport, QueryOptions, ReportReasonCode,
+    support::sanitize_uri_for_display,
 };
 
 /// Conservative source usage status for a workflow report.
@@ -48,7 +51,7 @@ pub struct DeltaSourceReport {
     scan_metadata_exhausted: bool,
     usage_status: SourceUsageStatus,
     used_by_output_names: Vec<String>,
-    provider_read_stats: Option<DeltaProviderReadStatsSnapshot>,
+    provider_read_stats: Option<DeltaDataFusionMetricsSnapshot>,
     provider_stats_reason: Option<ReportReasonCode>,
     phase_timings: Vec<PhaseTimingReport>,
 }
@@ -57,7 +60,7 @@ pub struct DeltaSourceReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaProviderSchedulingReport {
     query_target_partitions: Option<u64>,
-    reader_backend: DeltaProviderReaderBackend,
+    reader_backend: DeltaReaderBackend,
     max_concurrent_file_reads_per_scan: Option<u64>,
     max_concurrent_file_reads_per_partition: u64,
     output_buffer_capacity_per_partition: u64,
@@ -69,30 +72,30 @@ pub struct DeltaProviderSchedulingReport {
 impl DeltaProviderSchedulingReport {
     pub(crate) fn from_options(
         query_options: QueryOptions,
-        scan_options: DeltaProviderScanExecutionOptions,
+        scan_options: DeltaReaderExecutionOptions,
     ) -> Self {
         Self {
             query_target_partitions: query_options
                 .target_partitions
                 .map(crate::usize_to_u64_saturating),
-            reader_backend: scan_options.reader_backend,
+            reader_backend: scan_options.reader_backend(),
             max_concurrent_file_reads_per_scan: scan_options
-                .max_concurrent_file_reads_per_scan
+                .max_concurrent_file_reads_per_scan()
                 .map(crate::usize_to_u64_saturating),
             max_concurrent_file_reads_per_partition: crate::usize_to_u64_saturating(
-                scan_options.max_concurrent_file_reads_per_partition,
+                scan_options.max_concurrent_file_reads_per_partition(),
             ),
             output_buffer_capacity_per_partition: crate::usize_to_u64_saturating(
-                scan_options.output_buffer_capacity_per_partition,
+                scan_options.output_buffer_capacity_per_partition(),
             ),
             native_async_prefetch_file_count_per_partition: crate::usize_to_u64_saturating(
-                scan_options.native_async_prefetch_file_count_per_partition,
+                scan_options.native_async_prefetch_file_count_per_partition(),
             ),
             parquet_metadata_size_hint: scan_options
-                .parquet_metadata_size_hint
+                .parquet_metadata_size_hint()
                 .map(crate::usize_to_u64_saturating),
             parquet_full_file_read_threshold: scan_options
-                .parquet_full_file_read_threshold
+                .parquet_full_file_read_threshold()
                 .map(crate::usize_to_u64_saturating),
         }
     }
@@ -105,7 +108,7 @@ impl DeltaProviderSchedulingReport {
 
     /// Returns the provider reader backend configured for source scans.
     #[must_use]
-    pub const fn reader_backend(&self) -> DeltaProviderReaderBackend {
+    pub const fn reader_backend(&self) -> DeltaReaderBackend {
         self.reader_backend
     }
 
@@ -191,12 +194,12 @@ impl DeltaSourceReport {
 
     pub(crate) fn with_provider_read_stats(
         mut self,
-        stats: DeltaProviderReadStatsSnapshot,
+        stats: DeltaDataFusionMetricsSnapshot,
     ) -> Self {
-        self.scan_metadata_exhausted = stats.scan_metadata_exhausted.unwrap_or(false);
-        self.file_count = match stats.scan_metadata_exhausted {
-            Some(true) => FileCount::exact(stats.files_planned),
-            Some(false) => FileCount::estimated(stats.files_planned),
+        self.scan_metadata_exhausted = stats.reader.scan_metadata_exhausted.unwrap_or(false);
+        self.file_count = match stats.reader.scan_metadata_exhausted {
+            Some(true) => FileCount::exact(stats.reader.files_planned),
+            Some(false) => FileCount::estimated(stats.reader.files_planned),
             None => FileCount::unavailable(),
         };
         self.file_count_reason = match self.file_count {
@@ -277,7 +280,7 @@ impl DeltaSourceReport {
 
     /// Returns provider read statistics when planning or execution made them available.
     #[must_use]
-    pub const fn provider_read_stats(&self) -> Option<&DeltaProviderReadStatsSnapshot> {
+    pub const fn provider_read_stats(&self) -> Option<&DeltaDataFusionMetricsSnapshot> {
         self.provider_read_stats.as_ref()
     }
 

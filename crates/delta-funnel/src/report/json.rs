@@ -5,20 +5,21 @@
 //! here gives both APIs one report shape and makes the fields that are safe to
 //! expose explicit instead of relying on generic serialization.
 
+use delta_arrow_reader::{DeltaDataFusionMetricsSnapshot, DeltaReaderBackend};
 use serde_json::{Value, json};
 
 use crate::{
-    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaSourceReport, FileCount,
-    LazyTableKind, LoadMode, MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport,
-    MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport, MssqlOutputBatchValidationReport,
-    MssqlOutputFieldReport, MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable,
-    MssqlWorkflowWriteReport, MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWritePhase,
-    MssqlWriteReport, MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats,
-    OutputStatus, PhaseStatus, PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricValue,
-    QueryExecutionOperatorProfile, QueryExecutionProfile, ReportReasonCode, RowCount, RunMode,
-    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
-    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheFailure,
-    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
+    DeltaSourceReport, FileCount, LazyTableKind, LoadMode, MssqlDryRunOutputFieldReport,
+    MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
+    MssqlOutputBatchValidationReport, MssqlOutputFieldReport, MssqlOutputWriteStatus,
+    MssqlTargetCleanupStatus, MssqlTargetTable, MssqlWorkflowWriteReport, MssqlWriteFailureContext,
+    MssqlWriteFailureReport, MssqlWritePhase, MssqlWriteReport, MssqlWriteSkippedReason,
+    MssqlWriteSkippedReport, MssqlWriteStats, OutputStatus, PhaseStatus, PhaseTimingReport,
+    QueryExecutionMetric, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
+    QueryExecutionProfile, ReportReasonCode, RowCount, RunMode, ValidationStatus, WorkflowStatus,
+    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
+    WriteAllCacheCandidateSkipReason, WriteAllCacheFailure, WriteAllCacheReport,
+    WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -143,7 +144,9 @@ impl QueryExecutionOperatorProfile {
                 .collect::<Vec<_>>(),
             "delta_provider_read_stats": self
                 .delta_provider_read_stats()
-                .map(provider_read_stats_value),
+                .map(|stats| {
+                    provider_read_stats_value(stats, self.delta_provider_source_name())
+                }),
         })
     }
 }
@@ -205,7 +208,9 @@ impl DeltaSourceReport {
             "usage_status": self.usage_status().as_str(),
             "used_by_output_names": self.used_by_output_names(),
             "provider_read_stats_available": self.provider_read_stats().is_some(),
-            "provider_read_stats": self.provider_read_stats().map(provider_read_stats_value),
+            "provider_read_stats": self.provider_read_stats().map(|stats| {
+                provider_read_stats_value(stats, Some(self.source_name()))
+            }),
             "provider_stats_reason": reason_value(self.provider_stats_reason()),
             "phase_timings": phase_timings_value(self.phase_timings()),
         })
@@ -821,41 +826,44 @@ fn batch_shaping_value(report: crate::MssqlBatchShapingReport) -> Value {
     })
 }
 
-fn provider_read_stats_value(stats: &DeltaProviderReadStatsSnapshot) -> Value {
+fn provider_read_stats_value(
+    stats: &DeltaDataFusionMetricsSnapshot,
+    source_name: Option<&str>,
+) -> Value {
     json!({
-        "source_name": stats.source_name,
-        "snapshot_version": stats.snapshot_version,
-        "reader_backend": reader_backend(stats.reader_backend),
-        "scan_metadata_exhausted": stats.scan_metadata_exhausted,
-        "scan_partitions_planned": stats.scan_partitions_planned,
-        "files_planned": stats.files_planned,
-        "approximate_files_filtered_during_planning": stats.files_filtered_during_planning,
-        "estimated_rows": stats.estimated_rows,
-        "estimated_bytes": stats.estimated_bytes,
-        "parquet_data_file_range_get_operations": stats.parquet_data_file_range_get_operations,
-        "parquet_data_file_full_get_operations": stats.parquet_data_file_full_get_operations,
-        "parquet_data_file_bytes_received": stats.parquet_data_file_bytes_received,
-        "parquet_data_file_opened_bytes": stats.parquet_data_file_opened_bytes,
-        "datafusion_output_batch_size": stats.datafusion_output_batch_size,
-        "scan_partitions_started": stats.scan_partitions_started,
-        "scan_partitions_completed": stats.scan_partitions_completed,
-        "files_started": stats.files_started,
-        "files_completed": stats.files_completed,
+        "source_name": source_name.unwrap_or(""),
+        "snapshot_version": stats.reader.snapshot_version,
+        "reader_backend": reader_backend(stats.reader.reader_backend),
+        "scan_metadata_exhausted": stats.reader.scan_metadata_exhausted,
+        "scan_partitions_planned": stats.reader.scan_partitions_planned,
+        "files_planned": stats.reader.files_planned,
+        "approximate_files_filtered_during_planning": stats.reader.files_filtered_during_planning,
+        "estimated_rows": stats.reader.estimated_rows,
+        "estimated_bytes": stats.reader.estimated_bytes,
+        "parquet_data_file_range_get_operations": stats.reader.parquet_data_file_range_get_operations,
+        "parquet_data_file_full_get_operations": stats.reader.parquet_data_file_full_get_operations,
+        "parquet_data_file_bytes_received": stats.reader.parquet_data_file_bytes_received,
+        "parquet_data_file_opened_bytes": stats.reader.parquet_data_file_opened_bytes,
+        "datafusion_output_batch_size": stats.output_batch_size,
+        "scan_partitions_started": stats.reader.scan_partitions_started,
+        "scan_partitions_completed": stats.reader.scan_partitions_completed,
+        "files_started": stats.reader.files_started,
+        "files_completed": stats.reader.files_completed,
         "dynamic_partition_files_pruned": stats.dynamic_partition_files_pruned,
         "dynamic_partition_files_kept": stats.dynamic_partition_files_kept,
         "dynamic_filters_received": stats.dynamic_filters_received,
         "dynamic_filters_accepted": stats.dynamic_filters_accepted,
         "dynamic_filters_unsupported": stats.dynamic_filters_unsupported,
         "dynamic_filter_snapshots": stats.dynamic_filter_snapshots,
-        "dynamic_partition_files_not_pruned_missing_metadata": stats.dynamic_partition_files_not_pruned_missing_metadata,
-        "dynamic_partition_files_not_pruned_unsupported_expression": stats.dynamic_partition_files_not_pruned_unsupported_expression,
-        "batches_produced": stats.batches_produced,
-        "rows_produced": stats.rows_produced,
-        "deletion_vector_payloads_loaded": stats.deletion_vector_payloads_loaded,
-        "deletion_vectors_applied": stats.deletion_vectors_applied,
-        "deletion_vector_rows_deleted": stats.deletion_vector_rows_deleted,
-        "deletion_vector_failures": stats.deletion_vector_failures,
-        "deletion_vector_rejections": stats.deletion_vector_rejections,
+        "dynamic_partition_files_not_pruned_missing_metadata": stats.dynamic_files_not_pruned_missing_metadata,
+        "dynamic_partition_files_not_pruned_unsupported_expression": stats.dynamic_files_not_pruned_unsupported_expression,
+        "batches_produced": stats.reader.batches_produced,
+        "rows_produced": stats.reader.rows_produced,
+        "deletion_vector_payloads_loaded": stats.reader.deletion_vector_payloads_loaded,
+        "deletion_vectors_applied": stats.reader.deletion_vectors_applied,
+        "deletion_vector_rows_deleted": stats.reader.deletion_vector_rows_deleted,
+        "deletion_vector_failures": stats.reader.deletion_vector_failures,
+        "deletion_vector_rejections": stats.reader.deletion_vector_rejections,
     })
 }
 
@@ -900,10 +908,10 @@ fn skipped_reason_value(reason: &MssqlWriteSkippedReason) -> Value {
     }
 }
 
-fn reader_backend(backend: DeltaProviderReaderBackend) -> &'static str {
+fn reader_backend(backend: DeltaReaderBackend) -> &'static str {
     match backend {
-        DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
-        DeltaProviderReaderBackend::NativeAsync => "native_async",
+        DeltaReaderBackend::OfficialKernel => "official_kernel",
+        DeltaReaderBackend::NativeAsync => "native_async",
     }
 }
 
@@ -955,14 +963,15 @@ mod tests {
     use super::*;
     use crate::MssqlWorkflowOutputWriter;
     use crate::{
-        DeltaProtocolReport, DeltaProviderScanExecutionOptions, DeltaProviderSchedulingReport,
-        MssqlConnectionConfig, MssqlOutputBatchStream, MssqlOutputWriteJob, MssqlSchemaPlanOptions,
-        MssqlTargetConfig, MssqlTargetOutputPlan, MssqlTargetResolutionContext,
-        MssqlWorkflowWriteOptions, MssqlWriteBackend, QueryOptions, ResolvedMssqlTarget,
-        ValidationOptions, plan_mssql_target_for_output, write_mssql_outputs_with_writer,
+        DeltaProtocolReport, DeltaProviderSchedulingReport, MssqlConnectionConfig,
+        MssqlOutputBatchStream, MssqlOutputWriteJob, MssqlSchemaPlanOptions, MssqlTargetConfig,
+        MssqlTargetOutputPlan, MssqlTargetResolutionContext, MssqlWorkflowWriteOptions,
+        MssqlWriteBackend, QueryOptions, ResolvedMssqlTarget, ValidationOptions,
+        plan_mssql_target_for_output, write_mssql_outputs_with_writer,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use arrow_sql_server::PlanOptions;
+    use delta_arrow_reader::DeltaReaderExecutionOptions;
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
@@ -1412,11 +1421,9 @@ mod tests {
                     target_partitions: Some(4),
                     output_batch_size: Some(128),
                 },
-                DeltaProviderScanExecutionOptions {
-                    parquet_metadata_size_hint: Some(16_384),
-                    parquet_full_file_read_threshold: Some(2_097_152),
-                    ..DeltaProviderScanExecutionOptions::default()
-                },
+                DeltaReaderExecutionOptions::default()
+                    .with_parquet_metadata_size_hint(Some(16_384))?
+                    .with_parquet_full_file_read_threshold(Some(2_097_152))?,
             ),
         )
         .with_provider_read_stats(provider_read_stats_snapshot());
@@ -1478,13 +1485,13 @@ mod tests {
     #[test]
     fn provider_read_stats_json_preserves_unavailable_parquet_io_metrics() {
         let mut stats = provider_read_stats_snapshot();
-        stats.reader_backend = DeltaProviderReaderBackend::OfficialKernel;
-        stats.parquet_data_file_range_get_operations = None;
-        stats.parquet_data_file_full_get_operations = None;
-        stats.parquet_data_file_bytes_received = None;
-        stats.parquet_data_file_opened_bytes = None;
+        stats.reader.reader_backend = DeltaReaderBackend::OfficialKernel;
+        stats.reader.parquet_data_file_range_get_operations = None;
+        stats.reader.parquet_data_file_full_get_operations = None;
+        stats.reader.parquet_data_file_bytes_received = None;
+        stats.reader.parquet_data_file_opened_bytes = None;
 
-        let value = provider_read_stats_value(&stats);
+        let value = provider_read_stats_value(&stats, Some("orders"));
 
         assert_eq!(value["parquet_data_file_range_get_operations"], Value::Null);
         assert_eq!(value["parquet_data_file_full_get_operations"], Value::Null);
@@ -1495,12 +1502,12 @@ mod tests {
     #[test]
     fn provider_read_stats_json_preserves_available_parquet_io_metric_zeros() {
         let mut stats = provider_read_stats_snapshot();
-        stats.parquet_data_file_range_get_operations = Some(0);
-        stats.parquet_data_file_full_get_operations = Some(0);
-        stats.parquet_data_file_bytes_received = Some(0);
-        stats.parquet_data_file_opened_bytes = Some(0);
+        stats.reader.parquet_data_file_range_get_operations = Some(0);
+        stats.reader.parquet_data_file_full_get_operations = Some(0);
+        stats.reader.parquet_data_file_bytes_received = Some(0);
+        stats.reader.parquet_data_file_opened_bytes = Some(0);
 
-        let value = provider_read_stats_value(&stats);
+        let value = provider_read_stats_value(&stats, Some("orders"));
 
         assert_eq!(value["parquet_data_file_range_get_operations"], 0);
         assert_eq!(value["parquet_data_file_full_get_operations"], 0);
@@ -1575,41 +1582,42 @@ mod tests {
         ])
     }
 
-    fn provider_read_stats_snapshot() -> DeltaProviderReadStatsSnapshot {
-        DeltaProviderReadStatsSnapshot {
-            source_name: "orders".to_owned(),
-            snapshot_version: 3,
-            reader_backend: DeltaProviderReaderBackend::NativeAsync,
-            scan_metadata_exhausted: Some(true),
-            scan_partitions_planned: 4,
-            files_planned: 5,
-            files_filtered_during_planning: Some(8),
-            estimated_rows: Some(99),
-            estimated_bytes: Some(2048),
-            parquet_data_file_range_get_operations: Some(4),
-            parquet_data_file_full_get_operations: Some(0),
-            parquet_data_file_bytes_received: Some(512),
-            parquet_data_file_opened_bytes: Some(2048),
-            datafusion_output_batch_size: Some(128),
-            scan_partitions_started: 4,
-            scan_partitions_completed: 4,
-            files_started: 5,
-            files_completed: 5,
+    fn provider_read_stats_snapshot() -> DeltaDataFusionMetricsSnapshot {
+        DeltaDataFusionMetricsSnapshot {
+            reader: delta_arrow_reader::DeltaReadMetricsSnapshot {
+                snapshot_version: 3,
+                reader_backend: DeltaReaderBackend::NativeAsync,
+                scan_metadata_exhausted: Some(true),
+                scan_partitions_planned: 4,
+                files_planned: 5,
+                files_filtered_during_planning: Some(8),
+                estimated_rows: Some(99),
+                estimated_bytes: Some(2048),
+                scan_partitions_started: 4,
+                scan_partitions_completed: 4,
+                files_started: 5,
+                files_completed: 5,
+                batches_produced: 2,
+                rows_produced: 10,
+                deletion_vector_payloads_loaded: 1,
+                deletion_vectors_applied: 1,
+                deletion_vector_rows_deleted: 2,
+                deletion_vector_failures: 0,
+                deletion_vector_rejections: 0,
+                parquet_data_file_range_get_operations: Some(4),
+                parquet_data_file_full_get_operations: Some(0),
+                parquet_data_file_bytes_received: Some(512),
+                parquet_data_file_opened_bytes: Some(2048),
+            },
+            output_batch_size: Some(128),
             dynamic_partition_files_pruned: 2,
             dynamic_partition_files_kept: 3,
             dynamic_filters_received: 1,
             dynamic_filters_accepted: 1,
             dynamic_filters_unsupported: 0,
             dynamic_filter_snapshots: 1,
-            dynamic_partition_files_not_pruned_missing_metadata: 0,
-            dynamic_partition_files_not_pruned_unsupported_expression: 0,
-            batches_produced: 2,
-            rows_produced: 10,
-            deletion_vector_payloads_loaded: 1,
-            deletion_vectors_applied: 1,
-            deletion_vector_rows_deleted: 2,
-            deletion_vector_failures: 0,
-            deletion_vector_rejections: 0,
+            dynamic_files_not_pruned_missing_metadata: 0,
+            dynamic_files_not_pruned_unsupported_expression: 0,
         }
     }
 

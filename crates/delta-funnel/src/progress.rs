@@ -183,7 +183,7 @@ impl ProgressEvent {
     pub(crate) fn file_progress_from_provider_stats(
         phase: ProgressPhase,
         output_name: Option<&str>,
-        provider_stats: &[crate::DeltaProviderReadStatsSnapshot],
+        provider_stats: &[delta_arrow_reader::DeltaDataFusionMetricsSnapshot],
     ) -> Option<Self> {
         let mut snapshot = ProgressSnapshot::new(phase, output_name);
         snapshot.file_progress = DeltaFileProgress::from_provider_stats(provider_stats);
@@ -420,30 +420,30 @@ impl DeltaFileProgress {
     }
 
     fn from_provider_stats(
-        provider_stats: &[crate::DeltaProviderReadStatsSnapshot],
+        provider_stats: &[delta_arrow_reader::DeltaDataFusionMetricsSnapshot],
     ) -> Option<Self> {
         if provider_stats.is_empty()
             || provider_stats
                 .iter()
-                .any(|stats| stats.scan_metadata_exhausted != Some(true))
+                .any(|stats| stats.reader.scan_metadata_exhausted != Some(true))
         {
             return None;
         }
 
-        let total = provider_stats
-            .iter()
-            .try_fold(0_u64, |total, stats| total.checked_add(stats.files_planned))?;
+        let total = provider_stats.iter().try_fold(0_u64, |total, stats| {
+            total.checked_add(stats.reader.files_planned)
+        })?;
         let (completed, pruned) =
             provider_stats
                 .iter()
                 .fold((0_u64, 0_u64), |(completed, pruned), stats| {
                     (
-                        completed.saturating_add(stats.files_completed),
+                        completed.saturating_add(stats.reader.files_completed),
                         pruned.saturating_add(stats.dynamic_partition_files_pruned),
                     )
                 });
         let planning_pruned = provider_stats.iter().try_fold(0_u64, |total, stats| {
-            total.checked_add(stats.files_filtered_during_planning?)
+            total.checked_add(stats.reader.files_filtered_during_planning?)
         });
         Self::new(
             completed.saturating_add(pruned),
@@ -515,7 +515,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend};
+    use delta_arrow_reader::{DeltaDataFusionMetricsSnapshot, DeltaReaderBackend};
 
     #[test]
     fn events_expose_only_the_payload_for_their_kind() {
@@ -736,41 +736,42 @@ mod tests {
         files_planned: u64,
         files_completed: u64,
         dynamic_partition_files_pruned: u64,
-    ) -> DeltaProviderReadStatsSnapshot {
-        DeltaProviderReadStatsSnapshot {
-            source_name: "orders".to_owned(),
-            snapshot_version: 1,
-            reader_backend: DeltaProviderReaderBackend::NativeAsync,
-            scan_metadata_exhausted,
-            scan_partitions_planned: 1,
-            files_planned,
-            files_filtered_during_planning: Some(9),
-            estimated_rows: None,
-            estimated_bytes: None,
-            parquet_data_file_range_get_operations: Some(0),
-            parquet_data_file_full_get_operations: Some(0),
-            parquet_data_file_bytes_received: Some(0),
-            parquet_data_file_opened_bytes: Some(0),
-            datafusion_output_batch_size: None,
-            scan_partitions_started: 0,
-            scan_partitions_completed: 0,
-            files_started: files_completed,
-            files_completed,
+    ) -> DeltaDataFusionMetricsSnapshot {
+        DeltaDataFusionMetricsSnapshot {
+            reader: delta_arrow_reader::DeltaReadMetricsSnapshot {
+                snapshot_version: 1,
+                reader_backend: DeltaReaderBackend::NativeAsync,
+                scan_metadata_exhausted,
+                scan_partitions_planned: 1,
+                files_planned,
+                files_filtered_during_planning: Some(9),
+                estimated_rows: None,
+                estimated_bytes: None,
+                scan_partitions_started: 0,
+                scan_partitions_completed: 0,
+                files_started: files_completed,
+                files_completed,
+                batches_produced: 0,
+                rows_produced: 0,
+                deletion_vector_payloads_loaded: 0,
+                deletion_vectors_applied: 0,
+                deletion_vector_rows_deleted: 0,
+                deletion_vector_failures: 0,
+                deletion_vector_rejections: 0,
+                parquet_data_file_range_get_operations: Some(0),
+                parquet_data_file_full_get_operations: Some(0),
+                parquet_data_file_bytes_received: Some(0),
+                parquet_data_file_opened_bytes: Some(0),
+            },
+            output_batch_size: None,
             dynamic_partition_files_pruned,
             dynamic_partition_files_kept: 0,
             dynamic_filters_received: 0,
             dynamic_filters_accepted: 0,
             dynamic_filters_unsupported: 0,
             dynamic_filter_snapshots: 0,
-            dynamic_partition_files_not_pruned_missing_metadata: 0,
-            dynamic_partition_files_not_pruned_unsupported_expression: 0,
-            batches_produced: 0,
-            rows_produced: 0,
-            deletion_vector_payloads_loaded: 0,
-            deletion_vectors_applied: 0,
-            deletion_vector_rows_deleted: 0,
-            deletion_vector_failures: 0,
-            deletion_vector_rejections: 0,
+            dynamic_files_not_pruned_missing_metadata: 0,
+            dynamic_files_not_pruned_unsupported_expression: 0,
         }
     }
 

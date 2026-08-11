@@ -7,10 +7,10 @@ This preparation change does not route production through the published crate.
 
 ## Published dependency and type compatibility
 
-Delta Funnel depends on exact crates.io version `delta-arrow-reader = "=0.1.1"`
+Delta Funnel depends on exact crates.io version `delta-arrow-reader = "=0.1.2"`
 with its default `native-async` feature plus `datafusion` and `official-kernel`.
 `Cargo.lock` records crates.io checksum
-`6e75b1cda3e8a3450bd6653175abb83f272b0cdba5abda1fff62146f4d96385e`.
+`5fffaa237248e0cdfc81d31e2a89be332409336a59822daa97a708719aa0ab98`.
 There is no path, Git, patch, or staging source.
 
 The resolved graph has one copy of each compatibility-critical package:

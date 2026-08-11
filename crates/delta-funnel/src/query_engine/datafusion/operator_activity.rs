@@ -25,7 +25,7 @@ use datafusion::{
 };
 use futures_util::Stream;
 
-use super::{QueryTraceIdentity, execution::DeltaScanPlanningExec};
+use super::{QueryTraceIdentity, delta_datafusion_metrics_for_plan};
 
 #[cfg(feature = "perfetto-profile")]
 mod task_tracing;
@@ -33,9 +33,7 @@ mod task_tracing;
 #[cfg(feature = "perfetto-profile")]
 use task_tracing::DataFusionTaskTraceContext;
 #[cfg(feature = "perfetto-profile")]
-pub(crate) use task_tracing::{
-    current_datafusion_object_store_transport_span, initialize_datafusion_task_tracing,
-};
+pub(crate) use task_tracing::initialize_datafusion_task_tracing;
 
 const DELTA_SCAN_OUTPUT_WAIT_NAME: &str = "Await Delta scan output";
 const DELTA_SCAN_OUTPUT_WAIT_ACTIVITY: &str = "await_output";
@@ -507,7 +505,8 @@ fn instrument_query_execution_node(
     let inner = plan.with_new_children(children)?;
     // Instrument only the provider-owned output boundary. Name matching could
     // accidentally include an unrelated third-party plan with the same label.
-    let records_delta_scan_output_wait = inner.is::<DeltaScanPlanningExec>();
+    let records_delta_scan_output_wait =
+        delta_datafusion_metrics_for_plan(inner.as_ref()).is_some();
     let operator_name = Arc::<str>::from(inner.name());
     let plan: Arc<dyn ExecutionPlan> = Arc::new(ProfiledOperatorExec {
         inner,
@@ -697,6 +696,18 @@ impl RecordBatchStream for ProfiledRecordBatchStream {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "perfetto-profile")]
+    use std::error::Error;
+
+    #[cfg(feature = "perfetto-profile")]
+    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    #[cfg(feature = "perfetto-profile")]
+    use delta_arrow_reader::{DeltaDataFusionScanOptions, DeltaTableBuilder, register_delta_table};
+
+    #[cfg(feature = "perfetto-profile")]
+    use crate::query_engine::datafusion::test_support::{
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable,
+    };
     use crate::{
         QueryExecutionScope, observability::test_capture::TracingCapture,
         profiling::OperationTraceContext,
@@ -775,5 +786,70 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(truncations.len(), 1);
         assert_eq!(truncations[0].fields["maximum_spans"], "1");
+    }
+
+    #[cfg(feature = "perfetto-profile")]
+    #[tokio::test]
+    async fn standalone_object_store_transport_inherits_execution_context()
+    -> Result<(), Box<dyn Error>> {
+        let _ = initialize_datafusion_task_tracing();
+        let capture = TracingCapture::start_with_profile_spans_enabled();
+        let context = SessionContext::new();
+        let table = DeltaLogTable::new_with_schema_and_sized_adds(
+            "transport-span",
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            "[]",
+            &[(r#""partitionValues":{}"#, 100)],
+        )?;
+        let loaded = DeltaTableBuilder::new(table.path().to_string_lossy()).load()?;
+        register_delta_table(
+            &context,
+            "orders",
+            loaded,
+            DeltaDataFusionScanOptions::default(),
+        )?;
+        let dataframe = context.sql("select * from orders").await?;
+        let plan = dataframe.create_physical_plan().await?;
+        let operation =
+            OperationTraceContext::start_for_test(true).ok_or("profile tracing should start")?;
+        let identity = QueryTraceIdentity::new(
+            operation.clone(),
+            QueryExecutionScope::Preview,
+            Some("orders"),
+        )
+        .ok_or("query identity should be available")?;
+        let plan = instrument_query_execution_plan(plan, identity)?;
+
+        assert!(collect(plan, context.task_ctx()).await.is_err());
+        operation.record_process_result("error");
+        drop(operation);
+
+        let spans = capture.captured().spans();
+        let transport = spans
+            .iter()
+            .find(|span| {
+                span.target == "delta_arrow_reader::profile"
+                    && span.name == "Object store transport"
+            })
+            .ok_or("object-store transport span was not captured")?;
+        let task = spans
+            .iter()
+            .find(|span| {
+                Some(span.id) == transport.parent_id
+                    && span.target == "delta_arrow_reader::profile"
+                    && span.name == "Delta partition task"
+            })
+            .ok_or("partition task span was not the transport parent")?;
+        assert_eq!(task.parent_id, None);
+        assert!(task.follows_from_ids.iter().any(|id| {
+            spans.iter().any(|span| {
+                span.id == *id
+                    && span.target == crate::profiling::PROFILE_TARGET
+                    && span.name == "DataFusion operator activity"
+            })
+        }));
+        assert!(task.closed);
+        assert!(transport.closed);
+        Ok(())
     }
 }

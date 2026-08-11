@@ -8,10 +8,7 @@ use std::{
 use datafusion::common::runtime::{JoinSetTracer, JoinSetTracerError, set_join_set_tracer};
 use futures_util::{FutureExt, future::BoxFuture, future::poll_fn};
 
-use crate::{
-    profiling::{OBJECT_STORE_TRANSPORT_ACTIVITY, OBJECT_STORE_TRANSPORT_CONTEXT_NAME},
-    usize_to_u64_saturating,
-};
+use crate::usize_to_u64_saturating;
 
 use super::{
     ACTIVE_OPERATOR_ACTIVITY_SPANS, ActiveOperatorActivitySpan, OperatorActivityIdentityState,
@@ -91,18 +88,6 @@ impl DataFusionTaskTraceContext {
         drop(guard);
         result
     }
-
-    fn object_store_transport_span(&self) -> tracing::Span {
-        tracing::trace_span!(
-            target: crate::profiling::PROFILE_TARGET,
-            parent: None,
-            OBJECT_STORE_TRANSPORT_CONTEXT_NAME,
-            operation_id = self.activity.context.operation_id(),
-            query_execution_id = self.activity.query_execution_id,
-            execution_stream_id = self.stream_id,
-            activity = OBJECT_STORE_TRANSPORT_ACTIVITY,
-        )
-    }
 }
 
 struct DataFusionTaskScope {
@@ -139,10 +124,6 @@ fn current_datafusion_task_trace_context() -> Option<DataFusionTaskTraceContext>
         })
         .ok()
         .flatten()
-}
-
-pub(crate) fn current_datafusion_object_store_transport_span() -> Option<tracing::Span> {
-    current_datafusion_task_trace_context().map(|context| context.object_store_transport_span())
 }
 
 pub(super) struct DeltaFunnelDataFusionTaskTracer;

@@ -1522,13 +1522,19 @@ mod tests {
             let profile = alias
                 .execution_profile()
                 .ok_or("expected cache alias execution profile")?;
-            let provider_snapshot = profile
+            let provider_operator = profile
                 .operators()
                 .iter()
-                .find_map(|operator| operator.delta_provider_read_stats())
+                .find(|operator| operator.delta_provider_read_stats().is_some())
                 .ok_or("expected cache profile Delta provider snapshot")?;
-            assert_eq!(provider_snapshot.source_name, "orders");
-            assert!(provider_snapshot.files_started > 0);
+            let provider_snapshot = provider_operator
+                .delta_provider_read_stats()
+                .ok_or("expected cache profile Delta provider snapshot")?;
+            assert_eq!(
+                provider_operator.delta_provider_source_name(),
+                Some("orders")
+            );
+            assert!(provider_snapshot.reader.files_started > 0);
             let profile_events = execution_profile_events(&capture);
             assert_eq!(
                 execution_profile_event_count(&profile_events, "write_all_cache_alias"),
@@ -1869,11 +1875,11 @@ mod tests {
                 let profile = output
                     .execution_profile()
                     .ok_or("expected output profile")?;
-                assert!(profile.operators().iter().any(|operator| {
-                    operator
-                        .delta_provider_read_stats()
-                        .is_some_and(|stats| stats.source_name == "orders")
-                }));
+                assert!(
+                    profile.operators().iter().any(|operator| {
+                        operator.delta_provider_source_name() == Some("orders")
+                    })
+                );
             }
             Ok(())
         }
@@ -2004,24 +2010,23 @@ mod tests {
             let stats = source
                 .provider_read_stats()
                 .ok_or("expected execution provider stats")?;
-            assert_eq!(stats.source_name, "orders");
-            assert_eq!(stats.snapshot_version, source.snapshot_version());
-            assert!(stats.files_started > 0);
-            assert_eq!(stats.files_started, stats.files_completed);
-            assert!(stats.rows_produced > 0);
-            assert!(stats.batches_produced > 0);
-            match stats.scan_metadata_exhausted {
+            assert_eq!(stats.reader.snapshot_version, source.snapshot_version());
+            assert!(stats.reader.files_started > 0);
+            assert_eq!(stats.reader.files_started, stats.reader.files_completed);
+            assert!(stats.reader.rows_produced > 0);
+            assert!(stats.reader.batches_produced > 0);
+            match stats.reader.scan_metadata_exhausted {
                 Some(true) => {
                     assert_eq!(
                         source.file_count(),
-                        crate::FileCount::exact(stats.files_planned)
+                        crate::FileCount::exact(stats.reader.files_planned)
                     );
                     assert_eq!(source.file_count_reason(), None);
                 }
                 Some(false) => {
                     assert_eq!(
                         source.file_count(),
-                        crate::FileCount::estimated(stats.files_planned)
+                        crate::FileCount::estimated(stats.reader.files_planned)
                     );
                     assert_eq!(source.file_count_reason(), None);
                 }
@@ -2082,10 +2087,13 @@ mod tests {
             let stats = source
                 .provider_read_stats()
                 .ok_or("expected execution provider stats")?;
-            assert_eq!(stats.rows_produced, u64::try_from(table.rows())?);
-            assert_ne!(stats.rows_produced, output_report.stats().rows_written());
+            assert_eq!(stats.reader.rows_produced, u64::try_from(table.rows())?);
             assert_ne!(
-                stats.rows_produced,
+                stats.reader.rows_produced,
+                output_report.stats().rows_written()
+            );
+            assert_ne!(
+                stats.reader.rows_produced,
                 output_report.output_row_count().exact_value().unwrap_or(0)
             );
             Ok(())

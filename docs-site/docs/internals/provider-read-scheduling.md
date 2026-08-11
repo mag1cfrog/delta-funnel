@@ -1,13 +1,14 @@
 # Delta Provider Read Scheduling
 
-Delta DataFusion scan execution owns bounded scheduling for provider file reads.
+The published `delta-arrow-reader` DataFusion integration owns bounded
+scheduling for provider file reads.
 This page explains the two reader backends, concurrency limits, dynamic
 partition pruning, backpressure, and cancellation behavior.
 
 ## Reader Backends
 
 Provider execution supports two production reader backends selected through
-`DeltaProviderScanExecutionOptions`.
+`delta_arrow_reader::DeltaReaderExecutionOptions`.
 
 - `native_async`: the default provider backend. It uses parquet-rs async
   object-store reads, preserves original row indexes for deletion-vector files,
@@ -29,8 +30,8 @@ the scan-wide and partition-local permits are acquired.
 
 ## Execution Options
 
-`DeltaProviderScanExecutionOptions` exposes the active-read caps and handoff
-buffers used by provider execution:
+`DeltaReaderExecutionOptions` exposes the active-read caps and handoff buffers
+used by provider execution:
 
 - `max_concurrent_file_reads_per_scan`: scan-wide cap shared by all DataFusion
   execution partitions for one provider scan.

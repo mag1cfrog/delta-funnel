@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::{
-    DeltaFunnelError, ReportReasonCode, collect_delta_provider_read_stats,
+    DeltaFunnelError, ReportReasonCode,
+    query_engine::datafusion::{
+        NamedDeltaDataFusionMetricsSnapshot, collect_named_delta_datafusion_metrics,
+    },
     report::delta::{DeltaProviderSchedulingReport, DeltaSourceReport, SourceUsageStatus},
 };
 
@@ -46,19 +49,19 @@ impl DeltaFunnelSession {
             .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
-        let provider_stats = collect_delta_provider_read_stats(physical_plan.as_ref());
+        let provider_stats = collect_named_delta_datafusion_metrics(physical_plan.as_ref());
 
         Ok(self.source_reports_with_provider_read_stats(provider_stats))
     }
 
     fn source_reports_with_provider_read_stats(
         &self,
-        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+        provider_stats: Vec<NamedDeltaDataFusionMetricsSnapshot>,
     ) -> Vec<DeltaSourceReport> {
         let scheduling = self.delta_source_scheduling_report();
         let mut provider_stats_by_source = BTreeMap::new();
         for stats in provider_stats {
-            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+            provider_stats_by_source.insert(stats.source_name.clone(), stats.snapshot);
         }
 
         self.sources
@@ -89,11 +92,11 @@ impl DeltaFunnelSession {
     pub(super) fn source_reports_for_dry_run_outputs_with_provider_stats(
         &self,
         outputs: &[MssqlDryRunOutputReport],
-        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+        provider_stats: Vec<NamedDeltaDataFusionMetricsSnapshot>,
     ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
         let mut provider_stats_by_source = BTreeMap::new();
         for stats in provider_stats {
-            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+            provider_stats_by_source.insert(stats.source_name.clone(), stats.snapshot);
         }
 
         Ok(self
@@ -112,7 +115,7 @@ impl DeltaFunnelSession {
     pub(super) async fn provider_read_stats_for_dry_run_outputs(
         &self,
         outputs: &[MssqlDryRunOutputReport],
-    ) -> Result<Vec<crate::DeltaProviderReadStatsSnapshot>, DeltaFunnelError> {
+    ) -> Result<Vec<NamedDeltaDataFusionMetricsSnapshot>, DeltaFunnelError> {
         let mut provider_stats = Vec::new();
         for output in outputs {
             provider_stats.extend(
@@ -126,24 +129,26 @@ impl DeltaFunnelSession {
     async fn provider_read_stats_for_lazy_table(
         &self,
         table: &LazyTable,
-    ) -> Result<Vec<crate::DeltaProviderReadStatsSnapshot>, DeltaFunnelError> {
+    ) -> Result<Vec<NamedDeltaDataFusionMetricsSnapshot>, DeltaFunnelError> {
         let dataframe = self.dataframe_for_lazy_table(table).await?;
         let physical_plan = dataframe
             .create_physical_plan()
             .await
             .map_err(|error| datafusion_handoff_setup_error("physical_plan", error))?;
 
-        Ok(collect_delta_provider_read_stats(physical_plan.as_ref()))
+        Ok(collect_named_delta_datafusion_metrics(
+            physical_plan.as_ref(),
+        ))
     }
 
     pub(super) fn source_reports_for_planned_outputs_with_provider_stats(
         &self,
         outputs: &[PlannedMssqlOutput],
-        provider_stats: Vec<crate::DeltaProviderReadStatsSnapshot>,
+        provider_stats: Vec<NamedDeltaDataFusionMetricsSnapshot>,
     ) -> Result<Vec<DeltaSourceReport>, DeltaFunnelError> {
         let mut provider_stats_by_source = BTreeMap::new();
         for stats in provider_stats {
-            provider_stats_by_source.insert(stats.source_name.clone(), stats);
+            provider_stats_by_source.insert(stats.source_name.clone(), stats.snapshot);
         }
 
         Ok(self
@@ -233,7 +238,7 @@ fn delta_source_report_metadata_only(
 #[cfg(test)]
 mod tests {
     use super::super::{SessionOptions, test_support::DeltaLogTable};
-    use super::DeltaFunnelSession;
+    use super::{DeltaFunnelSession, NamedDeltaDataFusionMetricsSnapshot};
     use crate::{DeltaSourceConfig, FileCount, ReportReasonCode};
 
     #[tokio::test]
@@ -252,22 +257,24 @@ mod tests {
         let stats = report
             .provider_read_stats()
             .ok_or("expected provider read stats")?;
-        assert_eq!(stats.source_name, "orders");
-        assert_eq!(stats.snapshot_version, report.snapshot_version());
-        assert_eq!(stats.files_started, 0);
-        assert_eq!(stats.files_completed, 0);
-        assert_eq!(stats.batches_produced, 0);
-        assert_eq!(stats.rows_produced, 0);
-        match stats.scan_metadata_exhausted {
+        assert_eq!(stats.reader.snapshot_version, report.snapshot_version());
+        assert_eq!(stats.reader.files_started, 0);
+        assert_eq!(stats.reader.files_completed, 0);
+        assert_eq!(stats.reader.batches_produced, 0);
+        assert_eq!(stats.reader.rows_produced, 0);
+        match stats.reader.scan_metadata_exhausted {
             Some(true) => {
-                assert_eq!(report.file_count(), FileCount::exact(stats.files_planned));
+                assert_eq!(
+                    report.file_count(),
+                    FileCount::exact(stats.reader.files_planned)
+                );
                 assert_eq!(report.file_count_reason(), None);
                 assert!(report.scan_metadata_exhausted());
             }
             Some(false) => {
                 assert_eq!(
                     report.file_count(),
-                    FileCount::estimated(stats.files_planned)
+                    FileCount::estimated(stats.reader.files_planned)
                 );
                 assert_eq!(report.file_count_reason(), None);
                 assert!(!report.scan_metadata_exhausted());
@@ -296,11 +303,20 @@ mod tests {
             .and_then(|report| report.provider_read_stats())
             .ok_or("expected planned provider read stats")?
             .clone();
-        first.parquet_data_file_range_get_operations = Some(11);
+        first.reader.parquet_data_file_range_get_operations = Some(11);
         let mut second = first.clone();
-        second.parquet_data_file_range_get_operations = Some(29);
+        second.reader.parquet_data_file_range_get_operations = Some(29);
 
-        let reports = session.source_reports_with_provider_read_stats(vec![first, second]);
+        let reports = session.source_reports_with_provider_read_stats(vec![
+            NamedDeltaDataFusionMetricsSnapshot {
+                source_name: "orders".to_owned(),
+                snapshot: first,
+            },
+            NamedDeltaDataFusionMetricsSnapshot {
+                source_name: "orders".to_owned(),
+                snapshot: second,
+            },
+        ]);
         let value = reports
             .first()
             .ok_or("expected source report")?

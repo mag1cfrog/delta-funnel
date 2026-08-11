@@ -2513,11 +2513,12 @@ mod tests {
         assert_eq!(report.stats().batches_written(), call.batches);
         let profile = report.execution_profile().ok_or("expected profile")?;
         assert!(!profile.operators().is_empty());
-        assert!(profile.operators().iter().any(|operator| {
-            operator
-                .delta_provider_read_stats()
-                .is_some_and(|stats| stats.source_name == "orders")
-        }));
+        assert!(
+            profile
+                .operators()
+                .iter()
+                .any(|operator| { operator.delta_provider_source_name() == Some("orders") })
+        );
         Ok(())
     }
 

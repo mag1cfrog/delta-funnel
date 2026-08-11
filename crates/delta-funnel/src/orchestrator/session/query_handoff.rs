@@ -32,8 +32,8 @@ use crate::{
     },
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
-        DFQueryExecution, DeltaProviderReadStatsHandle, QueryTraceIdentity,
-        collect_delta_provider_read_stats_handles,
+        DFQueryExecution, DeltaProviderReadStatsHandle, NamedDeltaDataFusionMetricsSnapshot,
+        QueryTraceIdentity, collect_delta_provider_read_stats_handles,
         datafusion_query_output_stream_with_effective_root,
         execution_profile::{
             QueryExecutionProfileConsumer, QueryExecutionProfileResult,
@@ -56,8 +56,7 @@ use super::{
     },
 };
 
-pub(super) type SharedProviderStatsSnapshots =
-    Arc<Mutex<Vec<crate::DeltaProviderReadStatsSnapshot>>>;
+pub(super) type SharedProviderStatsSnapshots = Arc<Mutex<Vec<NamedDeltaDataFusionMetricsSnapshot>>>;
 
 pub(super) fn shared_provider_stats_snapshots() -> SharedProviderStatsSnapshots {
     Arc::new(Mutex::new(Vec::new()))
@@ -65,7 +64,7 @@ pub(super) fn shared_provider_stats_snapshots() -> SharedProviderStatsSnapshots 
 
 pub(super) fn provider_stats_snapshots(
     provider_stats_snapshots: &SharedProviderStatsSnapshots,
-) -> Vec<crate::DeltaProviderReadStatsSnapshot> {
+) -> Vec<NamedDeltaDataFusionMetricsSnapshot> {
     match provider_stats_snapshots.lock() {
         Ok(provider_stats_snapshots) => provider_stats_snapshots.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -90,14 +89,15 @@ pub(super) fn finalize_tracked_query_execution(
             Ok(retained) => retained,
             Err(poisoned) => poisoned.into_inner(),
         };
-        retained.extend(
-            terminal_snapshots
-                .iter()
-                .map(|(_, snapshot)| snapshot.clone()),
-        );
+        retained.extend(terminal_snapshots.iter().map(|(handle, snapshot)| {
+            NamedDeltaDataFusionMetricsSnapshot {
+                source_name: handle.source_name().unwrap_or_default().to_owned(),
+                snapshot: snapshot.clone(),
+            }
+        }));
     }
-    for (_, snapshot) in &terminal_snapshots {
-        delta_provider_parquet_io_summary(snapshot, outcome);
+    for (handle, snapshot) in &terminal_snapshots {
+        delta_provider_parquet_io_summary(handle.source_name(), snapshot, outcome);
     }
     if let Some(profile_consumer) = profile_consumer {
         profile_consumer.consume_terminal(outcome.query_execution_outcome(), &terminal_snapshots);
@@ -1264,10 +1264,9 @@ mod tests {
     };
 
     use crate::{
-        DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
-        DeltaSourceConfig, ExecutionProfileMode, PhaseStatus, PreviewFailureContext,
-        PreviewOptions, QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope,
-        QueryOptions, ReportReasonCode,
+        DeltaFunnelError, DeltaSourceConfig, ExecutionProfileMode, PhaseStatus,
+        PreviewFailureContext, PreviewOptions, QueryExecutionOutcome, QueryExecutionProfile,
+        QueryExecutionScope, QueryOptions, ReportReasonCode,
         observability::test_capture::{CapturedEvent, CapturedEvents, TracingCapture},
         progress::{ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter},
         query_engine::datafusion::{
@@ -1285,6 +1284,7 @@ mod tests {
         logical_expr::{Volatility, create_udf},
         physical_plan::{ExecutionPlan, empty::EmptyExec, union::UnionExec},
     };
+    use delta_arrow_reader::{DeltaReaderBackend, DeltaReaderExecutionOptions};
     use futures_util::StreamExt;
     use tracing::Level;
 
@@ -1497,18 +1497,19 @@ mod tests {
 
     fn assert_provider_io_event_matches_snapshot(
         event: &CapturedEvent,
-        snapshot: &crate::DeltaProviderReadStatsSnapshot,
+        source_name: &str,
+        snapshot: &delta_arrow_reader::DeltaDataFusionMetricsSnapshot,
         outcome: &str,
     ) {
-        let reader_backend = match snapshot.reader_backend {
-            crate::DeltaProviderReaderBackend::OfficialKernel => "official_kernel",
-            crate::DeltaProviderReaderBackend::NativeAsync => "native_async",
+        let reader_backend = match snapshot.reader.reader_backend {
+            delta_arrow_reader::DeltaReaderBackend::OfficialKernel => "official_kernel",
+            delta_arrow_reader::DeltaReaderBackend::NativeAsync => "native_async",
         };
         let metrics = [
-            snapshot.parquet_data_file_range_get_operations,
-            snapshot.parquet_data_file_full_get_operations,
-            snapshot.parquet_data_file_bytes_received,
-            snapshot.parquet_data_file_opened_bytes,
+            snapshot.reader.parquet_data_file_range_get_operations,
+            snapshot.reader.parquet_data_file_full_get_operations,
+            snapshot.reader.parquet_data_file_bytes_received,
+            snapshot.reader.parquet_data_file_opened_bytes,
         ];
         let metrics_available = metrics.iter().all(Option::is_some);
 
@@ -1516,14 +1517,14 @@ mod tests {
         assert_eq!(event.level, Level::DEBUG);
         assert_eq!(
             event.fields.get("source_name").map(String::as_str),
-            Some(snapshot.source_name.as_str())
+            Some(source_name)
         );
         assert_eq!(
             event
                 .fields
                 .get("snapshot_version")
                 .and_then(|value| value.parse::<u64>().ok()),
-            Some(snapshot.snapshot_version)
+            Some(snapshot.reader.snapshot_version)
         );
         assert_eq!(
             event.fields.get("reader_backend").map(String::as_str),
@@ -1672,7 +1673,7 @@ mod tests {
         );
         let summaries = provider_io_events(capture.captured());
         assert_eq!(summaries.len(), 1);
-        assert_provider_io_event_matches_snapshot(&summaries[0], expected, "error");
+        assert_provider_io_event_matches_snapshot(&summaries[0], "orders", expected, "error");
         assert_eq!(
             profile_result.profile().map(QueryExecutionProfile::outcome),
             Some(QueryExecutionOutcome::Error)
@@ -1716,7 +1717,7 @@ mod tests {
         );
         let summaries = provider_io_events(capture.captured());
         assert_eq!(summaries.len(), 1);
-        assert_provider_io_event_matches_snapshot(&summaries[0], expected, "cancelled");
+        assert_provider_io_event_matches_snapshot(&summaries[0], "orders", expected, "cancelled");
         assert_eq!(
             profile_result.profile().map(QueryExecutionProfile::outcome),
             Some(QueryExecutionOutcome::Cancelled)
@@ -1741,7 +1742,6 @@ mod tests {
         let physical_plan = dataframe.create_physical_plan().await?;
         let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
         assert_eq!(handles.len(), 1);
-        let handle = Arc::downgrade(&handles[0]);
         drop(physical_plan);
 
         let retained = super::shared_provider_stats_snapshots();
@@ -1756,7 +1756,6 @@ mod tests {
         assert!(stream.next().await.is_none());
         assert!(stream.read_stats_handles.is_none());
         assert!(stream.provider_stats_snapshots.is_none());
-        assert!(handle.upgrade().is_none());
         assert!(stream.next().await.is_none());
         drop(stream);
         assert_eq!(super::provider_stats_snapshots(&retained).len(), 1);
@@ -1893,10 +1892,15 @@ mod tests {
             .iter()
             .find_map(|operator| operator.delta_provider_read_stats())
             .ok_or("expected profile provider snapshot")?;
-        assert_eq!(profile_snapshot, &retained[0]);
+        assert_eq!(profile_snapshot, &retained[0].snapshot);
         let provider_events = provider_io_events(capture.captured());
         assert_eq!(provider_events.len(), 1);
-        assert_provider_io_event_matches_snapshot(&provider_events[0], &retained[0], "error");
+        assert_provider_io_event_matches_snapshot(
+            &provider_events[0],
+            &retained[0].source_name,
+            &retained[0].snapshot,
+            "error",
+        );
         let profile_events = execution_profile_events(capture.captured());
         assert_eq!(profile_events.len(), 1);
         assert_eq!(
@@ -1984,10 +1988,17 @@ mod tests {
         assert_eq!(rows, table.rows());
         assert_eq!(snapshots.len(), 1);
         assert_eq!(summaries.len(), 1);
-        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "success");
-        assert_eq!(snapshots[0].files_completed, 1);
+        assert_provider_io_event_matches_snapshot(
+            &summaries[0],
+            &snapshots[0].source_name,
+            &snapshots[0].snapshot,
+            "success",
+        );
+        assert_eq!(snapshots[0].snapshot.reader.files_completed, 1);
         assert!(
             snapshots[0]
+                .snapshot
+                .reader
                 .parquet_data_file_bytes_received
                 .is_some_and(|bytes| bytes > 0)
         );
@@ -2019,16 +2030,25 @@ mod tests {
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(summaries.len(), 1);
-        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "cancelled");
-        assert!(snapshots[0].files_started > 0);
-        assert!(snapshots[0].rows_produced > 0);
+        assert_provider_io_event_matches_snapshot(
+            &summaries[0],
+            &snapshots[0].source_name,
+            &snapshots[0].snapshot,
+            "cancelled",
+        );
+        assert!(snapshots[0].snapshot.reader.files_started > 0);
+        assert!(snapshots[0].snapshot.reader.rows_produced > 0);
         assert!(
             snapshots[0]
+                .snapshot
+                .reader
                 .parquet_data_file_bytes_received
                 .is_some_and(|bytes| bytes > 0)
         );
         assert!(
             snapshots[0]
+                .snapshot
+                .reader
                 .parquet_data_file_opened_bytes
                 .is_some_and(|bytes| bytes > 0)
         );
@@ -2053,9 +2073,14 @@ mod tests {
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(summaries.len(), 1);
-        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
-        assert_eq!(snapshots[0].files_started, 1);
-        assert_eq!(snapshots[0].files_completed, 0);
+        assert_provider_io_event_matches_snapshot(
+            &summaries[0],
+            &snapshots[0].source_name,
+            &snapshots[0].snapshot,
+            "error",
+        );
+        assert_eq!(snapshots[0].snapshot.reader.files_started, 1);
+        assert_eq!(snapshots[0].snapshot.reader.files_completed, 0);
         Ok(())
     }
 
@@ -2096,12 +2121,32 @@ mod tests {
         assert!(profile.partial());
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].source_name, "orders");
-        assert_eq!(snapshots[0].files_started, 0);
-        assert_eq!(snapshots[0].parquet_data_file_range_get_operations, Some(0));
-        assert_eq!(snapshots[0].parquet_data_file_bytes_received, Some(0));
-        assert_eq!(snapshots[0].parquet_data_file_opened_bytes, Some(0));
+        assert_eq!(snapshots[0].snapshot.reader.files_started, 0);
+        assert_eq!(
+            snapshots[0]
+                .snapshot
+                .reader
+                .parquet_data_file_range_get_operations,
+            Some(0)
+        );
+        assert_eq!(
+            snapshots[0]
+                .snapshot
+                .reader
+                .parquet_data_file_bytes_received,
+            Some(0)
+        );
+        assert_eq!(
+            snapshots[0].snapshot.reader.parquet_data_file_opened_bytes,
+            Some(0)
+        );
         assert_eq!(summaries.len(), 1);
-        assert_provider_io_event_matches_snapshot(&summaries[0], &snapshots[0], "error");
+        assert_provider_io_event_matches_snapshot(
+            &summaries[0],
+            &snapshots[0].source_name,
+            &snapshots[0].snapshot,
+            "error",
+        );
         assert_eq!(profile_events.len(), 1);
         assert_eq!(
             profile_events[0].fields.get("outcome").map(String::as_str),
@@ -2703,14 +2748,13 @@ mod tests {
         )?;
 
         for reader_backend in [
-            DeltaProviderReaderBackend::OfficialKernel,
-            DeltaProviderReaderBackend::NativeAsync,
+            DeltaReaderBackend::OfficialKernel,
+            DeltaReaderBackend::NativeAsync,
         ] {
-            let provider_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-                reader_backend,
-                2,
-                1,
-            )?;
+            let provider_options = DeltaReaderExecutionOptions::new()
+                .with_reader_backend(reader_backend)?
+                .with_max_concurrent_file_reads_per_scan(Some(2))?
+                .with_max_concurrent_file_reads_per_partition(1)?;
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new()
                     .with_query_options(QueryOptions {
@@ -2764,10 +2808,10 @@ mod tests {
                 .iter()
                 .find_map(crate::QueryExecutionOperatorProfile::delta_provider_read_stats)
                 .ok_or("expected terminal provider snapshot")?;
-            assert_eq!(snapshot.reader_backend, reader_backend);
-            assert_eq!(snapshot.scan_partitions_planned, 2);
-            assert_eq!(snapshot.files_planned, 2);
-            assert_eq!(snapshot.datafusion_output_batch_size, Some(8));
+            assert_eq!(snapshot.reader.reader_backend, reader_backend);
+            assert_eq!(snapshot.reader.scan_partitions_planned, 2);
+            assert_eq!(snapshot.reader.files_planned, 2);
+            assert_eq!(snapshot.output_batch_size, Some(8));
         }
         Ok(())
     }
@@ -2792,18 +2836,26 @@ mod tests {
         let profile = preview
             .execution_profile()
             .ok_or("expected detailed Delta preview profile")?;
-        let snapshot = profile
+        let operator = profile
             .operators()
             .iter()
-            .find_map(crate::QueryExecutionOperatorProfile::delta_provider_read_stats)
+            .find(|operator| operator.delta_provider_read_stats().is_some())
+            .ok_or("expected terminal provider snapshot")?;
+        let snapshot = operator
+            .delta_provider_read_stats()
             .ok_or("expected terminal provider snapshot")?;
 
-        assert_eq!(snapshot.source_name, "orders");
-        assert!(snapshot.files_planned > 0);
-        assert!(snapshot.rows_produced > 0);
+        assert_eq!(operator.delta_provider_source_name(), Some("orders"));
+        assert!(snapshot.reader.files_planned > 0);
+        assert!(snapshot.reader.rows_produced > 0);
         let provider_events = provider_io_events(capture.captured());
         assert_eq!(provider_events.len(), 1);
-        assert_provider_io_event_matches_snapshot(&provider_events[0], snapshot, "success");
+        assert_provider_io_event_matches_snapshot(
+            &provider_events[0],
+            "orders",
+            snapshot,
+            "success",
+        );
         assert_eq!(execution_profile_events(capture.captured()).len(), 1);
         Ok(())
     }
@@ -2812,11 +2864,10 @@ mod tests {
     async fn detailed_preview_progress_preserves_profile_and_timing_shape()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_two_files("detailed-progress-parity")?;
-        let provider_options = DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-            DeltaProviderReaderBackend::NativeAsync,
-            1,
-            1,
-        )?;
+        let provider_options = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(DeltaReaderBackend::NativeAsync)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?
+            .with_max_concurrent_file_reads_per_partition(1)?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new()
                 .with_query_options(QueryOptions {

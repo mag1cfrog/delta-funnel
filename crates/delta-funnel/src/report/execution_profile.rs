@@ -1,4 +1,4 @@
-use crate::DeltaProviderReadStatsSnapshot;
+use delta_arrow_reader::DeltaDataFusionMetricsSnapshot;
 
 /// Controls whether a query execution profile is collected.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -194,7 +194,8 @@ pub struct QueryExecutionOperatorProfile {
     metrics_available: bool,
     aggregated_metrics: Vec<QueryExecutionMetric>,
     metrics: Vec<QueryExecutionMetric>,
-    delta_provider_read_stats: Option<DeltaProviderReadStatsSnapshot>,
+    delta_provider_source_name: Option<String>,
+    delta_provider_read_stats: Option<DeltaDataFusionMetricsSnapshot>,
 }
 
 impl QueryExecutionOperatorProfile {
@@ -207,7 +208,8 @@ impl QueryExecutionOperatorProfile {
         metrics_available: bool,
         aggregated_metrics: Vec<QueryExecutionMetric>,
         metrics: Vec<QueryExecutionMetric>,
-        delta_provider_read_stats: Option<DeltaProviderReadStatsSnapshot>,
+        delta_provider_source_name: Option<String>,
+        delta_provider_read_stats: Option<DeltaDataFusionMetricsSnapshot>,
     ) -> Self {
         Self {
             node_id,
@@ -217,6 +219,7 @@ impl QueryExecutionOperatorProfile {
             metrics_available,
             aggregated_metrics,
             metrics,
+            delta_provider_source_name,
             delta_provider_read_stats,
         }
     }
@@ -263,9 +266,15 @@ impl QueryExecutionOperatorProfile {
         &self.metrics
     }
 
+    /// Returns the registered source name for an exact Delta scan node.
+    #[must_use]
+    pub fn delta_provider_source_name(&self) -> Option<&str> {
+        self.delta_provider_source_name.as_deref()
+    }
+
     /// Returns the immutable provider snapshot for an exact Delta scan node.
     #[must_use]
-    pub const fn delta_provider_read_stats(&self) -> Option<&DeltaProviderReadStatsSnapshot> {
+    pub const fn delta_provider_read_stats(&self) -> Option<&DeltaDataFusionMetricsSnapshot> {
         self.delta_provider_read_stats.as_ref()
     }
 }
@@ -425,6 +434,7 @@ mod tests {
             true,
             Vec::new(),
             vec![metric],
+            None,
             None,
         );
         let profile =

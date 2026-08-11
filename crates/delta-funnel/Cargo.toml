@@ -45,7 +45,7 @@ clap = { version = "4.6.4", default-features = false, features = ["derive", "err
 datafusion = { version = "54.1.0", default-features = false, features = [
     "sql",
 ] }
-delta-arrow-reader = { version = "=0.1.1", features = ["datafusion", "official-kernel"] }
+delta-arrow-reader = { version = "=0.1.2", features = ["datafusion", "official-kernel"] }
 delta_kernel = { version = "=0.25.0", default-features = false, features = [
     "arrow",
     "internal-api",
