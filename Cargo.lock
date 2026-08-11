@@ -1321,9 +1321,9 @@ dependencies = [
 
 [[package]]
 name = "delta-arrow-reader"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fffaa237248e0cdfc81d31e2a89be332409336a59822daa97a708719aa0ab98"
+checksum = "5bf56f437f2f3846cca1b7992bb0cf97c248e4b170f2042c2b77ea455816138a"
 dependencies = [
  "arrow",
  "async-trait",
