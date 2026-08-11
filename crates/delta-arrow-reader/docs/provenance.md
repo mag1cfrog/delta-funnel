@@ -78,6 +78,7 @@ publish the candidate package.
 | Single-table registration portions of `crates/delta-funnel/src/query_engine/datafusion/catalog/registration.rs` | `crates/delta-arrow-reader/src/datafusion_provider.rs` | #468 |
 | Frozen public provider and execution fixtures | `crates/delta-arrow-reader/tests/support/real_parquet_delta_table.rs` | #469 |
 | Applicable public assertions from `catalog/provider_tests.rs`, `catalog/registration.rs`, and `execution/planning_exec.rs` | `crates/delta-arrow-reader/tests/datafusion_provider.rs` | #483 |
+| Controlled provider-exec cases, fixture generation, delayed storage, measurement, and schema-22 CSV portions of `crates/delta-funnel/src/bin/delta_scan_partition_bench.rs` | `crates/delta-arrow-reader/benches/reader.rs`, `docs/benchmark-parity.md`, and `docs/benchmark-parity-results.csv` | #470 |
 
 ## Test migration
 
@@ -147,3 +148,9 @@ publish the candidate package.
   profiling, operator activity, session workflow, and reporting remain Delta
   Funnel-owned because the standalone public boundary has no corresponding
   orchestration API.
+- #470 ports the 12 controlled provider-exec reader cases, four deterministic
+  fixture recipes and fingerprints, delayed storage model, output validation,
+  schema-22 measurements, and two-warm-up/five-measurement comparison method.
+  The extracted public API matches every deterministic field and has no
+  material timing regression. Product workflow and report benchmarks remain in
+  Delta Funnel.

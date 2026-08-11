@@ -6,10 +6,18 @@ rust-version = "1.88"
 license = "Apache-2.0"
 publish = false
 exclude = [
+    "benches/reader.rs",
+    "tests/benchmark_harness.rs",
     "tests/datafusion_provider.rs",
     "tests/portable_fixtures.rs",
     "tests/support/**",
 ]
+
+[[bench]]
+name = "reader"
+harness = false
+required-features = ["datafusion", "native-async", "official-kernel"]
+test = false
 
 [features]
 default = ["native-async"]
