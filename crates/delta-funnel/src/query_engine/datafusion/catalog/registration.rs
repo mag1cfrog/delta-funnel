@@ -71,12 +71,13 @@ pub fn register_delta_sources_with_scan_execution_options(
     register_delta_sources_with_options(ctx, sources, execution_options)
 }
 
-pub(crate) fn register_delta_source_with_scan_execution_options(
+pub(crate) fn register_delta_source_with_scan_options(
     ctx: &SessionContext,
     source_name: String,
     table: DeltaTable,
     scan_target_partitions: Option<usize>,
     execution_options: DeltaReaderExecutionOptions,
+    use_view_types: bool,
     reporter: Option<&ProgressReporter>,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
     execution_options
@@ -92,6 +93,7 @@ pub(crate) fn register_delta_source_with_scan_execution_options(
         DeltaDataFusionScanOptions {
             execution_options,
             target_partitions: scan_target_partitions,
+            use_view_types,
         },
     )
 }
@@ -120,6 +122,7 @@ fn register_delta_sources_with_options(
         let options = DeltaDataFusionScanOptions {
             execution_options,
             target_partitions,
+            use_view_types: false,
         };
         match register_delta_table_with_tracing(ctx, name, table, options) {
             Ok(source) => registered.push(source),

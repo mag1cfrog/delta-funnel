@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- expose the Delta reader view-type policy through Rust and Python session options, with ordinary Arrow string and binary arrays as the Delta Funnel default
+
 ## [0.5.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.4.1...delta-funnel-v0.5.0) - 2026-08-05
 
 ### Added

@@ -834,6 +834,7 @@ fn provider_read_stats_value(
         "source_name": source_name.unwrap_or(""),
         "snapshot_version": stats.reader.snapshot_version,
         "reader_backend": reader_backend(stats.reader.reader_backend),
+        "use_view_types": stats.use_view_types,
         "scan_metadata_exhausted": stats.reader.scan_metadata_exhausted,
         "scan_partitions_planned": stats.reader.scan_partitions_planned,
         "files_planned": stats.reader.files_planned,
@@ -1450,6 +1451,7 @@ mod tests {
             value["provider_read_stats"]["reader_backend"],
             "native_async"
         );
+        assert_eq!(value["provider_read_stats"]["use_view_types"], false);
         assert_eq!(value["provider_read_stats"]["files_planned"], 5);
         assert_eq!(
             value["provider_read_stats"]["parquet_data_file_range_get_operations"],
@@ -1609,6 +1611,7 @@ mod tests {
                 parquet_data_file_bytes_received: Some(512),
                 parquet_data_file_opened_bytes: Some(2048),
             },
+            use_view_types: false,
             output_batch_size: Some(128),
             dynamic_partition_files_pruned: 2,
             dynamic_partition_files_kept: 3,

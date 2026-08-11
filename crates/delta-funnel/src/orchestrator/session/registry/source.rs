@@ -11,7 +11,7 @@ use crate::{
     RegisteredDeltaSource, observability,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
-        register_delta_source_with_scan_execution_options, reject_existing_delta_registration_name,
+        register_delta_source_with_scan_options, reject_existing_delta_registration_name,
         validate_delta_table_snapshot_protocol,
     },
     report::PhaseTimer,
@@ -199,12 +199,13 @@ impl DeltaFunnelSession {
                 return Err(map_load_error(&source_name, &table_uri, None, error));
             }
         };
-        let registered = match register_delta_source_with_scan_execution_options(
+        let registered = match register_delta_source_with_scan_options(
             &self.context,
             source_name,
             table,
             None,
             self.options.provider_scan_options(),
+            self.options.provider_use_view_types(),
             reporter,
         ) {
             Ok(registered) => {
@@ -371,7 +372,10 @@ fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressP
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use datafusion::{arrow::datatypes::Schema, datasource::empty::EmptyTable};
+    use datafusion::{
+        arrow::datatypes::{DataType, Schema},
+        datasource::empty::EmptyTable,
+    };
 
     use super::{
         DATAFUSION_REGISTRATION_PHASE, EMPTY_TABLE_URI, PROTOCOL_PREFLIGHT_PHASE,
@@ -554,6 +558,29 @@ mod tests {
             assert_eq!(
                 events.last().map(ProgressEvent::kind),
                 Some(ProgressEventKind::Completed)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_provider_view_policy_defaults_to_standard_and_can_enable_views()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("provider-view-policy")?;
+
+        for (use_view_types, expected) in [(false, DataType::Utf8), (true, DataType::Utf8View)] {
+            let mut session = DeltaFunnelSession::new(
+                SessionOptions::new().with_provider_use_view_types(use_view_types),
+            )?;
+            session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+            let provider = session.context().table_provider("orders").await?;
+
+            assert_eq!(
+                provider
+                    .schema()
+                    .field_with_name("customer_name")?
+                    .data_type(),
+                &expected
             );
         }
         Ok(())
