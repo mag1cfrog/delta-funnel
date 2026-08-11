@@ -88,32 +88,28 @@ Production must have one route after the cutover: Delta Funnel orchestration to
 the published reader. It must not dual-read, fall back, or expose compatibility
 aliases.
 
-## Mechanical #476 cleanup
+## #476 cleanup outcome
 
-Delete these standalone-owned implementation files once #475 makes them
-unreachable:
+The duplicate reader source and its unreachable tests were deleted only after
+each reader ownership unit passed focused checks in both the staged crate and
+the independent repository. The staged crate import matches the independent
+repository's initial commit byte-for-byte. The reviewed 0.1.1 and 0.1.2 parity
+corrections required by #474 and #475 were then mirrored back into the staging
+crate before cleanup.
 
-- `crates/delta-funnel/src/table_formats/delta.rs`
-- `crates/delta-funnel/src/table_formats/delta/`
-- `crates/delta-funnel/src/query_engine/datafusion/catalog/provider.rs`
-- `crates/delta-funnel/src/query_engine/datafusion/execution.rs`
-- `crates/delta-funnel/src/query_engine/datafusion/execution/`
-- `crates/delta-funnel/src/query_engine/datafusion/planning.rs`
-- `crates/delta-funnel/src/query_engine/datafusion/planning/`
+Delta Funnel retains source-name and environment policy, multi-source
+registration and rollback, session and workflow orchestration, reports,
+progress, profiling, SQL Server, Python integration, and their tests. The local
+Parquet fixture remains test-only because retained workflow and reporting tests
+use it. `delta_scan_partition_bench` remains because its non-reader modes and
+tests cover Delta Funnel-owned policy, profiling, workflow, host probes, CLI,
+and report behavior; its 12 reader comparison cases also exist in the
+standalone benchmark harness.
 
-Retain and simplify `table_formats.rs` for source-name/environment policy,
-`catalog/registration.rs`, `query_engine/datafusion.rs`, the session, profiling,
-report, progress, workflow, and Python modules. Split or delete reader-only
-cases in `catalog/provider_tests.rs`; retain its product
-registration, rollback, report, session, and query behavior cases. Delete
-`delta_scan_partition_bench` and reader-only fixtures only after their retained
-product coverage or standalone owner is confirmed.
-
-After source deletion, inspect usage and remove the direct dependencies that
-served only the duplicate reader: `delta_kernel_default_engine`, `object_store`,
-and the Windows system dependency used by the old partition probe. Remove
-`delta_kernel` and `parquet` too if deleting the reader benchmark leaves no
-retained caller. `async-trait`, `futures-util`, Tokio, and `libc` have independent
-Delta Funnel callers and are not cleanup candidates. Confirm the final list
-with `cargo machete`, `cargo tree`, and source search instead of changing any
-unrelated version.
+Source and dependency inspection removed the now-unused direct
+`delta_kernel_default_engine`, `object_store`, and Windows system dependencies.
+`delta_kernel` and `parquet` remain direct because the retained product fixture,
+benchmark, source policy, and protocol report use them. The standalone
+[`docs/provenance.md`](https://github.com/mag1cfrog/delta-arrow-reader/blob/main/docs/provenance.md)
+records the frozen source, staging branch, exact path mapping, test migration,
+and repository export before the temporary staging branch is retired.

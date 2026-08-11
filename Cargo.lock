@@ -1354,12 +1354,10 @@ dependencies = [
  "datafusion",
  "delta-arrow-reader",
  "delta_kernel",
- "delta_kernel_default_engine",
  "flate2",
  "futures-util",
  "hyper-util",
  "libc",
- "object_store",
  "parquet",
  "perfetto-sdk",
  "rkyv",
@@ -1372,7 +1370,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "windows-sys 0.61.2",
  "zstd",
 ]
 

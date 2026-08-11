@@ -759,8 +759,6 @@ mod tests {
     fn lower_level_modules_do_not_create_hidden_tokio_runtimes() {
         let low_level_sources = [
             include_str!("../pipeline/batch_handoff.rs"),
-            include_str!("../query_engine/datafusion/execution.rs"),
-            include_str!("../query_engine/datafusion/execution/planning_exec.rs"),
             include_str!("../sql_server/execution/connection.rs"),
             include_str!("../sql_server/execution/sink.rs"),
             include_str!("../sql_server/execution/workflow.rs"),

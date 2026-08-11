@@ -9,12 +9,7 @@ use url::Url;
 mod name;
 
 #[cfg(test)]
-mod kernel {
-    pub(crate) use delta_kernel::arrow::record_batch::RecordBatch;
-}
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "table_formats/delta/test_support.rs"]
+#[path = "table_formats/test_support.rs"]
 mod test_support;
 
 pub(crate) use name::validate_table_source_names;

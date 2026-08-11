@@ -10,10 +10,8 @@ const selectsDiagnostics = (file) =>
 
 for (const file of [
   "crates/delta-funnel/src/sql_server/execution/sink.rs",
-  "crates/delta-funnel/src/table_formats/delta/read.rs",
   "crates/delta-funnel-python/src/logging.rs",
   "crates/delta-funnel/src/query_engine/datafusion.rs",
-  "crates/delta-funnel/src/query_engine/datafusion/execution/metered_object_store.rs",
 ]) {
   assert.equal(selectsDiagnostics(file), false, `${file} selected diagnostics`);
 }
@@ -30,7 +28,6 @@ for (const file of [
   "crates/delta-funnel/src/query_engine/datafusion/operator_activity/task_tracing.rs",
   "crates/delta-funnel/src/query_engine/datafusion/planning_activity.rs",
   "crates/delta-funnel/src/query_engine/datafusion/profiled_execution.rs",
-  "crates/delta-funnel/src/query_engine/datafusion/profiled_object_store.rs",
   "crates/delta-funnel-python/build.rs",
   "crates/delta-funnel-python/pyproject.toml",
   "crates/delta-funnel-python/src/perfetto_diagnostics.rs",
