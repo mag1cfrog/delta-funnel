@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, OnceLock},
 };
 
@@ -8,20 +8,21 @@ use datafusion::physical_plan::{
     ExecutionPlan,
     metrics::{Metric, MetricType, MetricValue, MetricsSet},
 };
+use delta_arrow_reader::DeltaDataFusionMetricsSnapshot;
 
 use crate::{
-    DeltaProviderReadStatsSnapshot, QueryExecutionMetric, QueryExecutionMetricCategory,
-    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
-    QueryExecutionProfile, QueryExecutionScope, usize_to_u64_saturating,
+    QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionMetricValue,
+    QueryExecutionOperatorProfile, QueryExecutionOutcome, QueryExecutionProfile,
+    QueryExecutionScope, usize_to_u64_saturating,
 };
 
 use super::{
-    DeltaProviderReadStatsHandle, execution::DeltaScanPlanningExec,
+    DeltaProviderReadStatsHandle, delta_datafusion_metrics_for_plan,
     operator_activity::unprofiled_execution_plan,
 };
 
-pub(crate) type DeltaProviderReadStatsSnapshotSet =
-    Vec<(DeltaProviderReadStatsHandle, DeltaProviderReadStatsSnapshot)>;
+pub(crate) type DeltaDataFusionMetricsSnapshotSet =
+    Vec<(DeltaProviderReadStatsHandle, DeltaDataFusionMetricsSnapshot)>;
 
 #[derive(Clone)]
 pub(crate) struct QueryExecutionProfileResult {
@@ -64,7 +65,7 @@ impl QueryExecutionProfileConsumer {
     pub(crate) fn consume_terminal(
         self,
         outcome: QueryExecutionOutcome,
-        terminal_provider_snapshots: &DeltaProviderReadStatsSnapshotSet,
+        terminal_provider_snapshots: &DeltaDataFusionMetricsSnapshotSet,
     ) {
         let Self {
             root,
@@ -87,16 +88,18 @@ impl QueryExecutionProfileConsumer {
 
 pub(crate) fn delta_provider_read_stats_snapshot_set(
     handles: &[DeltaProviderReadStatsHandle],
-    snapshots: &[DeltaProviderReadStatsSnapshot],
-) -> DeltaProviderReadStatsSnapshotSet {
-    let mut seen = HashSet::new();
-
-    handles
-        .iter()
-        .zip(snapshots)
-        .filter(|(handle, _)| seen.insert(handle_identity(handle)))
-        .map(|(handle, snapshot)| (Arc::clone(handle), snapshot.clone()))
-        .collect()
+    snapshots: &[DeltaDataFusionMetricsSnapshot],
+) -> DeltaDataFusionMetricsSnapshotSet {
+    let mut unique = DeltaDataFusionMetricsSnapshotSet::new();
+    for (handle, snapshot) in handles.iter().zip(snapshots) {
+        if !unique
+            .iter()
+            .any(|(existing, _)| existing.same_instance(handle))
+        {
+            unique.push((handle.clone(), snapshot.clone()));
+        }
+    }
+    unique
 }
 
 pub(crate) fn collect_query_execution_profile(
@@ -104,16 +107,10 @@ pub(crate) fn collect_query_execution_profile(
     scope: QueryExecutionScope,
     outcome: QueryExecutionOutcome,
     delta_funnel_row_limit: u64,
-    terminal_provider_snapshots: Option<&DeltaProviderReadStatsSnapshotSet>,
+    terminal_provider_snapshots: Option<&DeltaDataFusionMetricsSnapshotSet>,
 ) -> QueryExecutionProfile {
-    let supplied_snapshots = terminal_provider_snapshots.map(|snapshots| {
-        let mut supplied = HashMap::new();
-        for (handle, snapshot) in snapshots {
-            supplied.entry(handle_identity(handle)).or_insert(snapshot);
-        }
-        supplied
-    });
-    let mut fallback_snapshots = HashMap::new();
+    let supplied_snapshots = terminal_provider_snapshots;
+    let mut fallback_snapshots = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = vec![(Arc::clone(root), None)];
     let mut operators = Vec::new();
@@ -131,12 +128,16 @@ pub(crate) fn collect_query_execution_profile(
             }
             None => (false, Vec::new(), Vec::new()),
         };
-        let provider_snapshot = provider_snapshot(
+        let provider = provider_snapshot(
             plan.as_ref(),
             node_id,
-            supplied_snapshots.as_ref(),
+            supplied_snapshots,
             &mut fallback_snapshots,
         );
+        let (provider_source_name, provider_snapshot) = provider
+            .map_or((None, None), |(source_name, snapshot)| {
+                (source_name, Some(snapshot))
+            });
 
         operators.push(QueryExecutionOperatorProfile::new(
             node_id,
@@ -146,6 +147,7 @@ pub(crate) fn collect_query_execution_profile(
             metrics_available,
             aggregated_metrics,
             metrics,
+            provider_source_name,
             provider_snapshot,
         ));
 
@@ -176,16 +178,17 @@ pub(crate) fn collect_query_execution_profile(
 fn provider_snapshot(
     plan: &dyn ExecutionPlan,
     node_id: u64,
-    supplied_snapshots: Option<&HashMap<usize, &DeltaProviderReadStatsSnapshot>>,
-    fallback_snapshots: &mut HashMap<usize, DeltaProviderReadStatsSnapshot>,
-) -> Option<DeltaProviderReadStatsSnapshot> {
+    supplied_snapshots: Option<&DeltaDataFusionMetricsSnapshotSet>,
+    fallback_snapshots: &mut DeltaDataFusionMetricsSnapshotSet,
+) -> Option<(Option<String>, DeltaDataFusionMetricsSnapshot)> {
     let plan = unprofiled_execution_plan(plan);
-    let scan = plan.downcast_ref::<DeltaScanPlanningExec>()?;
-    let handle = scan.read_stats_handle();
-    let identity = handle_identity(&handle);
+    let handle = delta_datafusion_metrics_for_plan(plan)?;
 
     if let Some(supplied_snapshots) = supplied_snapshots {
-        let snapshot = supplied_snapshots.get(&identity).copied().cloned();
+        let snapshot = supplied_snapshots
+            .iter()
+            .find(|(candidate, _)| candidate.same_instance(&handle))
+            .map(|(_, snapshot)| snapshot.clone());
         if snapshot.is_none() {
             tracing::debug!(
                 target: "delta_funnel",
@@ -195,24 +198,23 @@ fn provider_snapshot(
                 "Delta scan profile omitted a missing terminal provider snapshot"
             );
         }
-        return snapshot;
+        return snapshot.map(|snapshot| (handle.source_name().map(str::to_owned), snapshot));
     }
 
-    if let Some(snapshot) = fallback_snapshots.get(&identity) {
-        return Some(snapshot.clone());
+    if let Some((_, snapshot)) = fallback_snapshots
+        .iter()
+        .find(|(candidate, _)| candidate.same_instance(&handle))
+    {
+        return Some((handle.source_name().map(str::to_owned), snapshot.clone()));
     }
 
     let snapshot = handle.snapshot();
-    fallback_snapshots.insert(identity, snapshot.clone());
-    Some(snapshot)
+    fallback_snapshots.push((handle.clone(), snapshot.clone()));
+    Some((handle.source_name().map(str::to_owned), snapshot))
 }
 
 fn plan_identity(plan: &Arc<dyn ExecutionPlan>) -> usize {
     Arc::as_ptr(plan) as *const () as usize
-}
-
-fn handle_identity(handle: &DeltaProviderReadStatsHandle) -> usize {
-    Arc::as_ptr(handle) as *const () as usize
 }
 
 pub(super) fn collect_query_execution_metrics(
@@ -734,49 +736,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_provider_snapshots_attach_by_exact_handle_identity() -> TestResult {
+    async fn terminal_provider_snapshots_attach_by_exact_metrics_instance() -> TestResult {
         let context = SessionContext::new();
         let _table = register_fixture_source(&context, "orders", "profile-provider-identity")?;
         let first_plan = delta_plan(&context, "orders").await?;
         let second_plan = delta_plan(&context, "orders").await?;
         let first_handles = collect_delta_provider_read_stats_handles(first_plan.as_ref());
         let second_handles = collect_delta_provider_read_stats_handles(second_plan.as_ref());
-        let first_handle = Arc::clone(first_handles.first().ok_or("expected first scan handle")?);
-        let second_handle = Arc::clone(
-            second_handles
-                .first()
-                .ok_or("expected second scan handle")?,
-        );
+        let first_handle = first_handles
+            .first()
+            .ok_or("expected first scan handle")?
+            .clone();
+        let second_handle = (second_handles
+            .first()
+            .ok_or("expected second scan handle")?)
+        .clone();
         assert_eq!(first_handles.len(), 1);
         assert_eq!(second_handles.len(), 1);
-        assert!(!Arc::ptr_eq(&first_handle, &second_handle));
+        assert!(!first_handle.same_instance(&second_handle));
 
-        let mut first_snapshot = snapshot_delta_provider_read_stats(&[Arc::clone(&first_handle)])
-            .into_iter()
-            .next()
-            .ok_or("expected first provider snapshot")?;
-        first_snapshot.rows_produced = 11;
-        first_snapshot.parquet_data_file_bytes_received = Some(111);
-        let mut second_snapshot = snapshot_delta_provider_read_stats(&[Arc::clone(&second_handle)])
-            .into_iter()
-            .next()
-            .ok_or("expected second provider snapshot")?;
-        second_snapshot.rows_produced = 22;
-        second_snapshot.parquet_data_file_bytes_received = Some(222);
+        let mut first_snapshot =
+            snapshot_delta_provider_read_stats(std::slice::from_ref(&first_handle))
+                .into_iter()
+                .next()
+                .ok_or("expected first provider snapshot")?;
+        first_snapshot.reader.rows_produced = 11;
+        first_snapshot.reader.parquet_data_file_bytes_received = Some(111);
+        let mut second_snapshot =
+            snapshot_delta_provider_read_stats(std::slice::from_ref(&second_handle))
+                .into_iter()
+                .next()
+                .ok_or("expected second provider snapshot")?;
+        second_snapshot.reader.rows_produced = 22;
+        second_snapshot.reader.parquet_data_file_bytes_received = Some(222);
         let mut duplicate_first_snapshot = first_snapshot.clone();
-        duplicate_first_snapshot.rows_produced = 999;
+        duplicate_first_snapshot.reader.rows_produced = 999;
 
         let terminal_snapshots = delta_provider_read_stats_snapshot_set(
             &[
-                Arc::clone(&second_handle),
-                Arc::clone(&first_handle),
-                Arc::clone(&first_handle),
+                second_handle.clone(),
+                first_handle.clone(),
+                first_handle.clone(),
             ],
             &[second_snapshot, first_snapshot, duplicate_first_snapshot],
         );
         assert_eq!(terminal_snapshots.len(), 2);
-        assert!(Arc::ptr_eq(&terminal_snapshots[0].0, &second_handle));
-        assert!(Arc::ptr_eq(&terminal_snapshots[1].0, &first_handle));
+        assert!(terminal_snapshots[0].0.same_instance(&second_handle));
+        assert!(terminal_snapshots[1].0.same_instance(&first_handle));
 
         let root: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![first_plan, second_plan])?;
         let profile = collect_query_execution_profile(
@@ -789,14 +795,14 @@ mod tests {
         let scans = profile
             .operators()
             .iter()
-            .filter(|operator| operator.operator_name() == "DeltaScanPlanningExec")
+            .filter(|operator| operator.operator_name() == "DeltaDataFusionExec")
             .collect::<Vec<_>>();
         assert_eq!(scans.len(), 2);
         assert_eq!(
             scans
                 .iter()
                 .filter_map(|operator| operator.delta_provider_read_stats())
-                .map(|stats| stats.rows_produced)
+                .map(|stats| stats.reader.rows_produced)
                 .collect::<Vec<_>>(),
             [11, 22]
         );
@@ -806,7 +812,7 @@ mod tests {
                 .as_array()
                 .ok_or("expected profile operators")?
                 .iter()
-                .filter(|operator| operator["operator_name"] == "DeltaScanPlanningExec")
+                .filter(|operator| operator["operator_name"] == "DeltaDataFusionExec")
                 .map(|operator| {
                     operator["delta_provider_read_stats"]["parquet_data_file_bytes_received"]
                         .as_u64()
@@ -830,14 +836,13 @@ mod tests {
         let unrelated_plan = delta_plan(&context, "profile_secret_source").await?;
         let target_handles = collect_delta_provider_read_stats_handles(target_plan.as_ref());
         let unrelated_handles = collect_delta_provider_read_stats_handles(unrelated_plan.as_ref());
-        let unrelated_handle = Arc::clone(
-            unrelated_handles
-                .first()
-                .ok_or("expected unrelated scan handle")?,
-        );
+        let unrelated_handle = (unrelated_handles
+            .first()
+            .ok_or("expected unrelated scan handle")?)
+        .clone();
         assert_eq!(target_handles.len(), 1);
         assert_eq!(unrelated_handles.len(), 1);
-        assert!(!Arc::ptr_eq(&target_handles[0], &unrelated_handle));
+        assert!(!target_handles[0].same_instance(&unrelated_handle));
         let terminal_snapshots = delta_provider_read_stats_snapshot_set(
             &[unrelated_handle],
             &snapshot_delta_provider_read_stats(&unrelated_handles),
@@ -855,7 +860,7 @@ mod tests {
         let scan = profile
             .operators()
             .iter()
-            .find(|operator| operator.operator_name() == "DeltaScanPlanningExec")
+            .find(|operator| operator.operator_name() == "DeltaDataFusionExec")
             .ok_or("expected target Delta scan profile")?;
         assert!(scan.delta_provider_read_stats().is_none());
         let diagnostics = capture
@@ -885,9 +890,8 @@ mod tests {
             fallback_profile
                 .operators()
                 .iter()
-                .find(|operator| operator.operator_name() == "DeltaScanPlanningExec")
-                .and_then(|operator| operator.delta_provider_read_stats())
-                .map(|stats| stats.source_name.as_str()),
+                .find(|operator| operator.operator_name() == "DeltaDataFusionExec")
+                .and_then(|operator| operator.delta_provider_source_name()),
             Some("profile_secret_source")
         );
 

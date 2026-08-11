@@ -1,8 +1,9 @@
 # Scan Partition Target Policy
 
-Delta DataFusion provider scan planning derives a file task partition target
-before Delta scan metadata expansion. The target is passed to metadata-only file
-task grouping after Delta Kernel has selected the active files.
+The published `delta-arrow-reader` DataFusion provider derives a file task
+partition target before Delta scan metadata expansion. The target is passed to
+metadata-only file task grouping after Delta Kernel has selected the active
+files.
 
 This policy decides how many provider scan partitions Delta Funnel asks for. It
 does not read Parquet data, create Arrow `RecordBatch` values, or execute file
@@ -12,8 +13,8 @@ reads.
 
 The production policy is:
 
-1. Use `DeltaTableProviderConfig::scan_target_partitions` when it is `Some`.
-   This source-local Delta Funnel override must be greater than zero.
+1. Use `delta_arrow_reader::DeltaDataFusionScanOptions::target_partitions` when
+   it is `Some`. This source-local override must be greater than zero.
 2. Otherwise, build a fallback baseline from
    `DeltaExecutionEnvironmentProfile::available_parallelism *
    parallelism_multiplier`.
@@ -23,7 +24,7 @@ The production policy is:
    - Unix fd soft limit, when available.
    - Available memory hint, when available.
 
-An explicit Delta Funnel override wins over all caps. It is the most specific user
+An explicit source override wins over all caps. It is the most specific user
 choice and applies only to Delta scan file task grouping for the configured
 source.
 

@@ -7,11 +7,12 @@ use datafusion::{
     execution::TaskContext,
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
 };
+use delta_arrow_reader::DeltaDataFusionMetricsSnapshot;
 use delta_funnel::{
-    DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, DeltaProviderReadStatsSnapshot,
-    ExecutionProfileMode, MssqlWriteReport, OutputWritePlan, QueryExecutionMetric,
-    QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
-    QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope, WriteAllCacheAliasReport,
+    DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, ExecutionProfileMode,
+    MssqlWriteReport, OutputWritePlan, QueryExecutionMetric, QueryExecutionMetricCategory,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
+    QueryExecutionProfile, QueryExecutionScope, WriteAllCacheAliasReport,
     datafusion_query_output_stream, progress::ProgressReporter,
 };
 use serde_json::Value;
@@ -82,8 +83,10 @@ fn execution_profile_types_and_accessors_are_exported_from_the_crate_root() {
         QueryExecutionOperatorProfile::metrics;
     let _: for<'a> fn(
         &'a QueryExecutionOperatorProfile,
-    ) -> Option<&'a DeltaProviderReadStatsSnapshot> =
+    ) -> Option<&'a DeltaDataFusionMetricsSnapshot> =
         QueryExecutionOperatorProfile::delta_provider_read_stats;
+    let _: for<'a> fn(&'a QueryExecutionOperatorProfile) -> Option<&'a str> =
+        QueryExecutionOperatorProfile::delta_provider_source_name;
     let _: fn(&QueryExecutionOperatorProfile) -> Value =
         QueryExecutionOperatorProfile::to_json_value;
 

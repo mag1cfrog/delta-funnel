@@ -18,13 +18,12 @@ use super::{
     SemanticTrack, delta_scan_output_track, diagnostics_track, operation_track, owner_track,
     perfetto_te_ns, phase_track, planning_track, query_track, worker_track,
 };
-use crate::profiling::{
-    OBJECT_STORE_TRANSPORT_CONTEXT_NAME, OBJECT_STORE_TRANSPORT_DISPLAY_NAME, allocate_id,
-};
+use crate::profiling::allocate_id;
 
 /// Exact tracing target consumed by the Perfetto profile layer.
 pub const PROFILE_TARGET: &str = "delta_funnel::profile";
 const TIBERIUS_PROFILE_TARGET: &str = "tiberius_raw_bulk::protocol";
+const DELTA_ARROW_READER_PROFILE_TARGET: &str = "delta_arrow_reader::profile";
 
 const BULK_FINALIZE_PREPARE: &str = "protocol.bulk_load.finalize.prepare";
 const BULK_FINALIZE_WRITE: &str = "protocol.bulk_load.finalize.write";
@@ -34,7 +33,10 @@ static NEXT_PROFILE_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Returns whether a tracing target contributes exact spans to a Perfetto profile.
 pub fn is_profile_target(target: &str) -> bool {
-    matches!(target, PROFILE_TARGET | TIBERIUS_PROFILE_TARGET)
+    matches!(
+        target,
+        PROFILE_TARGET | TIBERIUS_PROFILE_TARGET | DELTA_ARROW_READER_PROFILE_TARGET
+    )
 }
 
 /// Converts canonical Delta Funnel spans and their instrumented dependency spans
@@ -57,8 +59,8 @@ where
             let mut fields = ProfileFields::default();
             attributes.record(&mut fields);
             ActiveProfileSpan::from_fields(metadata.name(), fields)
-        } else if metadata.target() == TIBERIUS_PROFILE_TARGET {
-            let Some(name) = dependency_span_label(metadata.name()) else {
+        } else {
+            let Some(name) = dependency_span_label(metadata.target(), metadata.name()) else {
                 return;
             };
             let mut ancestor = span.parent();
@@ -75,8 +77,6 @@ where
                 }
                 ancestor = parent.parent();
             }
-        } else {
-            None
         };
         let Some(active) = active else {
             return;
@@ -94,6 +94,26 @@ where
         if let Some(active) = span.extensions_mut().get_mut::<ActiveProfileSpan>() {
             active.record(fields);
         }
+    }
+
+    fn on_follows_from(&self, id: &Id, follows: &Id, context: Context<'_, S>) {
+        let Some(span) = context.span(id) else {
+            return;
+        };
+        let metadata = span.metadata();
+        let Some(name) = dependency_span_label(metadata.target(), metadata.name()) else {
+            return;
+        };
+        let Some(active) = context.span(follows).and_then(|parent| {
+            parent
+                .extensions()
+                .get::<ActiveProfileSpan>()?
+                .inherit(name)
+        }) else {
+            return;
+        };
+        active.emit_begin();
+        span.extensions_mut().insert(active);
     }
 
     fn on_enter(&self, id: &Id, context: Context<'_, S>) {
@@ -150,12 +170,25 @@ where
     }
 }
 
-fn dependency_span_label(name: &str) -> Option<&'static str> {
-    match name {
-        BULK_FINALIZE_PREPARE => Some("Prepare final bulk packet"),
-        BULK_FINALIZE_WRITE => Some("Write final bulk packet"),
-        BULK_FINALIZE_FLUSH => Some("Flush SQL Server connection"),
-        BULK_FINALIZE_RESULT => Some("Await SQL Server result"),
+fn dependency_span_label(target: &str, name: &'static str) -> Option<&'static str> {
+    match (target, name) {
+        (TIBERIUS_PROFILE_TARGET, BULK_FINALIZE_PREPARE) => Some("Prepare final bulk packet"),
+        (TIBERIUS_PROFILE_TARGET, BULK_FINALIZE_WRITE) => Some("Write final bulk packet"),
+        (TIBERIUS_PROFILE_TARGET, BULK_FINALIZE_FLUSH) => Some("Flush SQL Server connection"),
+        (TIBERIUS_PROFILE_TARGET, BULK_FINALIZE_RESULT) => Some("Await SQL Server result"),
+        (
+            DELTA_ARROW_READER_PROFILE_TARGET,
+            name @ ("Delta scan planning"
+            | "Delta projection planning"
+            | "Delta filter planning"
+            | "Delta Kernel scan construction"
+            | "Delta scan metadata expansion"
+            | "Delta file task partitioning"
+            | "Delta partition target selection"
+            | "Delta scan execution setup"
+            | "Delta partition task"
+            | "Object store transport"),
+        ) => Some(name),
         _ => None,
     }
 }
@@ -330,13 +363,6 @@ impl ActiveProfileSpan {
             "DataFusion task context" => ProfileEvent::TaskContext {
                 name: fields.operator_name.clone()?,
             },
-            name if name == OBJECT_STORE_TRANSPORT_CONTEXT_NAME => {
-                fields.query_execution_id?;
-                fields.execution_stream_id?;
-                ProfileEvent::TaskContext {
-                    name: OBJECT_STORE_TRANSPORT_DISPLAY_NAME.to_owned(),
-                }
-            }
             _ => return None,
         };
         let profile_context_identity_dirty = matches!(event, ProfileEvent::TaskContext { .. });
@@ -1001,30 +1027,6 @@ mod tests {
     }
 
     #[test]
-    fn object_store_transport_context_uses_stream_identity_without_a_worker() {
-        let mut transport = fields(1, 2, 3);
-        transport.worker_lane_id = None;
-        transport.worker_kind = None;
-        let active = ActiveProfileSpan::from_fields(OBJECT_STORE_TRANSPORT_CONTEXT_NAME, transport)
-            .expect("complete transport identity should map");
-
-        assert!(matches!(
-            active.event,
-            ProfileEvent::TaskContext { ref name } if name == OBJECT_STORE_TRANSPORT_DISPLAY_NAME
-        ));
-        assert_eq!(active.fields.query_execution_id, Some(2));
-        assert_eq!(active.fields.execution_stream_id, Some(11));
-        assert_eq!(active.fields.worker_lane_id, None);
-
-        let mut incomplete = fields(1, 2, 3);
-        incomplete.execution_stream_id = None;
-        assert!(
-            ActiveProfileSpan::from_fields(OBJECT_STORE_TRANSPORT_CONTEXT_NAME, incomplete)
-                .is_none()
-        );
-    }
-
-    #[test]
     fn completion_records_preserve_begin_identity_and_update_completion_fields() {
         let mut initial = fields(1, 1, 1);
         initial.capture_scope_id = Some(42);
@@ -1066,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_finalize_dependency_spans_use_friendly_labels_on_the_parent_track() {
+    fn dependency_spans_use_stable_labels_on_the_parent_track() {
         let parent = ActiveProfileSpan::from_fields(
             "Delta Funnel operation stage",
             ProfileFields {
@@ -1082,7 +1084,7 @@ mod tests {
 
         let child = parent
             .inherit(
-                dependency_span_label(BULK_FINALIZE_RESULT)
+                dependency_span_label(TIBERIUS_PROFILE_TARGET, BULK_FINALIZE_RESULT)
                     .expect("the stable dependency span should map"),
             )
             .expect("the complete parent identity should propagate");
@@ -1096,6 +1098,7 @@ mod tests {
         ));
         assert!(is_profile_target(PROFILE_TARGET));
         assert!(is_profile_target(TIBERIUS_PROFILE_TARGET));
+        assert!(is_profile_target(DELTA_ARROW_READER_PROFILE_TARGET));
         assert!(!is_profile_target("application"));
 
         for (name, label) in [
@@ -1104,9 +1107,36 @@ mod tests {
             (BULK_FINALIZE_FLUSH, "Flush SQL Server connection"),
             (BULK_FINALIZE_RESULT, "Await SQL Server result"),
         ] {
-            assert_eq!(dependency_span_label(name), Some(label));
+            assert_eq!(
+                dependency_span_label(TIBERIUS_PROFILE_TARGET, name),
+                Some(label)
+            );
         }
-        assert_eq!(dependency_span_label("protocol.bulk_load.request"), None);
+        assert_eq!(
+            dependency_span_label(TIBERIUS_PROFILE_TARGET, "protocol.bulk_load.request"),
+            None
+        );
+        for name in [
+            "Delta scan planning",
+            "Delta projection planning",
+            "Delta filter planning",
+            "Delta Kernel scan construction",
+            "Delta scan metadata expansion",
+            "Delta file task partitioning",
+            "Delta partition target selection",
+            "Delta scan execution setup",
+            "Delta partition task",
+            "Object store transport",
+        ] {
+            assert_eq!(
+                dependency_span_label(DELTA_ARROW_READER_PROFILE_TARGET, name),
+                Some(name)
+            );
+        }
+        assert_eq!(
+            dependency_span_label(DELTA_ARROW_READER_PROFILE_TARGET, "unrelated"),
+            None
+        );
     }
 
     #[test]

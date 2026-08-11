@@ -870,23 +870,22 @@ mod tests {
         let stats = source
             .provider_read_stats()
             .ok_or("expected provider stats from dry-run scan summary")?;
-        assert_eq!(stats.source_name, "orders");
-        assert_eq!(stats.files_started, 0);
-        assert_eq!(stats.files_completed, 0);
-        assert_eq!(stats.batches_produced, 0);
-        assert_eq!(stats.rows_produced, 0);
-        match stats.scan_metadata_exhausted {
+        assert_eq!(stats.reader.files_started, 0);
+        assert_eq!(stats.reader.files_completed, 0);
+        assert_eq!(stats.reader.batches_produced, 0);
+        assert_eq!(stats.reader.rows_produced, 0);
+        match stats.reader.scan_metadata_exhausted {
             Some(true) => {
                 assert_eq!(
                     source.file_count(),
-                    crate::FileCount::exact(stats.files_planned)
+                    crate::FileCount::exact(stats.reader.files_planned)
                 );
                 assert_eq!(source.file_count_reason(), None);
             }
             Some(false) => {
                 assert_eq!(
                     source.file_count(),
-                    crate::FileCount::estimated(stats.files_planned)
+                    crate::FileCount::estimated(stats.reader.files_planned)
                 );
                 assert_eq!(source.file_count_reason(), None);
             }

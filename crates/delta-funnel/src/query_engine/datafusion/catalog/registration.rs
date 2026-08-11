@@ -1,35 +1,22 @@
 //! DataFusion session registration for Delta sources.
 
-use std::sync::Arc;
+use std::error::Error as _;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
+use delta_arrow_reader::{
+    DeltaDataFusionScanOptions, DeltaProtocolInfo, DeltaReaderError, DeltaReaderExecutionOptions,
+    DeltaTable, DeltaTableSnapshot, register_delta_table,
+};
 
 use crate::{
-    DeltaFunnelError, DeltaProtocolReport, PlannedDeltaSource, ProtocolPreflight,
+    DeltaFunnelError, DeltaProtocolReport,
     error::DataFusionRegistrationSnafu,
     observability,
     progress::{ProgressEvent, ProgressPhase, ProgressReporter},
     support::sanitize_uri_for_display,
     table_formats::validate_table_source_names,
 };
-
-use super::super::execution::DeltaProviderScanExecutionOptions;
-use super::provider::DeltaTableProvider;
-
-/// Delta source and preflight state used to build a DataFusion table provider.
-pub struct DeltaTableProviderConfig {
-    /// Loaded Delta source.
-    pub source: PlannedDeltaSource,
-    /// Successful Delta protocol preflight for the source.
-    pub protocol: ProtocolPreflight,
-    /// Optional DeltaFunnel scan file task partition target override.
-    ///
-    /// When set, this value wins over DataFusion's session target and automatic
-    /// machine fallback policy for this Delta source only.
-    pub scan_target_partitions: Option<usize>,
-}
 
 /// Registered Delta sources visible to a DataFusion session.
 #[derive(Debug, Clone)]
@@ -53,60 +40,60 @@ pub struct RegisteredDeltaSource {
     pub protocol: DeltaProtocolReport,
 }
 
-/// Registers preflighted Delta sources into a DataFusion session.
+/// Registers loaded Delta sources into a DataFusion session.
+///
+/// Each tuple contains the table name, loaded table, and optional scan partition target.
 ///
 /// # Errors
 ///
-/// Returns [`DeltaFunnelError::DeltaSourceSchema`] when a source schema cannot
-/// be converted to Arrow, or [`DeltaFunnelError::DataFusionRegistration`] when
-/// DataFusion rejects a table registration.
+/// Returns a source-name or DataFusion registration error before leaving a partial catalog.
 pub fn register_delta_sources(
     ctx: &SessionContext,
-    configs: Vec<DeltaTableProviderConfig>,
+    sources: Vec<(String, DeltaTable, Option<usize>)>,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
-    register_delta_sources_with_options(ctx, configs, DeltaProviderScanExecutionOptions::default())
+    register_delta_sources_with_options(ctx, sources, DeltaReaderExecutionOptions::default())
 }
 
-/// Registers preflighted Delta sources with explicit provider execution bounds.
+/// Registers loaded Delta sources with explicit reader execution bounds.
 ///
 /// # Errors
 ///
-/// Returns [`DeltaFunnelError::Config`] when execution bounds are invalid,
-/// [`DeltaFunnelError::DeltaSourceSchema`] when a source schema cannot be
-/// converted to Arrow, or [`DeltaFunnelError::DataFusionRegistration`] when
-/// DataFusion rejects a table registration.
+/// Returns a configuration, source-name, or DataFusion registration error before leaving a
+/// partial catalog.
 pub fn register_delta_sources_with_scan_execution_options(
     ctx: &SessionContext,
-    configs: Vec<DeltaTableProviderConfig>,
-    execution_options: DeltaProviderScanExecutionOptions,
+    sources: Vec<(String, DeltaTable, Option<usize>)>,
+    execution_options: DeltaReaderExecutionOptions,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
-    execution_options.validate()?;
-    register_delta_sources_with_options(ctx, configs, execution_options)
+    execution_options
+        .validate()
+        .map_err(map_reader_configuration_error)?;
+    register_delta_sources_with_options(ctx, sources, execution_options)
 }
 
-/// Prepares and registers one Delta source with explicit provider options.
-///
-/// When a reporter is present, provider preparation and catalog registration
-/// are announced at their actual boundaries. Reporting does not change the
-/// registration result or expose the internal provider type.
 pub(crate) fn register_delta_source_with_scan_execution_options(
     ctx: &SessionContext,
-    config: DeltaTableProviderConfig,
-    execution_options: DeltaProviderScanExecutionOptions,
+    source_name: String,
+    table: DeltaTable,
+    scan_target_partitions: Option<usize>,
+    execution_options: DeltaReaderExecutionOptions,
     reporter: Option<&ProgressReporter>,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
-    execution_options.validate()?;
-    validate_table_source_names([config.source.name()])?;
-    emit_registration_phase(reporter, ProgressPhase::PreparingDeltaProvider);
-    let provider = DeltaTableProvider::try_new_with_execution_options(
-        config.source,
-        config.protocol,
-        config.scan_target_partitions,
-        execution_options,
-    )?;
-    reject_existing_registration_names(ctx, std::slice::from_ref(&provider))?;
+    execution_options
+        .validate()
+        .map_err(map_reader_configuration_error)?;
+    validate_table_source_names([source_name.as_str()])?;
+    reject_existing_delta_registration_name(ctx, &source_name, table.table_uri())?;
     emit_registration_phase(reporter, ProgressPhase::RegisteringDeltaSource);
-    register_delta_provider_with_tracing(ctx, provider)
+    register_delta_table_with_tracing(
+        ctx,
+        source_name,
+        table,
+        DeltaDataFusionScanOptions {
+            execution_options,
+            target_partitions: scan_target_partitions,
+        },
+    )
 }
 
 fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
@@ -117,48 +104,41 @@ fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressP
 
 fn register_delta_sources_with_options(
     ctx: &SessionContext,
-    configs: Vec<DeltaTableProviderConfig>,
-    execution_options: DeltaProviderScanExecutionOptions,
+    sources: Vec<(String, DeltaTable, Option<usize>)>,
+    execution_options: DeltaReaderExecutionOptions,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
-    reject_duplicate_registration_names(&configs)?;
-    let providers = configs
-        .into_iter()
-        .map(|config| {
-            DeltaTableProvider::try_new_with_execution_options(
-                config.source,
-                config.protocol,
-                config.scan_target_partitions,
-                execution_options,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    reject_existing_registration_names(ctx, &providers)?;
-
-    let sources = register_delta_providers(ctx, providers)?;
-
-    Ok(RegisteredDeltaSources { sources })
-}
-
-fn reject_duplicate_registration_names(
-    configs: &[DeltaTableProviderConfig],
-) -> Result<(), DeltaFunnelError> {
-    validate_table_source_names(configs.iter().map(|config| config.source.name()))
-}
-
-fn reject_existing_registration_names(
-    ctx: &SessionContext,
-    providers: &[DeltaTableProvider],
-) -> Result<(), DeltaFunnelError> {
-    for provider in providers {
-        reject_existing_delta_registration_name(
-            ctx,
-            provider.source_name(),
-            provider.source_table_uri(),
-        )?;
+    validate_table_source_names(sources.iter().map(|(name, _, _)| name.as_str()))?;
+    for (name, table, _) in &sources {
+        validate_delta_table_protocol(name, table)?;
+    }
+    for (name, table, _) in &sources {
+        reject_existing_delta_registration_name(ctx, name, table.table_uri())?;
     }
 
-    Ok(())
+    let mut registered = Vec::with_capacity(sources.len());
+    for (name, table, target_partitions) in sources {
+        let options = DeltaDataFusionScanOptions {
+            execution_options,
+            target_partitions,
+        };
+        match register_delta_table_with_tracing(ctx, name, table, options) {
+            Ok(source) => registered.push(source),
+            Err(error) => {
+                rollback_registered_delta_sources(
+                    ctx,
+                    &registered
+                        .iter()
+                        .map(|source: &RegisteredDeltaSource| source.name.clone())
+                        .collect::<Vec<_>>(),
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(RegisteredDeltaSources {
+        sources: registered,
+    })
 }
 
 /// Rejects a case-insensitive conflict in DataFusion's default catalog.
@@ -192,40 +172,26 @@ pub(crate) fn reject_existing_delta_registration_name(
     Ok(())
 }
 
-fn register_delta_provider(
+fn register_delta_table_with_tracing(
     ctx: &SessionContext,
-    provider: DeltaTableProvider,
+    source_name: String,
+    table: DeltaTable,
+    options: DeltaDataFusionScanOptions,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
+    let table_uri = table.table_uri().to_owned();
+    let snapshot_version = table.version();
     let registered = RegisteredDeltaSource {
-        name: provider.source_name().to_owned(),
-        table_uri: sanitize_uri_for_display(provider.source_table_uri()),
-        snapshot_version: provider.snapshot_version(),
-        schema: provider.schema(),
-        protocol: provider.protocol().clone(),
+        name: source_name.clone(),
+        table_uri: sanitize_uri_for_display(&table_uri),
+        snapshot_version,
+        schema: table.schema().clone(),
+        protocol: delta_protocol_report(&source_name, &table),
     };
-    let table_uri = provider.source_table_uri().to_owned();
-
-    if let Err(error) = ctx.register_table(registered.name.as_str(), Arc::new(provider)) {
-        return DataFusionRegistrationSnafu {
-            source_name: registered.name.clone(),
-            table_uri,
-            reason: error.to_string(),
-        }
-        .fail();
-    }
-
-    Ok(registered)
-}
-
-fn register_delta_provider_with_tracing(
-    ctx: &SessionContext,
-    provider: DeltaTableProvider,
-) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
-    let source_name = provider.source_name().to_owned();
-    let snapshot_version = provider.snapshot_version();
     observability::datafusion_registration_started(&source_name, snapshot_version);
 
-    let result = register_delta_provider(ctx, provider);
+    let result = register_delta_table(ctx, source_name.clone(), table, options)
+        .map(|_| registered)
+        .map_err(|error| map_registration_error(&source_name, &table_uri, error));
     match &result {
         Ok(registered) => {
             observability::datafusion_registration_completed(&registered.name, snapshot_version);
@@ -237,57 +203,119 @@ fn register_delta_provider_with_tracing(
     result
 }
 
-fn register_delta_providers(
-    ctx: &SessionContext,
-    providers: Vec<DeltaTableProvider>,
-) -> Result<Vec<RegisteredDeltaSource>, DeltaFunnelError> {
-    let mut registered_sources = Vec::with_capacity(providers.len());
-    let mut registered_names = Vec::with_capacity(providers.len());
-
-    for provider in providers {
-        let registered = match register_delta_provider_with_tracing(ctx, provider) {
-            Ok(registered) => registered,
-            Err(error) => {
-                rollback_registered_delta_sources(ctx, &registered_names);
-                return Err(error);
-            }
-        };
-
-        registered_names.push(registered.name.clone());
-        registered_sources.push(registered);
-    }
-
-    Ok(registered_sources)
-}
-
 fn rollback_registered_delta_sources(ctx: &SessionContext, names: &[String]) {
     for name in names.iter().rev() {
         let _ = ctx.deregister_table(name.as_str());
     }
 }
 
-pub(super) fn reject_mismatched_preflight(
-    source: &PlannedDeltaSource,
-    protocol: &DeltaProtocolReport,
-) -> Result<(), DeltaFunnelError> {
-    let source_table_uri = sanitize_uri_for_display(source.table_uri());
+pub(crate) fn delta_protocol_report(source_name: &str, table: &DeltaTable) -> DeltaProtocolReport {
+    protocol_report(
+        source_name,
+        table.table_uri(),
+        table.version(),
+        table.protocol(),
+    )
+}
 
-    if protocol.source_name != source.name()
-        || protocol.snapshot_version != source.version()
-        || protocol.table_uri != source_table_uri
-    {
-        return DataFusionRegistrationSnafu {
-            source_name: source.name().to_owned(),
-            table_uri: source.table_uri().to_owned(),
-            reason: format!(
-                "protocol preflight belongs to source `{}` at snapshot version {} ({})",
-                protocol.source_name, protocol.snapshot_version, protocol.table_uri
-            ),
-        }
-        .fail();
+fn protocol_report(
+    source_name: &str,
+    table_uri: &str,
+    snapshot_version: u64,
+    protocol: &DeltaProtocolInfo,
+) -> DeltaProtocolReport {
+    DeltaProtocolReport {
+        source_name: source_name.to_owned(),
+        table_uri: sanitize_uri_for_display(table_uri),
+        snapshot_version,
+        min_reader_version: protocol.min_reader_version(),
+        min_writer_version: protocol.min_writer_version(),
+        reader_features: protocol.reader_features().to_vec(),
+        writer_features: protocol.writer_features().to_vec(),
+    }
+}
+
+pub(crate) fn validate_delta_table_protocol(
+    source_name: &str,
+    table: &DeltaTable,
+) -> Result<(), DeltaFunnelError> {
+    validate_protocol(
+        source_name,
+        table.table_uri(),
+        table.version(),
+        table.protocol(),
+        table.validate_protocol(),
+    )
+}
+
+pub(crate) fn validate_delta_table_snapshot_protocol(
+    source_name: &str,
+    snapshot: &DeltaTableSnapshot,
+) -> Result<(), DeltaFunnelError> {
+    validate_protocol(
+        source_name,
+        snapshot.table_uri(),
+        snapshot.version(),
+        snapshot.protocol(),
+        snapshot.validate_protocol(),
+    )
+}
+
+fn validate_protocol(
+    source_name: &str,
+    table_uri: &str,
+    snapshot_version: u64,
+    protocol: &DeltaProtocolInfo,
+    validation: Result<(), DeltaReaderError>,
+) -> Result<(), DeltaFunnelError> {
+    if validation.is_ok() {
+        return Ok(());
     }
 
-    Ok(())
+    let reason = if !matches!(protocol.min_reader_version(), 1..=3) {
+        format!(
+            "unsupported Delta minReaderVersion {}",
+            protocol.min_reader_version()
+        )
+    } else {
+        let unsupported = protocol
+            .first_unsupported_reader_feature()
+            .unwrap_or_default();
+        format!(
+            "unsupported Delta reader feature `{}`",
+            unsupported
+                .chars()
+                .flat_map(char::escape_default)
+                .collect::<String>()
+        )
+    };
+    let protocol = protocol_report(source_name, table_uri, snapshot_version, protocol);
+    Err(DeltaFunnelError::DeltaProtocolCompatibility {
+        source_name: protocol.source_name,
+        table_uri: protocol.table_uri,
+        snapshot_version: protocol.snapshot_version,
+        reason,
+    })
+}
+
+fn map_reader_configuration_error(error: DeltaReaderError) -> DeltaFunnelError {
+    DeltaFunnelError::Config {
+        message: error.to_string(),
+    }
+}
+
+fn map_registration_error(
+    source_name: &str,
+    table_uri: &str,
+    error: DeltaReaderError,
+) -> DeltaFunnelError {
+    DeltaFunnelError::DataFusionRegistration {
+        source_name: source_name.to_owned(),
+        table_uri: sanitize_uri_for_display(table_uri),
+        reason: error
+            .source()
+            .map_or_else(|| error.to_string(), ToString::to_string),
+    }
 }
 
 #[cfg(test)]
@@ -295,505 +323,212 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::TableType;
-    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::datasource::{TableType, empty::EmptyTable};
     use datafusion::prelude::{SessionConfig, SessionContext};
+    use delta_arrow_reader::{DeltaReaderBackend, DeltaTableBuilder};
 
     use super::*;
-    use crate::query_engine::datafusion::execution::DeltaProviderReaderBackend;
     use crate::query_engine::datafusion::test_support::{
-        DeltaLogTable, FailsOnCustomersSchemaProvider, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
+        DEFAULT_SCHEMA_FIELDS_JSON, DeltaLogTable, FailsOnCustomersSchemaProvider,
         SingleSchemaCatalogProvider, register_fixture_source,
     };
-    use crate::{DeltaFunnelError, DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+
+    const UNSUPPORTED_PROTOCOL_JSON: &str =
+        r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
+
+    fn load(table: &DeltaLogTable) -> Result<DeltaTable, DeltaReaderError> {
+        DeltaTableBuilder::new(table.path().to_string_lossy()).load()
+    }
 
     #[test]
-    fn registers_preflighted_delta_source() -> Result<(), Box<dyn std::error::Error>> {
+    fn registers_loaded_delta_source() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("registration")?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: table.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let preflight = preflight_delta_protocol(&source)?;
-        let ctx = SessionContext::new();
+        let context = SessionContext::new();
 
-        let registered = register_delta_sources(
-            &ctx,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-        )?;
+        let registered =
+            register_delta_sources(&context, vec![("orders".to_owned(), load(&table)?, None)])?;
 
-        assert_eq!(registered.sources.len(), 1);
-        assert_eq!(registered.sources[0].name, "orders");
-        assert!(registered.sources[0].table_uri.starts_with("file://"));
-        assert_eq!(registered.sources[0].snapshot_version, 1);
-        assert_eq!(registered.sources[0].schema.field(0).name(), "id");
-        assert_eq!(registered.sources[0].protocol.source_name, "orders");
-
+        let source = &registered.sources[0];
+        assert_eq!(source.name, "orders");
+        assert!(source.table_uri.starts_with("file://"));
+        assert_eq!(source.snapshot_version, 1);
+        assert_eq!(source.schema.field(0).name(), "id");
+        assert_eq!(source.protocol.source_name, "orders");
+        assert!(context.table_exist("orders")?);
         Ok(())
     }
 
     #[test]
-    fn registration_rejects_zero_execution_bounds_before_registration()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("registration-zero-execution-bounds")?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: table.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let preflight = preflight_delta_protocol(&source)?;
-        let ctx = SessionContext::new();
+    fn registration_accepts_native_async_backend() -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new("registration-native")?;
+        let context = SessionContext::new();
+        let options = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(DeltaReaderBackend::NativeAsync)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?
+            .with_max_concurrent_file_reads_per_partition(1)?
+            .with_output_buffer_capacity_per_partition(1)?;
 
-        let result = register_delta_sources_with_scan_execution_options(
-            &ctx,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-            DeltaProviderScanExecutionOptions {
-                reader_backend: DeltaProviderReaderBackend::OfficialKernel,
-                max_concurrent_file_reads_per_scan: Some(0),
-                max_concurrent_file_reads_per_partition: 1,
-                output_buffer_capacity_per_partition: 1,
-                native_async_prefetch_file_count_per_partition: 0,
-                parquet_metadata_size_hint: None,
-                parquet_full_file_read_threshold: None,
-            },
-        );
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::Config { message })
-                if message == "max_concurrent_file_reads_per_scan must be greater than zero"
-        ));
-        assert!(!ctx.table_exist("orders")?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn registration_accepts_native_async_backend_for_local_file_uri()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("registration-native-async-local-file")?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: table.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let preflight = preflight_delta_protocol(&source)?;
-        let ctx = SessionContext::new();
-
-        let registered = register_delta_sources_with_scan_execution_options(
-            &ctx,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-            DeltaProviderScanExecutionOptions {
-                reader_backend: DeltaProviderReaderBackend::NativeAsync,
-                max_concurrent_file_reads_per_scan: Some(1),
-                max_concurrent_file_reads_per_partition: 1,
-                output_buffer_capacity_per_partition: 1,
-                native_async_prefetch_file_count_per_partition: 0,
-                parquet_metadata_size_hint: None,
-                parquet_full_file_read_threshold: None,
-            },
+        register_delta_sources_with_scan_execution_options(
+            &context,
+            vec![("orders".to_owned(), load(&table)?, None)],
+            options,
         )?;
 
-        assert_eq!(registered.sources.len(), 1);
-        assert_eq!(registered.sources[0].name, "orders");
-        assert!(ctx.table_exist("orders")?);
-
+        assert!(context.table_exist("orders")?);
         Ok(())
     }
 
     #[tokio::test]
-    async fn catalog_inspection_exposes_registered_provider_schema()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = SessionContext::new();
-        let _table = register_fixture_source(&ctx, "orders", "catalog-inspection")?;
+    async fn catalog_inspection_exposes_registered_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let context = SessionContext::new();
+        let _table = register_fixture_source(&context, "orders", "catalog-inspection")?;
+        let catalog = context.catalog("datafusion").ok_or("missing catalog")?;
+        let schema = catalog.schema("public").ok_or("missing schema")?;
+        let provider = schema.table("orders").await?.ok_or("missing provider")?;
 
-        let catalog = ctx.catalog("datafusion").ok_or("missing default catalog")?;
-        let schema = catalog.schema("public").ok_or("missing default schema")?;
-        let provider = schema
-            .table("orders")
-            .await?
-            .ok_or("missing registered table provider")?;
-        let provider_schema = provider.schema();
-
-        assert!(schema.table_names().contains(&"orders".to_owned()));
         assert_eq!(provider.table_type(), TableType::Base);
-        assert_eq!(provider_schema.fields().len(), 2);
-        assert_eq!(provider_schema.field(0).name(), "id");
-        assert_eq!(provider_schema.field(0).data_type(), &DataType::Int32);
-        assert!(!provider_schema.field(0).is_nullable());
-        assert_eq!(provider_schema.field(1).name(), "customer_name");
-        assert_eq!(provider_schema.field(1).data_type(), &DataType::Utf8);
-        assert!(provider_schema.field(1).is_nullable());
-
+        assert_eq!(provider.schema().field(0).data_type(), &DataType::Int32);
         Ok(())
     }
 
     #[test]
-    fn registration_failure_reports_source_context() -> Result<(), Box<dyn std::error::Error>> {
-        let table = DeltaLogTable::new("registration-failure")?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: table.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let preflight = preflight_delta_protocol(&source)?;
-        let ctx = SessionContext::new();
-        let placeholder_schema = Arc::new(Schema::new(vec![Field::new(
+    fn existing_conflict_fails_before_partial_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("conflict-orders")?;
+        let customers = DeltaLogTable::new("conflict-customers")?;
+        let context = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
             "existing",
             DataType::Utf8,
             true,
         )]));
-
-        ctx.register_table("orders", Arc::new(EmptyTable::new(placeholder_schema)))?;
-        let result = register_delta_sources(
-            &ctx,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-        );
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DataFusionRegistration {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "orders" && reason.contains("already exists")
-        ));
-
-        Ok(())
-    }
-
-    #[test]
-    fn mismatched_preflight_is_rejected_before_registration()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let orders = DeltaLogTable::new("mismatched-preflight-orders")?;
-        let customers = DeltaLogTable::new("mismatched-preflight-customers")?;
-        let orders_source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: orders.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_source = load_delta_source(DeltaSourceConfig {
-            name: "customers".to_owned(),
-            table_uri: customers.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_preflight = preflight_delta_protocol(&customers_source)?;
-        let ctx = SessionContext::new();
+        context.register_table("customers", Arc::new(EmptyTable::new(schema)))?;
 
         let result = register_delta_sources(
-            &ctx,
-            vec![DeltaTableProviderConfig {
-                source: orders_source,
-                protocol: customers_preflight,
-                scan_target_partitions: None,
-            }],
-        );
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DataFusionRegistration {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "orders"
-                && reason.contains("protocol preflight belongs to source `customers`")
-        ));
-        assert!(!ctx.table_exist("orders")?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn existing_table_conflict_fails_before_partial_registration()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let orders = DeltaLogTable::new("existing-conflict-orders")?;
-        let customers = DeltaLogTable::new("existing-conflict-customers")?;
-        let orders_source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: orders.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_source = load_delta_source(DeltaSourceConfig {
-            name: "customers".to_owned(),
-            table_uri: customers.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let orders_preflight = preflight_delta_protocol(&orders_source)?;
-        let customers_preflight = preflight_delta_protocol(&customers_source)?;
-        let ctx = SessionContext::new();
-        let placeholder_schema = Arc::new(Schema::new(vec![Field::new(
-            "existing",
-            DataType::Utf8,
-            true,
-        )]));
-
-        ctx.register_table("customers", Arc::new(EmptyTable::new(placeholder_schema)))?;
-        let result = register_delta_sources(
-            &ctx,
+            &context,
             vec![
-                DeltaTableProviderConfig {
-                    source: orders_source,
-                    protocol: orders_preflight,
-                    scan_target_partitions: None,
-                },
-                DeltaTableProviderConfig {
-                    source: customers_source,
-                    protocol: customers_preflight,
-                    scan_target_partitions: None,
-                },
+                ("orders".to_owned(), load(&orders)?, None),
+                ("customers".to_owned(), load(&customers)?, None),
             ],
         );
 
         assert!(matches!(
             result,
-            Err(DeltaFunnelError::DataFusionRegistration {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "customers" && reason.contains("already exists")
+            Err(DeltaFunnelError::DataFusionRegistration { source_name, .. })
+                if source_name == "customers"
         ));
-        assert!(!ctx.table_exist("orders")?);
-        assert!(ctx.table_exist("customers")?);
-
+        assert!(!context.table_exist("orders")?);
+        assert!(context.table_exist("customers")?);
         Ok(())
     }
 
     #[test]
-    fn late_registration_failure_rolls_back_prior_sources() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn protocol_failure_precedes_partial_registration() -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("protocol-orders")?;
+        let customers = DeltaLogTable::new_with_schema_protocol_and_adds(
+            "protocol-customers",
+            UNSUPPORTED_PROTOCOL_JSON,
+            DEFAULT_SCHEMA_FIELDS_JSON,
+            "[]",
+            &[r#""partitionValues":{}"#],
+        )?;
+        let context = SessionContext::new();
+
+        let result = register_delta_sources(
+            &context,
+            vec![
+                ("orders".to_owned(), load(&orders)?, None),
+                ("customers".to_owned(), load(&customers)?, None),
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DeltaProtocolCompatibility { source_name, reason, .. })
+                if source_name == "customers"
+                    && reason == "unsupported Delta minReaderVersion 99"
+        ));
+        assert!(!context.table_exist("orders")?);
+        assert!(!context.table_exist("customers")?);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_conflict_uses_the_configured_default_catalog_and_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let orders = DeltaLogTable::new("custom-conflict-orders")?;
+        let customers = DeltaLogTable::new("custom-conflict-customers")?;
+        let context = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema("custom", "schema"),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "existing",
+            DataType::Utf8,
+            true,
+        )]));
+        context.register_table("customers", Arc::new(EmptyTable::new(schema)))?;
+
+        let result = register_delta_sources(
+            &context,
+            vec![
+                ("orders".to_owned(), load(&orders)?, None),
+                ("customers".to_owned(), load(&customers)?, None),
+            ],
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeltaFunnelError::DataFusionRegistration { source_name, .. })
+                if source_name == "customers"
+        ));
+        assert!(!context.table_exist("orders")?);
+        assert!(context.table_exist("customers")?);
+        Ok(())
+    }
+
+    #[test]
+    fn late_failure_rolls_back_prior_sources() -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("rollback-orders")?;
         let customers = DeltaLogTable::new("rollback-customers")?;
-        let orders_source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: orders.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_source = load_delta_source(DeltaSourceConfig {
-            name: "customers".to_owned(),
-            table_uri: customers.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let orders_preflight = preflight_delta_protocol(&orders_source)?;
-        let customers_preflight = preflight_delta_protocol(&customers_source)?;
-        let ctx = SessionContext::new();
-        let failing_schema: Arc<dyn datafusion::catalog::SchemaProvider> =
+        let context = SessionContext::new();
+        let schema: Arc<dyn datafusion::catalog::SchemaProvider> =
             Arc::new(FailsOnCustomersSchemaProvider::default());
-
-        ctx.register_catalog(
+        context.register_catalog(
             "datafusion",
-            Arc::new(SingleSchemaCatalogProvider::new(Arc::clone(
-                &failing_schema,
-            ))),
+            Arc::new(SingleSchemaCatalogProvider::new(schema)),
         );
+
         let result = register_delta_sources(
-            &ctx,
+            &context,
             vec![
-                DeltaTableProviderConfig {
-                    source: orders_source,
-                    protocol: orders_preflight,
-                    scan_target_partitions: None,
-                },
-                DeltaTableProviderConfig {
-                    source: customers_source,
-                    protocol: customers_preflight,
-                    scan_target_partitions: None,
-                },
+                ("orders".to_owned(), load(&orders)?, None),
+                ("customers".to_owned(), load(&customers)?, None),
             ],
         );
 
         assert!(matches!(
             result,
-            Err(DeltaFunnelError::DataFusionRegistration {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "customers"
-                && reason.contains("forced customers registration failure")
+            Err(DeltaFunnelError::DataFusionRegistration { source_name, .. })
+                if source_name == "customers"
         ));
-        assert!(!ctx.table_exist("orders")?);
-        assert!(!ctx.table_exist("customers")?);
-
+        assert!(!context.table_exist("orders")?);
+        assert!(!context.table_exist("customers")?);
         Ok(())
     }
 
     #[test]
-    fn existing_table_conflict_uses_configured_default_catalog_and_schema()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let orders = DeltaLogTable::new("custom-default-orders")?;
-        let customers = DeltaLogTable::new("custom-default-customers")?;
-        let orders_source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: orders.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_source = load_delta_source(DeltaSourceConfig {
-            name: "customers".to_owned(),
-            table_uri: customers.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let orders_preflight = preflight_delta_protocol(&orders_source)?;
-        let customers_preflight = preflight_delta_protocol(&customers_source)?;
-        let ctx = SessionContext::new_with_config(
-            SessionConfig::new().with_default_catalog_and_schema("custom_catalog", "custom_schema"),
-        );
-        let placeholder_schema = Arc::new(Schema::new(vec![Field::new(
-            "existing",
-            DataType::Utf8,
-            true,
-        )]));
-
-        ctx.register_table("customers", Arc::new(EmptyTable::new(placeholder_schema)))?;
-        let result = register_delta_sources(
-            &ctx,
-            vec![
-                DeltaTableProviderConfig {
-                    source: orders_source,
-                    protocol: orders_preflight,
-                    scan_target_partitions: None,
-                },
-                DeltaTableProviderConfig {
-                    source: customers_source,
-                    protocol: customers_preflight,
-                    scan_target_partitions: None,
-                },
-            ],
-        );
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DataFusionRegistration {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "customers" && reason.contains("already exists")
-        ));
-        assert!(!ctx.table_exist("orders")?);
-        assert!(ctx.table_exist("customers")?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn schema_conversion_failure_fails_before_partial_registration()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let orders = DeltaLogTable::new("schema-partial-orders")?;
-        let customers = DeltaLogTable::new_with_schema(
-            "schema-partial-customers",
-            INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
-            "[]",
-            r#""partitionValues":{}"#,
-        )?;
-        let orders_source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: orders.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_source = load_delta_source(DeltaSourceConfig {
-            name: "customers".to_owned(),
-            table_uri: customers.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let orders_preflight = preflight_delta_protocol(&orders_source)?;
-        let customers_preflight = preflight_delta_protocol(&customers_source)?;
-        let ctx = SessionContext::new();
-
-        let result = register_delta_sources(
-            &ctx,
-            vec![
-                DeltaTableProviderConfig {
-                    source: orders_source,
-                    protocol: orders_preflight,
-                    scan_target_partitions: None,
-                },
-                DeltaTableProviderConfig {
-                    source: customers_source,
-                    protocol: customers_preflight,
-                    scan_target_partitions: None,
-                },
-            ],
-        );
-
-        assert!(matches!(
-            result,
-            Err(DeltaFunnelError::DeltaSourceSchema {
-                source_name,
-                reason,
-                ..
-            }) if source_name == "customers"
-                && reason.contains("bad_array")
-                && reason.contains("delta.columnMapping.nested.ids")
-        ));
-        assert!(!ctx.table_exist("orders")?);
-        assert!(!ctx.table_exist("customers")?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_registration_names_fail_before_partial_registration()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn duplicate_names_fail_before_partial_registration() -> Result<(), Box<dyn std::error::Error>>
+    {
         let orders = DeltaLogTable::new("duplicate-orders")?;
         let customers = DeltaLogTable::new("duplicate-customers")?;
-        let orders_source = load_delta_source(DeltaSourceConfig {
-            name: "orders".to_owned(),
-            table_uri: orders.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let customers_source = load_delta_source(DeltaSourceConfig {
-            name: "Orders".to_owned(),
-            table_uri: customers.path().to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let orders_preflight = preflight_delta_protocol(&orders_source)?;
-        let customers_preflight = preflight_delta_protocol(&customers_source)?;
-        let ctx = SessionContext::new();
+        let context = SessionContext::new();
 
         let result = register_delta_sources(
-            &ctx,
+            &context,
             vec![
-                DeltaTableProviderConfig {
-                    source: orders_source,
-                    protocol: orders_preflight,
-                    scan_target_partitions: None,
-                },
-                DeltaTableProviderConfig {
-                    source: customers_source,
-                    protocol: customers_preflight,
-                    scan_target_partitions: None,
-                },
+                ("orders".to_owned(), load(&orders)?, None),
+                ("Orders".to_owned(), load(&customers)?, None),
             ],
         );
 
@@ -801,8 +536,7 @@ mod tests {
             result,
             Err(DeltaFunnelError::DuplicateSourceName { name }) if name == "Orders"
         ));
-        assert!(!ctx.table_exist("orders")?);
-
+        assert!(!context.table_exist("orders")?);
         Ok(())
     }
 }

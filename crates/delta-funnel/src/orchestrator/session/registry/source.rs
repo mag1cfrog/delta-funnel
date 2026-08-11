@@ -1,19 +1,22 @@
-use std::fmt;
+use std::{error::Error as _, fmt};
 
 use datafusion::arrow::datatypes::SchemaRef;
+use delta_arrow_reader::{
+    DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaTableBuilder,
+    DeltaTableSnapshot,
+};
 
 use crate::{
-    DeltaFunnelError, DeltaProtocolReport, DeltaSourceConfig, DeltaTableProviderConfig,
-    PhaseTimingReport, RegisteredDeltaSource,
+    DeltaFunnelError, DeltaProtocolReport, DeltaSourceConfig, PhaseTimingReport,
+    RegisteredDeltaSource, observability,
     progress::{ProgressEvent, ProgressOperation, ProgressPhase, ProgressReporter},
     query_engine::datafusion::{
         register_delta_source_with_scan_execution_options, reject_existing_delta_registration_name,
+        validate_delta_table_snapshot_protocol,
     },
     report::PhaseTimer,
-    table_formats::{
-        load_delta_source_with_tracing, preflight_delta_protocol_with_tracing,
-        validate_table_source_names,
-    },
+    support::{sanitize_text_for_display, sanitize_uri_for_display},
+    table_formats::{S3AuthModeHint, validate_table_source_names},
 };
 
 use super::super::{DeltaFunnelSession, LazyTable};
@@ -21,6 +24,11 @@ use super::super::{DeltaFunnelSession, LazyTable};
 const SOURCE_LOADING_PHASE: &str = "source_loading";
 const PROTOCOL_PREFLIGHT_PHASE: &str = "protocol_preflight";
 const DATAFUSION_REGISTRATION_PHASE: &str = "datafusion_registration";
+const SNAPSHOT_LOAD_FAILED: &str = "snapshot could not be loaded";
+const EMPTY_TABLE_URI: &str = "table location must not be empty";
+const INVALID_TABLE_URI: &str = "table location could not be parsed or normalized";
+const ENGINE_CONSTRUCTION_FAILED: &str = "object store engine could not be constructed";
+const S3_IMPLICIT_CREDENTIAL_HINT: &str = "S3 credential hint: no explicit S3 credentials were supplied through storage_options; local shells may need explicit AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, optional AWS_SESSION_TOKEN, and AWS_REGION.";
 
 /// Registered Delta source tracked by a query-load session.
 #[derive(Clone, PartialEq, Eq)]
@@ -157,39 +165,45 @@ impl DeltaFunnelSession {
 
         emit_registration_phase(reporter, ProgressPhase::LoadingDeltaMetadata);
         let source_timer = PhaseTimer::start(SOURCE_LOADING_PHASE);
-        let planned = match load_delta_source_with_tracing(source) {
-            Ok(planned) => {
-                phase_timings.push(source_timer.completed());
-                planned
-            }
-            Err(error) => {
-                phase_timings.push(source_timer.failed());
-                return Err(error);
-            }
-        };
+        let (source_name, snapshot) =
+            match load_delta_snapshot(source, self.options.provider_scan_options()) {
+                Ok(loaded) => {
+                    phase_timings.push(source_timer.completed());
+                    loaded
+                }
+                Err(error) => {
+                    phase_timings.push(source_timer.failed());
+                    return Err(error);
+                }
+            };
 
         emit_registration_phase(reporter, ProgressPhase::ValidatingDeltaProtocol);
         let preflight_timer = PhaseTimer::start(PROTOCOL_PREFLIGHT_PHASE);
-        let preflight = match preflight_delta_protocol_with_tracing(&planned) {
-            Ok(preflight) => {
+        match validate_delta_protocol(&source_name, &snapshot) {
+            Ok(()) => {
                 phase_timings.push(preflight_timer.completed());
-                preflight
             }
             Err(error) => {
                 phase_timings.push(preflight_timer.failed());
                 return Err(error);
             }
-        };
+        }
 
         let registration_timer = PhaseTimer::start(DATAFUSION_REGISTRATION_PHASE);
-        let config = DeltaTableProviderConfig {
-            source: planned,
-            protocol: preflight,
-            scan_target_partitions: None,
+        emit_registration_phase(reporter, ProgressPhase::PreparingDeltaProvider);
+        let table_uri = snapshot.table_uri().to_owned();
+        let table = match snapshot.into_table() {
+            Ok(table) => table,
+            Err(error) => {
+                phase_timings.push(registration_timer.failed());
+                return Err(map_load_error(&source_name, &table_uri, None, error));
+            }
         };
         let registered = match register_delta_source_with_scan_execution_options(
             &self.context,
-            config,
+            source_name,
+            table,
+            None,
             self.options.provider_scan_options(),
             reporter,
         ) {
@@ -226,6 +240,127 @@ impl DeltaFunnelSession {
     }
 }
 
+fn load_delta_snapshot(
+    mut source: DeltaSourceConfig,
+    execution_options: delta_arrow_reader::DeltaReaderExecutionOptions,
+) -> Result<(String, DeltaTableSnapshot), DeltaFunnelError> {
+    source.apply_environment_storage_options();
+    let source_name = source.name.clone();
+    let table_uri = source.table_uri.clone();
+    let auth_mode = source.s3_auth_mode_hint();
+    observability::source_loading_started(&source_name, auth_mode.map(S3AuthModeHint::as_str));
+
+    let selection = source.version.map_or(
+        DeltaSnapshotSelection::Latest,
+        DeltaSnapshotSelection::Version,
+    );
+    let result = DeltaTableBuilder::new(&source.table_uri)
+        .with_storage_options(source.storage_options)
+        .with_snapshot_selection(selection)
+        .with_execution_options(execution_options)
+        .load_snapshot()
+        .map_err(|error| map_load_error(&source_name, &table_uri, auth_mode, error));
+
+    match &result {
+        Ok(snapshot) => observability::source_loading_completed(
+            &source_name,
+            snapshot.version(),
+            auth_mode.map(S3AuthModeHint::as_str),
+        ),
+        Err(error) => observability::source_loading_failed(
+            &source_name,
+            error,
+            auth_mode.map(S3AuthModeHint::as_str),
+        ),
+    }
+    result.map(|snapshot| (source_name, snapshot))
+}
+
+fn validate_delta_protocol(
+    source_name: &str,
+    snapshot: &DeltaTableSnapshot,
+) -> Result<(), DeltaFunnelError> {
+    observability::protocol_preflight_started(source_name, snapshot.version());
+    let result = validate_delta_table_snapshot_protocol(source_name, snapshot);
+    match &result {
+        Ok(()) => observability::protocol_preflight_completed(source_name, snapshot.version()),
+        Err(error) => {
+            observability::protocol_preflight_failed(source_name, snapshot.version(), error);
+        }
+    }
+    result
+}
+
+fn map_load_error(
+    source_name: &str,
+    table_uri: &str,
+    auth_mode: Option<S3AuthModeHint>,
+    error: DeltaReaderError,
+) -> DeltaFunnelError {
+    match error.phase() {
+        DeltaReaderPhase::Configuration => DeltaFunnelError::Config {
+            message: error.to_string(),
+        },
+        DeltaReaderPhase::TableUri => DeltaFunnelError::InvalidSourceUri {
+            reason: if table_uri.trim().is_empty() {
+                EMPTY_TABLE_URI
+            } else {
+                INVALID_TABLE_URI
+            },
+        },
+        DeltaReaderPhase::Storage => DeltaFunnelError::DeltaSourceEngine {
+            reason: ENGINE_CONSTRUCTION_FAILED,
+        },
+        DeltaReaderPhase::Snapshot => DeltaFunnelError::DeltaSnapshotLoad {
+            reason: snapshot_load_failed_reason(&error, auth_mode),
+        },
+        DeltaReaderPhase::Schema => DeltaFunnelError::DeltaSourceSchema {
+            source_name: source_name.to_owned(),
+            table_uri: table_uri.to_owned(),
+            reason: reader_error_source_reason(&error),
+        },
+        _ => DeltaFunnelError::DeltaSnapshotLoad {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn snapshot_load_failed_reason(
+    error: &DeltaReaderError,
+    auth_mode: Option<S3AuthModeHint>,
+) -> String {
+    let cause = reader_error_source_reason(error);
+    let mut reason = format!(
+        "{SNAPSHOT_LOAD_FAILED}: {}",
+        sanitize_snapshot_load_cause(&cause)
+    );
+    if auth_mode == Some(S3AuthModeHint::ImplicitProviderChain) {
+        reason.push(' ');
+        reason.push_str(S3_IMPLICIT_CREDENTIAL_HINT);
+    }
+    reason
+}
+
+fn reader_error_source_reason(error: &DeltaReaderError) -> String {
+    error
+        .source()
+        .map_or_else(|| error.to_string(), ToString::to_string)
+}
+
+fn sanitize_snapshot_load_cause(cause: &str) -> String {
+    cause
+        .split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                sanitize_uri_for_display(token)
+            } else {
+                sanitize_text_for_display(token)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
     if let Some(reporter) = reporter {
         reporter.emit(&ProgressEvent::phase_changed(phase, None));
@@ -238,11 +373,13 @@ mod tests {
 
     use datafusion::{arrow::datatypes::Schema, datasource::empty::EmptyTable};
 
-    use super::{DATAFUSION_REGISTRATION_PHASE, PROTOCOL_PREFLIGHT_PHASE, SOURCE_LOADING_PHASE};
+    use super::{
+        DATAFUSION_REGISTRATION_PHASE, EMPTY_TABLE_URI, PROTOCOL_PREFLIGHT_PHASE,
+        S3_IMPLICIT_CREDENTIAL_HINT, SOURCE_LOADING_PHASE, snapshot_load_failed_reason,
+    };
 
     use crate::{
-        DeltaFunnelError, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
-        DeltaSourceConfig, DeltaStorageOptions, QueryOptions,
+        DeltaFunnelError, DeltaSourceConfig, QueryOptions,
         progress::{
             ProgressEvent, ProgressEventKind, ProgressOperation, ProgressPhase, ProgressReporter,
         },
@@ -250,7 +387,9 @@ mod tests {
             FailsOnCustomersSchemaProvider, INVALID_NESTED_IDS_SCHEMA_FIELDS_JSON,
             SingleSchemaCatalogProvider,
         },
-        table_formats::snapshot_metadata_load_attempt_count,
+    };
+    use delta_arrow_reader::{
+        DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaStorageOptions,
     };
 
     use super::super::super::{
@@ -260,6 +399,28 @@ mod tests {
 
     const UNSUPPORTED_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
+    const UNSUPPORTED_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["madeUpFeature","laterFeature"],"writerFeatures":["madeUpFeature","laterFeature"]}}"#;
+
+    #[test]
+    fn snapshot_error_keeps_the_s3_hint_only_for_implicit_auth() {
+        let error = delta_arrow_reader::DeltaTableBuilder::new("")
+            .load()
+            .expect_err("blank URI should fail");
+
+        let implicit = snapshot_load_failed_reason(
+            &error,
+            Some(crate::table_formats::S3AuthModeHint::ImplicitProviderChain),
+        );
+        let explicit = snapshot_load_failed_reason(
+            &error,
+            Some(crate::table_formats::S3AuthModeHint::ExplicitStatic),
+        );
+        let non_s3 = snapshot_load_failed_reason(&error, None);
+
+        assert!(implicit.contains(S3_IMPLICIT_CREDENTIAL_HINT));
+        assert!(!explicit.contains(S3_IMPLICIT_CREDENTIAL_HINT));
+        assert!(!non_s3.contains(S3_IMPLICIT_CREDENTIAL_HINT));
+    }
 
     fn recording_reporter() -> (ProgressReporter, Arc<Mutex<Vec<ProgressEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -340,11 +501,11 @@ mod tests {
         let table = DeltaLogTable::new("progress-reader-backends")?;
 
         for backend in [
-            DeltaProviderReaderBackend::OfficialKernel,
-            DeltaProviderReaderBackend::NativeAsync,
+            DeltaReaderBackend::OfficialKernel,
+            DeltaReaderBackend::NativeAsync,
         ] {
             let provider_options =
-                DeltaProviderScanExecutionOptions::try_new_with_reader_backend(backend, 1, 1)?;
+                DeltaReaderExecutionOptions::new().with_reader_backend(backend)?;
             let mut ordinary = DeltaFunnelSession::new(
                 SessionOptions::new().with_provider_scan_options(provider_options),
             )?;
@@ -352,15 +513,12 @@ mod tests {
                 SessionOptions::new().with_provider_scan_options(provider_options),
             )?;
             let source_uri = table.uri();
-            let load_attempts = snapshot_metadata_load_attempt_count();
 
             let ordinary_table =
                 ordinary.delta_lake(DeltaSourceConfig::new("orders", source_uri.clone()))?;
-            assert_eq!(snapshot_metadata_load_attempt_count(), load_attempts + 1);
             let (reporter, events) = recording_reporter();
             let reported_table = reported
                 .delta_lake_with_progress(DeltaSourceConfig::new("orders", source_uri), reporter)?;
-            assert_eq!(snapshot_metadata_load_attempt_count(), load_attempts + 2);
 
             assert_eq!(reported_table, ordinary_table);
             let ordinary_source = ordinary
@@ -404,9 +562,10 @@ mod tests {
     #[test]
     fn delta_lake_progress_covers_source_loading_failure_variants()
     -> Result<(), Box<dyn std::error::Error>> {
-        assert_source_loading_progress_failure(DeltaSourceConfig::new("orders", ""), |error| {
-            matches!(error, DeltaFunnelError::InvalidSourceUri { .. })
-        })?;
+        assert_source_loading_progress_failure(
+            DeltaSourceConfig::new("orders", ""),
+            |error| matches!(error, DeltaFunnelError::InvalidSourceUri { reason } if *reason == EMPTY_TABLE_URI),
+        )?;
         assert_source_loading_progress_failure(
             DeltaSourceConfig::new("orders", "ftp://example.com/table"),
             |error| matches!(error, DeltaFunnelError::DeltaSourceEngine { .. }),
@@ -461,7 +620,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(DeltaFunnelError::DeltaSourceSchema { .. })
+            Err(DeltaFunnelError::DeltaSourceSchema { reason, .. })
+                if reason.contains("bad_array")
+                    && reason.contains("delta.columnMapping.nested.ids")
         ));
         let events = events.lock().map_err(|_| "progress events lock poisoned")?;
         assert_eq!(events.len(), 5);
@@ -613,7 +774,7 @@ mod tests {
         assert_eq!(report.scheduling().query_target_partitions(), None);
         assert_eq!(
             report.scheduling().reader_backend(),
-            DeltaProviderReaderBackend::NativeAsync
+            DeltaReaderBackend::NativeAsync
         );
         assert_eq!(
             report.scheduling().max_concurrent_file_reads_per_scan(),
@@ -729,6 +890,28 @@ mod tests {
     }
 
     #[test]
+    fn protocol_preflight_reports_the_first_unsupported_reader_feature()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol(
+            "unsupported-feature",
+            UNSUPPORTED_FEATURE_PROTOCOL_JSON,
+        )?;
+        let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
+
+        let error = session
+            .delta_lake(DeltaSourceConfig::new("unsupported", table.uri()))
+            .err()
+            .ok_or("expected protocol compatibility error")?;
+
+        let DeltaFunnelError::DeltaProtocolCompatibility { reason, .. } = error else {
+            return Err("expected protocol compatibility error".into());
+        };
+        assert_eq!(reason, "unsupported Delta reader feature `madeUpFeature`");
+        assert!(session.sources().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn protocol_preflight_failure_redacts_secret_uri_parts()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
@@ -822,15 +1005,13 @@ mod tests {
     fn source_registration_honors_configured_provider_options()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("configured-provider")?;
-        let provider_scan_options = DeltaProviderScanExecutionOptions {
-            parquet_metadata_size_hint: Some(16_384),
-            ..DeltaProviderScanExecutionOptions::try_new_with_reader_backend(
-                DeltaProviderReaderBackend::OfficialKernel,
-                2,
-                1,
-            )?
+        let provider_scan_options = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(DeltaReaderBackend::OfficialKernel)?
+            .with_max_concurrent_file_reads_per_scan(Some(2))?
+            .with_max_concurrent_file_reads_per_partition(1)?
             .with_output_buffer_capacity_per_partition(3)?
-        };
+            .with_native_async_prefetch_file_count_per_partition(0)?
+            .with_parquet_metadata_size_hint(Some(16_384))?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new()
                 .with_query_options(QueryOptions {
@@ -850,7 +1031,7 @@ mod tests {
         assert_eq!(scheduling.query_target_partitions(), Some(4));
         assert_eq!(
             scheduling.reader_backend(),
-            DeltaProviderReaderBackend::OfficialKernel
+            DeltaReaderBackend::OfficialKernel
         );
         assert_eq!(scheduling.max_concurrent_file_reads_per_scan(), Some(2));
         assert_eq!(scheduling.max_concurrent_file_reads_per_partition(), 1);

@@ -1,6 +1,6 @@
 //! DataFusion integration.
 
-use std::{error::Error, fmt, sync::Arc};
+use std::{collections::HashSet, error::Error, fmt, sync::Arc};
 
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -8,50 +8,72 @@ use datafusion::physical_plan::{
     EmptyRecordBatchStream, ExecutionPlan, SendableRecordBatchStream,
     coalesce_partitions::CoalescePartitionsExec,
 };
+use delta_arrow_reader::{
+    DeltaDataFusionMetrics, DeltaDataFusionMetricsSnapshot, collect_delta_datafusion_metrics,
+};
 
 use crate::DeltaFunnelError;
 
 mod catalog;
-mod execution;
 pub(crate) mod execution_profile;
 mod operator_activity;
-mod planning;
 mod planning_activity;
 mod profiled_execution;
-mod profiled_object_store;
 mod session;
 
 #[cfg(feature = "perfetto-profile")]
 pub(crate) use operator_activity::initialize_datafusion_task_tracing;
 pub(crate) use operator_activity::instrument_query_execution_plan;
-pub(crate) use planning_activity::{
-    profile_query_planning_sync_result, with_query_planning_activity,
-};
+pub(crate) use planning_activity::with_query_planning_activity;
 pub(crate) use profiled_execution::{
     QueryTraceIdentity, profiled_datafusion_query_output_stream_with_effective_root,
 };
 
 pub use catalog::registration::{
-    DeltaTableProviderConfig, RegisteredDeltaSource, RegisteredDeltaSources,
-    register_delta_sources, register_delta_sources_with_scan_execution_options,
+    RegisteredDeltaSource, RegisteredDeltaSources, register_delta_sources,
+    register_delta_sources_with_scan_execution_options,
 };
 pub(crate) use catalog::registration::{
     register_delta_source_with_scan_execution_options, reject_existing_delta_registration_name,
-};
-pub use execution::{
-    DeltaProviderReadStatsSnapshot, DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions,
-};
-pub use planning::partition_target::{
-    DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
-    DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
-    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
-    delta_scan_partition_target_local_environment_diagnostic,
-    derive_delta_scan_partition_target_diagnostic,
+    validate_delta_table_snapshot_protocol,
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
 
-/// Shared live read counters for one physical Delta scan.
-pub(crate) type DeltaProviderReadStatsHandle = Arc<execution::read_stats::DeltaProviderReadStats>;
+/// One standalone metrics handle for a Delta provider scan.
+#[derive(Clone)]
+pub(crate) struct DeltaProviderReadStatsHandle {
+    metrics: DeltaDataFusionMetrics,
+}
+
+impl DeltaProviderReadStatsHandle {
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        self.metrics.same_instance(&other.metrics)
+    }
+
+    pub(crate) fn snapshot(&self) -> DeltaDataFusionMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub(crate) fn source_name(&self) -> Option<&str> {
+        self.metrics.source_name()
+    }
+}
+
+pub(crate) fn delta_datafusion_metrics_for_plan(
+    plan: &dyn ExecutionPlan,
+) -> Option<DeltaProviderReadStatsHandle> {
+    let plan = operator_activity::unprofiled_execution_plan(plan);
+    if !plan.children().is_empty() {
+        return None;
+    }
+    let metrics = collect_delta_datafusion_metrics(plan);
+    let [metrics] = metrics.as_slice() else {
+        return None;
+    };
+    Some(DeltaProviderReadStatsHandle {
+        metrics: metrics.clone(),
+    })
+}
 
 impl From<DeltaFunnelError> for DataFusionError {
     fn from(error: DeltaFunnelError) -> Self {
@@ -59,47 +81,64 @@ impl From<DeltaFunnelError> for DataFusionError {
     }
 }
 
-/// Collects provider-owned Delta read stats snapshots from a DataFusion
-/// physical plan.
-#[must_use]
-pub fn collect_delta_provider_read_stats(
-    plan: &dyn ExecutionPlan,
-) -> Vec<DeltaProviderReadStatsSnapshot> {
-    snapshot_delta_provider_read_stats(&collect_delta_provider_read_stats_handles(plan))
-}
-
 /// Collects distinct shared read stats counters without retaining the physical plan.
 ///
-/// Repeated references to the same `Arc` identity are omitted while preserving
-/// the first-seen physical-plan traversal order.
+/// Repeated references to the same metrics instance are omitted while
+/// preserving the first-seen physical-plan traversal order.
 pub(crate) fn collect_delta_provider_read_stats_handles(
     plan: &dyn ExecutionPlan,
 ) -> Vec<DeltaProviderReadStatsHandle> {
-    let mut found = Vec::new();
-    collect_delta_provider_read_stats_handles_into(plan, &mut found);
-    found
-}
+    fn collect(
+        plan: &dyn ExecutionPlan,
+        seen: &mut HashSet<usize>,
+        found: &mut Vec<DeltaProviderReadStatsHandle>,
+    ) {
+        let plan = operator_activity::unprofiled_execution_plan(plan);
+        let plan_identity = plan as *const dyn ExecutionPlan as *const () as usize;
+        if !seen.insert(plan_identity) {
+            return;
+        }
 
-fn collect_delta_provider_read_stats_handles_into(
-    plan: &dyn ExecutionPlan,
-    found: &mut Vec<DeltaProviderReadStatsHandle>,
-) {
-    if let Some(scan) = plan.downcast_ref::<execution::DeltaScanPlanningExec>() {
-        let handle = scan.read_stats_handle();
-        if !found.iter().any(|found| Arc::ptr_eq(found, &handle)) {
+        let children = plan.children();
+        if let Some(handle) = delta_datafusion_metrics_for_plan(plan)
+            && !found.iter().any(|existing| existing.same_instance(&handle))
+        {
             found.push(handle);
         }
+        for child in children {
+            collect(child.as_ref(), seen, found);
+        }
     }
-    for child in plan.children() {
-        collect_delta_provider_read_stats_handles_into(child.as_ref(), found);
-    }
+
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    collect(plan, &mut seen, &mut found);
+    found
 }
 
 /// Creates point-in-time snapshots from shared live read counters.
 pub(crate) fn snapshot_delta_provider_read_stats(
     handles: &[DeltaProviderReadStatsHandle],
-) -> Vec<DeltaProviderReadStatsSnapshot> {
+) -> Vec<DeltaDataFusionMetricsSnapshot> {
     handles.iter().map(|stats| stats.snapshot()).collect()
+}
+
+#[derive(Clone)]
+pub(crate) struct NamedDeltaDataFusionMetricsSnapshot {
+    pub(crate) source_name: String,
+    pub(crate) snapshot: DeltaDataFusionMetricsSnapshot,
+}
+
+pub(crate) fn collect_named_delta_datafusion_metrics(
+    plan: &dyn ExecutionPlan,
+) -> Vec<NamedDeltaDataFusionMetricsSnapshot> {
+    collect_delta_datafusion_metrics(plan)
+        .into_iter()
+        .map(|metrics| NamedDeltaDataFusionMetricsSnapshot {
+            source_name: metrics.source_name().unwrap_or_default().to_owned(),
+            snapshot: metrics.snapshot(),
+        })
+        .collect()
 }
 
 /// Executes one selected DataFusion query output as a single merged stream.
@@ -197,7 +236,7 @@ pub(super) fn execute_datafusion_query_output(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    #![allow(missing_docs)]
+    #![allow(dead_code, missing_docs)]
 
     use std::collections::HashMap;
     use std::fs;
@@ -212,14 +251,8 @@ pub(crate) mod test_support {
     use datafusion::catalog::{CatalogProvider, SchemaProvider};
     use datafusion::common::{DataFusionError, Result as DataFusionResult};
     use datafusion::datasource::TableProvider;
-    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionContext;
-
-    use crate::query_engine::datafusion::catalog::registration::{
-        DeltaTableProviderConfig, register_delta_sources,
-    };
-    use crate::query_engine::datafusion::execution::DeltaScanPlanningExec;
-    use crate::{DeltaSourceConfig, load_delta_source, preflight_delta_protocol};
+    use delta_arrow_reader::{DeltaDataFusionScanOptions, DeltaTableBuilder, register_delta_table};
 
     pub(crate) struct DeltaLogTable {
         path: PathBuf,
@@ -382,36 +415,15 @@ pub(crate) mod test_support {
         fixture_name: &str,
     ) -> Result<DeltaLogTable, Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new(fixture_name)?;
-        let source = load_delta_source(DeltaSourceConfig {
-            name: source_name.to_owned(),
-            table_uri: table.path.to_string_lossy().to_string(),
-            version: None,
-            storage_options: Default::default(),
-        })?;
-        let preflight = preflight_delta_protocol(&source)?;
-
-        register_delta_sources(
+        let loaded = DeltaTableBuilder::new(table.path.to_string_lossy()).load()?;
+        register_delta_table(
             ctx,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
+            source_name,
+            loaded,
+            DeltaDataFusionScanOptions::default(),
         )?;
 
         Ok(table)
-    }
-
-    pub(crate) fn find_delta_scan_plans<'a>(
-        plan: &'a dyn ExecutionPlan,
-        found: &mut Vec<&'a DeltaScanPlanningExec>,
-    ) {
-        if let Some(scan) = plan.downcast_ref::<DeltaScanPlanningExec>() {
-            found.push(scan);
-        }
-        for child in plan.children() {
-            find_delta_scan_plans(child.as_ref(), found);
-        }
     }
 
     #[derive(Debug, Default)]
@@ -525,7 +537,8 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn read_stats_handles_deduplicate_repeated_plan_identity() -> Result<(), Box<dyn Error>> {
+    async fn read_stats_handles_deduplicate_repeated_metrics_instance() -> Result<(), Box<dyn Error>>
+    {
         let context = SessionContext::new();
         let _table = register_fixture_source(&context, "orders", "shared-scan-handle")?;
         let plan = delta_plan(&context).await?;
@@ -536,12 +549,12 @@ mod tests {
 
         assert_eq!(original.len(), 1);
         assert_eq!(found.len(), 1);
-        assert!(Arc::ptr_eq(&found[0], &original[0]));
+        assert!(found[0].same_instance(&original[0]));
         Ok(())
     }
 
     #[tokio::test]
-    async fn read_stats_handles_keep_distinct_identities_in_first_seen_order()
+    async fn read_stats_handles_keep_distinct_metrics_in_first_seen_order()
     -> Result<(), Box<dyn Error>> {
         let context = SessionContext::new();
         let _table = register_fixture_source(&context, "orders", "distinct-scan-handles")?;
@@ -556,10 +569,10 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
-        assert!(!Arc::ptr_eq(&first[0], &second[0]));
+        assert!(!first[0].same_instance(&second[0]));
         assert_eq!(found.len(), 2);
-        assert!(Arc::ptr_eq(&found[0], &second[0]));
-        assert!(Arc::ptr_eq(&found[1], &first[0]));
+        assert!(found[0].same_instance(&second[0]));
+        assert!(found[1].same_instance(&first[0]));
         Ok(())
     }
 

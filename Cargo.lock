@@ -1321,9 +1321,9 @@ dependencies = [
 
 [[package]]
 name = "delta-arrow-reader"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e75b1cda3e8a3450bd6653175abb83f272b0cdba5abda1fff62146f4d96385e"
+checksum = "5fffaa237248e0cdfc81d31e2a89be332409336a59822daa97a708719aa0ab98"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1381,6 +1381,7 @@ name = "delta-funnel-python"
 version = "0.5.0"
 dependencies = [
  "arrow-schema",
+ "delta-arrow-reader",
  "delta-funnel",
  "libc",
  "pyo3",

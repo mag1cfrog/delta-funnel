@@ -14,11 +14,7 @@ use delta_arrow_reader::{
     collect_delta_datafusion_metrics, derive_delta_scan_partition_target_diagnostic,
     register_delta_table,
 };
-use delta_funnel::{
-    DeltaProviderReaderBackend, DeltaProviderScanExecutionOptions, DeltaSourceConfig,
-    DeltaTableProviderConfig, load_delta_source, preflight_delta_protocol,
-    register_delta_sources_with_scan_execution_options,
-};
+use delta_funnel::{DeltaFunnelSession, DeltaSourceConfig, SessionOptions};
 use futures_util::TryStreamExt;
 
 fn type_widening_fixture_uri() -> String {
@@ -44,27 +40,26 @@ async fn type_widening_reads_old_and_new_physical_types_with_both_backends()
     ];
 
     for backend in [
-        DeltaProviderReaderBackend::NativeAsync,
-        DeltaProviderReaderBackend::OfficialKernel,
+        DeltaReaderBackend::NativeAsync,
+        DeltaReaderBackend::OfficialKernel,
     ] {
-        let context = SessionContext::new();
-        let source = load_delta_source(DeltaSourceConfig::new("widened", &table_uri))?;
-        let preflight = preflight_delta_protocol(&source)?;
+        let options = DeltaReaderExecutionOptions::new()
+            .with_reader_backend(backend)?
+            .with_max_concurrent_file_reads_per_scan(Some(1))?
+            .with_max_concurrent_file_reads_per_partition(1)?;
+        let mut session =
+            DeltaFunnelSession::new(SessionOptions::new().with_provider_scan_options(options))?;
+        session.delta_lake(DeltaSourceConfig::new("widened", &table_uri))?;
+        let source = session
+            .registered_source("widened")
+            .ok_or("missing registered source")?;
         assert_eq!(
-            preflight.protocol().reader_features,
+            source.protocol().reader_features,
             vec!["timestampNtz", "typeWidening-preview"]
         );
-        register_delta_sources_with_scan_execution_options(
-            &context,
-            vec![DeltaTableProviderConfig {
-                source,
-                protocol: preflight,
-                scan_target_partitions: None,
-            }],
-            DeltaProviderScanExecutionOptions::try_new_with_reader_backend(backend, 1, 1)?,
-        )?;
 
-        let batches = context
+        let batches = session
+            .context()
             .sql(
                 "select byte_long, int_long, \
                  float_double > 3.3 as float_widened, \

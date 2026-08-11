@@ -131,14 +131,17 @@ text. These redaction rules apply to both JSON and Rust `Debug` output.
 
 ## Delta Provider Snapshots
 
-A `DeltaScanPlanningExec` operator can contain the existing
-`DeltaProviderReadStatsSnapshot` under `delta_provider_read_stats`. The profile
-reuses the established provider JSON mapping wholesale, so provider fields keep
-their existing names and availability semantics.
+A `DeltaDataFusionExec` operator can contain a canonical
+`delta_arrow_reader::DeltaDataFusionMetricsSnapshot` under
+`delta_provider_read_stats`. The profile flattens that snapshot through the
+established provider JSON mapping, so provider fields keep their existing names
+and availability semantics. Rust callers read the separately retained source
+name through `delta_provider_source_name()`.
 
-Terminal consumers associate snapshots by exact read-stats `Arc` identity, not
-source name or snapshot contents. They reuse the immutable snapshot captured at
-the shared terminal transition and do not take a later live snapshot. A scan
+Terminal consumers associate snapshots by exact shared metrics identity, not
+source name, plan-node identity, or snapshot contents. They reuse the immutable
+snapshot captured at the shared terminal transition and do not take a later
+live snapshot. A scan
 missing from a supplied terminal set gets `null` provider stats and an internal
 redacted diagnostic. A supplied snapshot with no matching scan is ignored.
 The standalone internal collector can instead snapshot each unique handle once
