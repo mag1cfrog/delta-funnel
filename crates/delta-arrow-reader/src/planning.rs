@@ -81,6 +81,11 @@ pub(crate) fn build_scan(
     predicate: Option<DeltaKernelPredicate>,
     include_stats: bool,
 ) -> Result<KernelScan, DeltaReaderError> {
+    let _planning = tracing::debug_span!(
+        target: "delta_arrow_reader::profile",
+        "Delta Kernel scan construction"
+    )
+    .entered();
     validate_protocol(snapshot.protocol_info())?;
     validate_projection(snapshot.schema().as_ref(), projection)?;
     snapshot
@@ -194,12 +199,18 @@ fn build_unpartitioned_scan_plan(
         kernel_predicate.clone(),
         include_stats,
     )?;
-    let metadata = scan
-        .file_metadata(snapshot.engine_context())
-        .boxed()
-        .context(ScanPlanningSnafu {
-            reason: "kernel_scan_metadata_failed",
-        })?;
+    let metadata = {
+        let _planning = tracing::debug_span!(
+            target: "delta_arrow_reader::profile",
+            "Delta scan metadata expansion"
+        )
+        .entered();
+        scan.file_metadata(snapshot.engine_context())
+            .boxed()
+            .context(ScanPlanningSnafu {
+                reason: "kernel_scan_metadata_failed",
+            })?
+    };
     let file_tasks = metadata
         .files
         .into_iter()
@@ -246,10 +257,17 @@ fn finalize_scan_plan(
     partition_target_diagnostic: DeltaScanPartitionTargetDiagnosticOutput,
 ) -> Result<DeltaScanPlan, DeltaReaderError> {
     let files_planned = unpartitioned.file_tasks.len();
-    let partitions = group_scan_file_tasks(
-        unpartitioned.file_tasks,
-        partition_target_diagnostic.target_partitions,
-    )?;
+    let partitions = {
+        let _planning = tracing::debug_span!(
+            target: "delta_arrow_reader::profile",
+            "Delta file task partitioning"
+        )
+        .entered();
+        group_scan_file_tasks(
+            unpartitioned.file_tasks,
+            partition_target_diagnostic.target_partitions,
+        )?
+    };
     let metrics = DeltaReadMetrics::new(DeltaReadMetricsConfig {
         snapshot_version: unpartitioned.snapshot_version,
         reader_backend: unpartitioned.execution_options.reader_backend(),
@@ -284,6 +302,11 @@ fn finalize_scan_plan(
 fn local_partition_target_diagnostic(
     options: DeltaScanPartitionTargetOptions,
 ) -> Result<DeltaScanPartitionTargetDiagnosticOutput, DeltaReaderError> {
+    let _planning = tracing::debug_span!(
+        target: "delta_arrow_reader::profile",
+        "Delta partition target selection"
+    )
+    .entered();
     let mut input = delta_scan_partition_target_local_environment_diagnostic().policy_input;
     input.explicit_target_partitions = options.explicit_target_partitions;
     if options.caller_target_partitions.is_some() {
@@ -2388,10 +2411,10 @@ mod tests {
             "datafusion::",
             "MetricBuilder",
             "ExecutionPlanMetricsSet",
-            "tracing::",
         ] {
             assert!(!planning_source.contains(forbidden), "{forbidden}");
             assert!(!transform_source.contains(forbidden), "{forbidden}");
         }
+        assert!(!transform_source.contains("tracing::"));
     }
 }

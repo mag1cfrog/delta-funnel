@@ -8,7 +8,7 @@ use delta_arrow_reader::{
     DeltaScanPartitionTargetDiagnosticInput, DeltaScanPartitionTargetDiagnosticOutput,
     DeltaScanPartitionTargetDiagnosticSource, DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
     DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaSnapshotSelection,
-    DeltaStorageOptions, DeltaTable, DeltaTableBuilder,
+    DeltaStorageOptions, DeltaTable, DeltaTableBuilder, DeltaTableSnapshot,
     delta_scan_partition_target_local_environment_diagnostic,
     derive_delta_scan_partition_target_diagnostic,
 };
@@ -25,12 +25,15 @@ fn configuration_and_error_contract_is_public() -> Result<(), DeltaReaderError> 
         DeltaProtocolInfo::reader_features;
     let writer_features: for<'a> fn(&'a DeltaProtocolInfo) -> &'a [String] =
         DeltaProtocolInfo::writer_features;
+    let first_unsupported_reader_feature: for<'a> fn(&'a DeltaProtocolInfo) -> Option<&'a str> =
+        DeltaProtocolInfo::first_unsupported_reader_feature;
     let _ = (
         snapshot_version,
         min_reader_version,
         min_writer_version,
         reader_features,
         writer_features,
+        first_unsupported_reader_feature,
     );
 
     let mut storage_options = DeltaStorageOptions::new();
@@ -203,7 +206,30 @@ fn direct_reader_contract_is_public() {
     assert_future::<Result<DeltaTable, DeltaReaderError>>(builder.load_async());
     let load: fn(DeltaTableBuilder) -> Result<DeltaTable, DeltaReaderError> =
         DeltaTableBuilder::load;
-    let _ = load;
+    let load_snapshot: fn(DeltaTableBuilder) -> Result<DeltaTableSnapshot, DeltaReaderError> =
+        DeltaTableBuilder::load_snapshot;
+    let snapshot_builder = DeltaTableBuilder::new("file:///tmp/table");
+    assert_future::<Result<DeltaTableSnapshot, DeltaReaderError>>(
+        snapshot_builder.load_snapshot_async(),
+    );
+    let _ = (load, load_snapshot);
+
+    let snapshot_version: fn(&DeltaTableSnapshot) -> u64 = DeltaTableSnapshot::version;
+    let snapshot_protocol: for<'a> fn(&'a DeltaTableSnapshot) -> &'a DeltaProtocolInfo =
+        DeltaTableSnapshot::protocol;
+    let snapshot_table_uri: for<'a> fn(&'a DeltaTableSnapshot) -> &'a str =
+        DeltaTableSnapshot::table_uri;
+    let validate_snapshot_protocol: fn(&DeltaTableSnapshot) -> Result<(), DeltaReaderError> =
+        DeltaTableSnapshot::validate_protocol;
+    let into_table: fn(DeltaTableSnapshot) -> Result<DeltaTable, DeltaReaderError> =
+        DeltaTableSnapshot::into_table;
+    let _ = (
+        snapshot_version,
+        snapshot_protocol,
+        snapshot_table_uri,
+        validate_snapshot_protocol,
+        into_table,
+    );
 
     let version: fn(&DeltaTable) -> u64 = DeltaTable::version;
     let schema: for<'a> fn(&'a DeltaTable) -> &'a SchemaRef = DeltaTable::schema;
@@ -278,9 +304,11 @@ fn datafusion_metrics_contract_is_public() {
         DeltaDataFusionMetrics::source_name;
     let snapshot: fn(&DeltaDataFusionMetrics) -> DeltaDataFusionMetricsSnapshot =
         DeltaDataFusionMetrics::snapshot;
+    let same_instance: fn(&DeltaDataFusionMetrics, &DeltaDataFusionMetrics) -> bool =
+        DeltaDataFusionMetrics::same_instance;
     let collect: fn(&dyn datafusion::physical_plan::ExecutionPlan) -> Vec<DeltaDataFusionMetrics> =
         collect_delta_datafusion_metrics;
-    let _ = (source_name, snapshot, collect, inspect);
+    let _ = (source_name, snapshot, same_instance, collect, inspect);
 }
 
 #[cfg(feature = "datafusion")]

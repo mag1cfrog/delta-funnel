@@ -25,6 +25,41 @@ pub(crate) struct LoadedDeltaTableSnapshot {
     engine_context: Arc<DeltaKernelEngineContext>,
 }
 
+pub(crate) struct StagedDeltaTableSnapshot {
+    snapshot: KernelSnapshot,
+    protocol_info: DeltaProtocolInfo,
+    engine_context: Arc<DeltaKernelEngineContext>,
+}
+
+impl StagedDeltaTableSnapshot {
+    pub(crate) fn table_uri(&self) -> &str {
+        self.engine_context.table_url().as_str()
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.snapshot.version()
+    }
+
+    pub(crate) fn protocol_info(&self) -> &DeltaProtocolInfo {
+        &self.protocol_info
+    }
+
+    pub(crate) fn into_loaded(self) -> Result<LoadedDeltaTableSnapshot, DeltaReaderError> {
+        let schema =
+            snapshot_arrow_schema(&self.snapshot)
+                .boxed()
+                .context(SchemaConversionSnafu {
+                    reason: "schema_conversion_failed",
+                })?;
+        Ok(LoadedDeltaTableSnapshot {
+            snapshot: self.snapshot,
+            protocol_info: self.protocol_info,
+            schema,
+            engine_context: self.engine_context,
+        })
+    }
+}
+
 #[allow(dead_code)]
 impl LoadedDeltaTableSnapshot {
     pub(crate) fn table_uri(&self) -> &str {
@@ -67,46 +102,62 @@ pub(crate) fn load_delta_table_snapshot_blocking(
 ) -> Result<LoadedDeltaTableSnapshot, DeltaReaderError> {
     let selection_kind = snapshot_selection_kind(selection);
     trace_snapshot_load_started(selection_kind);
-    let result = (|| {
-        let table_url = normalize_delta_table_uri(table_uri)?;
-        let s3_auth_mode_hint = s3_auth_mode_hint_for_source(&table_url, storage_options);
-        let engine_context = DeltaKernelEngineContext::build(table_url, storage_options)
-            .boxed()
-            .context(StorageInitializationSnafu {
-                reason: "storage_initialization_failed",
-            })?;
-        let engine_context = Arc::new(engine_context);
-        let version = match selection {
-            DeltaSnapshotSelection::Latest => None,
-            DeltaSnapshotSelection::Version(version) => Some(version),
-        };
-        let snapshot =
-            engine_context
-                .load_snapshot(version)
-                .boxed()
-                .context(SnapshotLoadSnafu {
-                    reason: snapshot_load_failed_reason(s3_auth_mode_hint),
-                })?;
-        let protocol_info = DeltaProtocolInfo::from_snapshot(&snapshot);
-        let schema = snapshot_arrow_schema(&snapshot)
-            .boxed()
-            .context(SchemaConversionSnafu {
-                reason: "schema_conversion_failed",
-            })?;
-
-        Ok(LoadedDeltaTableSnapshot {
-            snapshot,
-            protocol_info,
-            schema,
-            engine_context,
-        })
-    })();
+    let result = stage_delta_table_snapshot(table_uri, storage_options, selection)
+        .and_then(StagedDeltaTableSnapshot::into_loaded);
 
     match &result {
         Ok(snapshot) => trace_snapshot_load_completed(selection_kind, snapshot),
         Err(error) => trace_snapshot_load_failed(selection_kind, error),
     }
     result
+}
+
+pub(crate) fn load_staged_delta_table_snapshot_blocking(
+    table_uri: &str,
+    storage_options: &DeltaStorageOptions,
+    selection: DeltaSnapshotSelection,
+) -> Result<StagedDeltaTableSnapshot, DeltaReaderError> {
+    let selection_kind = snapshot_selection_kind(selection);
+    trace_snapshot_load_started(selection_kind);
+    let result = stage_delta_table_snapshot(table_uri, storage_options, selection);
+
+    match &result {
+        Ok(snapshot) => trace_staged_snapshot_load_completed(selection_kind, snapshot),
+        Err(error) => trace_snapshot_load_failed(selection_kind, error),
+    }
+    result
+}
+
+fn stage_delta_table_snapshot(
+    table_uri: &str,
+    storage_options: &DeltaStorageOptions,
+    selection: DeltaSnapshotSelection,
+) -> Result<StagedDeltaTableSnapshot, DeltaReaderError> {
+    let table_url = normalize_delta_table_uri(table_uri)?;
+    let s3_auth_mode_hint = s3_auth_mode_hint_for_source(&table_url, storage_options);
+    let engine_context = DeltaKernelEngineContext::build(table_url, storage_options)
+        .boxed()
+        .context(StorageInitializationSnafu {
+            reason: "storage_initialization_failed",
+        })?;
+    let engine_context = Arc::new(engine_context);
+    let version = match selection {
+        DeltaSnapshotSelection::Latest => None,
+        DeltaSnapshotSelection::Version(version) => Some(version),
+    };
+    let snapshot = engine_context
+        .load_snapshot(version)
+        .boxed()
+        .context(SnapshotLoadSnafu {
+            reason: snapshot_load_failed_reason(s3_auth_mode_hint),
+        })?;
+    let protocol_info = DeltaProtocolInfo::from_snapshot(&snapshot);
+
+    Ok(StagedDeltaTableSnapshot {
+        snapshot,
+        protocol_info,
+        engine_context,
+    })
 }
 
 #[allow(dead_code)]
@@ -122,6 +173,30 @@ pub(crate) async fn load_delta_table_snapshot_async(
     let selection_kind = snapshot_selection_kind(selection);
     let result = tokio::task::spawn_blocking(move || {
         load_delta_table_snapshot_blocking(&table_uri, &storage_options, selection)
+    })
+    .await
+    .boxed()
+    .context(SnapshotLoadSnafu {
+        reason: "snapshot_load_task_failed",
+    });
+
+    match result {
+        Ok(result) => result,
+        Err(error) => {
+            trace_snapshot_load_failed(selection_kind, &error);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn load_staged_delta_table_snapshot_async(
+    table_uri: String,
+    storage_options: DeltaStorageOptions,
+    selection: DeltaSnapshotSelection,
+) -> Result<StagedDeltaTableSnapshot, DeltaReaderError> {
+    let selection_kind = snapshot_selection_kind(selection);
+    let result = tokio::task::spawn_blocking(move || {
+        load_staged_delta_table_snapshot_blocking(&table_uri, &storage_options, selection)
     })
     .await
     .boxed()
@@ -154,6 +229,19 @@ fn trace_snapshot_load_started(selection: &'static str) {
 }
 
 fn trace_snapshot_load_completed(selection: &'static str, snapshot: &LoadedDeltaTableSnapshot) {
+    tracing::debug!(
+        target: TRACING_TARGET,
+        event = SNAPSHOT_LOAD_COMPLETED_EVENT,
+        selection,
+        snapshot_version = snapshot.version(),
+        protocol_reader_version = snapshot.protocol_info().min_reader_version()
+    );
+}
+
+fn trace_staged_snapshot_load_completed(
+    selection: &'static str,
+    snapshot: &StagedDeltaTableSnapshot,
+) {
     tracing::debug!(
         target: TRACING_TARGET,
         event = SNAPSHOT_LOAD_COMPLETED_EVENT,
@@ -309,8 +397,8 @@ mod tests {
 
     use super::{
         S3AuthModeHint, TRACING_TARGET, load_delta_table_snapshot_async,
-        load_delta_table_snapshot_blocking, s3_auth_mode_hint_for_source,
-        snapshot_load_failed_reason,
+        load_delta_table_snapshot_blocking, load_staged_delta_table_snapshot_blocking,
+        s3_auth_mode_hint_for_source, snapshot_load_failed_reason,
     };
     use crate::{
         DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaStorageOptions,
@@ -323,6 +411,7 @@ mod tests {
     const SUPPORTED_TYPES_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"profile\",\"type\":{\"type\":\"struct\",\"fields\":[{\"name\":\"age\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}},{\"name\":\"nickname\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]},\"nullable\":true,\"metadata\":{}},{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":false},\"nullable\":true,\"metadata\":{}},{\"name\":\"attributes\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"long\",\"valueContainsNull\":false},\"nullable\":true,\"metadata\":{}},{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}},{\"name\":\"event_ts_ntz\",\"type\":\"timestamp_ntz\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
     const COLUMN_MAPPING_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}"#;
     const COLUMN_MAPPING_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"phys_id\"}},{\"name\":\"customer_name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"phys_customer_name\"}}]}","partitionColumns":[],"configuration":{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"2"},"createdTime":1587968585495}}"#;
+    const INVALID_ARROW_SCHEMA_METADATA_JSON: &str = r#"{"metaData":{"id":"delta-arrow-reader-test","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"bad_array\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.nested.ids\":\"not an object\"}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
 
     static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TRACING_TEST_GLOBAL_SUBSCRIBER: Once = Once::new();
@@ -571,6 +660,32 @@ mod tests {
         assert_eq!(key_value[0].data_type(), &DataType::Utf8);
         assert_eq!(key_value[1].data_type(), &DataType::Int64);
         assert!(!key_value[1].is_nullable());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_load_exposes_metadata_before_schema_conversion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let table = DeltaLogTable::new_with_protocol_and_metadata(
+            "staged-schema-failure",
+            PROTOCOL_JSON,
+            INVALID_ARROW_SCHEMA_METADATA_JSON,
+        )?;
+        let staged = load_staged_delta_table_snapshot_blocking(
+            &table.0.to_string_lossy(),
+            &DeltaStorageOptions::new(),
+            DeltaSnapshotSelection::Latest,
+        )?;
+
+        assert_eq!(staged.version(), 1);
+        assert_eq!(staged.protocol_info().min_reader_version(), 1);
+        assert!(staged.table_uri().starts_with("file://"));
+        let error = match staged.into_loaded() {
+            Ok(_) => panic!("invalid nested column metadata must fail schema conversion"),
+            Err(error) => error,
+        };
+        assert_eq!(error.phase(), DeltaReaderPhase::Schema);
+        assert!(matches!(error, DeltaReaderError::SchemaConversion { .. }));
         Ok(())
     }
 

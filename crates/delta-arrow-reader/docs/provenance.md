@@ -19,10 +19,17 @@ The governing issues are
 
 ## Independent handoff
 
-[Issue #486](https://github.com/mag1cfrog/delta-funnel/issues/486) will export
-one later frozen staging SHA into the independent repository and become the
-final repository and provenance authority. This scaffold does not reserve or
-publish the candidate package.
+[Issue #486](https://github.com/mag1cfrog/delta-funnel/issues/486) exported the
+validated staging subtree into the independent repository with unchanged crate
+bytes and file modes. The independent repository is the canonical source.
+
+After that export, independent repository pull requests
+[#4](https://github.com/mag1cfrog/delta-arrow-reader/pull/4) and
+[#5](https://github.com/mag1cfrog/delta-arrow-reader/pull/5) corrected parity
+gaps found during the Delta Funnel cutover. Issue #476 mirrors those corrected
+source files and public contract tests back into this temporary staging tree
+before the corresponding Delta Funnel code is deleted. The independent
+repository remains the canonical source.
 
 ## Path mapping
 

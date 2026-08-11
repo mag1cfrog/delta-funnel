@@ -134,6 +134,11 @@ impl DeltaDataFusionMetrics {
         }
     }
 
+    /// Returns whether both handles refer to the same live metrics instance.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     fn record_output_batch_size(&self, value: usize) {
         self.inner
             .output_batch_size
@@ -1228,6 +1233,8 @@ mod tests {
         assert_eq!(shared_handles.len(), 2);
         assert_eq!(shared_handles[0].source_name(), Some("first"));
         assert_eq!(shared_handles[1].source_name(), Some("second"));
+        assert!(handles[0].same_instance(&shared_handles[0]));
+        assert!(!handles[0].same_instance(&shared_handles[1]));
 
         drop(shared_metrics_union);
         drop(union);

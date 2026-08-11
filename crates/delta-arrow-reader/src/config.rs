@@ -186,25 +186,6 @@ impl DeltaReaderExecutionOptions {
             "parquet_full_file_read_threshold_must_be_positive",
         )?;
 
-        if self
-            .max_concurrent_file_reads_per_scan
-            .is_some_and(|scan_limit| self.max_concurrent_file_reads_per_partition > scan_limit)
-        {
-            return InvalidConfigurationSnafu {
-                reason: "partition_file_read_limit_exceeds_scan_limit",
-            }
-            .fail();
-        }
-
-        if self.native_async_prefetch_file_count_per_partition
-            > self.max_concurrent_file_reads_per_partition
-        {
-            return InvalidConfigurationSnafu {
-                reason: "native_async_prefetch_exceeds_partition_file_read_limit",
-            }
-            .fail();
-        }
-
         Ok(())
     }
 
@@ -308,9 +289,6 @@ mod tests {
             DeltaReaderExecutionOptions::new().with_output_buffer_capacity_per_partition(0),
             DeltaReaderExecutionOptions::new().with_parquet_metadata_size_hint(Some(0)),
             DeltaReaderExecutionOptions::new().with_parquet_full_file_read_threshold(Some(0)),
-            DeltaReaderExecutionOptions::new().with_max_concurrent_file_reads_per_scan(Some(2)),
-            DeltaReaderExecutionOptions::new()
-                .with_native_async_prefetch_file_count_per_partition(4),
         ];
 
         for result in invalid {
@@ -318,6 +296,19 @@ mod tests {
             assert_eq!(error.phase(), DeltaReaderPhase::Configuration);
             assert_eq!(error.as_str(), "invalid_configuration");
         }
+    }
+
+    #[test]
+    fn independent_bounds_preserve_the_frozen_reader_behavior()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = DeltaReaderExecutionOptions::new()
+            .with_max_concurrent_file_reads_per_scan(Some(2))?
+            .with_native_async_prefetch_file_count_per_partition(4)?;
+
+        assert_eq!(options.max_concurrent_file_reads_per_scan(), Some(2));
+        assert_eq!(options.max_concurrent_file_reads_per_partition(), 3);
+        assert_eq!(options.native_async_prefetch_file_count_per_partition(), 4);
+        Ok(())
     }
 
     #[test]

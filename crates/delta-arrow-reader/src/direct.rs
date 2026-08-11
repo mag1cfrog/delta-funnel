@@ -27,8 +27,9 @@ use crate::{
         PartitionStream,
     },
     snapshot::{
-        LoadedDeltaTableSnapshot, load_delta_table_snapshot_async,
-        load_delta_table_snapshot_blocking,
+        LoadedDeltaTableSnapshot, StagedDeltaTableSnapshot, load_delta_table_snapshot_async,
+        load_delta_table_snapshot_blocking, load_staged_delta_table_snapshot_async,
+        load_staged_delta_table_snapshot_blocking,
     },
 };
 
@@ -126,6 +127,29 @@ impl DeltaTableBuilder {
         .await?;
         Ok(DeltaTable::new(snapshot, self.execution_options))
     }
+
+    /// Loads snapshot metadata without converting its logical Arrow schema.
+    pub fn load_snapshot(self) -> Result<DeltaTableSnapshot, DeltaReaderError> {
+        validate_direct_execution_options(self.execution_options)?;
+        let snapshot = load_staged_delta_table_snapshot_blocking(
+            &self.table_uri,
+            &self.storage_options,
+            self.snapshot_selection,
+        )?;
+        Ok(DeltaTableSnapshot::new(snapshot, self.execution_options))
+    }
+
+    /// Loads snapshot metadata through the caller-owned Tokio runtime.
+    pub async fn load_snapshot_async(self) -> Result<DeltaTableSnapshot, DeltaReaderError> {
+        validate_direct_execution_options(self.execution_options)?;
+        let snapshot = load_staged_delta_table_snapshot_async(
+            self.table_uri,
+            self.storage_options,
+            self.snapshot_selection,
+        )
+        .await?;
+        Ok(DeltaTableSnapshot::new(snapshot, self.execution_options))
+    }
 }
 
 impl fmt::Debug for DeltaTableBuilder {
@@ -137,6 +161,63 @@ impl fmt::Debug for DeltaTableBuilder {
             .field("snapshot_selection", &self.snapshot_selection)
             .field("execution_options", &self.execution_options)
             .finish()
+    }
+}
+
+/// Loaded Delta snapshot metadata awaiting logical Arrow schema conversion.
+pub struct DeltaTableSnapshot {
+    snapshot: StagedDeltaTableSnapshot,
+    execution_options: DeltaReaderExecutionOptions,
+}
+
+impl DeltaTableSnapshot {
+    fn new(
+        snapshot: StagedDeltaTableSnapshot,
+        execution_options: DeltaReaderExecutionOptions,
+    ) -> Self {
+        Self {
+            snapshot,
+            execution_options,
+        }
+    }
+
+    /// Returns the loaded Delta snapshot version.
+    pub fn version(&self) -> u64 {
+        self.snapshot.version()
+    }
+
+    /// Returns the loaded Delta protocol metadata.
+    pub fn protocol(&self) -> &DeltaProtocolInfo {
+        self.snapshot.protocol_info()
+    }
+
+    /// Returns the normalized table URI.
+    ///
+    /// This value may contain sensitive caller input. Do not log or expose it.
+    pub fn table_uri(&self) -> &str {
+        self.snapshot.table_uri()
+    }
+
+    /// Validates the loaded snapshot against the supported reader protocol.
+    pub fn validate_protocol(&self) -> Result<(), DeltaReaderError> {
+        validate_protocol(self.protocol())
+    }
+
+    /// Converts the logical Arrow schema and finishes constructing the table.
+    pub fn into_table(self) -> Result<DeltaTable, DeltaReaderError> {
+        Ok(DeltaTable::new(
+            self.snapshot.into_loaded()?,
+            self.execution_options,
+        ))
+    }
+}
+
+impl fmt::Debug for DeltaTableSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeltaTableSnapshot")
+            .field("version", &self.version())
+            .finish_non_exhaustive()
     }
 }
 

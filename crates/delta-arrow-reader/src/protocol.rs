@@ -73,6 +73,14 @@ impl DeltaProtocolInfo {
     pub fn writer_features(&self) -> &[String] {
         &self.writer_features
     }
+
+    /// Returns the first required reader feature unsupported by this crate.
+    pub fn first_unsupported_reader_feature(&self) -> Option<&str> {
+        self.reader_features
+            .iter()
+            .map(String::as_str)
+            .find(|feature| !SUPPORTED_READER_FEATURES.contains(feature))
+    }
 }
 
 #[allow(dead_code)]
@@ -86,11 +94,7 @@ pub(crate) fn validate_protocol(protocol: &DeltaProtocolInfo) -> Result<(), Delt
         .fail();
     }
 
-    if protocol
-        .reader_features
-        .iter()
-        .any(|feature| !SUPPORTED_READER_FEATURES.contains(&feature.as_str()))
-    {
+    if protocol.first_unsupported_reader_feature().is_some() {
         return UnsupportedProtocolSnafu {
             reason: "unsupported_reader_feature",
         }
@@ -238,6 +242,10 @@ mod tests {
         let protocol = loaded.protocol_info();
 
         assert_eq!(protocol.reader_features(), ["madeUpFeature"]);
+        assert_eq!(
+            protocol.first_unsupported_reader_feature(),
+            Some("madeUpFeature")
+        );
         let error = validate_protocol(protocol).expect_err("unknown feature must fail");
         assert!(matches!(
             error,

@@ -9,6 +9,7 @@ use object_store::{
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
     path::Path,
 };
+use tracing::Instrument;
 
 use crate::DeltaReadMetrics;
 
@@ -64,7 +65,14 @@ impl ObjectStore for MeteredParquetObjectStore {
             }
         }
 
-        let result = self.inner.get_opts(location, options).await?;
+        let result = self
+            .inner
+            .get_opts(location, options)
+            .instrument(tracing::debug_span!(
+                target: "delta_arrow_reader::profile",
+                "Object store transport"
+            ))
+            .await?;
         if should_meter_payload {
             Ok(meter_get_result(result, self.metrics.clone()))
         } else {

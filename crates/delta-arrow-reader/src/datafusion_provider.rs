@@ -97,6 +97,11 @@ impl DeltaTableProvider {
         projection: Option<&[usize]>,
         filters: &[Expr],
     ) -> Result<(Arc<dyn ExecutionPlan>, usize), DeltaReaderError> {
+        let _planning = tracing::debug_span!(
+            target: "delta_arrow_reader::profile",
+            "Delta scan planning"
+        )
+        .entered();
         let partition_columns = self
             .table
             .partition_columns()
@@ -169,15 +174,20 @@ impl DeltaTableProvider {
             },
         )?;
         let partition_count = core.partitions.len();
-        Ok((
+        let plan = {
+            let _setup = tracing::debug_span!(
+                target: "delta_arrow_reader::profile",
+                "Delta scan execution setup"
+            )
+            .entered();
             create_datafusion_execution_plan(
                 core,
                 planning,
                 row_predicate,
                 self.source_name.clone(),
-            ),
-            partition_count,
-        ))
+            )
+        };
+        Ok((plan, partition_count))
     }
 }
 

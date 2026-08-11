@@ -59,9 +59,23 @@ pub(crate) fn plan_datafusion_scan(
     capabilities: DataFusionFilterCapabilities,
 ) -> Result<DataFusionScanPlanning, DeltaReaderError> {
     validate_projection(schema, projection)?;
-    let filter_plan = plan_datafusion_filters(schema, partition_columns, filters, capabilities);
+    let filter_plan = {
+        let _planning = tracing::debug_span!(
+            target: "delta_arrow_reader::profile",
+            "Delta filter planning"
+        )
+        .entered();
+        plan_datafusion_filters(schema, partition_columns, filters, capabilities)
+    };
     validate_inexact_residual_projection(schema, projection, &filter_plan)?;
-    let projection_plan = plan_projection(schema, projection, &filter_plan.referenced_columns)?;
+    let projection_plan = {
+        let _planning = tracing::debug_span!(
+            target: "delta_arrow_reader::profile",
+            "Delta projection planning"
+        )
+        .entered();
+        plan_projection(schema, projection, &filter_plan.referenced_columns)?
+    };
     Ok(DataFusionScanPlanning {
         projection: projection_plan,
         filters: filter_plan,

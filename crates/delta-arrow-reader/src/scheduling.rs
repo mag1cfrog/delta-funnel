@@ -17,6 +17,7 @@ use tokio::{
     sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
 };
+use tracing::Instrument;
 
 use crate::{
     DeltaReadMetrics, DeltaReaderBackend, DeltaReaderError, DeltaReaderExecutionOptions,
@@ -394,13 +395,22 @@ impl PartitionStream {
         );
         let run_cancellation = cancellation.clone();
         let start = Box::new(move |output| {
-            tokio::spawn(run_partition(
-                output,
-                scheduler,
-                metrics,
-                run_cancellation,
-                prefetch_file_count,
-            ))
+            let span = tracing::debug_span!(
+                target: "delta_arrow_reader::profile",
+                parent: None,
+                "Delta partition task"
+            );
+            span.follows_from(tracing::Span::current().id());
+            tokio::spawn(
+                run_partition(
+                    output,
+                    scheduler,
+                    metrics,
+                    run_cancellation,
+                    prefetch_file_count,
+                )
+                .instrument(span),
+            )
         });
 
         Self {
