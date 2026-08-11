@@ -1,25 +1,26 @@
 # DataFusion and Delta Internals
 
-Delta Funnel uses DataFusion for SQL planning and execution, and Delta Kernel
-for Delta Lake metadata and protocol handling.
+Delta Funnel uses DataFusion for SQL planning and execution. The published
+[`delta-arrow-reader`](https://docs.rs/delta-arrow-reader/0.1.2/delta_arrow_reader/)
+crate owns Delta metadata loading, scan planning, file reads, transforms,
+deletion vectors, and the DataFusion table provider.
 
-The Delta provider connects those systems. It turns Delta scan metadata into
-bounded DataFusion work, applies Delta transforms and deletion vectors, and
-records read statistics for reports and progress displays.
+Delta Funnel supplies source and execution policy to that provider, then owns
+the surrounding session, workflow, report, progress, profiling, SQL Server,
+and Python integration. It does not contain a second Delta reader.
 
 ## Delta scan planning
 
-Delta scan planning turns active Delta files into DataFusion scan work. The
-provider decides how many scan partitions to request before Delta scan metadata
-is expanded.
+The standalone provider turns active Delta files into bounded DataFusion scan
+work. Delta Funnel exposes the relevant source options and records the
+resulting diagnostics.
 
 - [Scan partition target policy](scan-partition-planning.md)
 
 ## Read scheduling and dynamic pruning
 
-Provider reads are bounded so one scan cannot create unbounded file-read work.
-The native async backend applies Delta transforms and deletion-vector masks
-before rows reach DataFusion. Dynamic partition pruning can skip selected files
-before that work starts.
+The standalone provider owns bounded reads, cancellation, transforms,
+deletion-vector masking, and dynamic partition pruning. Delta Funnel consumes
+its metrics in product reports and execution profiles.
 
 - [Delta provider read scheduling](provider-read-scheduling.md)

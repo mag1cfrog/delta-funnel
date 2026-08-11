@@ -131,32 +131,6 @@ fn delta_funnel_error_parts(
             Ok(("datafusion_registration", "datafusion_registration", None))
         }
         delta_funnel::DeltaFunnelError::SqlTable { .. } => Ok(("sql_table", "sql_table", None)),
-        delta_funnel::DeltaFunnelError::DeltaScanProjection { .. } => {
-            Ok(("delta_scan", "delta_scan_projection", None))
-        }
-        delta_funnel::DeltaFunnelError::DeltaScanFilter { .. } => {
-            Ok(("delta_scan", "delta_scan_filter", None))
-        }
-        delta_funnel::DeltaFunnelError::DeltaScanConstruction { .. } => {
-            Ok(("delta_scan", "delta_scan_construction", None))
-        }
-        delta_funnel::DeltaFunnelError::DeltaScanMetadataExpansion { .. } => {
-            Ok(("delta_scan", "delta_scan_metadata_expansion", None))
-        }
-        delta_funnel::DeltaFunnelError::DeltaScanFileTaskPlanning { .. } => {
-            Ok(("delta_scan", "delta_scan_file_task_planning", None))
-        }
-        delta_funnel::DeltaFunnelError::DeltaScanFileTaskPartitionPlanning { .. } => Ok((
-            "delta_scan",
-            "delta_scan_file_task_partition_planning",
-            None,
-        )),
-        delta_funnel::DeltaFunnelError::DeltaScanFileRead { .. } => {
-            Ok(("delta_scan", "delta_scan_file_read", None))
-        }
-        delta_funnel::DeltaFunnelError::DeltaScanDeletionVector { .. } => {
-            Ok(("delta_scan", "delta_scan_deletion_vector", None))
-        }
         delta_funnel::DeltaFunnelError::DependencyCompatibility { .. } => {
             Ok(("dependency_compatibility", "dependency_compatibility", None))
         }

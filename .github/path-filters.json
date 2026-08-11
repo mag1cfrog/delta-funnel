@@ -22,7 +22,6 @@
     "crates/delta-funnel/src/query_engine/datafusion/operator_activity/**",
     "crates/delta-funnel/src/query_engine/datafusion/planning_activity.rs",
     "crates/delta-funnel/src/query_engine/datafusion/profiled_execution.rs",
-    "crates/delta-funnel/src/query_engine/datafusion/profiled_object_store.rs",
     "crates/delta-funnel/tests/perfetto_ranked_report_cli.rs",
     "crates/delta-funnel-python/Cargo.toml",
     "crates/delta-funnel-python/build.rs",

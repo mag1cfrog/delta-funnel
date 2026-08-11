@@ -5,6 +5,10 @@ partition target before Delta scan metadata expansion. The target is passed to
 metadata-only file task grouping after Delta Kernel has selected the active
 files.
 
+The implementation and its tests live in the standalone crate. This page
+documents the policy visible through Delta Funnel configuration, diagnostics,
+and benchmarks; it is not a second implementation specification.
+
 This policy decides how many provider scan partitions Delta Funnel asks for. It
 does not read Parquet data, create Arrow `RecordBatch` values, or execute file
 reads.

@@ -50,15 +50,10 @@ delta_kernel = { version = "=0.25.0", default-features = false, features = [
     "arrow",
     "internal-api",
 ] }
-delta_kernel_default_engine = { version = "=0.25.0", default-features = false, features = [
-    "arrow",
-    "native-tls",
-] }
 futures-util = "0.3"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"], optional = true }
 hyper-util = { version = "0.1.20", default-features = false, features = ["tracing"], optional = true }
 libc = "0.2"
-object_store = "0.13.2"
 parquet = { version = "58.3.0", features = ["async", "object_store"] }
 perfetto-sdk = { version = "1.0.3", optional = true }
 rkyv = { version = "0.8.17", default-features = false, features = ["aligned", "bytecheck", "little_endian", "pointer_width_32", "std"], optional = true }
@@ -75,6 +70,3 @@ zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation"] }

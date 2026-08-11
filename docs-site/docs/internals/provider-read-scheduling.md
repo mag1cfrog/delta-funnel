@@ -5,6 +5,10 @@ scheduling for provider file reads.
 This page explains the two reader backends, concurrency limits, dynamic
 partition pruning, backpressure, and cancellation behavior.
 
+The implementation and reader tests live in the standalone crate. Delta
+Funnel only adapts product configuration and consumes the resulting metrics,
+reports, and tracing spans.
+
 ## Reader Backends
 
 Provider execution supports two production reader backends selected through
