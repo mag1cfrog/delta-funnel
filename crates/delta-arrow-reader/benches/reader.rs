@@ -34,6 +34,7 @@ const BENCHMARK_SCHEMA_VERSION: u32 = 22;
 const DEFAULT_REPETITIONS: usize = 3;
 const MAX_REPETITIONS: usize = 128;
 const MODIFICATION_TIME_MS: i64 = 1_587_968_586_000;
+const FROZEN_PARQUET_CREATED_BY: &str = "parquet-rs version 58.3.0";
 const PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
 const DELETION_VECTOR_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#;
 const RELATIVE_DV_ID: &str = "vBn[lx{q8@P<9BNH/isA";
@@ -668,6 +669,7 @@ impl Fixture {
             next_row_id = next_row_id.saturating_add(file.rows);
             let batch = simple_orders_batch(Arc::clone(&schema), first_row_id, file.rows)?;
             let properties = WriterProperties::builder()
+                .set_created_by(FROZEN_PARQUET_CREATED_BY.to_owned())
                 .set_max_row_group_row_count(Some(file.rows))
                 .build();
             let data_path = path.join(&file.path);
