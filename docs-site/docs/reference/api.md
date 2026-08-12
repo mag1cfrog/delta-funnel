@@ -53,15 +53,23 @@ class WriteAllExecutionOptions(TypedDict, total=False):
     cache_mode: WriteAllCacheMode
     cache_aliases: Sequence[str]
 
-class ProviderScanOptions(TypedDict, total=False):
-    max_concurrent_file_reads_per_scan: int
-    max_concurrent_file_reads_per_partition: int
-    output_buffer_capacity_per_partition: int
-    native_async_prefetch_file_count_per_partition: int
-    parquet_metadata_size_hint: int | None
-    parquet_full_file_read_threshold: int | None
-    intra_file_repartitioning: Literal["fill_missing_parallelism", "rebalance"]
-    use_view_types: bool
+class FileRepartitioning:
+    FILL_MISSING_PARALLELISM: ClassVar[FileRepartitioning]
+    REBALANCE: ClassVar[FileRepartitioning]
+
+class ProviderScanOptions:
+    def __init__(
+        self,
+        *,
+        max_concurrent_file_reads_per_scan: int | None = None,
+        max_concurrent_file_reads_per_partition: int = 3,
+        output_buffer_capacity_per_partition: int = 1,
+        native_async_prefetch_file_count_per_partition: int = 2,
+        parquet_metadata_size_hint: int | None = 65_536,
+        parquet_full_file_read_threshold: int | None = None,
+        intra_file_repartitioning: FileRepartitioning = FileRepartitioning.FILL_MISSING_PARALLELISM,
+        use_view_types: bool = False,
+    ) -> None: ...
 ```
 
 Reports are JSON-compatible Python dictionaries. See
@@ -190,11 +198,24 @@ SQL Server defaults.
 | `validation_options` | Target validation and dry-run scan-summary behavior. |
 | `schema_options` | Arrow-to-SQL Server type mapping policies. |
 
-##### Session option mappings
+##### Session options
 
-All option mappings reject unknown keys.
+Dictionary-backed validation and schema options reject unknown keys.
 
-`provider_scan_options` accepts:
+Use the typed options object for editor completion and checked policy values:
+
+```python
+from deltafunnel import FileRepartitioning, ProviderScanOptions, Session
+
+session = Session(
+    provider_scan_options=ProviderScanOptions(
+        intra_file_repartitioning=FileRepartitioning.REBALANCE,
+        use_view_types=True,
+    )
+)
+```
+
+`ProviderScanOptions` accepts these keyword arguments:
 
 | Key | Accepted value | Default |
 | --- | --- | --- |
@@ -204,7 +225,7 @@ All option mappings reject unknown keys.
 | `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
 | `parquet_metadata_size_hint` | Positive Parquet file-tail size in bytes; `None` disables footer metadata prefetch | `65536` (64 KiB) |
 | `parquet_full_file_read_threshold` | Positive maximum Parquet file size in bytes; `None` disables buffered full-file reads | `None` |
-| `intra_file_repartitioning` | `"fill_missing_parallelism"` splits files only when whole-file planning produces too few partitions; `"rebalance"` also lets DataFusion rebalance file groups that already fill the target | `"fill_missing_parallelism"` |
+| `intra_file_repartitioning` | `FileRepartitioning.FILL_MISSING_PARALLELISM` splits files only when whole-file planning produces too few partitions; `FileRepartitioning.REBALANCE` also lets DataFusion rebalance file groups that already fill the target | `FileRepartitioning.FILL_MISSING_PARALLELISM` |
 | `use_view_types` | Boolean selecting Arrow Utf8View and BinaryView data columns | `False` |
 
 Delta Funnel defaults to ordinary Arrow Utf8 and Binary arrays because they
@@ -223,9 +244,9 @@ For example, to buffer Parquet files up to 2 MiB for one measured workload:
 
 ```python
 session = Session(
-    provider_scan_options={
-        "parquet_full_file_read_threshold": 2 * 1024 * 1024,
-    }
+    provider_scan_options=ProviderScanOptions(
+        parquet_full_file_read_threshold=2 * 1024 * 1024,
+    )
 )
 ```
 

@@ -9,6 +9,7 @@ mod output;
 mod perfetto_diagnostics;
 mod profiler;
 mod progress;
+mod provider_options;
 mod session;
 mod table;
 #[cfg(all(feature = "perfetto-profile", target_os = "linux"))]
@@ -35,6 +36,7 @@ fn deltafunnel(module: &Bound<'_, PyModule>) -> PyResult<()> {
     logging::add_logging(module)?;
     output::add_output(module)?;
     profiler::add_profiler(module)?;
+    provider_options::add_provider_options(module)?;
     session::add_session(module)?;
     table::add_table(module)?;
     module.add("__version__", env!("DELTAFUNNEL_PY_VERSION"))?;
