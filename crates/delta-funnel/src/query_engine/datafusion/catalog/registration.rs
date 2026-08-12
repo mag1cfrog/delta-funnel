@@ -5,8 +5,8 @@ use std::error::Error as _;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 use delta_arrow_reader::{
-    DeltaDataFusionScanOptions, DeltaProtocolInfo, DeltaReaderError, DeltaReaderExecutionOptions,
-    DeltaTable, DeltaTableSnapshot, register_delta_table,
+    DeltaDataFusionScanOptions, DeltaFileRepartitioning, DeltaProtocolInfo, DeltaReaderError,
+    DeltaReaderExecutionOptions, DeltaTable, DeltaTableSnapshot, register_delta_table,
 };
 
 use crate::{
@@ -75,27 +75,17 @@ pub(crate) fn register_delta_source_with_scan_options(
     ctx: &SessionContext,
     source_name: String,
     table: DeltaTable,
-    scan_target_partitions: Option<usize>,
-    execution_options: DeltaReaderExecutionOptions,
-    use_view_types: bool,
+    scan_options: DeltaDataFusionScanOptions,
     reporter: Option<&ProgressReporter>,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
-    execution_options
+    scan_options
+        .execution_options
         .validate()
         .map_err(map_reader_configuration_error)?;
     validate_table_source_names([source_name.as_str()])?;
     reject_existing_delta_registration_name(ctx, &source_name, table.table_uri())?;
     emit_registration_phase(reporter, ProgressPhase::RegisteringDeltaSource);
-    register_delta_table_with_tracing(
-        ctx,
-        source_name,
-        table,
-        DeltaDataFusionScanOptions {
-            execution_options,
-            target_partitions: scan_target_partitions,
-            use_view_types,
-        },
-    )
+    register_delta_table_with_tracing(ctx, source_name, table, scan_options)
 }
 
 fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
@@ -122,6 +112,7 @@ fn register_delta_sources_with_options(
         let options = DeltaDataFusionScanOptions {
             execution_options,
             target_partitions,
+            intra_file_repartitioning: DeltaFileRepartitioning::default(),
             use_view_types: false,
         };
         match register_delta_table_with_tracing(ctx, name, table, options) {

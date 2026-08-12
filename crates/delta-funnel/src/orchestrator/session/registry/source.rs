@@ -2,8 +2,8 @@ use std::{error::Error as _, fmt};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use delta_arrow_reader::{
-    DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaTableBuilder,
-    DeltaTableSnapshot,
+    DeltaDataFusionScanOptions, DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection,
+    DeltaTableBuilder, DeltaTableSnapshot,
 };
 
 use crate::{
@@ -203,9 +203,12 @@ impl DeltaFunnelSession {
             &self.context,
             source_name,
             table,
-            None,
-            self.options.provider_scan_options(),
-            self.options.provider_use_view_types(),
+            DeltaDataFusionScanOptions {
+                execution_options: self.options.provider_scan_options(),
+                target_partitions: None,
+                intra_file_repartitioning: self.options.provider_file_repartitioning(),
+                use_view_types: self.options.provider_use_view_types(),
+            },
             reporter,
         ) {
             Ok(registered) => {
