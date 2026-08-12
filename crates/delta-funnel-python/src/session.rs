@@ -10,6 +10,7 @@ use crate::profiler::{
     PyRankedProfileConfig, execution_profile_mode, in_ranked_profile_scope, start_ranked_profile,
 };
 use crate::progress::PythonProgress;
+use crate::provider_options::PyProviderScanOptions;
 use crate::table::PyTable;
 
 /// Delta Funnel workflow session.
@@ -52,7 +53,7 @@ impl PySession {
         default_mssql_connection_string: Option<String>,
         #[pyo3(from_py_with = parse_target_partitions_arg)] target_partitions: Option<usize>,
         #[pyo3(from_py_with = parse_output_batch_size_arg)] output_batch_size: Option<usize>,
-        provider_scan_options: Option<&Bound<'_, PyDict>>,
+        provider_scan_options: Option<PyRef<'_, PyProviderScanOptions>>,
         validation_options: Option<&Bound<'_, PyDict>>,
         schema_options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
@@ -66,13 +67,8 @@ impl PySession {
             target_partitions,
             output_batch_size,
         });
-        if let Some((provider_scan_options, file_repartitioning, use_view_types)) =
-            parse_provider_scan_options(py, provider_scan_options)?
-        {
-            options = options
-                .with_provider_scan_options(provider_scan_options)
-                .with_provider_file_repartitioning(file_repartitioning)
-                .with_provider_use_view_types(use_view_types);
+        if let Some(provider_scan_options) = provider_scan_options {
+            options = provider_scan_options.apply_to(options);
         }
         options =
             options.with_validation_options(parse_validation_options(py, validation_options)?);
@@ -606,19 +602,6 @@ fn rust_error_to_py(py: Python<'_>, error: delta_funnel::DeltaFunnelError) -> Py
     }
 }
 
-fn config_error_to_py(py: Python<'_>, error: impl std::fmt::Display) -> PyErr {
-    rust_error_to_py(
-        py,
-        delta_funnel::DeltaFunnelError::Config {
-            message: error.to_string(),
-        },
-    )
-}
-
-fn provider_scan_bound_error_to_py(py: Python<'_>, option_name: &str) -> PyErr {
-    config_error_to_py(py, format!("{option_name} must be greater than zero"))
-}
-
 fn delta_source_config(
     name: String,
     source_uri: String,
@@ -710,104 +693,6 @@ fn optional_usize_arg(value: &Bound<'_, PyAny>, option_name: &str) -> PyResult<O
         Ok(None)
     } else {
         usize_option(value.py(), value, option_name).map(Some)
-    }
-}
-
-fn parse_provider_scan_options(
-    py: Python<'_>,
-    provider_scan_options: Option<&Bound<'_, PyDict>>,
-) -> PyResult<
-    Option<(
-        delta_arrow_reader::DeltaReaderExecutionOptions,
-        delta_arrow_reader::DeltaFileRepartitioning,
-        bool,
-    )>,
-> {
-    let Some(provider_scan_options) = provider_scan_options else {
-        return Ok(None);
-    };
-    let defaults = delta_arrow_reader::DeltaReaderExecutionOptions::default();
-    let mut max_concurrent_file_reads_per_scan = defaults.max_concurrent_file_reads_per_scan();
-    let mut max_concurrent_file_reads_per_partition =
-        defaults.max_concurrent_file_reads_per_partition();
-    let mut output_buffer_capacity_per_partition = defaults.output_buffer_capacity_per_partition();
-    let mut native_async_prefetch_file_count_per_partition =
-        defaults.native_async_prefetch_file_count_per_partition();
-    let mut parquet_metadata_size_hint = defaults.parquet_metadata_size_hint();
-    let mut parquet_full_file_read_threshold = defaults.parquet_full_file_read_threshold();
-    let mut file_repartitioning = delta_arrow_reader::DeltaFileRepartitioning::default();
-    let mut use_view_types = false;
-
-    for (key, value) in option_entries(py, provider_scan_options)? {
-        match key.as_str() {
-            "max_concurrent_file_reads_per_scan" => {
-                max_concurrent_file_reads_per_scan = Some(usize_option(py, &value, key.as_str())?);
-            }
-            "max_concurrent_file_reads_per_partition" => {
-                max_concurrent_file_reads_per_partition = usize_option(py, &value, key.as_str())?;
-            }
-            "output_buffer_capacity_per_partition" => {
-                output_buffer_capacity_per_partition = usize_option(py, &value, key.as_str())?;
-            }
-            "native_async_prefetch_file_count_per_partition" => {
-                native_async_prefetch_file_count_per_partition =
-                    usize_option(py, &value, key.as_str())?;
-            }
-            "parquet_metadata_size_hint" => {
-                parquet_metadata_size_hint = optional_usize_arg(&value, key.as_str())?;
-            }
-            "parquet_full_file_read_threshold" => {
-                parquet_full_file_read_threshold = optional_usize_arg(&value, key.as_str())?;
-            }
-            "intra_file_repartitioning" => {
-                file_repartitioning = parse_file_repartitioning(py, &value, key.as_str())?;
-            }
-            "use_view_types" => {
-                use_view_types = bool_option(py, &value, key.as_str())?;
-            }
-            _ => {
-                return Err(unknown_option_error(py, "provider scan", key.as_str()));
-            }
-        }
-    }
-
-    // Apply values in the legacy validation order after parsing the whole mapping.
-    let options = defaults
-        .with_max_concurrent_file_reads_per_scan(max_concurrent_file_reads_per_scan)
-        .map_err(|_| provider_scan_bound_error_to_py(py, "max_concurrent_file_reads_per_scan"))?
-        .with_max_concurrent_file_reads_per_partition(max_concurrent_file_reads_per_partition)
-        .map_err(|_| {
-            provider_scan_bound_error_to_py(py, "max_concurrent_file_reads_per_partition")
-        })?
-        .with_output_buffer_capacity_per_partition(output_buffer_capacity_per_partition)
-        .map_err(|_| provider_scan_bound_error_to_py(py, "output_buffer_capacity_per_partition"))?
-        .with_parquet_metadata_size_hint(parquet_metadata_size_hint)
-        .map_err(|_| provider_scan_bound_error_to_py(py, "parquet_metadata_size_hint"))?
-        .with_parquet_full_file_read_threshold(parquet_full_file_read_threshold)
-        .map_err(|_| provider_scan_bound_error_to_py(py, "parquet_full_file_read_threshold"))?
-        .with_native_async_prefetch_file_count_per_partition(
-            native_async_prefetch_file_count_per_partition,
-        )
-        .map_err(|error| config_error_to_py(py, error))?;
-    Ok(Some((options, file_repartitioning, use_view_types)))
-}
-
-fn parse_file_repartitioning(
-    py: Python<'_>,
-    value: &Bound<'_, PyAny>,
-    option_name: &str,
-) -> PyResult<delta_arrow_reader::DeltaFileRepartitioning> {
-    let value = option_string(py, value, option_name)?;
-    match value.as_str() {
-        "fill_missing_parallelism" => {
-            Ok(delta_arrow_reader::DeltaFileRepartitioning::FillMissingParallelism)
-        }
-        "rebalance" => Ok(delta_arrow_reader::DeltaFileRepartitioning::Rebalance),
-        _ => Err(config_py_error(
-            py,
-            "invalid_option_value",
-            format!("invalid `{option_name}` value `{value}`"),
-        )),
     }
 }
 
@@ -1483,10 +1368,13 @@ mod tests {
     #[test]
     fn pyi_stub_exposes_provider_scan_options() {
         let stub = include_str!("../deltafunnel.pyi");
-        assert!(stub.contains("class ProviderScanOptions(TypedDict, total=False):"));
+        assert!(stub.contains("class FileRepartitioning:"));
+        assert!(!stub.contains("ProviderScanOptionsDict"));
+        assert!(stub.contains("    REBALANCE: ClassVar[FileRepartitioning]"));
+        assert!(stub.contains("class ProviderScanOptions:"));
         assert!(stub.contains("    parquet_full_file_read_threshold: int | None"));
         assert!(stub.contains(
-            "    intra_file_repartitioning: Literal[\"fill_missing_parallelism\", \"rebalance\"]"
+            "        intra_file_repartitioning: FileRepartitioning = FileRepartitioning.FILL_MISSING_PARALLELISM,"
         ));
         assert!(stub.contains("    use_view_types: bool"));
         assert!(stub.contains("        provider_scan_options: ProviderScanOptions | None = None,"));
@@ -3962,25 +3850,6 @@ union all select cast(902 as bigint) as order_id",),
                 );
             }
 
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("max_concurrent_file_reads_per_partition", true)?;
-            let error = match PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
-            ) {
-                Ok(_) => return Err(PyAssertionError::new_err("expected bool option error")),
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.value(py).getattr("phase")?.extract::<String>()?,
-                "config"
-            );
-
             let string_policy = PyDict::new(py);
             string_policy.set_item("nvarchar", true)?;
             let schema_options = PyDict::new(py);
@@ -4000,27 +3869,30 @@ union all select cast(902 as bigint) as order_id",),
     }
 
     #[test]
-    fn session_accepts_provider_scan_options() -> PyResult<()> {
+    fn session_accepts_typed_provider_scan_options() -> PyResult<()> {
         Python::attach(|py| {
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("max_concurrent_file_reads_per_scan", 8)?;
-            provider_scan_options.set_item("max_concurrent_file_reads_per_partition", 2)?;
-            provider_scan_options.set_item("output_buffer_capacity_per_partition", 4)?;
-            provider_scan_options.set_item("native_async_prefetch_file_count_per_partition", 1)?;
-            provider_scan_options.set_item("parquet_metadata_size_hint", 16_384)?;
-            provider_scan_options.set_item("parquet_full_file_read_threshold", 2_097_152)?;
-            provider_scan_options.set_item("intra_file_repartitioning", "rebalance")?;
-            provider_scan_options.set_item("use_view_types", true)?;
-
-            let session = PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("max_concurrent_file_reads_per_scan", 8)?;
+            kwargs.set_item("max_concurrent_file_reads_per_partition", 2)?;
+            kwargs.set_item("output_buffer_capacity_per_partition", 4)?;
+            kwargs.set_item("native_async_prefetch_file_count_per_partition", 1)?;
+            kwargs.set_item("parquet_metadata_size_hint", 16_384)?;
+            kwargs.set_item("parquet_full_file_read_threshold", 2_097_152)?;
+            kwargs.set_item(
+                "intra_file_repartitioning",
+                module.getattr("FileRepartitioning")?.getattr("REBALANCE")?,
             )?;
+            kwargs.set_item("use_view_types", true)?;
+            let provider_scan_options = module
+                .getattr("ProviderScanOptions")?
+                .call((), Some(&kwargs))?;
+
+            let session_kwargs = PyDict::new(py);
+            session_kwargs.set_item("provider_scan_options", provider_scan_options)?;
+            let session = module.getattr("Session")?.call((), Some(&session_kwargs))?;
+            let session = session.cast::<PySession>()?.borrow();
 
             let options = session.inner.options().provider_scan_options();
             assert_eq!(options.max_concurrent_file_reads_per_scan(), Some(8));
@@ -4040,232 +3912,21 @@ union all select cast(902 as bigint) as order_id",),
     }
 
     #[test]
-    fn partial_provider_scan_options_keep_auto_scan_wide_capacity() -> PyResult<()> {
+    fn session_rejects_provider_scan_option_dictionaries() -> PyResult<()> {
         Python::attach(|py| {
+            let module = PyModule::new(py, "deltafunnel")?;
+            deltafunnel(&module)?;
             let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("max_concurrent_file_reads_per_partition", 2)?;
+            provider_scan_options.set_item("use_view_types", true)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("provider_scan_options", provider_scan_options)?;
 
-            let session = PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
-            )?;
+            let error = module
+                .getattr("Session")?
+                .call((), Some(&kwargs))
+                .expect_err("provider scan dictionaries must fail");
 
-            assert_eq!(
-                session
-                    .inner
-                    .options()
-                    .provider_scan_options()
-                    .max_concurrent_file_reads_per_partition(),
-                2
-            );
-            assert!(
-                session
-                    .inner
-                    .options()
-                    .provider_scan_options()
-                    .max_concurrent_file_reads_per_scan()
-                    .is_none()
-            );
-            assert_eq!(
-                session.inner.options().provider_file_repartitioning(),
-                delta_arrow_reader::DeltaFileRepartitioning::FillMissingParallelism
-            );
-            assert!(!session.inner.options().provider_use_view_types());
-
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn session_can_disable_parquet_metadata_prefetch() -> PyResult<()> {
-        Python::attach(|py| {
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("parquet_metadata_size_hint", py.None())?;
-
-            let session = PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
-            )?;
-
-            assert_eq!(
-                session
-                    .inner
-                    .options()
-                    .provider_scan_options()
-                    .parquet_metadata_size_hint(),
-                None
-            );
-
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn session_rejects_bad_provider_scan_options_with_config_phase() -> PyResult<()> {
-        Python::attach(|py| {
-            let cases = [
-                ("unknown_option", 1),
-                ("max_concurrent_file_reads_per_scan", 0),
-                ("max_concurrent_file_reads_per_partition", 0),
-                ("output_buffer_capacity_per_partition", 0),
-                ("parquet_metadata_size_hint", 0),
-                ("parquet_full_file_read_threshold", 0),
-            ];
-
-            for (key, value) in cases {
-                let provider_scan_options = PyDict::new(py);
-                provider_scan_options.set_item(key, value)?;
-                let error = match PySession::new(
-                    py,
-                    None,
-                    None,
-                    None,
-                    Some(&provider_scan_options),
-                    None,
-                    None,
-                ) {
-                    Ok(_) => {
-                        return Err(PyAssertionError::new_err(
-                            "expected provider scan option error",
-                        ));
-                    }
-                    Err(error) => error,
-                };
-
-                assert_eq!(
-                    error.value(py).getattr("phase")?.extract::<String>()?,
-                    "config"
-                );
-                if key != "unknown_option" {
-                    assert_eq!(
-                        error.value(py).getattr("message")?.extract::<String>()?,
-                        format!("configuration error: {key} must be greater than zero")
-                    );
-                }
-            }
-
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("reader_backend", "official_kernel")?;
-            let error = match PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
-            ) {
-                Ok(_) => {
-                    return Err(PyAssertionError::new_err(
-                        "expected unknown provider scan option error",
-                    ));
-                }
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.value(py).getattr("kind")?.extract::<String>()?,
-                "unknown_option"
-            );
-            assert_eq!(
-                error.value(py).getattr("message")?.extract::<String>()?,
-                "unknown provider scan option `reader_backend`"
-            );
-
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("use_view_types", 1)?;
-            let error = match PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
-            ) {
-                Ok(_) => {
-                    return Err(PyAssertionError::new_err(
-                        "expected provider view type option error",
-                    ));
-                }
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.value(py).getattr("kind")?.extract::<String>()?,
-                "invalid_option_value"
-            );
-            assert_eq!(
-                error.value(py).getattr("message")?.extract::<String>()?,
-                "`use_view_types` must be a bool"
-            );
-
-            for value in ["always", ""] {
-                let provider_scan_options = PyDict::new(py);
-                provider_scan_options.set_item("intra_file_repartitioning", value)?;
-                let error = match PySession::new(
-                    py,
-                    None,
-                    None,
-                    None,
-                    Some(&provider_scan_options),
-                    None,
-                    None,
-                ) {
-                    Ok(_) => {
-                        return Err(PyAssertionError::new_err(
-                            "expected provider file repartitioning option error",
-                        ));
-                    }
-                    Err(error) => error,
-                };
-                assert_eq!(
-                    error.value(py).getattr("kind")?.extract::<String>()?,
-                    "invalid_option_value"
-                );
-            }
-
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn provider_scan_option_validation_keeps_the_legacy_field_order() -> PyResult<()> {
-        Python::attach(|py| {
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("output_buffer_capacity_per_partition", 0)?;
-            provider_scan_options.set_item("max_concurrent_file_reads_per_scan", 0)?;
-
-            let error = match PySession::new(
-                py,
-                None,
-                None,
-                None,
-                Some(&provider_scan_options),
-                None,
-                None,
-            ) {
-                Ok(_) => {
-                    return Err(PyAssertionError::new_err(
-                        "expected provider scan option error",
-                    ));
-                }
-                Err(error) => error,
-            };
-            let message = error.value(py).getattr("message")?.extract::<String>()?;
-
-            assert_eq!(
-                message,
-                "configuration error: max_concurrent_file_reads_per_scan must be greater than zero"
-            );
+            assert!(error.is_instance_of::<PyTypeError>(py));
             Ok(())
         })
     }
@@ -4713,8 +4374,7 @@ union all select cast(902 as bigint) as order_id",),
             )?;
             kwargs.set_item("target_partitions", 3)?;
             kwargs.set_item("output_batch_size", 17)?;
-            let provider_scan_options = PyDict::new(py);
-            provider_scan_options.set_item("max_concurrent_file_reads_per_scan", 8)?;
+            let provider_scan_options = module.getattr("ProviderScanOptions")?.call0()?;
             kwargs.set_item("provider_scan_options", provider_scan_options)?;
             let validation_options = PyDict::new(py);
             validation_options.set_item("target_validation_mode", "disabled")?;

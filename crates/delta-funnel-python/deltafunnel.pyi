@@ -1,6 +1,6 @@
 from os import PathLike
 from pathlib import Path
-from typing import Literal, Mapping, Sequence, TypeAlias, TypedDict, overload
+from typing import ClassVar, Literal, Mapping, Sequence, TypeAlias, TypedDict, overload
 
 __version__: str
 
@@ -15,15 +15,33 @@ class WriteAllExecutionOptions(TypedDict, total=False):
     cache_aliases: Sequence[str]
 
 
-class ProviderScanOptions(TypedDict, total=False):
-    max_concurrent_file_reads_per_scan: int
+class FileRepartitioning:
+    FILL_MISSING_PARALLELISM: ClassVar[FileRepartitioning]
+    REBALANCE: ClassVar[FileRepartitioning]
+
+
+class ProviderScanOptions:
+    max_concurrent_file_reads_per_scan: int | None
     max_concurrent_file_reads_per_partition: int
     output_buffer_capacity_per_partition: int
     native_async_prefetch_file_count_per_partition: int
     parquet_metadata_size_hint: int | None
     parquet_full_file_read_threshold: int | None
-    intra_file_repartitioning: Literal["fill_missing_parallelism", "rebalance"]
+    intra_file_repartitioning: FileRepartitioning
     use_view_types: bool
+
+    def __init__(
+        self,
+        *,
+        max_concurrent_file_reads_per_scan: int | None = None,
+        max_concurrent_file_reads_per_partition: int = 3,
+        output_buffer_capacity_per_partition: int = 1,
+        native_async_prefetch_file_count_per_partition: int = 2,
+        parquet_metadata_size_hint: int | None = 65_536,
+        parquet_full_file_read_threshold: int | None = None,
+        intra_file_repartitioning: FileRepartitioning = FileRepartitioning.FILL_MISSING_PARALLELISM,
+        use_view_types: bool = False,
+    ) -> None: ...
 
 
 def init_logging(filter: str | None = None, logger: str = "deltafunnel") -> bool: ...
