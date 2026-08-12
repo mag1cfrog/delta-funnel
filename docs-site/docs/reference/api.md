@@ -60,6 +60,7 @@ class ProviderScanOptions(TypedDict, total=False):
     native_async_prefetch_file_count_per_partition: int
     parquet_metadata_size_hint: int | None
     parquet_full_file_read_threshold: int | None
+    intra_file_repartitioning: Literal["fill_missing_parallelism", "rebalance"]
     use_view_types: bool
 ```
 
@@ -203,6 +204,7 @@ All option mappings reject unknown keys.
 | `native_async_prefetch_file_count_per_partition` | Non-negative integer; `0` is fully lazy | `2` |
 | `parquet_metadata_size_hint` | Positive Parquet file-tail size in bytes; `None` disables footer metadata prefetch | `65536` (64 KiB) |
 | `parquet_full_file_read_threshold` | Positive maximum Parquet file size in bytes; `None` disables buffered full-file reads | `None` |
+| `intra_file_repartitioning` | `"fill_missing_parallelism"` splits files only when whole-file planning produces too few partitions; `"rebalance"` also lets DataFusion rebalance file groups that already fill the target | `"fill_missing_parallelism"` |
 | `use_view_types` | Boolean selecting Arrow Utf8View and BinaryView data columns | `False` |
 
 Delta Funnel defaults to ordinary Arrow Utf8 and Binary arrays because they

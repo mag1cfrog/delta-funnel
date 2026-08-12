@@ -2799,6 +2799,7 @@ async fn run_provider_exec_once(
         DeltaDataFusionScanOptions {
             execution_options,
             target_partitions: scheduling_profile.scan_target_partitions,
+            intra_file_repartitioning: Default::default(),
             use_view_types: true,
         },
     )?;

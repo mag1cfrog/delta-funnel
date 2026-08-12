@@ -1,6 +1,6 @@
 use std::fmt;
 
-use delta_arrow_reader::DeltaReaderExecutionOptions;
+use delta_arrow_reader::{DeltaFileRepartitioning, DeltaReaderExecutionOptions};
 
 use crate::{
     DeltaFunnelError, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlWorkflowWriteOptions,
@@ -12,6 +12,7 @@ use crate::{
 pub struct SessionOptions {
     query_options: QueryOptions,
     provider_scan_options: DeltaReaderExecutionOptions,
+    provider_file_repartitioning: DeltaFileRepartitioning,
     provider_use_view_types: bool,
     mssql_schema_options: MssqlSchemaPlanOptions,
     mssql_write_backend: MssqlWriteBackend,
@@ -25,6 +26,7 @@ impl Default for SessionOptions {
         Self {
             query_options: QueryOptions::default(),
             provider_scan_options: DeltaReaderExecutionOptions::default(),
+            provider_file_repartitioning: DeltaFileRepartitioning::default(),
             provider_use_view_types: false,
             mssql_schema_options: MssqlSchemaPlanOptions::default(),
             mssql_write_backend: default_mssql_write_backend(),
@@ -56,6 +58,16 @@ impl SessionOptions {
         provider_scan_options: DeltaReaderExecutionOptions,
     ) -> Self {
         self.provider_scan_options = provider_scan_options;
+        self
+    }
+
+    /// Sets when Delta providers may split Parquet files into ranged scan tasks.
+    #[must_use]
+    pub const fn with_provider_file_repartitioning(
+        mut self,
+        file_repartitioning: DeltaFileRepartitioning,
+    ) -> Self {
+        self.provider_file_repartitioning = file_repartitioning;
         self
     }
 
@@ -125,6 +137,12 @@ impl SessionOptions {
         self.provider_scan_options
     }
 
+    /// Returns when Delta providers may split Parquet files into ranged scan tasks.
+    #[must_use]
+    pub const fn provider_file_repartitioning(&self) -> DeltaFileRepartitioning {
+        self.provider_file_repartitioning
+    }
+
     /// Returns whether Delta providers use Arrow view arrays for string and binary data columns.
     #[must_use]
     pub const fn provider_use_view_types(&self) -> bool {
@@ -186,6 +204,10 @@ impl fmt::Debug for SessionOptions {
             .debug_struct("SessionOptions")
             .field("query_options", &self.query_options)
             .field("provider_scan_options", &self.provider_scan_options)
+            .field(
+                "provider_file_repartitioning",
+                &self.provider_file_repartitioning,
+            )
             .field("provider_use_view_types", &self.provider_use_view_types)
             .field("mssql_schema_options", &self.mssql_schema_options)
             .field("mssql_write_backend", &self.mssql_write_backend)
@@ -208,7 +230,9 @@ mod tests {
         BatchPipelinePhase, DeltaFunnelError, MssqlConnectionConfig, MssqlWorkflowWriteOptions,
         QueryOptions,
     };
-    use delta_arrow_reader::{DeltaReaderBackend, DeltaReaderExecutionOptions};
+    use delta_arrow_reader::{
+        DeltaFileRepartitioning, DeltaReaderBackend, DeltaReaderExecutionOptions,
+    };
 
     use super::SessionOptions;
     use crate::orchestrator::DeltaFunnelSession;
@@ -218,6 +242,10 @@ mod tests {
         let session = DeltaFunnelSession::new(SessionOptions::default())?;
 
         assert_eq!(session.options().query_options(), QueryOptions::default());
+        assert_eq!(
+            session.options().provider_file_repartitioning(),
+            DeltaFileRepartitioning::FillMissingParallelism
+        );
         assert!(!session.options().provider_use_view_types());
         assert!(
             session
@@ -239,6 +267,20 @@ mod tests {
             DeltaFunnelSession::new(SessionOptions::new().with_provider_use_view_types(true))?;
 
         assert!(session.options().provider_use_view_types());
+        Ok(())
+    }
+
+    #[test]
+    fn session_can_rebalance_provider_files() -> Result<(), DeltaFunnelError> {
+        let session = DeltaFunnelSession::new(
+            SessionOptions::new()
+                .with_provider_file_repartitioning(DeltaFileRepartitioning::Rebalance),
+        )?;
+
+        assert_eq!(
+            session.options().provider_file_repartitioning(),
+            DeltaFileRepartitioning::Rebalance
+        );
         Ok(())
     }
 
