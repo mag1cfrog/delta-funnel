@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "delta-funnel"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrow-schema",
  "arrow-sql-server",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "delta-funnel-python"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrow-schema",
  "delta-arrow-reader",
