@@ -37,8 +37,8 @@ The event fields are:
 Native async scans include all four numeric fields, including zero. Official
 kernel scans omit all four and set `metrics_available=false`. An unexpected
 partial metric set is also reported as unavailable without publishing a
-misleading numeric subset. See
-[Parquet data-file I/O metrics](../internals/provider-read-scheduling.md#parquet-data-file-io-metrics)
+misleading numeric subset. See the Delta Arrow Reader
+[scan metrics](https://mag1cfrog.github.io/delta-arrow-reader/reference/metrics/#parquet-io-boundaries)
 for the metric definitions and measurement boundaries.
 
 One event represents one distinct provider scan in one fresh physical-plan

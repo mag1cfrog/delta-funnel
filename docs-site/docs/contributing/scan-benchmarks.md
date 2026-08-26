@@ -219,6 +219,8 @@ of a specific S3 deployment. Provider execution uses generated local fixtures,
 not production data. The phase-aligned `write_all` option exercises workflow
 and Arrow stream boundaries without opening SQL Server or writing target rows.
 
-For the production behavior behind these measurements, see
-[Scan partition planning](../internals/scan-partition-planning.md) and
-[Provider read scheduling](../internals/provider-read-scheduling.md).
+For the reader behavior behind these measurements, see Delta Arrow Reader's
+[scan planning](https://mag1cfrog.github.io/delta-arrow-reader/scan-planning/)
+and
+[read scheduling](https://mag1cfrog.github.io/delta-arrow-reader/read-scheduling/)
+documentation.
