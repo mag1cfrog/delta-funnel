@@ -250,7 +250,8 @@ session = Session(
 )
 ```
 
-See [Provider read scheduling](../internals/provider-read-scheduling.md#execution-options)
+See the Delta Arrow Reader
+[execution options](https://mag1cfrog.github.io/delta-arrow-reader/reference/execution-options/)
 for the execution boundaries controlled by these values.
 
 `validation_options` accepts:
