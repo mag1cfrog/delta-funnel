@@ -793,7 +793,9 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -847,7 +849,9 @@ mod tests {
                     crate::DryRunScanSummaryMode::ExhaustScanMetadata,
                 )),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -913,9 +917,15 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        session.delta_lake(DeltaSourceConfig::new("orders", orders_table.uri()))?;
-        session.delta_lake(DeltaSourceConfig::new("customers", customers_table.uri()))?;
-        session.delta_lake(DeltaSourceConfig::new("inventory", inventory_table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", orders_table.uri()))
+            .await?;
+        session
+            .delta_lake(DeltaSourceConfig::new("customers", customers_table.uri()))
+            .await?;
+        session
+            .delta_lake(DeltaSourceConfig::new("inventory", inventory_table.uri()))
+            .await?;
         let joined = session
             .table_from_sql(
                 "select orders.id from orders inner join customers on orders.id = customers.id",
@@ -1098,12 +1108,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dry_run_to_mssql_rejects_missing_connection_before_side_effects()
+    #[tokio::test]
+    async fn dry_run_to_mssql_rejects_missing_connection_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -1138,14 +1150,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dry_run_to_mssql_accepts_replace_before_side_effects()
+    #[tokio::test]
+    async fn dry_run_to_mssql_accepts_replace_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(source, "orders_output", "orders_sink", LoadMode::Replace)?;
 
         let report = session.dry_run_to_mssql(&request)?;
@@ -1167,12 +1181,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn host_callback_panic_after_started_escapes_without_an_unwind_delivery()
+    #[tokio::test]
+    async fn host_callback_panic_after_started_escapes_without_an_unwind_delivery()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -1196,14 +1212,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn interleaved_actions_keep_callbacks_serial_ordered_and_isolated()
+    #[tokio::test]
+    async fn interleaved_actions_keep_callbacks_serial_ordered_and_isolated()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("interleaved-progress")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let west_request = output_request(
             source.clone(),
             "west_output",
@@ -1284,14 +1302,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dry_run_to_mssql_report_debug_redacts_connection_material()
+    #[tokio::test]
+    async fn dry_run_to_mssql_report_debug_redacts_connection_material()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_sink")?)
             .with_connection(override_connection()?);
         let request = OutputWritePlan::new(

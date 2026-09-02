@@ -1,4 +1,4 @@
-use delta_arrow_reader::DeltaDataFusionMetricsSnapshot;
+use crate::DeltaDataFusionMetricsSnapshot;
 
 /// Controls whether a query execution profile is collected.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -9,7 +9,8 @@ use datafusion::physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
 };
 use delta_arrow_reader::{
-    DeltaDataFusionMetrics, DeltaDataFusionMetricsSnapshot, collect_delta_datafusion_metrics,
+    DeltaScanMetricsSnapshot, ParquetReaderBackend,
+    datafusion::{ScanMetrics, ScanMetricsSnapshot, collect_scan_metrics},
 };
 
 use crate::DeltaFunnelError;
@@ -39,23 +40,152 @@ pub(crate) use catalog::registration::{
 };
 pub use session::{QueryOptions, datafusion_session_config, datafusion_session_context};
 
+/// Stable Delta Funnel view of one Delta reader scan's metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaReadMetricsSnapshot {
+    /// Delta snapshot version selected for the scan.
+    pub snapshot_version: u64,
+    /// Parquet reader backend selected for the scan.
+    pub reader_backend: ParquetReaderBackend,
+    /// Whether planning exhausted the Delta scan metadata.
+    pub scan_metadata_exhausted: Option<bool>,
+    /// Final execution partitions planned for the scan.
+    pub scan_partitions_planned: u64,
+    /// Data files selected during planning.
+    pub files_planned: u64,
+    /// Add actions excluded during planning, when known.
+    pub files_filtered_during_planning: Option<u64>,
+    /// Estimated input rows, when known for every selected file.
+    pub estimated_rows: Option<u64>,
+    /// Estimated input bytes, when known for every selected file.
+    pub estimated_bytes: Option<u64>,
+    /// Scan partitions whose execution started.
+    pub scan_partitions_started: u64,
+    /// Scan partitions that completed normally.
+    pub scan_partitions_completed: u64,
+    /// Data-file tasks that started.
+    pub files_started: u64,
+    /// Data-file tasks that completed normally.
+    pub files_completed: u64,
+    /// Batches emitted by the Delta scheduler.
+    pub batches_produced: u64,
+    /// Rows emitted by the Delta scheduler.
+    pub rows_produced: u64,
+    /// Deletion-vector payloads loaded.
+    pub deletion_vector_payloads_loaded: u64,
+    /// Deletion-vector masks applied.
+    pub deletion_vectors_applied: u64,
+    /// Rows removed by deletion-vector masks.
+    pub deletion_vector_rows_deleted: u64,
+    /// Deletion-vector read or masking failures.
+    pub deletion_vector_failures: u64,
+    /// Deletion-vector operations rejected by safety checks.
+    pub deletion_vector_rejections: u64,
+    /// Direct Parquet ranged GET operations, when available.
+    pub parquet_data_file_range_get_operations: Option<u64>,
+    /// Direct Parquet full GET operations, when available.
+    pub parquet_data_file_full_get_operations: Option<u64>,
+    /// Direct Parquet payload bytes received, when available.
+    pub parquet_data_file_bytes_received: Option<u64>,
+    /// Estimated Parquet task bytes admitted, when available.
+    pub parquet_data_file_opened_bytes: Option<u64>,
+}
+
+/// Stable Delta Funnel view of one DataFusion Delta scan's metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaDataFusionMetricsSnapshot {
+    /// Delta reader planning and execution metrics.
+    pub reader: DeltaReadMetricsSnapshot,
+    /// Whether the provider requested Arrow view arrays.
+    pub use_view_types: bool,
+    /// Configured DataFusion batch row target observed at execution.
+    pub output_batch_size: Option<u64>,
+    /// File tasks pruned by dynamic partition filters.
+    pub dynamic_partition_files_pruned: u64,
+    /// File tasks kept after dynamic partition filtering.
+    pub dynamic_partition_files_kept: u64,
+    /// Physical filters offered to the dynamic filter hook.
+    pub dynamic_filters_received: u64,
+    /// Offered dynamic filters retained for pruning.
+    pub dynamic_filters_accepted: u64,
+    /// Offered dynamic filters rejected by policy.
+    pub dynamic_filters_unsupported: u64,
+    /// Dynamic partition filter checks during file admission.
+    pub dynamic_filter_snapshots: u64,
+    /// Kept tasks with unusable partition metadata.
+    pub dynamic_files_not_pruned_missing_metadata: u64,
+    /// Kept tasks whose dynamic filter could not be evaluated.
+    pub dynamic_files_not_pruned_unsupported_expression: u64,
+}
+
+impl From<ScanMetricsSnapshot> for DeltaDataFusionMetricsSnapshot {
+    fn from(snapshot: ScanMetricsSnapshot) -> Self {
+        Self {
+            reader: snapshot.reader_metrics.into(),
+            use_view_types: snapshot.uses_arrow_view_types,
+            output_batch_size: snapshot.configured_batch_size_rows,
+            dynamic_partition_files_pruned: snapshot.dynamic_partition_tasks_pruned,
+            dynamic_partition_files_kept: snapshot.dynamic_partition_tasks_kept,
+            dynamic_filters_received: snapshot.dynamic_filters_received,
+            dynamic_filters_accepted: snapshot.dynamic_filters_accepted,
+            dynamic_filters_unsupported: snapshot.dynamic_filters_rejected,
+            dynamic_filter_snapshots: snapshot.dynamic_partition_filter_checks,
+            dynamic_files_not_pruned_missing_metadata: snapshot
+                .dynamic_partition_tasks_kept_unusable_metadata,
+            dynamic_files_not_pruned_unsupported_expression: snapshot
+                .dynamic_partition_tasks_kept_unevaluable_filter,
+        }
+    }
+}
+
+impl From<DeltaScanMetricsSnapshot> for DeltaReadMetricsSnapshot {
+    fn from(snapshot: DeltaScanMetricsSnapshot) -> Self {
+        Self {
+            snapshot_version: snapshot.snapshot_version,
+            reader_backend: snapshot.parquet_backend,
+            scan_metadata_exhausted: Some(true),
+            scan_partitions_planned: snapshot.scan_partitions_planned,
+            files_planned: snapshot.files_planned,
+            files_filtered_during_planning: snapshot.add_actions_excluded_during_planning,
+            estimated_rows: snapshot.estimated_input_rows,
+            estimated_bytes: snapshot.estimated_input_bytes,
+            scan_partitions_started: snapshot.scan_partitions_started,
+            scan_partitions_completed: snapshot.scan_partitions_completed,
+            files_started: snapshot.file_tasks_started,
+            files_completed: snapshot.file_tasks_completed,
+            batches_produced: snapshot.scheduler_batches_emitted,
+            rows_produced: snapshot.scheduler_rows_emitted,
+            deletion_vector_payloads_loaded: snapshot.deletion_vector_payloads_loaded,
+            deletion_vectors_applied: snapshot.deletion_vectors_applied,
+            deletion_vector_rows_deleted: snapshot.deletion_vector_rows_deleted,
+            deletion_vector_failures: snapshot.deletion_vector_failures,
+            deletion_vector_rejections: snapshot.deletion_vector_coordinate_rejections,
+            parquet_data_file_range_get_operations: snapshot.parquet_data_file_range_get_operations,
+            parquet_data_file_full_get_operations: snapshot.parquet_data_file_full_get_operations,
+            parquet_data_file_bytes_received: snapshot.parquet_data_file_bytes_received,
+            parquet_data_file_opened_bytes: snapshot.estimated_parquet_task_bytes_admitted,
+        }
+    }
+}
+
 /// One standalone metrics handle for a Delta provider scan.
 #[derive(Clone)]
 pub(crate) struct DeltaProviderReadStatsHandle {
-    metrics: DeltaDataFusionMetrics,
+    metrics: ScanMetrics,
+    plan_identity: usize,
 }
 
 impl DeltaProviderReadStatsHandle {
     pub(crate) fn same_instance(&self, other: &Self) -> bool {
-        self.metrics.same_instance(&other.metrics)
+        self.plan_identity == other.plan_identity
     }
 
     pub(crate) fn snapshot(&self) -> DeltaDataFusionMetricsSnapshot {
-        self.metrics.snapshot()
+        self.metrics.snapshot().into()
     }
 
     pub(crate) fn source_name(&self) -> Option<&str> {
-        self.metrics.source_name()
+        self.metrics.registration_name()
     }
 }
 
@@ -66,12 +196,13 @@ pub(crate) fn delta_datafusion_metrics_for_plan(
     if !plan.children().is_empty() {
         return None;
     }
-    let metrics = collect_delta_datafusion_metrics(plan);
+    let metrics = collect_scan_metrics(plan);
     let [metrics] = metrics.as_slice() else {
         return None;
     };
     Some(DeltaProviderReadStatsHandle {
         metrics: metrics.clone(),
+        plan_identity: plan as *const dyn ExecutionPlan as *const () as usize,
     })
 }
 
@@ -132,11 +263,11 @@ pub(crate) struct NamedDeltaDataFusionMetricsSnapshot {
 pub(crate) fn collect_named_delta_datafusion_metrics(
     plan: &dyn ExecutionPlan,
 ) -> Vec<NamedDeltaDataFusionMetricsSnapshot> {
-    collect_delta_datafusion_metrics(plan)
+    collect_scan_metrics(plan)
         .into_iter()
         .map(|metrics| NamedDeltaDataFusionMetricsSnapshot {
-            source_name: metrics.source_name().unwrap_or_default().to_owned(),
-            snapshot: metrics.snapshot(),
+            source_name: metrics.registration_name().unwrap_or_default().to_owned(),
+            snapshot: metrics.snapshot().into(),
         })
         .collect()
 }
@@ -252,7 +383,10 @@ pub(crate) mod test_support {
     use datafusion::common::{DataFusionError, Result as DataFusionResult};
     use datafusion::datasource::TableProvider;
     use datafusion::prelude::SessionContext;
-    use delta_arrow_reader::{DeltaDataFusionScanOptions, DeltaTableBuilder, register_delta_table};
+    use delta_arrow_reader::{
+        DeltaTableBuilder,
+        datafusion::{ScanOptions, register_table},
+    };
 
     pub(crate) struct DeltaLogTable {
         path: PathBuf,
@@ -409,19 +543,16 @@ pub(crate) mod test_support {
         Ok(format!("{}-{}-{nanos}", std::process::id(), name))
     }
 
-    pub(crate) fn register_fixture_source(
+    pub(crate) async fn register_fixture_source(
         ctx: &SessionContext,
         source_name: &str,
         fixture_name: &str,
     ) -> Result<DeltaLogTable, Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new(fixture_name)?;
-        let loaded = DeltaTableBuilder::new(table.path.to_string_lossy()).load()?;
-        register_delta_table(
-            ctx,
-            source_name,
-            loaded,
-            DeltaDataFusionScanOptions::default(),
-        )?;
+        let loaded = DeltaTableBuilder::new(table.path.to_string_lossy())
+            .load_table()
+            .await?;
+        register_table(ctx, source_name, loaded, ScanOptions::default())?;
 
         Ok(table)
     }
@@ -540,7 +671,7 @@ mod tests {
     async fn read_stats_handles_deduplicate_repeated_metrics_instance() -> Result<(), Box<dyn Error>>
     {
         let context = SessionContext::new();
-        let _table = register_fixture_source(&context, "orders", "shared-scan-handle")?;
+        let _table = register_fixture_source(&context, "orders", "shared-scan-handle").await?;
         let plan = delta_plan(&context).await?;
         let original = collect_delta_provider_read_stats_handles(plan.as_ref());
         let repeated_plan = UnionExec::try_new(vec![Arc::clone(&plan), plan])?;
@@ -557,7 +688,7 @@ mod tests {
     async fn read_stats_handles_keep_distinct_metrics_in_first_seen_order()
     -> Result<(), Box<dyn Error>> {
         let context = SessionContext::new();
-        let _table = register_fixture_source(&context, "orders", "distinct-scan-handles")?;
+        let _table = register_fixture_source(&context, "orders", "distinct-scan-handles").await?;
         let first_plan = delta_plan(&context).await?;
         let second_plan = delta_plan(&context).await?;
         let first = collect_delta_provider_read_stats_handles(first_plan.as_ref());

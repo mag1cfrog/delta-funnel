@@ -1,6 +1,6 @@
 //! Integration coverage for supported Delta reader features.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use datafusion::{
     arrow::{datatypes::SchemaRef, record_batch::RecordBatch},
@@ -9,12 +9,16 @@ use datafusion::{
     prelude::SessionContext,
 };
 use delta_arrow_reader::{
-    DeltaDataFusionScanOptions, DeltaReaderBackend, DeltaReaderExecutionOptions,
-    DeltaScanPartitionTargetDiagnosticInput, DeltaTableBuilder, DeltaTableProvider,
-    collect_delta_datafusion_metrics, derive_delta_scan_partition_target_diagnostic,
-    register_delta_table,
+    DeltaScanExecutionOptions, DeltaTableBuilder, ParquetReaderBackend,
+    datafusion::{DeltaTableProvider, ScanOptions, collect_scan_metrics, register_table},
+    diagnostics::partition_target::{
+        Input as DeltaScanPartitionTargetDiagnosticInput,
+        derive as derive_delta_scan_partition_target_diagnostic,
+    },
 };
-use delta_funnel::{DeltaFunnelSession, DeltaSourceConfig, SessionOptions};
+use delta_funnel::{
+    DeltaDataFusionMetricsSnapshot, DeltaFunnelSession, DeltaSourceConfig, SessionOptions,
+};
 use futures_util::TryStreamExt;
 
 fn type_widening_fixture_uri() -> String {
@@ -40,16 +44,18 @@ async fn type_widening_reads_old_and_new_physical_types_with_both_backends()
     ];
 
     for backend in [
-        DeltaReaderBackend::NativeAsync,
-        DeltaReaderBackend::OfficialKernel,
+        ParquetReaderBackend::Direct,
+        ParquetReaderBackend::DeltaKernel,
     ] {
-        let options = DeltaReaderExecutionOptions::new()
-            .with_reader_backend(backend)?
+        let options = DeltaScanExecutionOptions::new()
+            .with_parquet_backend(backend)
             .with_max_concurrent_file_reads_per_scan(Some(1))?
             .with_max_concurrent_file_reads_per_partition(1)?;
         let mut session =
             DeltaFunnelSession::new(SessionOptions::new().with_provider_scan_options(options))?;
-        session.delta_lake(DeltaSourceConfig::new("widened", &table_uri))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("widened", &table_uri))
+            .await?;
         let source = session
             .registered_source("widened")
             .ok_or("missing registered source")?;
@@ -81,7 +87,7 @@ async fn type_widening_reads_old_and_new_physical_types_with_both_backends()
 async fn published_reader_uses_workspace_arrow_datafusion_and_async_types()
 -> Result<(), Box<dyn std::error::Error>> {
     let table = DeltaTableBuilder::new(type_widening_fixture_uri())
-        .load_async()
+        .load_table()
         .await?;
     table.validate_protocol()?;
     assert_eq!(
@@ -89,7 +95,7 @@ async fn published_reader_uses_workspace_arrow_datafusion_and_async_types()
         ["timestampNtz", "typeWidening-preview"]
     );
 
-    let schema: SchemaRef = Arc::clone(table.schema());
+    let schema: SchemaRef = table.schema();
     assert!(schema.field_with_name("byte_long").is_ok());
     let batches: Vec<RecordBatch> = table
         .scan()
@@ -97,25 +103,24 @@ async fn published_reader_uses_workspace_arrow_datafusion_and_async_types()
         .with_target_partitions(1)?
         .build()
         .await?
-        .execute()
-        .await?
+        .into_stream()
         .try_collect()
         .await?;
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
-    let official_options = DeltaReaderExecutionOptions::new()
-        .with_native_async_prefetch_file_count_per_partition(0)?
-        .with_parquet_metadata_size_hint(None)?
-        .with_reader_backend(DeltaReaderBackend::OfficialKernel)?
+    let official_options = DeltaScanExecutionOptions::new()
+        .with_prefetch_files_per_partition(0)
+        .with_parquet_metadata_size_hint_bytes(None)?
+        .with_parquet_backend(ParquetReaderBackend::DeltaKernel)
         .with_max_concurrent_file_reads_per_scan(Some(2))?
         .with_max_concurrent_file_reads_per_partition(1)?;
     let _official_provider = DeltaTableProvider::try_new(
         table.clone(),
-        DeltaDataFusionScanOptions {
+        ScanOptions {
             execution_options: official_options,
             target_partitions: Some(1),
             intra_file_repartitioning: Default::default(),
-            use_view_types: true,
+            use_arrow_view_types: true,
         },
     )?;
     let target =
@@ -126,27 +131,19 @@ async fn published_reader_uses_workspace_arrow_datafusion_and_async_types()
     assert_eq!(target.target_partitions, 2);
 
     let context = SessionContext::new();
-    let registered = register_delta_table(
-        &context,
-        "published_widened",
-        table,
-        DeltaDataFusionScanOptions::default(),
-    )?;
+    let registered = register_table(&context, "published_widened", table, ScanOptions::default())?;
     assert_eq!(registered.name, "published_widened");
-    assert_eq!(registered.version, 2);
+    assert_eq!(registered.snapshot_version, 2);
     let count_plan = context
         .sql("select count(*) as rows from published_widened")
         .await?;
     let count_plan = count_plan.create_physical_plan().await?;
-    let metrics = collect_delta_datafusion_metrics(count_plan.as_ref());
+    let metrics = collect_scan_metrics(count_plan.as_ref());
     assert_eq!(metrics.len(), 1);
     let count = collect_plan(count_plan, context.task_ctx()).await?;
-    let metrics = metrics[0].snapshot();
+    let metrics = DeltaDataFusionMetricsSnapshot::from(metrics[0].snapshot());
     assert_eq!(metrics.reader.snapshot_version, 2);
-    assert_eq!(
-        metrics.reader.reader_backend,
-        DeltaReaderBackend::NativeAsync
-    );
+    assert_eq!(metrics.reader.reader_backend, ParquetReaderBackend::Direct);
     assert_eq!(metrics.reader.rows_produced, 2);
     assert_batches_eq!(
         ["+------+", "| rows |", "+------+", "| 2    |", "+------+",],

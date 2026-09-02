@@ -1,12 +1,10 @@
 use std::fmt;
 
-use delta_arrow_reader::{
-    DeltaDataFusionMetricsSnapshot, DeltaReaderBackend, DeltaReaderExecutionOptions,
-};
+use delta_arrow_reader::{DeltaScanExecutionOptions, ParquetReaderBackend};
 
 use crate::{
-    DeltaProtocolReport, FileCount, PhaseTimingReport, QueryOptions, ReportReasonCode,
-    support::sanitize_uri_for_display,
+    DeltaDataFusionMetricsSnapshot, DeltaProtocolReport, FileCount, PhaseTimingReport,
+    QueryOptions, ReportReasonCode, support::sanitize_uri_for_display,
 };
 
 /// Conservative source usage status for a workflow report.
@@ -60,7 +58,7 @@ pub struct DeltaSourceReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaProviderSchedulingReport {
     query_target_partitions: Option<u64>,
-    reader_backend: DeltaReaderBackend,
+    reader_backend: ParquetReaderBackend,
     max_concurrent_file_reads_per_scan: Option<u64>,
     max_concurrent_file_reads_per_partition: u64,
     output_buffer_capacity_per_partition: u64,
@@ -72,13 +70,13 @@ pub struct DeltaProviderSchedulingReport {
 impl DeltaProviderSchedulingReport {
     pub(crate) fn from_options(
         query_options: QueryOptions,
-        scan_options: DeltaReaderExecutionOptions,
+        scan_options: DeltaScanExecutionOptions,
     ) -> Self {
         Self {
             query_target_partitions: query_options
                 .target_partitions
                 .map(crate::usize_to_u64_saturating),
-            reader_backend: scan_options.reader_backend(),
+            reader_backend: scan_options.parquet_backend(),
             max_concurrent_file_reads_per_scan: scan_options
                 .max_concurrent_file_reads_per_scan()
                 .map(crate::usize_to_u64_saturating),
@@ -86,16 +84,16 @@ impl DeltaProviderSchedulingReport {
                 scan_options.max_concurrent_file_reads_per_partition(),
             ),
             output_buffer_capacity_per_partition: crate::usize_to_u64_saturating(
-                scan_options.output_buffer_capacity_per_partition(),
+                scan_options.output_buffer_batches_per_partition(),
             ),
             native_async_prefetch_file_count_per_partition: crate::usize_to_u64_saturating(
-                scan_options.native_async_prefetch_file_count_per_partition(),
+                scan_options.prefetch_files_per_partition(),
             ),
             parquet_metadata_size_hint: scan_options
-                .parquet_metadata_size_hint()
+                .parquet_metadata_size_hint_bytes()
                 .map(crate::usize_to_u64_saturating),
             parquet_full_file_read_threshold: scan_options
-                .parquet_full_file_read_threshold()
+                .parquet_full_file_read_threshold_bytes()
                 .map(crate::usize_to_u64_saturating),
         }
     }
@@ -108,7 +106,7 @@ impl DeltaProviderSchedulingReport {
 
     /// Returns the provider reader backend configured for source scans.
     #[must_use]
-    pub const fn reader_backend(&self) -> DeltaReaderBackend {
+    pub const fn reader_backend(&self) -> ParquetReaderBackend {
         self.reader_backend
     }
 

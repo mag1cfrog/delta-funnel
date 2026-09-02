@@ -430,7 +430,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -507,7 +509,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let orders = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let big = session
             .table_from_sql("select id, customer_name from orders")
@@ -531,7 +535,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -559,7 +565,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -585,7 +593,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -611,7 +621,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -647,7 +659,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -680,7 +694,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let orders = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -709,7 +725,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let orders = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let orders = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let pending_big = session
             .table_from_sql("select id, customer_name from orders")
             .await?;

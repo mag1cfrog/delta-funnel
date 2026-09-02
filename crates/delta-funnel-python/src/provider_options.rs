@@ -24,11 +24,11 @@ pub(crate) enum PyFileRepartitioning {
     Rebalance,
 }
 
-impl From<PyFileRepartitioning> for delta_arrow_reader::DeltaFileRepartitioning {
+impl From<PyFileRepartitioning> for delta_arrow_reader::datafusion::IntraFileRepartitioning {
     fn from(value: PyFileRepartitioning) -> Self {
         match value {
-            PyFileRepartitioning::FillMissingParallelism => Self::FillMissingParallelism,
-            PyFileRepartitioning::Rebalance => Self::Rebalance,
+            PyFileRepartitioning::FillMissingParallelism => Self::WhenBelowTarget,
+            PyFileRepartitioning::Rebalance => Self::Always,
         }
     }
 }
@@ -36,7 +36,7 @@ impl From<PyFileRepartitioning> for delta_arrow_reader::DeltaFileRepartitioning 
 /// Immutable Delta provider scan configuration.
 #[pyclass(frozen, name = "ProviderScanOptions", module = "deltafunnel")]
 pub(crate) struct PyProviderScanOptions {
-    execution_options: delta_arrow_reader::DeltaReaderExecutionOptions,
+    execution_options: delta_arrow_reader::DeltaScanExecutionOptions,
     file_repartitioning: PyFileRepartitioning,
     use_view_types: bool,
 }
@@ -88,25 +88,22 @@ impl PyProviderScanOptions {
         >,
         #[pyo3(from_py_with = parse_use_view_types)] use_view_types: bool,
     ) -> PyResult<Self> {
-        let execution_options = delta_arrow_reader::DeltaReaderExecutionOptions::default()
+        let execution_options = delta_arrow_reader::DeltaScanExecutionOptions::default()
             .with_max_concurrent_file_reads_per_scan(max_concurrent_file_reads_per_scan)
             .map_err(|_| provider_scan_bound_error_to_py(py, "max_concurrent_file_reads_per_scan"))?
             .with_max_concurrent_file_reads_per_partition(max_concurrent_file_reads_per_partition)
             .map_err(|_| {
                 provider_scan_bound_error_to_py(py, "max_concurrent_file_reads_per_partition")
             })?
-            .with_output_buffer_capacity_per_partition(output_buffer_capacity_per_partition)
+            .with_output_buffer_batches_per_partition(output_buffer_capacity_per_partition)
             .map_err(|_| {
                 provider_scan_bound_error_to_py(py, "output_buffer_capacity_per_partition")
             })?
-            .with_parquet_metadata_size_hint(parquet_metadata_size_hint)
+            .with_parquet_metadata_size_hint_bytes(parquet_metadata_size_hint)
             .map_err(|_| provider_scan_bound_error_to_py(py, "parquet_metadata_size_hint"))?
-            .with_parquet_full_file_read_threshold(parquet_full_file_read_threshold)
+            .with_parquet_full_file_read_threshold_bytes(parquet_full_file_read_threshold)
             .map_err(|_| provider_scan_bound_error_to_py(py, "parquet_full_file_read_threshold"))?
-            .with_native_async_prefetch_file_count_per_partition(
-                native_async_prefetch_file_count_per_partition,
-            )
-            .map_err(|error| config_error_to_py(py, error))?;
+            .with_prefetch_files_per_partition(native_async_prefetch_file_count_per_partition);
         Ok(Self {
             execution_options,
             file_repartitioning: intra_file_repartitioning.unwrap_or_default(),
@@ -127,24 +124,23 @@ impl PyProviderScanOptions {
 
     #[getter]
     fn output_buffer_capacity_per_partition(&self) -> usize {
-        self.execution_options
-            .output_buffer_capacity_per_partition()
+        self.execution_options.output_buffer_batches_per_partition()
     }
 
     #[getter]
     fn native_async_prefetch_file_count_per_partition(&self) -> usize {
-        self.execution_options
-            .native_async_prefetch_file_count_per_partition()
+        self.execution_options.prefetch_files_per_partition()
     }
 
     #[getter]
     fn parquet_metadata_size_hint(&self) -> Option<usize> {
-        self.execution_options.parquet_metadata_size_hint()
+        self.execution_options.parquet_metadata_size_hint_bytes()
     }
 
     #[getter]
     fn parquet_full_file_read_threshold(&self) -> Option<usize> {
-        self.execution_options.parquet_full_file_read_threshold()
+        self.execution_options
+            .parquet_full_file_read_threshold_bytes()
     }
 
     #[getter]

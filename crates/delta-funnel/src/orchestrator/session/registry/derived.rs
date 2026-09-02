@@ -414,7 +414,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let derived = session
             .table_from_sql("select id, customer_name from orders")
@@ -451,7 +453,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let derived = session
             .table_from_sql(" \n\t select id from orders \t ")
@@ -470,7 +474,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -501,7 +507,9 @@ mod tests {
     async fn registered_derived_alias_retains_sql_text() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -549,7 +557,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let error = session
             .table_from_sql("select id from orders; select id from orders")
@@ -571,7 +581,9 @@ mod tests {
     async fn ddl_sql_fails_before_alias_registration() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let error = session
             .table_from_sql("create table created_orders as select id from orders")
@@ -593,7 +605,9 @@ mod tests {
     async fn dml_sql_fails_before_alias_registration() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let error = session
             .table_from_sql("insert into orders select id, customer_name from orders")
@@ -636,7 +650,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session.table_from_sql("select id from orders").await?;
 
         let error = session.register_alias("ORDERS", &derived);
@@ -658,7 +674,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session.table_from_sql("select id from orders").await?;
 
         let error = session.register_alias("select", &derived);
@@ -679,7 +697,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session.table_from_sql("select id from orders").await?;
 
         let error = session.register_alias("select", &derived);
@@ -705,7 +725,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let error = session.register_alias("recent_orders", &source);
 
@@ -726,7 +748,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let first = session.table_from_sql("select id from orders").await?;
         session.register_alias("recent_orders", &first)?;
         let second = session.table_from_sql("select id from orders").await?;
@@ -768,11 +792,15 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session.table_from_sql("select id from orders").await?;
         session.register_alias("recent_orders", &derived)?;
 
-        let error = session.delta_lake(DeltaSourceConfig::new("RECENT_ORDERS", ""));
+        let error = session
+            .delta_lake(DeltaSourceConfig::new("RECENT_ORDERS", ""))
+            .await;
 
         assert!(matches!(
             error,
@@ -790,7 +818,9 @@ mod tests {
 
         let table = DeltaLogTable::new_with_schema("orders", MARKER_REGION_SCHEMA_FIELDS_JSON)?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let source_dataframe = session
             .plan_read_only_sql("select marker from orders")

@@ -5,8 +5,8 @@ use std::error::Error as _;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 use delta_arrow_reader::{
-    DeltaDataFusionScanOptions, DeltaFileRepartitioning, DeltaProtocolInfo, DeltaReaderError,
-    DeltaReaderExecutionOptions, DeltaTable, DeltaTableSnapshot, register_delta_table,
+    DeltaProtocol, DeltaReaderError, DeltaScanExecutionOptions, DeltaTable, DeltaTableSnapshot,
+    datafusion::{IntraFileRepartitioning, ScanOptions, register_table},
 };
 
 use crate::{
@@ -51,7 +51,7 @@ pub fn register_delta_sources(
     ctx: &SessionContext,
     sources: Vec<(String, DeltaTable, Option<usize>)>,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
-    register_delta_sources_with_options(ctx, sources, DeltaReaderExecutionOptions::default())
+    register_delta_sources_with_options(ctx, sources, DeltaScanExecutionOptions::default())
 }
 
 /// Registers loaded Delta sources with explicit reader execution bounds.
@@ -63,11 +63,8 @@ pub fn register_delta_sources(
 pub fn register_delta_sources_with_scan_execution_options(
     ctx: &SessionContext,
     sources: Vec<(String, DeltaTable, Option<usize>)>,
-    execution_options: DeltaReaderExecutionOptions,
+    execution_options: DeltaScanExecutionOptions,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
-    execution_options
-        .validate()
-        .map_err(map_reader_configuration_error)?;
     register_delta_sources_with_options(ctx, sources, execution_options)
 }
 
@@ -75,17 +72,13 @@ pub(crate) fn register_delta_source_with_scan_options(
     ctx: &SessionContext,
     source_name: String,
     table: DeltaTable,
-    scan_options: DeltaDataFusionScanOptions,
+    scan_options: ScanOptions,
     reporter: Option<&ProgressReporter>,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
-    scan_options
-        .execution_options
-        .validate()
-        .map_err(map_reader_configuration_error)?;
     validate_table_source_names([source_name.as_str()])?;
-    reject_existing_delta_registration_name(ctx, &source_name, table.table_uri())?;
+    reject_existing_delta_registration_name(ctx, &source_name, table.table_url())?;
     emit_registration_phase(reporter, ProgressPhase::RegisteringDeltaSource);
-    register_delta_table_with_tracing(ctx, source_name, table, scan_options)
+    register_table_with_tracing(ctx, source_name, table, scan_options)
 }
 
 fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressPhase) {
@@ -97,25 +90,25 @@ fn emit_registration_phase(reporter: Option<&ProgressReporter>, phase: ProgressP
 fn register_delta_sources_with_options(
     ctx: &SessionContext,
     sources: Vec<(String, DeltaTable, Option<usize>)>,
-    execution_options: DeltaReaderExecutionOptions,
+    execution_options: DeltaScanExecutionOptions,
 ) -> Result<RegisteredDeltaSources, DeltaFunnelError> {
     validate_table_source_names(sources.iter().map(|(name, _, _)| name.as_str()))?;
     for (name, table, _) in &sources {
         validate_delta_table_protocol(name, table)?;
     }
     for (name, table, _) in &sources {
-        reject_existing_delta_registration_name(ctx, name, table.table_uri())?;
+        reject_existing_delta_registration_name(ctx, name, table.table_url())?;
     }
 
     let mut registered = Vec::with_capacity(sources.len());
     for (name, table, target_partitions) in sources {
-        let options = DeltaDataFusionScanOptions {
+        let options = ScanOptions {
             execution_options,
             target_partitions,
-            intra_file_repartitioning: DeltaFileRepartitioning::default(),
-            use_view_types: false,
+            intra_file_repartitioning: IntraFileRepartitioning::default(),
+            use_arrow_view_types: false,
         };
-        match register_delta_table_with_tracing(ctx, name, table, options) {
+        match register_table_with_tracing(ctx, name, table, options) {
             Ok(source) => registered.push(source),
             Err(error) => {
                 rollback_registered_delta_sources(
@@ -166,13 +159,13 @@ pub(crate) fn reject_existing_delta_registration_name(
     Ok(())
 }
 
-fn register_delta_table_with_tracing(
+fn register_table_with_tracing(
     ctx: &SessionContext,
     source_name: String,
     table: DeltaTable,
-    options: DeltaDataFusionScanOptions,
+    options: ScanOptions,
 ) -> Result<RegisteredDeltaSource, DeltaFunnelError> {
-    let table_uri = table.table_uri().to_owned();
+    let table_uri = table.table_url().to_owned();
     let snapshot_version = table.version();
     let registered = RegisteredDeltaSource {
         name: source_name.clone(),
@@ -183,7 +176,7 @@ fn register_delta_table_with_tracing(
     };
     observability::datafusion_registration_started(&source_name, snapshot_version);
 
-    let result = register_delta_table(ctx, source_name.clone(), table, options)
+    let result = register_table(ctx, source_name.clone(), table, options)
         .map(|_| registered)
         .map_err(|error| map_registration_error(&source_name, &table_uri, error));
     match &result {
@@ -206,7 +199,7 @@ fn rollback_registered_delta_sources(ctx: &SessionContext, names: &[String]) {
 pub(crate) fn delta_protocol_report(source_name: &str, table: &DeltaTable) -> DeltaProtocolReport {
     protocol_report(
         source_name,
-        table.table_uri(),
+        table.table_url(),
         table.version(),
         table.protocol(),
     )
@@ -216,7 +209,7 @@ fn protocol_report(
     source_name: &str,
     table_uri: &str,
     snapshot_version: u64,
-    protocol: &DeltaProtocolInfo,
+    protocol: &DeltaProtocol,
 ) -> DeltaProtocolReport {
     DeltaProtocolReport {
         source_name: source_name.to_owned(),
@@ -235,7 +228,7 @@ pub(crate) fn validate_delta_table_protocol(
 ) -> Result<(), DeltaFunnelError> {
     validate_protocol(
         source_name,
-        table.table_uri(),
+        table.table_url(),
         table.version(),
         table.protocol(),
         table.validate_protocol(),
@@ -248,7 +241,7 @@ pub(crate) fn validate_delta_table_snapshot_protocol(
 ) -> Result<(), DeltaFunnelError> {
     validate_protocol(
         source_name,
-        snapshot.table_uri(),
+        snapshot.table_url(),
         snapshot.version(),
         snapshot.protocol(),
         snapshot.validate_protocol(),
@@ -259,7 +252,7 @@ fn validate_protocol(
     source_name: &str,
     table_uri: &str,
     snapshot_version: u64,
-    protocol: &DeltaProtocolInfo,
+    protocol: &DeltaProtocol,
     validation: Result<(), DeltaReaderError>,
 ) -> Result<(), DeltaFunnelError> {
     if validation.is_ok() {
@@ -292,12 +285,6 @@ fn validate_protocol(
     })
 }
 
-fn map_reader_configuration_error(error: DeltaReaderError) -> DeltaFunnelError {
-    DeltaFunnelError::Config {
-        message: error.to_string(),
-    }
-}
-
 fn map_registration_error(
     source_name: &str,
     table_uri: &str,
@@ -319,7 +306,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::{TableType, empty::EmptyTable};
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use delta_arrow_reader::{DeltaReaderBackend, DeltaTableBuilder};
+    use delta_arrow_reader::{DeltaTableBuilder, ParquetReaderBackend};
 
     use super::*;
     use crate::query_engine::datafusion::test_support::{
@@ -330,17 +317,21 @@ mod tests {
     const UNSUPPORTED_PROTOCOL_JSON: &str =
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
 
-    fn load(table: &DeltaLogTable) -> Result<DeltaTable, DeltaReaderError> {
-        DeltaTableBuilder::new(table.path().to_string_lossy()).load()
+    async fn load(table: &DeltaLogTable) -> Result<DeltaTable, DeltaReaderError> {
+        DeltaTableBuilder::new(table.path().to_string_lossy())
+            .load_table()
+            .await
     }
 
-    #[test]
-    fn registers_loaded_delta_source() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn registers_loaded_delta_source() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("registration")?;
         let context = SessionContext::new();
 
-        let registered =
-            register_delta_sources(&context, vec![("orders".to_owned(), load(&table)?, None)])?;
+        let registered = register_delta_sources(
+            &context,
+            vec![("orders".to_owned(), load(&table).await?, None)],
+        )?;
 
         let source = &registered.sources[0];
         assert_eq!(source.name, "orders");
@@ -352,19 +343,19 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn registration_accepts_native_async_backend() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn registration_accepts_native_async_backend() -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("registration-native")?;
         let context = SessionContext::new();
-        let options = DeltaReaderExecutionOptions::new()
-            .with_reader_backend(DeltaReaderBackend::NativeAsync)?
+        let options = DeltaScanExecutionOptions::new()
+            .with_parquet_backend(ParquetReaderBackend::Direct)
             .with_max_concurrent_file_reads_per_scan(Some(1))?
             .with_max_concurrent_file_reads_per_partition(1)?
-            .with_output_buffer_capacity_per_partition(1)?;
+            .with_output_buffer_batches_per_partition(1)?;
 
         register_delta_sources_with_scan_execution_options(
             &context,
-            vec![("orders".to_owned(), load(&table)?, None)],
+            vec![("orders".to_owned(), load(&table).await?, None)],
             options,
         )?;
 
@@ -376,7 +367,7 @@ mod tests {
     async fn catalog_inspection_exposes_registered_schema() -> Result<(), Box<dyn std::error::Error>>
     {
         let context = SessionContext::new();
-        let _table = register_fixture_source(&context, "orders", "catalog-inspection")?;
+        let _table = register_fixture_source(&context, "orders", "catalog-inspection").await?;
         let catalog = context.catalog("datafusion").ok_or("missing catalog")?;
         let schema = catalog.schema("public").ok_or("missing schema")?;
         let provider = schema.table("orders").await?.ok_or("missing provider")?;
@@ -386,8 +377,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn existing_conflict_fails_before_partial_registration()
+    #[tokio::test]
+    async fn existing_conflict_fails_before_partial_registration()
     -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("conflict-orders")?;
         let customers = DeltaLogTable::new("conflict-customers")?;
@@ -402,8 +393,8 @@ mod tests {
         let result = register_delta_sources(
             &context,
             vec![
-                ("orders".to_owned(), load(&orders)?, None),
-                ("customers".to_owned(), load(&customers)?, None),
+                ("orders".to_owned(), load(&orders).await?, None),
+                ("customers".to_owned(), load(&customers).await?, None),
             ],
         );
 
@@ -417,8 +408,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn protocol_failure_precedes_partial_registration() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn protocol_failure_precedes_partial_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("protocol-orders")?;
         let customers = DeltaLogTable::new_with_schema_protocol_and_adds(
             "protocol-customers",
@@ -432,8 +424,8 @@ mod tests {
         let result = register_delta_sources(
             &context,
             vec![
-                ("orders".to_owned(), load(&orders)?, None),
-                ("customers".to_owned(), load(&customers)?, None),
+                ("orders".to_owned(), load(&orders).await?, None),
+                ("customers".to_owned(), load(&customers).await?, None),
             ],
         );
 
@@ -448,8 +440,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn existing_conflict_uses_the_configured_default_catalog_and_schema()
+    #[tokio::test]
+    async fn existing_conflict_uses_the_configured_default_catalog_and_schema()
     -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("custom-conflict-orders")?;
         let customers = DeltaLogTable::new("custom-conflict-customers")?;
@@ -466,8 +458,8 @@ mod tests {
         let result = register_delta_sources(
             &context,
             vec![
-                ("orders".to_owned(), load(&orders)?, None),
-                ("customers".to_owned(), load(&customers)?, None),
+                ("orders".to_owned(), load(&orders).await?, None),
+                ("customers".to_owned(), load(&customers).await?, None),
             ],
         );
 
@@ -481,8 +473,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn late_failure_rolls_back_prior_sources() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn late_failure_rolls_back_prior_sources() -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("rollback-orders")?;
         let customers = DeltaLogTable::new("rollback-customers")?;
         let context = SessionContext::new();
@@ -496,8 +488,8 @@ mod tests {
         let result = register_delta_sources(
             &context,
             vec![
-                ("orders".to_owned(), load(&orders)?, None),
-                ("customers".to_owned(), load(&customers)?, None),
+                ("orders".to_owned(), load(&orders).await?, None),
+                ("customers".to_owned(), load(&customers).await?, None),
             ],
         );
 
@@ -511,9 +503,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn duplicate_names_fail_before_partial_registration() -> Result<(), Box<dyn std::error::Error>>
-    {
+    #[tokio::test]
+    async fn duplicate_names_fail_before_partial_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("duplicate-orders")?;
         let customers = DeltaLogTable::new("duplicate-customers")?;
         let context = SessionContext::new();
@@ -521,8 +513,8 @@ mod tests {
         let result = register_delta_sources(
             &context,
             vec![
-                ("orders".to_owned(), load(&orders)?, None),
-                ("Orders".to_owned(), load(&customers)?, None),
+                ("orders".to_owned(), load(&orders).await?, None),
+                ("Orders".to_owned(), load(&customers).await?, None),
             ],
         );
 

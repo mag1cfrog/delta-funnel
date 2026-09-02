@@ -63,11 +63,22 @@ impl DeltaFunnelRuntime {
         self.runtime.block_on(session.table_from_sql(sql))
     }
 
+    /// Registers one Delta source for a synchronous host.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same error as [`DeltaFunnelSession::delta_lake`].
+    pub fn delta_lake(
+        &self,
+        session: &mut DeltaFunnelSession,
+        source: DeltaSourceConfig,
+    ) -> Result<LazyTable, DeltaFunnelError> {
+        reject_nested_runtime()?;
+        self.runtime.block_on(session.delta_lake(source))
+    }
+
     /// Registers one Delta source and reports its live lifecycle to the caller.
     ///
-    /// Registration is synchronous and does not enter this type's Tokio
-    /// runtime. The runtime wrapper exists as the public bridge used by
-    /// synchronous host bindings.
     #[doc(hidden)]
     pub fn delta_lake_with_progress(
         &self,
@@ -75,7 +86,9 @@ impl DeltaFunnelRuntime {
         source: DeltaSourceConfig,
         reporter: ProgressReporter,
     ) -> Result<LazyTable, DeltaFunnelError> {
-        session.delta_lake_with_progress(source, reporter)
+        reject_nested_runtime()?;
+        self.runtime
+            .block_on(session.delta_lake_with_progress(source, reporter))
     }
 
     /// Runs a bounded lazy table preview for a synchronous host.
@@ -628,10 +641,10 @@ mod tests {
                         .with_dry_run_scan_summary_mode(DryRunScanSummaryMode::ExhaustScanMetadata),
                 ),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = runtime.delta_lake(
+            &mut session,
+            DeltaSourceConfig::new("orders", table.path().to_string_lossy().to_string()),
+        )?;
         let request = output_request(source, "orders_output", "orders_sink")?;
 
         let report = runtime.dry_run_all_to_mssql_with_scan_summary(&session, &[request])?;

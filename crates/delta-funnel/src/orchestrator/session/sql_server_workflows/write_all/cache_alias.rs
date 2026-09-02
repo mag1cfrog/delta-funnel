@@ -1556,10 +1556,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("cache-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let task_ctx = Arc::new(dataframe.task_ctx());
         let physical_plan = dataframe.create_physical_plan().await?;
@@ -1984,10 +1986,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("cache-planning")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "cache_alias",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "cache_alias",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let capture = TracingCapture::start_with_profile_spans_enabled();
         let trace_context =
             OperationTraceContext::start_for_test(true).ok_or("expected process trace context")?;

@@ -1284,7 +1284,7 @@ mod tests {
         logical_expr::{Volatility, create_udf},
         physical_plan::{ExecutionPlan, empty::EmptyExec, union::UnionExec},
     };
-    use delta_arrow_reader::{DeltaReaderBackend, DeltaReaderExecutionOptions};
+    use delta_arrow_reader::{DeltaScanExecutionOptions, ParquetReaderBackend};
     use futures_util::StreamExt;
     use tracing::Level;
 
@@ -1498,12 +1498,12 @@ mod tests {
     fn assert_provider_io_event_matches_snapshot(
         event: &CapturedEvent,
         source_name: &str,
-        snapshot: &delta_arrow_reader::DeltaDataFusionMetricsSnapshot,
+        snapshot: &crate::DeltaDataFusionMetricsSnapshot,
         outcome: &str,
     ) {
         let reader_backend = match snapshot.reader.reader_backend {
-            delta_arrow_reader::DeltaReaderBackend::OfficialKernel => "official_kernel",
-            delta_arrow_reader::DeltaReaderBackend::NativeAsync => "native_async",
+            delta_arrow_reader::ParquetReaderBackend::DeltaKernel => "official_kernel",
+            delta_arrow_reader::ParquetReaderBackend::Direct => "native_async",
         };
         let metrics = [
             snapshot.reader.parquet_data_file_range_get_operations,
@@ -1556,10 +1556,12 @@ mod tests {
     ) -> Result<Vec<super::DeltaProviderReadStatsHandle>, Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default(fixture_name)?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            source_name,
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                source_name,
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
@@ -1734,10 +1736,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("terminal-ownership-release")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
@@ -1852,10 +1856,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("profile-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let failing_plan: Arc<dyn ExecutionPlan> =
@@ -1915,10 +1921,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("profiled-stream-setup-error-root")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let failing_plan: Arc<dyn ExecutionPlan> =
@@ -1956,10 +1964,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
 
         let stream = session.batch_stream_for_lazy_table(&source, None).await?;
         let rows = collect_stream_row_count(stream).await?;
@@ -1973,10 +1983,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-eof")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
         let capture = TracingCapture::start();
         let stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
@@ -2015,10 +2027,12 @@ mod tests {
                 target_partitions: Some(1),
                 output_batch_size: Some(1),
             }))?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
         let capture = TracingCapture::start();
         let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
@@ -2060,7 +2074,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("final-stats-upstream-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let shared_provider_stats = super::shared_provider_stats_snapshots();
         let capture = TracingCapture::start();
         let mut stream = report_tracked_stream(&session, &source, &shared_provider_stats).await?;
@@ -2089,10 +2105,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("final-stats-stream-setup-error")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let failing_plan: Arc<dyn ExecutionPlan> =
@@ -2160,10 +2178,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("zero-partition-summary")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
         let handles = super::collect_delta_provider_read_stats_handles(physical_plan.as_ref());
@@ -2206,10 +2226,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("distinct-summary-identities")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let dataframe = session.dataframe_for_lazy_table(&source).await?;
         let first_plan = dataframe.clone().create_physical_plan().await?;
         let second_plan = dataframe.create_physical_plan().await?;
@@ -2274,10 +2296,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_default("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let (reporter, events) = recording_file_progress();
 
         let stream = session
@@ -2303,14 +2327,18 @@ mod tests {
         let orders = RealParquetDeltaTable::new_default("orders")?;
         let customers = RealParquetDeltaTable::new_default("customers")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            orders.path().to_string_lossy().to_string(),
-        ))?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "customers",
-            customers.path().to_string_lossy().to_string(),
-        ))?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                orders.path().to_string_lossy().to_string(),
+            ))
+            .await?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "customers",
+                customers.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let joined = session
             .table_from_sql(
                 "select o.id \
@@ -2718,10 +2746,12 @@ mod tests {
                 target_partitions: Some(1),
                 output_batch_size: Some(1),
             }))?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let capture = TracingCapture::start();
 
         let preview = session.preview_table(&source, 1).await?;
@@ -2748,11 +2778,11 @@ mod tests {
         )?;
 
         for reader_backend in [
-            DeltaReaderBackend::OfficialKernel,
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::DeltaKernel,
+            ParquetReaderBackend::Direct,
         ] {
-            let provider_options = DeltaReaderExecutionOptions::new()
-                .with_reader_backend(reader_backend)?
+            let provider_options = DeltaScanExecutionOptions::new()
+                .with_parquet_backend(reader_backend)
                 .with_max_concurrent_file_reads_per_scan(Some(2))?
                 .with_max_concurrent_file_reads_per_partition(1)?;
             let mut session = DeltaFunnelSession::new(
@@ -2763,10 +2793,12 @@ mod tests {
                     })
                     .with_provider_scan_options(provider_options),
             )?;
-            let _source = session.delta_lake(DeltaSourceConfig::new(
-                "metrics",
-                table.path().to_string_lossy().to_string(),
-            ))?;
+            let _source = session
+                .delta_lake(DeltaSourceConfig::new(
+                    "metrics",
+                    table.path().to_string_lossy().to_string(),
+                ))
+                .await?;
             let filtered = session
                 .table_from_sql(
                     "select event_date, amount from metrics \
@@ -2821,10 +2853,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_two_files("detailed-preview-profile")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let capture = TracingCapture::start();
 
         let preview = session
@@ -2864,8 +2898,8 @@ mod tests {
     async fn detailed_preview_progress_preserves_profile_and_timing_shape()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_two_files("detailed-progress-parity")?;
-        let provider_options = DeltaReaderExecutionOptions::new()
-            .with_reader_backend(DeltaReaderBackend::NativeAsync)?
+        let provider_options = DeltaScanExecutionOptions::new()
+            .with_parquet_backend(ParquetReaderBackend::Direct)
             .with_max_concurrent_file_reads_per_scan(Some(1))?
             .with_max_concurrent_file_reads_per_partition(1)?;
         let mut session = DeltaFunnelSession::new(
@@ -2876,10 +2910,12 @@ mod tests {
                 })
                 .with_provider_scan_options(provider_options),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let options =
             PreviewOptions::new(1).with_execution_profile_mode(ExecutionProfileMode::Detailed);
         let capture = TracingCapture::start();
@@ -3301,10 +3337,12 @@ mod tests {
                 target_partitions: Some(1),
                 output_batch_size: Some(1),
             }))?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
 
         let (reporter, full_events) = recording_preview_file_progress();
         let full = session
@@ -3365,10 +3403,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = RealParquetDeltaTable::new_with_two_files("preview-terminal-order")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let (reporter, events) = recording_preview_progress();
 
         session
@@ -3467,12 +3507,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn scoped_cache_alias_guard_rejects_raw_source_before_catalog_replacement()
+    #[tokio::test]
+    async fn scoped_cache_alias_guard_rejects_raw_source_before_catalog_replacement()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let error = session.registered_derived_for_scoped_cache_alias(&source);
 

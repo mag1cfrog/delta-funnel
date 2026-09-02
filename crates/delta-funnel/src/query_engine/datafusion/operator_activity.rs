@@ -702,7 +702,10 @@ mod tests {
     #[cfg(feature = "perfetto-profile")]
     use datafusion::{physical_plan::collect, prelude::SessionContext};
     #[cfg(feature = "perfetto-profile")]
-    use delta_arrow_reader::{DeltaDataFusionScanOptions, DeltaTableBuilder, register_delta_table};
+    use delta_arrow_reader::{
+        DeltaTableBuilder,
+        datafusion::{ScanOptions, register_table},
+    };
 
     #[cfg(feature = "perfetto-profile")]
     use crate::query_engine::datafusion::test_support::{
@@ -801,13 +804,10 @@ mod tests {
             "[]",
             &[(r#""partitionValues":{}"#, 100)],
         )?;
-        let loaded = DeltaTableBuilder::new(table.path().to_string_lossy()).load()?;
-        register_delta_table(
-            &context,
-            "orders",
-            loaded,
-            DeltaDataFusionScanOptions::default(),
-        )?;
+        let loaded = DeltaTableBuilder::new(table.path().to_string_lossy())
+            .load_table()
+            .await?;
+        register_table(&context, "orders", loaded, ScanOptions::default())?;
         let dataframe = context.sql("select * from orders").await?;
         let plan = dataframe.create_physical_plan().await?;
         let operation =
