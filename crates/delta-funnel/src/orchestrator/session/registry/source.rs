@@ -708,17 +708,18 @@ mod tests {
             result,
             Err(DeltaFunnelError::DataFusionRegistration { .. })
         ));
-        let events = events.lock().map_err(|_| "progress events lock poisoned")?;
-        assert_eq!(events.len(), 6);
-        assert_eq!(
-            events[4].phase(),
-            Some(ProgressPhase::RegisteringDeltaSource)
-        );
-        assert_eq!(events[5].kind(), ProgressEventKind::Failed);
+        {
+            let events = events.lock().map_err(|_| "progress events lock poisoned")?;
+            assert_eq!(events.len(), 6);
+            assert_eq!(
+                events[4].phase(),
+                Some(ProgressPhase::RegisteringDeltaSource)
+            );
+            assert_eq!(events[5].kind(), ProgressEventKind::Failed);
+        }
         assert!(session.sources().is_empty());
         assert_eq!(session.next_table_id(), 0);
         assert!(!session.context().table_exist("customers")?);
-        drop(events);
 
         failing_schema.allow_customers();
         let (reporter, retry_events) = recording_reporter();

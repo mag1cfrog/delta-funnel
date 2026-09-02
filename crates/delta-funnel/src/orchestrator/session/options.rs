@@ -132,7 +132,6 @@ impl SessionOptions {
     }
 
     /// Returns Delta provider scan execution options.
-    #[must_use]
     pub const fn provider_scan_options(&self) -> DeltaScanExecutionOptions {
         self.provider_scan_options
     }
