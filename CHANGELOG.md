@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.5.0...delta-funnel-v0.6.0) - 2026-09-02
+
+### Added
+
+- upgrade delta arrow reader to 0.6
+- configure Delta file repartitioning from Python ([#670](https://github.com/mag1cfrog/delta-funnel/pull/670))
+- configure Delta provider view types ([#669](https://github.com/mag1cfrog/delta-funnel/pull/669))
+- add typed provider scan options ([#671](https://github.com/mag1cfrog/delta-funnel/pull/671))
+
+### Fixed
+
+- satisfy reader migration lints
+
+### Other
+
+- bump delta arrow reader to 0.1.3 ([#668](https://github.com/mag1cfrog/delta-funnel/pull/668))
+- remove the internal Delta reader
+- cut over to delta arrow reader ([#665](https://github.com/mag1cfrog/delta-funnel/pull/665))
+- prepare published reader migration ([#664](https://github.com/mag1cfrog/delta-funnel/pull/664))
+- complete issue 459 benchmark prerequisites ([#640](https://github.com/mag1cfrog/delta-funnel/pull/640))
+
 ### Added
 
 - expose the Delta reader view-type policy through Rust and Python session options, with ordinary Arrow string and binary arrays as the Delta Funnel default
