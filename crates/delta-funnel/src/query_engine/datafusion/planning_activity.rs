@@ -126,7 +126,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let capture = TracingCapture::start_with_profile_spans_enabled();
         let context = SessionContext::new();
-        let _table = register_fixture_source(&context, "orders", "planning-spans")?;
+        let _table = register_fixture_source(&context, "orders", "planning-spans").await?;
         let dataframe = context.sql("select * from orders").await?;
         let operation =
             OperationTraceContext::start_for_test(true).ok_or("profile tracing should start")?;

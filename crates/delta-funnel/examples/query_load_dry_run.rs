@@ -32,7 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let runtime = DeltaFunnelRuntime::new()?;
 
-    let _orders = session.delta_lake(DeltaSourceConfig::new("orders", orders_delta_uri))?;
+    let _orders = runtime.delta_lake(
+        &mut session,
+        DeltaSourceConfig::new("orders", orders_delta_uri),
+    )?;
     let selected_orders = runtime.table_from_sql(&mut session, "select * from orders")?;
 
     let target = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_output")?)

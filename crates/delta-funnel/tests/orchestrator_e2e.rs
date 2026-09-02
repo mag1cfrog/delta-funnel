@@ -57,7 +57,9 @@ impl Drop for DeltaLogFixture {
 fn hidden_progress_contract_is_usable_outside_the_crate() -> TestResult<()> {
     let orders = DeltaLogFixture::new("progress-contract", ORDERS_SCHEMA_FIELDS_JSON)?;
     let mut session = session_with_default_connection()?;
-    let orders_table = session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
+    let runtime = DeltaFunnelRuntime::new()?;
+    let orders_table =
+        runtime.delta_lake(&mut session, DeltaSourceConfig::new("orders", orders.uri()))?;
     let output = output_request(
         orders_table,
         "orders_output",
@@ -65,7 +67,6 @@ fn hidden_progress_contract_is_usable_outside_the_crate() -> TestResult<()> {
         LoadMode::AppendExisting,
         RunMode::DryRun,
     )?;
-    let runtime = DeltaFunnelRuntime::new()?;
     let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
     let callback_events = Arc::clone(&events);
     let reporter = ProgressReporter::new(move |event: &ProgressEvent| {
@@ -107,7 +108,9 @@ fn hidden_progress_contract_is_usable_outside_the_crate() -> TestResult<()> {
 async fn dry_run_plans_one_source_one_output_through_public_api() -> TestResult<()> {
     let orders = DeltaLogFixture::new("orders", ORDERS_SCHEMA_FIELDS_JSON)?;
     let mut session = session_with_default_connection()?;
-    let orders_table = session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
+    let orders_table = session
+        .delta_lake(DeltaSourceConfig::new("orders", orders.uri()))
+        .await?;
     let selected_orders = session
         .table_from_sql("select id, region from orders")
         .await?;
@@ -155,8 +158,12 @@ async fn dry_run_plans_multi_source_join_through_public_api() -> TestResult<()> 
     let orders = DeltaLogFixture::new("orders", ORDERS_SCHEMA_FIELDS_JSON)?;
     let customers = DeltaLogFixture::new("customers", CUSTOMERS_SCHEMA_FIELDS_JSON)?;
     let mut session = session_with_default_connection()?;
-    session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
-    session.delta_lake(DeltaSourceConfig::new("customers", customers.uri()))?;
+    session
+        .delta_lake(DeltaSourceConfig::new("orders", orders.uri()))
+        .await?;
+    session
+        .delta_lake(DeltaSourceConfig::new("customers", customers.uri()))
+        .await?;
     let joined = session
         .table_from_sql(
             "select o.id, c.customer_name \
@@ -192,9 +199,15 @@ async fn dry_run_all_reports_sources_through_public_api() -> TestResult<()> {
     let customers = DeltaLogFixture::new("customers", CUSTOMERS_SCHEMA_FIELDS_JSON)?;
     let regions = DeltaLogFixture::new("regions", REGIONS_SCHEMA_FIELDS_JSON)?;
     let mut session = session_with_default_connection()?;
-    session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
-    session.delta_lake(DeltaSourceConfig::new("customers", customers.uri()))?;
-    session.delta_lake(DeltaSourceConfig::new("regions", regions.uri()))?;
+    session
+        .delta_lake(DeltaSourceConfig::new("orders", orders.uri()))
+        .await?;
+    session
+        .delta_lake(DeltaSourceConfig::new("customers", customers.uri()))
+        .await?;
+    session
+        .delta_lake(DeltaSourceConfig::new("regions", regions.uri()))
+        .await?;
     let joined = session
         .table_from_sql(
             "select o.id, c.customer_name \
@@ -248,7 +261,9 @@ async fn dry_run_all_reports_sources_through_public_api() -> TestResult<()> {
 async fn dry_run_plans_shared_derived_table_for_two_outputs() -> TestResult<()> {
     let orders = DeltaLogFixture::new("orders", ORDERS_SCHEMA_FIELDS_JSON)?;
     let mut session = session_with_default_connection()?;
-    session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
+    session
+        .delta_lake(DeltaSourceConfig::new("orders", orders.uri()))
+        .await?;
     let pending_big = session
         .table_from_sql("select id, region from orders")
         .await?;

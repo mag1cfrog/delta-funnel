@@ -2,8 +2,8 @@ use std::{error::Error as _, fmt};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use delta_arrow_reader::{
-    DeltaDataFusionScanOptions, DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection,
-    DeltaTableBuilder, DeltaTableSnapshot,
+    DeltaReaderError, DeltaReaderPhase, DeltaSnapshotSelection, DeltaTableBuilder,
+    DeltaTableSnapshot, datafusion::ScanOptions,
 };
 
 use crate::{
@@ -127,9 +127,12 @@ impl DeltaFunnelSession {
     /// Returns the first Delta source loading, protocol preflight, duplicate
     /// alias, schema conversion, or DataFusion registration error. Session
     /// source state is updated only after the DataFusion registration succeeds.
-    pub fn delta_lake(&mut self, source: DeltaSourceConfig) -> Result<LazyTable, DeltaFunnelError> {
+    pub async fn delta_lake(
+        &mut self,
+        source: DeltaSourceConfig,
+    ) -> Result<LazyTable, DeltaFunnelError> {
         self.validate_delta_source_registration(&source)?;
-        self.register_delta_source(source, None)
+        self.register_delta_source(source, None).await
     }
 
     /// Registers one Delta source while reporting its live lifecycle.
@@ -137,7 +140,7 @@ impl DeltaFunnelSession {
     /// Name and catalog conflicts fail before progress starts. Once started,
     /// the reporter receives the source-loading phases and exactly one terminal
     /// event. Reporting does not change registration or rollback behavior.
-    pub(crate) fn delta_lake_with_progress(
+    pub(crate) async fn delta_lake_with_progress(
         &mut self,
         source: DeltaSourceConfig,
         reporter: ProgressReporter,
@@ -146,7 +149,7 @@ impl DeltaFunnelSession {
         reporter.emit(&ProgressEvent::started(
             ProgressOperation::RegisterDeltaSource,
         ));
-        let result = self.register_delta_source(source, Some(&reporter));
+        let result = self.register_delta_source(source, Some(&reporter)).await;
         reporter.emit(&if result.is_ok() {
             ProgressEvent::completed()
         } else {
@@ -156,7 +159,7 @@ impl DeltaFunnelSession {
     }
 
     /// Performs source loading and catalog registration after local checks.
-    fn register_delta_source(
+    async fn register_delta_source(
         &mut self,
         source: DeltaSourceConfig,
         reporter: Option<&ProgressReporter>,
@@ -166,7 +169,7 @@ impl DeltaFunnelSession {
         emit_registration_phase(reporter, ProgressPhase::LoadingDeltaMetadata);
         let source_timer = PhaseTimer::start(SOURCE_LOADING_PHASE);
         let (source_name, snapshot) =
-            match load_delta_snapshot(source, self.options.provider_scan_options()) {
+            match load_delta_snapshot(source, self.options.provider_scan_options()).await {
                 Ok(loaded) => {
                     phase_timings.push(source_timer.completed());
                     loaded
@@ -191,7 +194,7 @@ impl DeltaFunnelSession {
 
         let registration_timer = PhaseTimer::start(DATAFUSION_REGISTRATION_PHASE);
         emit_registration_phase(reporter, ProgressPhase::PreparingDeltaProvider);
-        let table_uri = snapshot.table_uri().to_owned();
+        let table_uri = snapshot.table_url().to_owned();
         let table = match snapshot.into_table() {
             Ok(table) => table,
             Err(error) => {
@@ -203,11 +206,11 @@ impl DeltaFunnelSession {
             &self.context,
             source_name,
             table,
-            DeltaDataFusionScanOptions {
+            ScanOptions {
                 execution_options: self.options.provider_scan_options(),
                 target_partitions: None,
                 intra_file_repartitioning: self.options.provider_file_repartitioning(),
-                use_view_types: self.options.provider_use_view_types(),
+                use_arrow_view_types: self.options.provider_use_view_types(),
             },
             reporter,
         ) {
@@ -244,9 +247,9 @@ impl DeltaFunnelSession {
     }
 }
 
-fn load_delta_snapshot(
+async fn load_delta_snapshot(
     mut source: DeltaSourceConfig,
-    execution_options: delta_arrow_reader::DeltaReaderExecutionOptions,
+    execution_options: delta_arrow_reader::DeltaScanExecutionOptions,
 ) -> Result<(String, DeltaTableSnapshot), DeltaFunnelError> {
     source.apply_environment_storage_options();
     let source_name = source.name.clone();
@@ -263,6 +266,7 @@ fn load_delta_snapshot(
         .with_snapshot_selection(selection)
         .with_execution_options(execution_options)
         .load_snapshot()
+        .await
         .map_err(|error| map_load_error(&source_name, &table_uri, auth_mode, error));
 
     match &result {
@@ -305,7 +309,7 @@ fn map_load_error(
         DeltaReaderPhase::Configuration => DeltaFunnelError::Config {
             message: error.to_string(),
         },
-        DeltaReaderPhase::TableUri => DeltaFunnelError::InvalidSourceUri {
+        DeltaReaderPhase::TableLocation => DeltaFunnelError::InvalidSourceUri {
             reason: if table_uri.trim().is_empty() {
                 EMPTY_TABLE_URI
             } else {
@@ -396,7 +400,7 @@ mod tests {
         },
     };
     use delta_arrow_reader::{
-        DeltaReaderBackend, DeltaReaderExecutionOptions, DeltaStorageOptions,
+        DeltaScanExecutionOptions, DeltaStorageOptions, ParquetReaderBackend,
     };
 
     use super::super::super::{
@@ -408,10 +412,11 @@ mod tests {
         r#"{"protocol":{"minReaderVersion":99,"minWriterVersion":2}}"#;
     const UNSUPPORTED_FEATURE_PROTOCOL_JSON: &str = r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["madeUpFeature","laterFeature"],"writerFeatures":["madeUpFeature","laterFeature"]}}"#;
 
-    #[test]
-    fn snapshot_error_keeps_the_s3_hint_only_for_implicit_auth() {
+    #[tokio::test]
+    async fn snapshot_error_keeps_the_s3_hint_only_for_implicit_auth() {
         let error = delta_arrow_reader::DeltaTableBuilder::new("")
-            .load()
+            .load_table()
+            .await
             .expect_err("blank URI should fail");
 
         let implicit = snapshot_load_failed_reason(
@@ -440,7 +445,7 @@ mod tests {
         (reporter, events)
     }
 
-    fn assert_source_loading_progress_failure(
+    async fn assert_source_loading_progress_failure(
         source: DeltaSourceConfig,
         error_matches: impl FnOnce(&DeltaFunnelError) -> bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -448,7 +453,7 @@ mod tests {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let (reporter, events) = recording_reporter();
 
-        let result = session.delta_lake_with_progress(source, reporter);
+        let result = session.delta_lake_with_progress(source, reporter).await;
 
         let error = result
             .as_ref()
@@ -466,15 +471,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_reports_ordered_registration_lifecycle()
+    #[tokio::test]
+    async fn delta_lake_progress_reports_ordered_registration_lifecycle()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders-progress")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         let (reporter, events) = recording_reporter();
 
         session
-            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter)?;
+            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter)
+            .await?;
 
         let events = events.lock().map_err(|_| "progress events lock poisoned")?;
         assert_eq!(events.len(), 6);
@@ -502,17 +508,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_preserves_each_reader_backend_registration()
+    #[tokio::test]
+    async fn delta_lake_progress_preserves_each_reader_backend_registration()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("progress-reader-backends")?;
 
         for backend in [
-            DeltaReaderBackend::OfficialKernel,
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::DeltaKernel,
+            ParquetReaderBackend::Direct,
         ] {
-            let provider_options =
-                DeltaReaderExecutionOptions::new().with_reader_backend(backend)?;
+            let provider_options = DeltaScanExecutionOptions::new().with_parquet_backend(backend);
             let mut ordinary = DeltaFunnelSession::new(
                 SessionOptions::new().with_provider_scan_options(provider_options),
             )?;
@@ -521,11 +526,13 @@ mod tests {
             )?;
             let source_uri = table.uri();
 
-            let ordinary_table =
-                ordinary.delta_lake(DeltaSourceConfig::new("orders", source_uri.clone()))?;
+            let ordinary_table = ordinary
+                .delta_lake(DeltaSourceConfig::new("orders", source_uri.clone()))
+                .await?;
             let (reporter, events) = recording_reporter();
             let reported_table = reported
-                .delta_lake_with_progress(DeltaSourceConfig::new("orders", source_uri), reporter)?;
+                .delta_lake_with_progress(DeltaSourceConfig::new("orders", source_uri), reporter)
+                .await?;
 
             assert_eq!(reported_table, ordinary_table);
             let ordinary_source = ordinary
@@ -575,7 +582,9 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_provider_use_view_types(use_view_types),
             )?;
-            session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+            session
+                .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+                .await?;
             let provider = session.context().table_provider("orders").await?;
 
             assert_eq!(
@@ -589,27 +598,30 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_covers_source_loading_failure_variants()
+    #[tokio::test]
+    async fn delta_lake_progress_covers_source_loading_failure_variants()
     -> Result<(), Box<dyn std::error::Error>> {
         assert_source_loading_progress_failure(
             DeltaSourceConfig::new("orders", ""),
             |error| matches!(error, DeltaFunnelError::InvalidSourceUri { reason } if *reason == EMPTY_TABLE_URI),
-        )?;
+        )
+        .await?;
         assert_source_loading_progress_failure(
             DeltaSourceConfig::new("orders", "ftp://example.com/table"),
             |error| matches!(error, DeltaFunnelError::DeltaSourceEngine { .. }),
-        )?;
+        )
+        .await?;
         let table = DeltaLogTable::new("progress-missing-snapshot")?;
         assert_source_loading_progress_failure(
             DeltaSourceConfig::new("orders", table.uri()).with_version(Some(999)),
             |error| matches!(error, DeltaFunnelError::DeltaSnapshotLoad { .. }),
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_reports_protocol_failure_after_validation_starts()
+    #[tokio::test]
+    async fn delta_lake_progress_reports_protocol_failure_after_validation_starts()
     -> Result<(), Box<dyn std::error::Error>> {
         let table =
             DeltaLogTable::new_with_protocol("progress-protocol", UNSUPPORTED_PROTOCOL_JSON)?;
@@ -617,7 +629,8 @@ mod tests {
         let (reporter, events) = recording_reporter();
 
         let result = session
-            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter);
+            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter)
+            .await;
 
         assert!(matches!(
             result,
@@ -635,8 +648,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_reports_provider_preparation_failure()
+    #[tokio::test]
+    async fn delta_lake_progress_reports_provider_preparation_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_schema(
             "progress-provider",
@@ -646,7 +659,8 @@ mod tests {
         let (reporter, events) = recording_reporter();
 
         let result = session
-            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter);
+            .delta_lake_with_progress(DeltaSourceConfig::new("orders", table.uri()), reporter)
+            .await;
 
         assert!(matches!(
             result,
@@ -669,8 +683,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_reports_catalog_registration_failure()
+    #[tokio::test]
+    async fn delta_lake_progress_reports_catalog_registration_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let source_table = DeltaLogTable::new("progress-catalog")?;
         let source_uri = source_table.uri();
@@ -683,10 +697,12 @@ mod tests {
         );
         let (reporter, events) = recording_reporter();
 
-        let result = session.delta_lake_with_progress(
-            DeltaSourceConfig::new("customers", source_uri.clone()),
-            reporter,
-        );
+        let result = session
+            .delta_lake_with_progress(
+                DeltaSourceConfig::new("customers", source_uri.clone()),
+                reporter,
+            )
+            .await;
 
         assert!(matches!(
             result,
@@ -707,7 +723,8 @@ mod tests {
         failing_schema.allow_customers();
         let (reporter, retry_events) = recording_reporter();
         let table = session
-            .delta_lake_with_progress(DeltaSourceConfig::new("customers", source_uri), reporter)?;
+            .delta_lake_with_progress(DeltaSourceConfig::new("customers", source_uri), reporter)
+            .await?;
 
         assert_eq!(table.id(), 0);
         assert_eq!(session.sources().len(), 1);
@@ -721,19 +738,26 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_does_not_start_for_local_registration_errors()
+    #[tokio::test]
+    async fn delta_lake_progress_does_not_start_for_local_registration_errors()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders-conflict")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         for source in [
             DeltaSourceConfig::new("select", ""),
             DeltaSourceConfig::new("ORDERS", ""),
         ] {
             let (reporter, events) = recording_reporter();
-            assert!(session.delta_lake_with_progress(source, reporter).is_err());
+            assert!(
+                session
+                    .delta_lake_with_progress(source, reporter)
+                    .await
+                    .is_err()
+            );
             assert!(
                 events
                     .lock()
@@ -744,8 +768,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_progress_does_not_start_for_datafusion_catalog_conflict()
+    #[tokio::test]
+    async fn delta_lake_progress_does_not_start_for_datafusion_catalog_conflict()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
         session.context().register_table(
@@ -754,10 +778,12 @@ mod tests {
         )?;
         let (reporter, events) = recording_reporter();
 
-        let result = session.delta_lake_with_progress(
-            DeltaSourceConfig::new("existingorders", "secret://must-not-load"),
-            reporter,
-        );
+        let result = session
+            .delta_lake_with_progress(
+                DeltaSourceConfig::new("existingorders", "secret://must-not-load"),
+                reporter,
+            )
+            .await;
 
         assert!(matches!(
             result,
@@ -772,13 +798,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_registers_source_and_returns_lazy_table() -> Result<(), Box<dyn std::error::Error>>
-    {
+    #[tokio::test]
+    async fn delta_lake_registers_source_and_returns_lazy_table()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        let lazy = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let lazy = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         assert_eq!(lazy.id(), 0);
         assert_eq!(lazy.kind(), LazyTableKind::DeltaSource);
@@ -804,7 +832,7 @@ mod tests {
         assert_eq!(report.scheduling().query_target_partitions(), None);
         assert_eq!(
             report.scheduling().reader_backend(),
-            DeltaReaderBackend::NativeAsync
+            ParquetReaderBackend::Direct
         );
         assert_eq!(
             report.scheduling().max_concurrent_file_reads_per_scan(),
@@ -849,14 +877,19 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn delta_lake_registers_multiple_distinct_sources() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn delta_lake_registers_multiple_distinct_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
         let orders = DeltaLogTable::new("orders")?;
         let customers = DeltaLogTable::new("customers")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        let orders = session.delta_lake(DeltaSourceConfig::new("orders", orders.uri()))?;
-        let customers = session.delta_lake(DeltaSourceConfig::new("customers", customers.uri()))?;
+        let orders = session
+            .delta_lake(DeltaSourceConfig::new("orders", orders.uri()))
+            .await?;
+        let customers = session
+            .delta_lake(DeltaSourceConfig::new("customers", customers.uri()))
+            .await?;
 
         assert_eq!(orders.id(), 0);
         assert_eq!(customers.id(), 1);
@@ -866,14 +899,18 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn duplicate_source_alias_fails_before_loading_second_source()
+    #[tokio::test]
+    async fn duplicate_source_alias_fails_before_loading_second_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
-        let error = session.delta_lake(DeltaSourceConfig::new("ORDERS", ""));
+        let error = session
+            .delta_lake(DeltaSourceConfig::new("ORDERS", ""))
+            .await;
 
         assert!(matches!(
             error,
@@ -884,11 +921,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn invalid_source_alias_fails_before_registration() -> Result<(), DeltaFunnelError> {
+    #[tokio::test]
+    async fn invalid_source_alias_fails_before_registration() -> Result<(), DeltaFunnelError> {
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        let error = session.delta_lake(DeltaSourceConfig::new("select", ""));
+        let error = session
+            .delta_lake(DeltaSourceConfig::new("select", ""))
+            .await;
 
         assert!(matches!(
             error,
@@ -899,13 +938,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn protocol_preflight_failure_does_not_register_source()
+    #[tokio::test]
+    async fn protocol_preflight_failure_does_not_register_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
+        let error = session
+            .delta_lake(DeltaSourceConfig::new("unsupported", table.uri()))
+            .await;
 
         let display = format!("{}", error.as_ref().err().ok_or("expected error")?);
         assert!(display.contains("unsupported"));
@@ -919,8 +960,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn protocol_preflight_reports_the_first_unsupported_reader_feature()
+    #[tokio::test]
+    async fn protocol_preflight_reports_the_first_unsupported_reader_feature()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_protocol(
             "unsupported-feature",
@@ -930,6 +971,7 @@ mod tests {
 
         let error = session
             .delta_lake(DeltaSourceConfig::new("unsupported", table.uri()))
+            .await
             .err()
             .ok_or("expected protocol compatibility error")?;
 
@@ -941,8 +983,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn protocol_preflight_failure_redacts_secret_uri_parts()
+    #[tokio::test]
+    async fn protocol_preflight_failure_redacts_secret_uri_parts()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
@@ -952,6 +994,7 @@ mod tests {
                 "unsupported",
                 table.file_uri_with_secret_parts()?,
             ))
+            .await
             .map(|_| ())
             .map_err(|error| error.to_string());
 
@@ -973,7 +1016,9 @@ mod tests {
         let table = DeltaLogTable::new_with_protocol("unsupported", UNSUPPORTED_PROTOCOL_JSON)?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        let error = session.delta_lake(DeltaSourceConfig::new("unsupported", table.uri()));
+        let error = session
+            .delta_lake(DeltaSourceConfig::new("unsupported", table.uri()))
+            .await;
 
         assert!(matches!(
             error,
@@ -991,7 +1036,9 @@ mod tests {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let dataframe = session
             .context()
             .sql("select id, customer_name from orders")
@@ -1005,9 +1052,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn source_debug_does_not_expose_storage_option_values() -> Result<(), Box<dyn std::error::Error>>
-    {
+    #[tokio::test]
+    async fn source_debug_does_not_expose_storage_option_values()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("storage-options")?;
         let mut storage_options = DeltaStorageOptions::new();
         storage_options.insert(
@@ -1016,9 +1063,11 @@ mod tests {
         );
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
 
-        session.delta_lake(
-            DeltaSourceConfig::new("orders", table.uri()).with_storage_options(storage_options),
-        )?;
+        session
+            .delta_lake(
+                DeltaSourceConfig::new("orders", table.uri()).with_storage_options(storage_options),
+            )
+            .await?;
 
         let debug = format!("{session:?}");
         assert!(debug.contains("orders"));
@@ -1031,17 +1080,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn source_registration_honors_configured_provider_options()
+    #[tokio::test]
+    async fn source_registration_honors_configured_provider_options()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("configured-provider")?;
-        let provider_scan_options = DeltaReaderExecutionOptions::new()
-            .with_reader_backend(DeltaReaderBackend::OfficialKernel)?
+        let provider_scan_options = DeltaScanExecutionOptions::new()
+            .with_parquet_backend(ParquetReaderBackend::DeltaKernel)
             .with_max_concurrent_file_reads_per_scan(Some(2))?
             .with_max_concurrent_file_reads_per_partition(1)?
-            .with_output_buffer_capacity_per_partition(3)?
-            .with_native_async_prefetch_file_count_per_partition(0)?
-            .with_parquet_metadata_size_hint(Some(16_384))?;
+            .with_output_buffer_batches_per_partition(3)?
+            .with_prefetch_files_per_partition(0)
+            .with_parquet_metadata_size_hint_bytes(Some(16_384))?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new()
                 .with_query_options(QueryOptions {
@@ -1051,7 +1100,9 @@ mod tests {
                 .with_provider_scan_options(provider_scan_options),
         )?;
 
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         assert_eq!(session.sources().len(), 1);
         assert!(session.registered_source("orders").is_some());
@@ -1061,7 +1112,7 @@ mod tests {
         assert_eq!(scheduling.query_target_partitions(), Some(4));
         assert_eq!(
             scheduling.reader_backend(),
-            DeltaReaderBackend::OfficialKernel
+            ParquetReaderBackend::DeltaKernel
         );
         assert_eq!(scheduling.max_concurrent_file_reads_per_scan(), Some(2));
         assert_eq!(scheduling.max_concurrent_file_reads_per_partition(), 1);

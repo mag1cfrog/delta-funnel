@@ -66,24 +66,28 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use delta_arrow_reader::{
-    DeltaDataFusionMetricsSnapshot, DeltaDataFusionScanOptions, DeltaReaderBackend,
-    DeltaReaderError, DeltaReaderExecutionOptions, DeltaScanPartitionTargetDiagnosticInput,
-    DeltaScanPartitionTargetDiagnosticOutput, DeltaScanPartitionTargetDiagnosticSource,
-    DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
-    DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus, DeltaStorageOptions,
-    DeltaTableBuilder, collect_delta_datafusion_metrics,
-    delta_scan_partition_target_local_environment_diagnostic,
-    derive_delta_scan_partition_target_diagnostic, register_delta_table,
+    DeltaReaderError, DeltaScanExecutionOptions, DeltaStorageOptions, DeltaTableBuilder,
+    ParquetReaderBackend,
+    datafusion::{ScanOptions, collect_scan_metrics, register_table},
+    diagnostics::partition_target::{
+        Input as DeltaScanPartitionTargetDiagnosticInput,
+        LocalEnvironment as DeltaScanPartitionTargetLocalEnvironmentDiagnostic,
+        Output as DeltaScanPartitionTargetDiagnosticOutput,
+        Source as DeltaScanPartitionTargetDiagnosticSource,
+        UnixFileDescriptorLimitStatus as DeltaScanPartitionTargetLocalUnixFileDescriptorLimitStatus,
+        collect_local_environment as delta_scan_partition_target_local_environment_diagnostic,
+        derive as derive_delta_scan_partition_target_diagnostic,
+    },
 };
 #[cfg(feature = "perfetto-profile")]
 use delta_funnel::perfetto_profile::{
     PerfettoProfileLayer, initialize_perfetto, is_profile_target, wait_for_capture,
 };
 use delta_funnel::{
-    DeltaFunnelSession, DeltaSourceConfig, ExecutionProfileMode, LoadMode, MssqlConnectionConfig,
-    MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetConfig, MssqlTargetTable,
-    MssqlTimezonePolicy, OutputWritePlan, PhaseTimingReport, QueryOptions, RunMode, SessionOptions,
-    WriteAllCacheMode, WriteAllOptions,
+    DeltaDataFusionMetricsSnapshot, DeltaFunnelSession, DeltaSourceConfig, ExecutionProfileMode,
+    LoadMode, MssqlConnectionConfig, MssqlOutputTarget, MssqlSchemaPlanOptions, MssqlTargetConfig,
+    MssqlTargetTable, MssqlTimezonePolicy, OutputWritePlan, PhaseTimingReport, QueryOptions,
+    RunMode, SessionOptions, WriteAllCacheMode, WriteAllOptions,
 };
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::actions::deletion_vector_writer::{
@@ -556,11 +560,11 @@ async fn write_provider_exec_benchmark_csv_async(
         scheduling_profiles
     };
     let backends = if config.default_case {
-        vec![DeltaReaderExecutionOptions::default().reader_backend()]
+        vec![DeltaScanExecutionOptions::default().parquet_backend()]
     } else {
         let backends = [
-            DeltaReaderBackend::OfficialKernel,
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::DeltaKernel,
+            ParquetReaderBackend::Direct,
         ]
         .into_iter()
         .filter(|backend| {
@@ -1151,7 +1155,7 @@ struct ProviderExecCsvRowInput<'a> {
     table: &'a ProviderExecDeltaTable,
     workload: &'a ProviderExecWorkloadCase,
     query: ProviderExecQueryCase,
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     execution_profile_mode: ExecutionProfileMode,
     parquet_metadata_size_hint: Option<usize>,
@@ -1163,7 +1167,7 @@ struct ProviderExecCsvRowInput<'a> {
 struct ProviderExecTraceContext<'a> {
     table: &'a ProviderExecDeltaTable,
     query: ProviderExecQueryCase,
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     repetition_index: usize,
 }
@@ -1413,7 +1417,7 @@ impl Default for HostProbeLocalIoConfig {
 
 impl Default for ProviderExecConfig {
     fn default() -> Self {
-        let execution_options = DeltaReaderExecutionOptions::default();
+        let execution_options = DeltaScanExecutionOptions::default();
         Self {
             repetitions: DEFAULT_PROVIDER_EXEC_REPETITIONS,
             temp_dir: None,
@@ -1421,8 +1425,9 @@ impl Default for ProviderExecConfig {
             default_case: false,
             phase_aligned_workflow: false,
             execution_profile_mode: ExecutionProfileMode::Disabled,
-            parquet_metadata_size_hint: execution_options.parquet_metadata_size_hint(),
-            parquet_full_file_read_threshold: execution_options.parquet_full_file_read_threshold(),
+            parquet_metadata_size_hint: execution_options.parquet_metadata_size_hint_bytes(),
+            parquet_full_file_read_threshold: execution_options
+                .parquet_full_file_read_threshold_bytes(),
             retain_fixtures: false,
             workload_filter: None,
             query_filter: None,
@@ -1805,16 +1810,15 @@ impl ProviderExecQueryCase {
 
 impl ProviderExecSchedulingProfile {
     fn default_execution_case() -> Self {
-        let options = DeltaReaderExecutionOptions::default();
+        let options = DeltaScanExecutionOptions::default();
         Self {
             name: PROVIDER_EXEC_DEFAULT_CASE_SCHEDULING_PROFILE,
             scan_target_partitions: None,
             max_concurrent_file_reads_per_scan: options.max_concurrent_file_reads_per_scan(),
             max_concurrent_file_reads_per_partition: options
                 .max_concurrent_file_reads_per_partition(),
-            output_buffer_capacity_per_partition: options.output_buffer_capacity_per_partition(),
-            native_async_prefetch_file_count_per_partition: options
-                .native_async_prefetch_file_count_per_partition(),
+            output_buffer_capacity_per_partition: options.output_buffer_batches_per_partition(),
+            native_async_prefetch_file_count_per_partition: options.prefetch_files_per_partition(),
             uses_default_execution_options: true,
         }
     }
@@ -2571,7 +2575,7 @@ async fn run_provider_exec_benchmark_case(
     table: &ProviderExecDeltaTable,
     _workload: &ProviderExecWorkloadCase,
     query: ProviderExecQueryCase,
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     config: &ProviderExecConfig,
 ) -> Result<ProviderExecSummary, Box<dyn Error>> {
@@ -2596,7 +2600,7 @@ async fn run_provider_exec_benchmark_case(
 async fn run_provider_exec_write_workflow_case(
     table: &ProviderExecDeltaTable,
     workload: &ProviderExecWorkloadCase,
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     config: &ProviderExecConfig,
 ) -> Result<ProviderExecSummary, Box<dyn Error>> {
@@ -2621,7 +2625,7 @@ async fn run_provider_exec_write_workflow_case(
 async fn run_provider_exec_write_workflow_once(
     table: &ProviderExecDeltaTable,
     workload: &ProviderExecWorkloadCase,
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     config: &ProviderExecConfig,
     _repetition_index: usize,
@@ -2644,10 +2648,12 @@ async fn run_provider_exec_write_workflow_once(
             .with_mssql_schema_options(provider_exec_write_workflow_schema_options())
             .with_default_mssql_connection(connection),
     )?;
-    session.delta_lake(
-        DeltaSourceConfig::new("orders", table.table_uri.clone())
-            .with_storage_options(table.storage_options.clone()),
-    )?;
+    session
+        .delta_lake(
+            DeltaSourceConfig::new("orders", table.table_uri.clone())
+                .with_storage_options(table.storage_options.clone()),
+        )
+        .await?;
 
     let mut requests = Vec::new();
     for query in workload.query_cases() {
@@ -2780,7 +2786,7 @@ fn u64_to_usize_saturating(value: u64) -> usize {
 async fn run_provider_exec_once(
     table: &ProviderExecDeltaTable,
     query: ProviderExecQueryCase,
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     config: &ProviderExecConfig,
     repetition_index: usize,
@@ -2791,16 +2797,17 @@ async fn run_provider_exec_once(
     let delta_table = DeltaTableBuilder::new(&table.table_uri)
         .with_storage_options(table.storage_options.clone())
         .with_execution_options(execution_options)
-        .load()?;
-    register_delta_table(
+        .load_table()
+        .await?;
+    register_table(
         &ctx,
         "orders",
         delta_table,
-        DeltaDataFusionScanOptions {
+        ScanOptions {
             execution_options,
             target_partitions: scheduling_profile.scan_target_partitions,
             intra_file_repartitioning: Default::default(),
-            use_view_types: true,
+            use_arrow_view_types: true,
         },
     )?;
     let trace_context = ProviderExecTraceContext {
@@ -2895,9 +2902,9 @@ async fn run_provider_exec_once(
         _ => None,
     };
     provider_exec_stats_collect_started(trace_context);
-    let snapshots = collect_delta_datafusion_metrics(stats_plan.as_ref())
+    let snapshots = collect_scan_metrics(stats_plan.as_ref())
         .into_iter()
-        .map(|metrics| metrics.snapshot())
+        .map(|metrics| DeltaDataFusionMetricsSnapshot::from(metrics.snapshot()))
         .collect::<Vec<_>>();
     let read_stats = provider_exec_read_stats_measurement(&snapshots);
     provider_exec_stats_collect_completed(trace_context, read_stats.scan_count);
@@ -2922,31 +2929,31 @@ async fn run_provider_exec_once(
 }
 
 fn provider_exec_scan_execution_options(
-    backend: DeltaReaderBackend,
+    backend: ParquetReaderBackend,
     scheduling_profile: ProviderExecSchedulingProfile,
     config: &ProviderExecConfig,
-) -> Result<DeltaReaderExecutionOptions, Box<dyn Error>> {
+) -> Result<DeltaScanExecutionOptions, Box<dyn Error>> {
     let options = if scheduling_profile.uses_default_execution_options {
-        DeltaReaderExecutionOptions::default()
+        DeltaScanExecutionOptions::default()
     } else {
-        DeltaReaderExecutionOptions::new()
-            .with_reader_backend(backend)?
+        DeltaScanExecutionOptions::new()
+            .with_parquet_backend(backend)
             .with_max_concurrent_file_reads_per_scan(
                 scheduling_profile.max_concurrent_file_reads_per_scan,
             )?
             .with_max_concurrent_file_reads_per_partition(
                 scheduling_profile.max_concurrent_file_reads_per_partition,
             )?
-            .with_output_buffer_capacity_per_partition(
+            .with_output_buffer_batches_per_partition(
                 scheduling_profile.output_buffer_capacity_per_partition,
             )?
-            .with_native_async_prefetch_file_count_per_partition(
+            .with_prefetch_files_per_partition(
                 scheduling_profile.native_async_prefetch_file_count_per_partition,
-            )?
+            )
     };
     Ok(options
-        .with_parquet_metadata_size_hint(config.parquet_metadata_size_hint)?
-        .with_parquet_full_file_read_threshold(config.parquet_full_file_read_threshold)?)
+        .with_parquet_metadata_size_hint_bytes(config.parquet_metadata_size_hint)?
+        .with_parquet_full_file_read_threshold_bytes(config.parquet_full_file_read_threshold)?)
 }
 
 fn provider_exec_summary(measurements: &[ProviderExecRunMeasurement]) -> ProviderExecSummary {
@@ -3468,10 +3475,10 @@ fn execution_profile_mode_name(mode: ExecutionProfileMode) -> &'static str {
     }
 }
 
-fn provider_exec_backend_name(backend: DeltaReaderBackend) -> &'static str {
+fn provider_exec_backend_name(backend: ParquetReaderBackend) -> &'static str {
     match backend {
-        DeltaReaderBackend::OfficialKernel => "official_kernel",
-        DeltaReaderBackend::NativeAsync => "native_async",
+        ParquetReaderBackend::DeltaKernel => "official_kernel",
+        ParquetReaderBackend::Direct => "native_async",
     }
 }
 
@@ -6989,13 +6996,13 @@ mod tests {
             }
         );
         let execution_options = provider_exec_scan_execution_options(
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::Direct,
             ProviderExecSchedulingProfile::default_execution_case(),
             &config.provider_exec,
         )?;
-        assert_eq!(execution_options.parquet_metadata_size_hint(), None);
+        assert_eq!(execution_options.parquet_metadata_size_hint_bytes(), None);
         assert_eq!(
-            execution_options.parquet_full_file_read_threshold(),
+            execution_options.parquet_full_file_read_threshold_bytes(),
             Some(1_048_576)
         );
 
@@ -8674,7 +8681,7 @@ mod tests {
     #[test]
     fn provider_exec_default_case_uses_scan_execution_defaults() {
         let profile = ProviderExecSchedulingProfile::default_execution_case();
-        let options = DeltaReaderExecutionOptions::default();
+        let options = DeltaScanExecutionOptions::default();
 
         assert_eq!(profile.name, PROVIDER_EXEC_DEFAULT_CASE_SCHEDULING_PROFILE);
         assert_eq!(profile.scan_target_partitions, None);
@@ -8688,11 +8695,11 @@ mod tests {
         );
         assert_eq!(
             profile.output_buffer_capacity_per_partition,
-            options.output_buffer_capacity_per_partition()
+            options.output_buffer_batches_per_partition()
         );
         assert_eq!(
             profile.native_async_prefetch_file_count_per_partition,
-            options.native_async_prefetch_file_count_per_partition()
+            options.prefetch_files_per_partition()
         );
         assert!(profile.uses_default_execution_options);
     }
@@ -8758,8 +8765,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn provider_exec_creates_synthetic_mimic_delta_table() -> Result<(), Box<dyn Error>> {
+    #[tokio::test]
+    async fn provider_exec_creates_synthetic_mimic_delta_table() -> Result<(), Box<dyn Error>> {
         let partition_date = SyntheticDate {
             year: 2026,
             month: 6,
@@ -8784,7 +8791,8 @@ mod tests {
         )?;
         let source = DeltaTableBuilder::new(&table.table_uri)
             .with_storage_options(table.storage_options.clone())
-            .load()?;
+            .load_table()
+            .await?;
         source.validate_protocol()?;
         let metadata_log =
             fs::read_to_string(table.path.join("_delta_log/00000000000000000000.json"))?;
@@ -8802,8 +8810,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn provider_exec_creates_wide_event_export_delta_table() -> Result<(), Box<dyn Error>> {
+    #[tokio::test]
+    async fn provider_exec_creates_wide_event_export_delta_table() -> Result<(), Box<dyn Error>> {
         let partition_date = SyntheticDate {
             year: 2026,
             month: 6,
@@ -8828,7 +8836,8 @@ mod tests {
         )?;
         let source = DeltaTableBuilder::new(&table.table_uri)
             .with_storage_options(table.storage_options.clone())
-            .load()?;
+            .load_table()
+            .await?;
         source.validate_protocol()?;
         let metadata_log =
             fs::read_to_string(table.path.join("_delta_log/00000000000000000000.json"))?;
@@ -8895,7 +8904,7 @@ mod tests {
         let measurement = runtime.block_on(run_provider_exec_once(
             &table,
             query,
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::Direct,
             ProviderExecSchedulingProfile::default_execution_case(),
             &config,
             0,
@@ -8948,8 +8957,8 @@ mod tests {
         let config = ProviderExecConfig::default();
 
         for backend in [
-            DeltaReaderBackend::OfficialKernel,
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::DeltaKernel,
+            ParquetReaderBackend::Direct,
         ] {
             let measurement = runtime.block_on(run_provider_exec_once(
                 &table,
@@ -8998,7 +9007,7 @@ mod tests {
         let measurement = runtime.block_on(run_provider_exec_once(
             &table,
             query,
-            DeltaReaderExecutionOptions::default().reader_backend(),
+            DeltaScanExecutionOptions::default().parquet_backend(),
             ProviderExecSchedulingProfile::default_execution_case(),
             &config,
             0,
@@ -9059,8 +9068,8 @@ mod tests {
             Some("true")
         );
         for backend in [
-            DeltaReaderBackend::OfficialKernel,
-            DeltaReaderBackend::NativeAsync,
+            ParquetReaderBackend::DeltaKernel,
+            ParquetReaderBackend::Direct,
         ] {
             let measurement = runtime.block_on(run_provider_exec_once(
                 &table,
@@ -9193,7 +9202,7 @@ mod tests {
                 name: "project_id",
                 sql: "select id from orders",
             },
-            backend: DeltaReaderBackend::NativeAsync,
+            backend: ParquetReaderBackend::Direct,
             scheduling_profile: ProviderExecSchedulingProfile {
                 name: "lazy_parallel_buffer_4",
                 scan_target_partitions: Some(4),

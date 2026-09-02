@@ -1153,14 +1153,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_mssql_output_uses_source_schema_and_session_connection()
+    #[tokio::test]
+    async fn plan_mssql_output_uses_source_schema_and_session_connection()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source.clone(),
             "orders_output",
@@ -1224,7 +1226,9 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session.table_from_sql("select id from orders").await?;
         let request = output_request(
             derived.clone(),
@@ -1269,7 +1273,9 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let derived = session
             .table_from_sql("select customer_name from orders")
             .await?;
@@ -1292,14 +1298,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plan_mssql_output_connection_override_wins_without_mutating_session_default()
+    #[tokio::test]
+    async fn plan_mssql_output_connection_override_wins_without_mutating_session_default()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_sink")?)
             .with_connection(override_connection()?);
         let request = OutputWritePlan::new(
@@ -1329,12 +1337,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plan_mssql_output_missing_effective_connection_fails_before_side_effects()
+    #[tokio::test]
+    async fn plan_mssql_output_missing_effective_connection_fails_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = execute_output_request(
             source,
             "orders_output",
@@ -1352,14 +1362,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plan_mssql_output_accepts_replace_before_side_effects()
+    #[tokio::test]
+    async fn plan_mssql_output_accepts_replace_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(source, "orders_output", "orders_sink", LoadMode::Replace)?;
 
         let planned = session.plan_mssql_output(&request)?;
@@ -1398,13 +1410,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plan_mssql_output_rejects_invalid_output_name() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn plan_mssql_output_rejects_invalid_output_name()
+    -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(source, "  ", "orders_sink", LoadMode::AppendExisting)?;
 
         let error = session.plan_mssql_output(&request);
@@ -1417,14 +1432,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plan_mssql_output_rejects_invalid_target_identifier_before_side_effects()
+    #[tokio::test]
+    async fn plan_mssql_output_rejects_invalid_target_identifier_before_side_effects()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -1445,16 +1462,17 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn plan_mssql_output_reports_unsupported_source_schema()
+    #[tokio::test]
+    async fn plan_mssql_output_reports_unsupported_source_schema()
     -> Result<(), Box<dyn std::error::Error>> {
         let table =
             DeltaLogTable::new_with_schema("unsupported-schema", UNSUPPORTED_SCHEMA_FIELDS_JSON)?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source =
-            session.delta_lake(DeltaSourceConfig::new("unsupported_schema", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("unsupported_schema", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "unsupported_output",
@@ -1474,14 +1492,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn planned_mssql_output_debug_redacts_connection_material()
+    #[tokio::test]
+    async fn planned_mssql_output_debug_redacts_connection_material()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let target_config = MssqlTargetConfig::new(MssqlTargetTable::new("dbo", "orders_sink")?)
             .with_connection(override_connection()?);
         let request = OutputWritePlan::new(
@@ -1506,7 +1526,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = execute_output_request(
             source,
             "orders_output",
@@ -1955,7 +1977,9 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = execute_output_request(
             source,
             "orders_output",
@@ -2215,14 +2239,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn query_phase_failures_keep_source_and_mark_remaining_phases_not_started()
+    #[tokio::test]
+    async fn query_phase_failures_keep_source_and_mark_remaining_phases_not_started()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -2297,14 +2323,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn query_phase_failure_reports_cleanup_status_for_each_load_mode()
+    #[tokio::test]
+    async fn query_phase_failure_reports_cleanup_status_for_each_load_mode()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         for (load_mode, expected_cleanup) in [
             (
@@ -2340,14 +2368,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn write_phase_failure_keeps_query_and_output_planning_timings()
+    #[tokio::test]
+    async fn write_phase_failure_keeps_query_and_output_planning_timings()
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let request = output_request(
             source,
             "orders_output",
@@ -2480,10 +2510,12 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let selected_orders = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -2529,10 +2561,12 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let selected_orders = session
             .table_from_sql("select id, customer_name from orders")
             .await?;
@@ -2586,14 +2620,18 @@ mod tests {
         let mut session = DeltaFunnelSession::new(
             SessionOptions::new().with_default_mssql_connection(secret_connection()?),
         )?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "orders",
-            orders.path().to_string_lossy().to_string(),
-        ))?;
-        session.delta_lake(DeltaSourceConfig::new(
-            "customers",
-            customers.path().to_string_lossy().to_string(),
-        ))?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "orders",
+                orders.path().to_string_lossy().to_string(),
+            ))
+            .await?;
+        session
+            .delta_lake(DeltaSourceConfig::new(
+                "customers",
+                customers.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let joined = session
             .table_from_sql(
                 "select o.id, c.customer_name \

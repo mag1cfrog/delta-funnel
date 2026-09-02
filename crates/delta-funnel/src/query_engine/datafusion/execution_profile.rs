@@ -4,16 +4,14 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::{
+    DeltaDataFusionMetricsSnapshot, QueryExecutionMetric, QueryExecutionMetricCategory,
+    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
+    QueryExecutionProfile, QueryExecutionScope, usize_to_u64_saturating,
+};
 use datafusion::physical_plan::{
     ExecutionPlan,
     metrics::{Metric, MetricType, MetricValue, MetricsSet},
-};
-use delta_arrow_reader::DeltaDataFusionMetricsSnapshot;
-
-use crate::{
-    QueryExecutionMetric, QueryExecutionMetricCategory, QueryExecutionMetricValue,
-    QueryExecutionOperatorProfile, QueryExecutionOutcome, QueryExecutionProfile,
-    QueryExecutionScope, usize_to_u64_saturating,
 };
 
 use super::{
@@ -738,7 +736,8 @@ mod tests {
     #[tokio::test]
     async fn terminal_provider_snapshots_attach_by_exact_metrics_instance() -> TestResult {
         let context = SessionContext::new();
-        let _table = register_fixture_source(&context, "orders", "profile-provider-identity")?;
+        let _table =
+            register_fixture_source(&context, "orders", "profile-provider-identity").await?;
         let first_plan = delta_plan(&context, "orders").await?;
         let second_plan = delta_plan(&context, "orders").await?;
         let first_handles = collect_delta_provider_read_stats_handles(first_plan.as_ref());
@@ -795,7 +794,7 @@ mod tests {
         let scans = profile
             .operators()
             .iter()
-            .filter(|operator| operator.operator_name() == "DeltaDataFusionExec")
+            .filter(|operator| operator.operator_name() == "DeltaScanExec")
             .collect::<Vec<_>>();
         assert_eq!(scans.len(), 2);
         assert_eq!(
@@ -812,7 +811,7 @@ mod tests {
                 .as_array()
                 .ok_or("expected profile operators")?
                 .iter()
-                .filter(|operator| operator["operator_name"] == "DeltaDataFusionExec")
+                .filter(|operator| operator["operator_name"] == "DeltaScanExec")
                 .map(|operator| {
                     operator["delta_provider_read_stats"]["parquet_data_file_bytes_received"]
                         .as_u64()
@@ -831,7 +830,8 @@ mod tests {
             &context,
             "profile_secret_source",
             "profile-provider-missing-secret",
-        )?;
+        )
+        .await?;
         let target_plan = delta_plan(&context, "profile_secret_source").await?;
         let unrelated_plan = delta_plan(&context, "profile_secret_source").await?;
         let target_handles = collect_delta_provider_read_stats_handles(target_plan.as_ref());
@@ -860,7 +860,7 @@ mod tests {
         let scan = profile
             .operators()
             .iter()
-            .find(|operator| operator.operator_name() == "DeltaDataFusionExec")
+            .find(|operator| operator.operator_name() == "DeltaScanExec")
             .ok_or("expected target Delta scan profile")?;
         assert!(scan.delta_provider_read_stats().is_none());
         let diagnostics = capture
@@ -890,7 +890,7 @@ mod tests {
             fallback_profile
                 .operators()
                 .iter()
-                .find(|operator| operator.operator_name() == "DeltaDataFusionExec")
+                .find(|operator| operator.operator_name() == "DeltaScanExec")
                 .and_then(|operator| operator.delta_provider_source_name()),
             Some("profile_secret_source")
         );

@@ -5,21 +5,21 @@
 //! here gives both APIs one report shape and makes the fields that are safe to
 //! expose explicit instead of relying on generic serialization.
 
-use delta_arrow_reader::{DeltaDataFusionMetricsSnapshot, DeltaReaderBackend};
+use delta_arrow_reader::ParquetReaderBackend;
 use serde_json::{Value, json};
 
 use crate::{
-    DeltaSourceReport, FileCount, LazyTableKind, LoadMode, MssqlDryRunOutputFieldReport,
-    MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport, MssqlDryRunWorkflowReport,
-    MssqlOutputBatchValidationReport, MssqlOutputFieldReport, MssqlOutputWriteStatus,
-    MssqlTargetCleanupStatus, MssqlTargetTable, MssqlWorkflowWriteReport, MssqlWriteFailureContext,
-    MssqlWriteFailureReport, MssqlWritePhase, MssqlWriteReport, MssqlWriteSkippedReason,
-    MssqlWriteSkippedReport, MssqlWriteStats, OutputStatus, PhaseStatus, PhaseTimingReport,
-    QueryExecutionMetric, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
-    QueryExecutionProfile, ReportReasonCode, RowCount, RunMode, ValidationStatus, WorkflowStatus,
-    WriteAllCacheAliasReport, WriteAllCacheAliasStatus, WriteAllCacheCandidateSkip,
-    WriteAllCacheCandidateSkipReason, WriteAllCacheFailure, WriteAllCacheReport,
-    WriteAllNoCacheReason, WriteAllReport,
+    DeltaDataFusionMetricsSnapshot, DeltaSourceReport, FileCount, LazyTableKind, LoadMode,
+    MssqlDryRunOutputFieldReport, MssqlDryRunOutputReport, MssqlDryRunSqlIdentityReport,
+    MssqlDryRunWorkflowReport, MssqlOutputBatchValidationReport, MssqlOutputFieldReport,
+    MssqlOutputWriteStatus, MssqlTargetCleanupStatus, MssqlTargetTable, MssqlWorkflowWriteReport,
+    MssqlWriteFailureContext, MssqlWriteFailureReport, MssqlWritePhase, MssqlWriteReport,
+    MssqlWriteSkippedReason, MssqlWriteSkippedReport, MssqlWriteStats, OutputStatus, PhaseStatus,
+    PhaseTimingReport, QueryExecutionMetric, QueryExecutionMetricValue,
+    QueryExecutionOperatorProfile, QueryExecutionProfile, ReportReasonCode, RowCount, RunMode,
+    ValidationStatus, WorkflowStatus, WriteAllCacheAliasReport, WriteAllCacheAliasStatus,
+    WriteAllCacheCandidateSkip, WriteAllCacheCandidateSkipReason, WriteAllCacheFailure,
+    WriteAllCacheReport, WriteAllNoCacheReason, WriteAllReport,
 };
 
 impl RowCount {
@@ -909,10 +909,10 @@ fn skipped_reason_value(reason: &MssqlWriteSkippedReason) -> Value {
     }
 }
 
-fn reader_backend(backend: DeltaReaderBackend) -> &'static str {
+fn reader_backend(backend: ParquetReaderBackend) -> &'static str {
     match backend {
-        DeltaReaderBackend::OfficialKernel => "official_kernel",
-        DeltaReaderBackend::NativeAsync => "native_async",
+        ParquetReaderBackend::DeltaKernel => "official_kernel",
+        ParquetReaderBackend::Direct => "native_async",
     }
 }
 
@@ -972,7 +972,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use arrow_sql_server::PlanOptions;
-    use delta_arrow_reader::DeltaReaderExecutionOptions;
+    use delta_arrow_reader::DeltaScanExecutionOptions;
 
     type TestResult<T> = Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
@@ -1422,9 +1422,9 @@ mod tests {
                     target_partitions: Some(4),
                     output_batch_size: Some(128),
                 },
-                DeltaReaderExecutionOptions::default()
-                    .with_parquet_metadata_size_hint(Some(16_384))?
-                    .with_parquet_full_file_read_threshold(Some(2_097_152))?,
+                DeltaScanExecutionOptions::default()
+                    .with_parquet_metadata_size_hint_bytes(Some(16_384))?
+                    .with_parquet_full_file_read_threshold_bytes(Some(2_097_152))?,
             ),
         )
         .with_provider_read_stats(provider_read_stats_snapshot());
@@ -1487,7 +1487,7 @@ mod tests {
     #[test]
     fn provider_read_stats_json_preserves_unavailable_parquet_io_metrics() {
         let mut stats = provider_read_stats_snapshot();
-        stats.reader.reader_backend = DeltaReaderBackend::OfficialKernel;
+        stats.reader.reader_backend = ParquetReaderBackend::DeltaKernel;
         stats.reader.parquet_data_file_range_get_operations = None;
         stats.reader.parquet_data_file_full_get_operations = None;
         stats.reader.parquet_data_file_bytes_received = None;
@@ -1586,9 +1586,9 @@ mod tests {
 
     fn provider_read_stats_snapshot() -> DeltaDataFusionMetricsSnapshot {
         DeltaDataFusionMetricsSnapshot {
-            reader: delta_arrow_reader::DeltaReadMetricsSnapshot {
+            reader: crate::DeltaReadMetricsSnapshot {
                 snapshot_version: 3,
-                reader_backend: DeltaReaderBackend::NativeAsync,
+                reader_backend: ParquetReaderBackend::Direct,
                 scan_metadata_exhausted: Some(true),
                 scan_partitions_planned: 4,
                 files_planned: 5,

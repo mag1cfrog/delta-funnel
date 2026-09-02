@@ -183,7 +183,7 @@ impl ProgressEvent {
     pub(crate) fn file_progress_from_provider_stats(
         phase: ProgressPhase,
         output_name: Option<&str>,
-        provider_stats: &[delta_arrow_reader::DeltaDataFusionMetricsSnapshot],
+        provider_stats: &[crate::DeltaDataFusionMetricsSnapshot],
     ) -> Option<Self> {
         let mut snapshot = ProgressSnapshot::new(phase, output_name);
         snapshot.file_progress = DeltaFileProgress::from_provider_stats(provider_stats);
@@ -420,7 +420,7 @@ impl DeltaFileProgress {
     }
 
     fn from_provider_stats(
-        provider_stats: &[delta_arrow_reader::DeltaDataFusionMetricsSnapshot],
+        provider_stats: &[crate::DeltaDataFusionMetricsSnapshot],
     ) -> Option<Self> {
         if provider_stats.is_empty()
             || provider_stats
@@ -515,7 +515,9 @@ mod tests {
     };
 
     use super::*;
-    use delta_arrow_reader::{DeltaDataFusionMetricsSnapshot, DeltaReaderBackend};
+    use delta_arrow_reader::ParquetReaderBackend;
+
+    use crate::{DeltaDataFusionMetricsSnapshot, DeltaReadMetricsSnapshot};
 
     #[test]
     fn events_expose_only_the_payload_for_their_kind() {
@@ -738,9 +740,9 @@ mod tests {
         dynamic_partition_files_pruned: u64,
     ) -> DeltaDataFusionMetricsSnapshot {
         DeltaDataFusionMetricsSnapshot {
-            reader: delta_arrow_reader::DeltaReadMetricsSnapshot {
+            reader: DeltaReadMetricsSnapshot {
                 snapshot_version: 1,
-                reader_backend: DeltaReaderBackend::NativeAsync,
+                reader_backend: ParquetReaderBackend::Direct,
                 scan_metadata_exhausted,
                 scan_partitions_planned: 1,
                 files_planned,

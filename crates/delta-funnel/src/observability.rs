@@ -1,11 +1,11 @@
 //! Internal tracing vocabulary for DeltaFunnel workflow observability.
 
-use delta_arrow_reader::{DeltaDataFusionMetricsSnapshot, DeltaReaderBackend};
+use delta_arrow_reader::ParquetReaderBackend;
 
 use crate::{
-    DeltaFunnelError, LoadMode, MssqlBatchShapingReport, MssqlTargetTable,
-    QueryExecutionMetricValue, QueryExecutionOutcome, QueryExecutionProfile, RunMode,
-    ValidationStatus,
+    DeltaDataFusionMetricsSnapshot, DeltaFunnelError, LoadMode, MssqlBatchShapingReport,
+    MssqlTargetTable, QueryExecutionMetricValue, QueryExecutionOutcome, QueryExecutionProfile,
+    RunMode, ValidationStatus,
     support::{sanitize_text_for_display, sanitize_uri_for_display},
     usize_to_u64_saturating,
 };
@@ -190,10 +190,10 @@ fn parquet_io_metrics(snapshot: &DeltaDataFusionMetricsSnapshot) -> ParquetIoMet
     }
 }
 
-const fn provider_reader_backend_as_str(backend: DeltaReaderBackend) -> &'static str {
+const fn provider_reader_backend_as_str(backend: ParquetReaderBackend) -> &'static str {
     match backend {
-        DeltaReaderBackend::OfficialKernel => "official_kernel",
-        DeltaReaderBackend::NativeAsync => "native_async",
+        ParquetReaderBackend::DeltaKernel => "official_kernel",
+        ParquetReaderBackend::Direct => "native_async",
     }
 }
 
@@ -1330,7 +1330,7 @@ mod tests {
     #[test]
     fn unavailable_and_mixed_summaries_emit_no_numeric_subset() {
         let mut unavailable = provider_stats_snapshot();
-        unavailable.reader.reader_backend = DeltaReaderBackend::OfficialKernel;
+        unavailable.reader.reader_backend = ParquetReaderBackend::DeltaKernel;
         unavailable.reader.parquet_data_file_range_get_operations = None;
         unavailable.reader.parquet_data_file_full_get_operations = None;
         unavailable.reader.parquet_data_file_bytes_received = None;
@@ -1370,10 +1370,12 @@ mod tests {
         let success_table =
             crate::table_formats::RealParquetDeltaTable::new_default("summary-success")?;
         let mut success_session = native_async_session(crate::QueryOptions::default())?;
-        let success_source = success_session.delta_lake(crate::DeltaSourceConfig::new(
-            "success_orders",
-            success_table.path().to_string_lossy().to_string(),
-        ))?;
+        let success_source = success_session
+            .delta_lake(crate::DeltaSourceConfig::new(
+                "success_orders",
+                success_table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let mut success_stream = success_session
             .batch_stream_for_lazy_table(&success_source, None)
             .await?;
@@ -1392,10 +1394,12 @@ mod tests {
             target_partitions: Some(1),
             output_batch_size: Some(1),
         })?;
-        let cancelled_source = cancelled_session.delta_lake(crate::DeltaSourceConfig::new(
-            "cancelled_orders",
-            cancelled_table.path().to_string_lossy().to_string(),
-        ))?;
+        let cancelled_source = cancelled_session
+            .delta_lake(crate::DeltaSourceConfig::new(
+                "cancelled_orders",
+                cancelled_table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let mut cancelled_stream = cancelled_session
             .batch_stream_for_lazy_table(&cancelled_source, None)
             .await?;
@@ -1405,10 +1409,12 @@ mod tests {
         let error_table =
             crate::query_engine::datafusion::test_support::DeltaLogTable::new("summary-error")?;
         let mut error_session = native_async_session(crate::QueryOptions::default())?;
-        let error_source = error_session.delta_lake(crate::DeltaSourceConfig::new(
-            "error_orders",
-            error_table.path().to_string_lossy().to_string(),
-        ))?;
+        let error_source = error_session
+            .delta_lake(crate::DeltaSourceConfig::new(
+                "error_orders",
+                error_table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let mut error_stream = error_session
             .batch_stream_for_lazy_table(&error_source, None)
             .await?;
@@ -2114,10 +2120,12 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let table = crate::table_formats::RealParquetDeltaTable::new_default(fixture_name)?;
         let mut session = native_async_session(crate::QueryOptions::default())?;
-        session.delta_lake(crate::DeltaSourceConfig::new(
-            source_name,
-            table.path().to_string_lossy().to_string(),
-        ))?;
+        session
+            .delta_lake(crate::DeltaSourceConfig::new(
+                source_name,
+                table.path().to_string_lossy().to_string(),
+            ))
+            .await?;
         let sql = format!("select * from {source_name}");
         let query = session.table_from_sql(&sql).await?;
         let alias_name = format!("cached_{source_name}");
@@ -2132,9 +2140,9 @@ mod tests {
 
     fn provider_stats_snapshot() -> DeltaDataFusionMetricsSnapshot {
         DeltaDataFusionMetricsSnapshot {
-            reader: delta_arrow_reader::DeltaReadMetricsSnapshot {
+            reader: crate::DeltaReadMetricsSnapshot {
                 snapshot_version: 3,
-                reader_backend: DeltaReaderBackend::NativeAsync,
+                reader_backend: ParquetReaderBackend::Direct,
                 scan_metadata_exhausted: Some(true),
                 scan_partitions_planned: 1,
                 files_planned: 2,
@@ -2173,7 +2181,7 @@ mod tests {
     fn native_async_session(
         query_options: crate::QueryOptions,
     ) -> Result<crate::DeltaFunnelSession, DeltaFunnelError> {
-        let provider_scan_options = delta_arrow_reader::DeltaReaderExecutionOptions::new()
+        let provider_scan_options = delta_arrow_reader::DeltaScanExecutionOptions::new()
             .with_max_concurrent_file_reads_per_scan(Some(1))
             .map_err(|error| DeltaFunnelError::Config {
                 message: error.to_string(),

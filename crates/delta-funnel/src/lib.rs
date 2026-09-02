@@ -42,10 +42,10 @@
 //!     let runtime = DeltaFunnelRuntime::new()?;
 //!
 //!     // Register the Delta table as "orders" so SQL can reference it.
-//!     let _orders = session.delta_lake(DeltaSourceConfig::new(
-//!         "orders",
-//!         "file:///path/to/orders-delta",
-//!     ))?;
+//!     let _orders = runtime.delta_lake(
+//!         &mut session,
+//!         DeltaSourceConfig::new("orders", "file:///path/to/orders-delta"),
+//!     )?;
 //!
 //!     // Build a lazy DataFusion SQL query. No rows are read yet.
 //!     let daily_orders = runtime.table_from_sql(
@@ -120,8 +120,9 @@ pub use pipeline::{
     RecordBatchConsumer, handoff_datafusion_query_output, handoff_record_batch_stream,
 };
 pub use query_engine::{
-    QueryOptions, RegisteredDeltaSource, RegisteredDeltaSources, datafusion_query_output_stream,
-    datafusion_session_config, datafusion_session_context, register_delta_sources,
+    DeltaDataFusionMetricsSnapshot, DeltaReadMetricsSnapshot, QueryOptions, RegisteredDeltaSource,
+    RegisteredDeltaSources, datafusion_query_output_stream, datafusion_session_config,
+    datafusion_session_context, register_delta_sources,
     register_delta_sources_with_scan_execution_options,
 };
 pub use report::{

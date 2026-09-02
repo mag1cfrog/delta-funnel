@@ -327,7 +327,7 @@ impl PySession {
                 self.runtime
                     .delta_lake_with_progress(&mut self.inner, source, progress.reporter())
             }
-            None => self.inner.delta_lake(source),
+            None => self.runtime.delta_lake(&mut self.inner, source),
         }
         .map_err(|error| rust_error_to_py(py, error));
         if let Some(progress) = progress {
@@ -3897,13 +3897,16 @@ union all select cast(902 as bigint) as order_id",),
             let options = session.inner.options().provider_scan_options();
             assert_eq!(options.max_concurrent_file_reads_per_scan(), Some(8));
             assert_eq!(options.max_concurrent_file_reads_per_partition(), 2);
-            assert_eq!(options.output_buffer_capacity_per_partition(), 4);
-            assert_eq!(options.native_async_prefetch_file_count_per_partition(), 1);
-            assert_eq!(options.parquet_metadata_size_hint(), Some(16_384));
-            assert_eq!(options.parquet_full_file_read_threshold(), Some(2_097_152));
+            assert_eq!(options.output_buffer_batches_per_partition(), 4);
+            assert_eq!(options.prefetch_files_per_partition(), 1);
+            assert_eq!(options.parquet_metadata_size_hint_bytes(), Some(16_384));
+            assert_eq!(
+                options.parquet_full_file_read_threshold_bytes(),
+                Some(2_097_152)
+            );
             assert_eq!(
                 session.inner.options().provider_file_repartitioning(),
-                delta_arrow_reader::DeltaFileRepartitioning::Rebalance
+                delta_arrow_reader::datafusion::IntraFileRepartitioning::Always
             );
             assert!(session.inner.options().provider_use_view_types());
 

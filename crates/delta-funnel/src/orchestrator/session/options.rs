@@ -1,6 +1,6 @@
 use std::fmt;
 
-use delta_arrow_reader::{DeltaFileRepartitioning, DeltaReaderExecutionOptions};
+use delta_arrow_reader::{DeltaScanExecutionOptions, datafusion::IntraFileRepartitioning};
 
 use crate::{
     DeltaFunnelError, MssqlConnectionConfig, MssqlSchemaPlanOptions, MssqlWorkflowWriteOptions,
@@ -11,8 +11,8 @@ use crate::{
 #[derive(Clone)]
 pub struct SessionOptions {
     query_options: QueryOptions,
-    provider_scan_options: DeltaReaderExecutionOptions,
-    provider_file_repartitioning: DeltaFileRepartitioning,
+    provider_scan_options: DeltaScanExecutionOptions,
+    provider_file_repartitioning: IntraFileRepartitioning,
     provider_use_view_types: bool,
     mssql_schema_options: MssqlSchemaPlanOptions,
     mssql_write_backend: MssqlWriteBackend,
@@ -25,8 +25,8 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             query_options: QueryOptions::default(),
-            provider_scan_options: DeltaReaderExecutionOptions::default(),
-            provider_file_repartitioning: DeltaFileRepartitioning::default(),
+            provider_scan_options: DeltaScanExecutionOptions::default(),
+            provider_file_repartitioning: IntraFileRepartitioning::default(),
             provider_use_view_types: false,
             mssql_schema_options: MssqlSchemaPlanOptions::default(),
             mssql_write_backend: default_mssql_write_backend(),
@@ -55,7 +55,7 @@ impl SessionOptions {
     #[must_use]
     pub const fn with_provider_scan_options(
         mut self,
-        provider_scan_options: DeltaReaderExecutionOptions,
+        provider_scan_options: DeltaScanExecutionOptions,
     ) -> Self {
         self.provider_scan_options = provider_scan_options;
         self
@@ -65,7 +65,7 @@ impl SessionOptions {
     #[must_use]
     pub const fn with_provider_file_repartitioning(
         mut self,
-        file_repartitioning: DeltaFileRepartitioning,
+        file_repartitioning: IntraFileRepartitioning,
     ) -> Self {
         self.provider_file_repartitioning = file_repartitioning;
         self
@@ -133,13 +133,13 @@ impl SessionOptions {
 
     /// Returns Delta provider scan execution options.
     #[must_use]
-    pub const fn provider_scan_options(&self) -> DeltaReaderExecutionOptions {
+    pub const fn provider_scan_options(&self) -> DeltaScanExecutionOptions {
         self.provider_scan_options
     }
 
     /// Returns when Delta providers may split Parquet files into ranged scan tasks.
     #[must_use]
-    pub const fn provider_file_repartitioning(&self) -> DeltaFileRepartitioning {
+    pub const fn provider_file_repartitioning(&self) -> IntraFileRepartitioning {
         self.provider_file_repartitioning
     }
 
@@ -187,11 +187,6 @@ impl SessionOptions {
     /// local validation options.
     pub fn validate(&self) -> Result<(), DeltaFunnelError> {
         self.query_options.validate()?;
-        self.provider_scan_options
-            .validate()
-            .map_err(|error| DeltaFunnelError::Config {
-                message: error.to_string(),
-            })?;
         self.mssql_workflow_options.validate()?;
         self.validation_options.validate()?;
         Ok(())
@@ -230,9 +225,7 @@ mod tests {
         BatchPipelinePhase, DeltaFunnelError, MssqlConnectionConfig, MssqlWorkflowWriteOptions,
         QueryOptions,
     };
-    use delta_arrow_reader::{
-        DeltaFileRepartitioning, DeltaReaderBackend, DeltaReaderExecutionOptions,
-    };
+    use delta_arrow_reader::{DeltaScanExecutionOptions, datafusion::IntraFileRepartitioning};
 
     use super::SessionOptions;
     use crate::orchestrator::DeltaFunnelSession;
@@ -244,7 +237,7 @@ mod tests {
         assert_eq!(session.options().query_options(), QueryOptions::default());
         assert_eq!(
             session.options().provider_file_repartitioning(),
-            DeltaFileRepartitioning::FillMissingParallelism
+            IntraFileRepartitioning::WhenBelowTarget
         );
         assert!(!session.options().provider_use_view_types());
         assert!(
@@ -274,12 +267,12 @@ mod tests {
     fn session_can_rebalance_provider_files() -> Result<(), DeltaFunnelError> {
         let session = DeltaFunnelSession::new(
             SessionOptions::new()
-                .with_provider_file_repartitioning(DeltaFileRepartitioning::Rebalance),
+                .with_provider_file_repartitioning(IntraFileRepartitioning::Always),
         )?;
 
         assert_eq!(
             session.options().provider_file_repartitioning(),
-            DeltaFileRepartitioning::Rebalance
+            IntraFileRepartitioning::Always
         );
         Ok(())
     }
@@ -317,9 +310,7 @@ mod tests {
 
     #[test]
     fn provider_option_validation_rejects_invalid_values_before_session_construction() {
-        let error = DeltaReaderExecutionOptions::new()
-            .with_reader_backend(DeltaReaderBackend::OfficialKernel)
-            .and_then(|options| options.with_output_buffer_capacity_per_partition(0));
+        let error = DeltaScanExecutionOptions::new().with_output_buffer_batches_per_partition(0);
 
         assert!(error.is_err());
     }

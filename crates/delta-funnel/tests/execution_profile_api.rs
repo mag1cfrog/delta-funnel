@@ -7,12 +7,11 @@ use datafusion::{
     execution::TaskContext,
     physical_plan::{ExecutionPlan, SendableRecordBatchStream},
 };
-use delta_arrow_reader::DeltaDataFusionMetricsSnapshot;
 use delta_funnel::{
-    DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession, ExecutionProfileMode,
-    MssqlWriteReport, OutputWritePlan, QueryExecutionMetric, QueryExecutionMetricCategory,
-    QueryExecutionMetricValue, QueryExecutionOperatorProfile, QueryExecutionOutcome,
-    QueryExecutionProfile, QueryExecutionScope, WriteAllCacheAliasReport,
+    DeltaDataFusionMetricsSnapshot, DeltaFunnelError, DeltaFunnelRuntime, DeltaFunnelSession,
+    ExecutionProfileMode, MssqlWriteReport, OutputWritePlan, QueryExecutionMetric,
+    QueryExecutionMetricCategory, QueryExecutionMetricValue, QueryExecutionOperatorProfile,
+    QueryExecutionOutcome, QueryExecutionProfile, QueryExecutionScope, WriteAllCacheAliasReport,
     datafusion_query_output_stream, progress::ProgressReporter,
 };
 use serde_json::Value;

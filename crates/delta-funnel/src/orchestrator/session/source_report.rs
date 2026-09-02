@@ -246,7 +246,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
 
         let reports = session.source_reports_for_lazy_table_plan(&source).await?;
 
@@ -296,7 +298,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let table = DeltaLogTable::new("orders-multiple-snapshots")?;
         let mut session = DeltaFunnelSession::new(SessionOptions::default())?;
-        let source = session.delta_lake(DeltaSourceConfig::new("orders", table.uri()))?;
+        let source = session
+            .delta_lake(DeltaSourceConfig::new("orders", table.uri()))
+            .await?;
         let planned_reports = session.source_reports_for_lazy_table_plan(&source).await?;
         let mut first = planned_reports
             .first()

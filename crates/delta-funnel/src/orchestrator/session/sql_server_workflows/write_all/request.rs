@@ -1424,10 +1424,12 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            session.delta_lake(DeltaSourceConfig::new(
-                "orders",
-                table.path().to_string_lossy().to_string(),
-            ))?;
+            session
+                .delta_lake(DeltaSourceConfig::new(
+                    "orders",
+                    table.path().to_string_lossy().to_string(),
+                ))
+                .await?;
             let west = session
                 .table_from_sql("select id from orders where id <= 2")
                 .await?;
@@ -1480,10 +1482,12 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            session.delta_lake(DeltaSourceConfig::new(
-                "orders",
-                table.path().to_string_lossy().to_string(),
-            ))?;
+            session
+                .delta_lake(DeltaSourceConfig::new(
+                    "orders",
+                    table.path().to_string_lossy().to_string(),
+                ))
+                .await?;
             let pending_big = session
                 .table_from_sql("select id, customer_name from orders")
                 .await?;
@@ -1843,10 +1847,12 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            let shared = session.delta_lake(DeltaSourceConfig::new(
-                "orders",
-                table.path().to_string_lossy().to_string(),
-            ))?;
+            let shared = session
+                .delta_lake(DeltaSourceConfig::new(
+                    "orders",
+                    table.path().to_string_lossy().to_string(),
+                ))
+                .await?;
             let first = execute_output_request(
                 shared.clone(),
                 "first_output",
@@ -1976,10 +1982,12 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            session.delta_lake(DeltaSourceConfig::new(
-                "orders",
-                table.path().to_string_lossy().to_string(),
-            ))?;
+            session
+                .delta_lake(DeltaSourceConfig::new(
+                    "orders",
+                    table.path().to_string_lossy().to_string(),
+                ))
+                .await?;
             let selected_orders = session
                 .table_from_sql("select id, customer_name from orders")
                 .await?;
@@ -2048,10 +2056,12 @@ mod tests {
             let mut session = DeltaFunnelSession::new(
                 SessionOptions::new().with_default_mssql_connection(secret_connection()?),
             )?;
-            session.delta_lake(DeltaSourceConfig::new(
-                "orders",
-                table.path().to_string_lossy().to_string(),
-            ))?;
+            session
+                .delta_lake(DeltaSourceConfig::new(
+                    "orders",
+                    table.path().to_string_lossy().to_string(),
+                ))
+                .await?;
             let aggregate = session
                 .table_from_sql("select count(*) as order_count from orders")
                 .await?;
