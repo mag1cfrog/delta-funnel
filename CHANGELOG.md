@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.6.0...delta-funnel-v0.6.1) - 2026-10-16
+
+### Other
+
+- upgrade delta-arrow-reader to 0.7.0
+
 ## [0.6.0](https://github.com/mag1cfrog/delta-funnel/compare/delta-funnel-v0.5.0...delta-funnel-v0.6.0) - 2026-09-02
 
 ### Added
