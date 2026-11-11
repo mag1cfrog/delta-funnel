@@ -62,7 +62,7 @@ Follow these steps in order:
 
 ![Surreal banner showing Delta Lake data flowing through a Rust-orange funnel into a database barrel.](https://raw.githubusercontent.com/mag1cfrog/delta-funnel/main/assets/delta-funnel-banner.jpg)
 
-**Observed:** 13.4M rows in ~14 minutes vs. a ~2 hour Spark/JDBC path.
+**Observed:** 13.4M rows in ~10 minutes vs. a ~2 hour Spark/JDBC path.
 
 Project links: [GitHub](https://github.com/mag1cfrog/delta-funnel),
 [PyPI](https://pypi.org/project/deltafunnel/),
