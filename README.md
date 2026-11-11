@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <strong>Observed:</strong> 13.4M rows in ~14 minutes vs. a ~2 hour Spark/JDBC path.<br/>
+  <strong>Observed:</strong> 13.4M rows in ~10 minutes vs. a ~2 hour Spark/JDBC path.<br/>
   <a href="https://mag1cfrog.github.io/delta-funnel/">Read the Delta Funnel documentation</a>.
 </p>
 
